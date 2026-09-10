@@ -28,9 +28,23 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 import torch
 from safetensors.torch import load_file
+
+# The signature, made executable rather than left as prose for someone to eyeball.
+#
+# Rounding accumulation and index corruption look different at their first
+# appearance, and that shape -- not a threshold on the final number -- is what
+# separates them.  Measured: two identical rows first differ at hc_mixes.0.0 in
+# layer 0 by 3.6e-12, fp32 rounding on values of order one, and grow from there.
+# A cache slot indexed on the wrong dimension, or a broadcast where a gather
+# belonged, would instead make some tensor differ *immediately and largely*.
+#
+# 1e-6 sits far above any plausible fp32 first-touch rounding (which lands near
+# 1e-12) and far below anything a wiring error would produce.
+FIRST_DIVERGENCE_BUG_THRESHOLD = 1e-6
 
 # Tensors whose leading axis is batch, versus the flat [batch*seqlen, ...] gate
 # tensors that need splitting instead of indexing.
@@ -106,19 +120,30 @@ def main():
                   f"{rel:>10.3e}  {str(route_same):>13}")
 
     print()
+    verdict_bug = False
     if first_diff is None:
         print("row 0 and row 1 are bit-identical on every dumped tensor")
     else:
         i, name, (mx, rel) = first_diff
         print(f"FIRST divergence: layer {i}, {name}, max|diff|={mx:.3e} rel_l2={rel:.3e}")
         print()
-        if rel < 1e-2 and mx < 1e-1:
-            print("Small and in an activation -> consistent with the MoE story:")
-            print("  batch 2 changes the expert GEMM's M, its rounding differs, and a")
-            print("  near-tie token later routes elsewhere. Not a batch-handling bug.")
+        if mx > FIRST_DIVERGENCE_BUG_THRESHOLD:
+            verdict_bug = True
+            print(f"BATCH BUG: the first divergence is {mx:.3e}, above "
+                  f"{FIRST_DIVERGENCE_BUG_THRESHOLD:.0e}.")
+            print(f"  A tensor with no business differing ({name}, layer {i}) differs")
+            print("  immediately and largely. That is the shape of a wiring error -- a")
+            print("  cache slot indexed on the wrong dimension, or a broadcast where a")
+            print("  gather belonged -- not of rounding accumulating.")
+            print("  Start at that tensor; do not look downstream of it.")
         else:
-            print("Large at first appearance -> consistent with a batch-handling bug:")
-            print("  a tensor that has no business differing differs immediately.")
+            print(f"Not a batch bug: the first divergence is {mx:.3e}, below "
+                  f"{FIRST_DIVERGENCE_BUG_THRESHOLD:.0e}.")
+            print("  That is fp32 rounding at first touch. Two rows of one batched GEMM")
+            print("  receive different rounding; MoE then amplifies it into an O(1)")
+            print("  difference once a near-tie token routes elsewhere.")
+            print("  => batch rows are NOT bit-comparable. Judge 'same routing implies")
+            print("     same output', or top-1. This is a diagnostic, not a gate.")
     if routing_diff:
         print()
         print(f"layers where the two halves select different experts: "
@@ -130,6 +155,16 @@ def main():
     else:
         print()
         print("routing identical between the two halves on every layer")
+
+    # The routing flip is a consequence, not a cause: if the difference was already
+    # large while routing still agreed, no routing logic is at fault.
+    if routing_diff and first_diff is not None:
+        flip = routing_diff[0][0]
+        print()
+        print(f"first routing flip at layer {flip}; first divergence at layer "
+              f"{first_diff[0]} -- growth precedes the flip, so the flip is an effect")
+
+    sys.exit(1 if verdict_bug else 0)
 
 
 if __name__ == "__main__":
