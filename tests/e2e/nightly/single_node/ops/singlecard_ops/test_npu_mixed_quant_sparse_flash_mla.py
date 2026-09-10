@@ -251,3 +251,178 @@ def test_accepts_the_ratio_v41_needs():
     torch.npu.synchronize()
     assert actual.shape == (BATCH, SEQ_Q, NUM_HEADS_Q, HEAD_DIM)
     assert torch.isfinite(actual.float()).all()
+
+
+# --- KV cache layout -------------------------------------------------------------------------
+# The docs give each token's field layout (mixed_quant_sparse_flash_mla.md:189, :328):
+#   quant_mode 1: rope(64, bf16) | nope(448, fp8_e4m3) | scale(7, bf16) | pad(18B) = 608
+#   quant_mode 2: nope(448, fp8_e4m3) | rope(64, bf16) | scale(7, e8m0) | pad(1B)  = 584
+# What they do not say is how those fields sit inside a paged block. Under PA_BBND, quant_mode 2
+# splits them -- the whole block's KV first, then the whole block's scales -- while quant_mode 1 is
+# one contiguous row per token. Laying quant_mode 2 out contiguously produces NaN.
+#   csrc reference: csa_block_vector.h:471-476 in CANN's kernel source.
+
+KV_D_BY_QUANT_MODE = {1: 608, 2: 584}
+KV_BYTES_PER_TOKEN_QM2 = 576  # nope(448) + rope(64 bf16 = 128)
+SCALE_BYTES_PER_TOKEN_QM2 = 8  # 7 e8m0 scales + 1 byte of padding
+E8M0_ONE = 127  # e8m0 is a bias-127 exponent byte, so 2**0 is 127, not 1
+
+
+def _kv_fields(num_tokens):
+    torch.manual_seed(11)
+    rope = (
+        (torch.randn(1, num_tokens, NUM_HEADS_KV, ROPE_HEAD_DIM, dtype=torch.bfloat16) * 0.1)
+        .view(torch.uint8)
+        .reshape(1, num_tokens, NUM_HEADS_KV, 128)
+    )
+    nope = (
+        (torch.randn(1, num_tokens, NUM_HEADS_KV, 448, dtype=torch.bfloat16) * 0.1)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    return rope, nope
+
+
+def _build_paged_kv(quant_mode, num_tokens, partitioned):
+    """Write each field at its offset. `partitioned` selects the two candidate quant_mode 2 layouts."""
+    kv_d = KV_D_BY_QUANT_MODE[quant_mode]
+    num_blocks = (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+    rope, nope = _kv_fields(num_tokens)
+    buf = torch.zeros(num_blocks, BLOCK_SIZE, NUM_HEADS_KV, kv_d, dtype=torch.uint8)
+    flat = buf.view(num_blocks, -1)
+    for token in range(num_tokens):
+        block, offset = token // BLOCK_SIZE, token % BLOCK_SIZE
+        if quant_mode == 1:
+            base = offset * NUM_HEADS_KV * kv_d
+            flat[block, base : base + 128] = rope[0, token, 0]
+            flat[block, base + 128 : base + 576] = nope[0, token, 0]
+            flat[block, base + 576 : base + 590] = torch.ones(7, dtype=torch.bfloat16).view(torch.uint8)
+        elif partitioned:
+            base = offset * NUM_HEADS_KV * KV_BYTES_PER_TOKEN_QM2
+            flat[block, base : base + 448] = nope[0, token, 0]
+            flat[block, base + 448 : base + 576] = rope[0, token, 0]
+            scale_at = BLOCK_SIZE * NUM_HEADS_KV * KV_BYTES_PER_TOKEN_QM2 + offset * SCALE_BYTES_PER_TOKEN_QM2
+            flat[block, scale_at : scale_at + 7] = E8M0_ONE
+        else:
+            base = offset * NUM_HEADS_KV * kv_d
+            flat[block, base : base + 448] = nope[0, token, 0]
+            flat[block, base + 448 : base + 576] = rope[0, token, 0]
+            flat[block, base + 576 : base + 583] = E8M0_ONE
+    block_table = torch.arange(num_blocks, dtype=torch.int32).view(1, num_blocks).npu()
+    return buf.npu().view(torch.float8_e4m3fn), block_table
+
+
+def _attend_over_layout(quant_mode, partitioned, num_tokens=256, topk=64):
+    torch.manual_seed(11)
+    q = torch.randn(1, SEQ_Q, NUM_HEADS_Q, HEAD_DIM, dtype=torch.bfloat16, device="npu") * 0.1
+    kv, block_table = _build_paged_kv(quant_mode, num_tokens, partitioned)
+    seqused_q = torch.tensor([SEQ_Q], dtype=torch.int32, device="npu")
+    seqused_kv = torch.tensor([num_tokens], dtype=torch.int32, device="npu")
+    sinks = torch.zeros(NUM_HEADS_Q, dtype=torch.float32, device="npu")
+    indices = (
+        torch.arange(topk, dtype=torch.int32, device="npu")
+        .view(1, 1, 1, topk)
+        .expand(1, SEQ_Q, NUM_HEADS_KV, topk)
+        .contiguous()
+    )
+    topk_length = torch.full((1, SEQ_Q, NUM_HEADS_KV), topk, dtype=torch.int32, device="npu")
+    dense = dict(
+        ori_mask_mode=0, cmp_mask_mode=0, ori_win_left=-1, ori_win_right=-1, layout_q="BSND", layout_kv="PA_BBND"
+    )
+    metadata = torch.ops._C_ascend.npu_mixed_quant_sparse_flash_mla_metadata(
+        NUM_HEADS_Q,
+        NUM_HEADS_KV,
+        HEAD_DIM,
+        quant_mode,
+        None,
+        None,
+        None,
+        seqused_q,
+        seqused_kv,
+        None,
+        None,
+        topk_length,
+        None,
+        1,
+        SEQ_Q,
+        num_tokens,
+        0,
+        topk,
+        0,
+        ROPE_HEAD_DIM,
+        1,
+        dense["ori_mask_mode"],
+        dense["cmp_mask_mode"],
+        dense["ori_win_left"],
+        dense["ori_win_right"],
+        dense["layout_q"],
+        dense["layout_kv"],
+        True,
+        False,
+        "npu",
+    )
+    attn_out, _ = torch.ops._C_ascend.npu_mixed_quant_sparse_flash_mla(
+        q,
+        quant_mode,
+        kv,
+        None,
+        indices,
+        None,
+        block_table,
+        None,
+        None,
+        None,
+        None,
+        seqused_q,
+        seqused_kv,
+        None,
+        None,
+        topk_length,
+        None,
+        sinks,
+        metadata,
+        ROPE_HEAD_DIM,
+        1.0 / math.sqrt(HEAD_DIM),
+        1,
+        dense["ori_mask_mode"],
+        dense["cmp_mask_mode"],
+        dense["ori_win_left"],
+        dense["ori_win_right"],
+        dense["layout_q"],
+        dense["layout_kv"],
+        1,
+        False,
+    )
+    torch.npu.synchronize()
+    return attn_out.float()
+
+
+@torch.inference_mode()
+def test_quant_mode_1_layout_is_contiguous_per_token():
+    out = _attend_over_layout(quant_mode=1, partitioned=False)
+    assert torch.isfinite(out).all()
+
+
+@torch.inference_mode()
+def test_quant_mode_2_layout_splits_kv_from_scales_within_a_block():
+    """The layout the kernel source describes; the same fields laid out contiguously give NaN."""
+    out = _attend_over_layout(quant_mode=2, partitioned=True)
+    assert torch.isfinite(out).all()
+
+
+@torch.inference_mode()
+def test_quant_mode_2_laid_out_contiguously_does_not_work():
+    """Pins the trap: reading the field list as "584 contiguous bytes per token" produces NaN.
+
+    Kept as a test so that anyone tempted to "simplify" the split layout above sees why it is split.
+    """
+    out = _attend_over_layout(quant_mode=2, partitioned=False)
+    assert torch.isnan(out).any()
+
+
+@torch.inference_mode()
+def test_both_quant_modes_agree_on_the_same_underlying_kv():
+    """Same rope and nope bytes, different container: the attention output should match."""
+    qm1 = _attend_over_layout(quant_mode=1, partitioned=False)
+    qm2 = _attend_over_layout(quant_mode=2, partitioned=True)
+    torch.testing.assert_close(qm1, qm2, rtol=2e-2, atol=2e-3)
