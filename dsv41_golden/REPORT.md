@@ -40,17 +40,54 @@
 | 项目 | 原因 | 影响 |
 |---|---|---|
 | ~~**decode（`start_pos > 0`）**~~ | ✅ **v1.1 已完成** | `golden.LayerStateStore` 跨流式层携带 KV 状态；`run_decode_check.py` 两个模式；40 层实测 6/7 个位置各 ~961 个张量全部在阈值内，第 7 个的唯一分歧是该层 margin 最小的 token（9.3e-5，全 27 个里最小）。见 `ALIGNMENT_PROTOCOL.md` 第 11 节 |
-| **decode 的环形缓冲回绕** | `window_size=128` > 27 token，标准输入到不了回绕 | 已加 `--window-size` 开关（调小滑窗让回绕在 27 token 内发生，且能覆盖 prefill 里 `seqlen > win` 那条从未走到的分支）。**3 层跑已排队但被机器内存占满挡住** |
+| ~~**decode 的环形缓冲回绕**~~ | ✅ **已完成** | `--window-size 8` 让回绕在 27 token 内发生，逐层模式 **PASS**。顺带覆盖了 prefill 里 `seqlen > win` 那条从未走到的分支 |
+| ~~**batch > 1**~~ | ⚠️ **已定位，是舍入累积不是 bug；判据已定，但是诊断工具不是门禁** | 见下面的 §2.1 |
 | **vision（ViT + Aligner）** | 本次限定纯文本路径 | 多模态未验证 |
 | **DSpark / MTP 草稿头**（`mtp.*` 3 层） | 参考实现里 `forward_spec` 没有被推理循环调用 | 投机解码未验证 |
 | **与 GPU/tilelang 原 kernel 逐位对照** | 本机无 GPU，`tilelang` 未安装 | 改做了**语义逐条比对**（`ALIGNMENT_PROTOCOL.md` 第 10.6 节，每条附行号）。结果：**已确认一处实质不一致** —— 原 kernel 的 `sparse_attn` 把 softmax 概率舍到 bf16 才做 P·V，golden 全程 fp32，**即 golden 比它要参考的 kernel 更准**，实测固定偏差 `rel_l2 = 1.80e-3`。**两处仍需 GPU 实测**：fp4 的 e2m1 舍入模式、fp4 的 nibble 打包顺序 |
 | **与 vllm 基线交叉验证** | 未做 | 少了一个独立的精度锚点。（v1.0 时卡 4/5 的服务不在跑；现在基线线在跑，但这条交叉验证还没安排）|
 | `fp4_act_quant` 非 inplace 打包路径 | `model.py` 里三处调用全是 `inplace=True` | 仅单测覆盖，实跑未走到 |
-| batch > 1 | 未测 | — |
 
 > 关于 vllm：任务说明提到 pid 45035 是精度基线且不能被杀。**本次工作全程没有触碰它**；
 > 开始检查时它已经不在了（僵尸进程 + 无监听端口），不是被本次工作影响的。
 > 全程内存最低点 558.9 GB，距 150 GB 下限极远。
+
+### 2.1 `batch > 1`：已定位
+
+同一段 prompt 复制成 batch=2，逐层比 row 0 vs row 1：**第一处分歧在 layer 0 的
+`hc_mixes.0.0`，`3.638e-12`（fp32 舍入量级）**，然后单调增长到 layer 39 的 `2.828e+00`
+（rel_l2 7.96e-2），路由在 layer 10 第一次翻转。
+
+**layer 9 是关键证据：路由仍相同、差异已到 4.7e-2 —— 增长先于翻转，所以翻转是结果不是原因。**
+
+**⇒ 不是 batch bug。** 同一次 batched GEMM 里两行拿到不同舍入（batch=2 时 MoE 输入是
+`[54, 5120]` 而非 `[27, 5120]`，BLAS 分块随之不同）。
+
+#### 🔴 顺带测出了一个比 batch 本身更重要的量
+
+**摁住路由**（两行喂同一组专家）重跑：
+
+| | 自由路由 | 强制路由 |
+|---|---|---|
+| 最终 `layer.out` rel_l2 | 7.96e-2 | **1.83e-2** |
+| 第一次路由翻转 | layer 10 | layer 16 |
+| 翻转层数 | 26 | 7 |
+
+**剩下的 1.83e-2 里完全没有路由参与。1e-12 → 1.8e-2 是十个数量级的放大，
+全部由「bf16 舍入 + 因果 attention 扩散」完成，没有任何离散事件。**
+
+**⇒ 这是协议第 0.2 节那条机制目前最干净的对照实验**（之前是靠逐 token 追踪论证的）。
+**⇒ 并且修正了两个注入开关的重要性排序**：`--force-layer-in` 切断的是**主力**路径，
+强制路由处理的是**次要**那一项。**强制路由坏了判据变松；`layer.in` 坏了判据完全失效。**
+
+#### 「真 batch bug」的可判别签名（已做成会报错的检查）
+
+不看最终差多少，**看第一处分歧有多大**：≲1e-12 是舍入累积；**>1e-6 是接线错误**
+（缓存槽索引错维度、该 gather 处做了 broadcast）。
+`compare_batch_rows.py` 超阈值就 **exit 1** 并指出张量名和层号。
+
+⚠️ **这一整节是诊断工具，不是验收门禁。** `batch > 1` 在不同实现之间**结构性不可逐位比**
+（昇腾的 BLAS 分块必然与 CPU 不同）。**真正的 batch 验收在 GSM8K 那一级。**
 
 ---
 
@@ -230,7 +267,7 @@ checkpoint 510 GB 里，290 GB 是 MoE 专家、203 GB 是两张 engram 表。�
 | ~~**decode 路径**~~ | ✅ **已完成** | `LayerStateStore` 按「在 `named_buffers()` 里但不在 `state_dict()` 里」自动发现要携带的 buffer，不是手写清单。两个验证模式（端到端判 top-1、逐层判数值）。⚠️ 剩：环形缓冲回绕、batch>1 |
 | ~~**强制路由注入模式**~~ | ✅ **已完成** | `ROUTING_INJECTION.md` + `routing_plan.py`。按**绝对序列位置**寻址（不是张量行号），两条 fail-safe 拒绝行为。端到端验证：注入后 `moe_gate.forced.1` 与 golden 逐位相同。model 线已实现并 10 passed。**并且额外发现「强制路由不充分」，加了第二个开关 `--force-layer-in`** |
 | ~~**与 GPU 原 kernel 对照**~~ | ⚠️ **改为语义比对，已完成** | 无 GPU 无 tilelang，改做带行号的语义逐条比对（第 10.6 节）。**剩两条必须有 GPU 才能定**：fp4 的 e2m1 舍入模式（若不是 RNE，中点元素最大偏差 33%）、fp4 nibble 打包顺序（CPU 与 `convert.py` 逐字一致，风险低但若反了是灾难性）。**建议：0.5 人天，前提是能借到一台 GPU 机器** |
-| **engram host 查表 / UVA offload** | 3~5 | 本次新增的工作项（分工已定：主干归 model 线，189 GiB 表的 host 查表归 golden 线）。**判据 G-3 的前提已实测验证**：e8m0 是纯指数、e4m3 三位尾数，乘积在 fp32 里精确无舍入，bf16 结果与 fp64 逐位相同 → **可以要求逐位相同，不需要容差**。首周待答：Triton gather kernel 能否在 A5 编过、UVA 跨 PCIe 实际带宽（**都需要卡**）|
+| **engram host 查表 / offload** | 3~5 | **首周那两个问题已经答完，而且答案改变了路线** —— 见 `ENGRAM_NOTES.md`。摘要：<br>✅ **G-3 的前提已实测验证**（e8m0 是纯指数、e4m3 三位尾数 → 乘积在 fp32 里精确无舍入，bf16 结果与 fp64 逐位相同）→ **可以要求逐位相同，不需要容差**<br>✅ **`ElasticBuffer` 的 engram 路径字节透明**（埋 2080 个 NaN + 16 个 Inf，全部逐位存活；加源码三层证据共四层一致）→ **fp8 装 bf16 外衣可行，host 203 GB 而非 393 GB**<br>❌ **远端 URMA/RDMA 取行在本机不可用**（kernel 内断言 `Urma drain failed, ret=255`）→ **官方那种分片表形态走不通**<br>❌ **「Triton gather kernel 能否在 A5 编过」这个问题的前提消失了** —— 官方实现里根本没有 Triton，gather 全在闭源 AIV 里<br>⚠️ 三个实现前提（热身集合通信 / `hidden % 128 == 0` 压线 / `eb.destroy()`），每个的症状都误导 |
 | **与 vllm 基线交叉验证** | 1.0 | 等 vllm 服务恢复，比 logits / top-1 / 困惑度 |
 | **vision 路径** | 1.5 | ViT + Aligner + `image_processor.prepare_vl_inputs`，还要准备固定图片输入 |
 | **DSpark / MTP** | 2.0 | `forward_spec` 在参考实现里没有被调用过，等于要自己搭驱动循环 |
