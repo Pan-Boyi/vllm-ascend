@@ -169,6 +169,25 @@ init_process_group  →  ★至少一次真实集合通信★  →  ElasticBuffe
 教训：**过滤器本身可以吃掉证据，而吃掉之后看起来和「证据不存在」一模一样。**
 诊断故障时不要给输出接 `head`。
 
+#### 热身之后：`engram_write` + `engram_fetch` 本地路径通了，数值正确
+
+```
+[r0] constructed  comm_buffer_size=0 rank_size=0
+[r0] engram_write + synchronize OK
+[r0] fetch returned (4, 128) bfloat16 -- NOT yet synchronized
+[r0] synchronize after fetch OK          ← 真正的判据
+[r0] D2H OK  first row[:4] = [0.0, 1.0, 2.0, 3.0]   ← 源是 arange 填的，值对上了
+```
+两个 rank 都成功，`num_max_tokens_per_rank` 设不设都成功（它是 MoE dispatch 的参数，
+engram 路径不用；`comm_buffer_size` 全程是 0 也不影响）。
+
+🔴 **判「NPU 算子跑通了」必须先 `torch.npu.synchronize()`。**
+AIV 是异步的，错误要到下一个同步点才浮现。我曾经拿到 `engram_fetch` 的返回值就报了
+「OK」—— **那是假通过**，那次的 kernel 其实 trap 了，只是我从没同步过。
+「函数返回了」和「计算成功了」是两件事，而失败会伪装成成功。
+
+**⇒ 探针里把「fetch 返回」和「同步后仍然 OK」打印成两条不同的消息**，避免自己再读错。
+
 #### 已排除的（都实测过，不要重试）
 
 | 假设 | 结论 |
