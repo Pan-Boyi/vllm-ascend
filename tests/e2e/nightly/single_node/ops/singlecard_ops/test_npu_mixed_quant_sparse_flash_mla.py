@@ -6,14 +6,28 @@ kv_quant_sparse_attn_sharedkv_check_existance.cpp:154-166), while DeepSeek-V4.1 
 layers 2..19. This operator is Ascend950-only and takes any ratio, which is what these cases pin down.
 """
 
+import importlib.util
 import math
+import os
 
 import pytest
 import torch
 import torch_npu  # noqa: F401 -- registers the npu device
 
-# torch.ops.cann_ops_transformer is empty until the package is imported.
-cann_ops_transformer = pytest.importorskip("cann_ops_transformer")
+# torch.ops.cann_ops_transformer is empty until the package is imported, and CANN 9.1 ships a
+# package of the same name that does not provide this operator. Resolving to that one raises a bare
+# ImportError which says nothing about why, so check the tree first and skip with a reason.
+_ASCEND_HOME = os.environ.get("ASCEND_HOME_PATH", "")
+_spec = importlib.util.find_spec("cann_ops_transformer")
+if _spec is None or not _spec.origin:
+    pytest.skip("cann_ops_transformer is not importable", allow_module_level=True)
+if not _ASCEND_HOME or not os.path.realpath(_spec.origin).startswith(os.path.realpath(_ASCEND_HOME)):
+    pytest.skip(
+        f"cann_ops_transformer resolves to {_spec.origin}, outside ASCEND_HOME_PATH "
+        f"({_ASCEND_HOME or 'unset'}); CANN 9.1 has a same-named package without this operator",
+        allow_module_level=True,
+    )
+import cann_ops_transformer  # noqa: E402,F401 -- registers torch.ops.cann_ops_transformer
 
 from vllm_ascend.utils import bootstrap_custom_op_env  # noqa: E402
 
