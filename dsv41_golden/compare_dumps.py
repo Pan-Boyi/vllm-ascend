@@ -277,7 +277,7 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                   if f.endswith(".safetensors"))
     results, failures, missing, notes = {}, [], [], []
     forced = force_route.startswith("moe")
-    mask_leak = []
+    mask_leak, mask_checked, mask_skipped = [], [], {}
 
     for tag in tags:
         gpath = os.path.join(golden, tag + ".safetensors")
@@ -314,15 +314,33 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
             # legitimately covers the perturbed token 5 and legitimately differs.
             # Checked against the token count rather than a list of exempt names,
             # for the same reason the dtype floor is not a name list.
-            if (perturb_tok is not None and gt.dim() >= 3 and gt.size(0) == 1
-                    and n_tokens is not None and gt.size(1) == n_tokens
-                    and gt.size(1) > perturb_tok):
+            # Two shapes carry a token axis: [1, T, ...] activations and the flat
+            # [T, ...] gate tensors.  Declaring the scope of this check is what
+            # revealed the second kind was being skipped while perfectly checkable
+            # -- which is the point of declaring scope rather than assuming it.
+            mask_axis = None
+            if perturb_tok is not None and n_tokens is not None:
+                if gt.dim() >= 3 and gt.size(0) == 1 and gt.size(1) == n_tokens:
+                    mask_axis = 1
+                elif gt.dim() >= 2 and gt.size(0) == n_tokens:
+                    mask_axis = 0
+            mask_applicable = mask_axis is not None and n_tokens > perturb_tok
+            if perturb_tok is not None and not mask_applicable and gt.dim() >= 2:
+                # Recorded, not silently dropped: a leak could show up only on a
+                # tensor this check cannot reach, and "the mask is verified" and
+                # "the mask is verified where I could look" are different claims.
+                mask_skipped.setdefault(name, tuple(gt.shape))
+            if mask_applicable:
+                mask_checked.append(f"{tag}/{name}")
                 # A token before the perturbation point is causally unable to see
                 # it, so it must stay bit-exact through all 40 layers.  With a
                 # 7.3e-3 perturbation amplified to 3e-1 downstream, any mask leak
                 # at all shows up here -- which makes this the most sensitive
                 # causal-mask check available, and it comes for free.
-                pre_c, pre_g = ct[:, :perturb_tok], gt[:, :perturb_tok]
+                if mask_axis == 1:
+                    pre_c, pre_g = ct[:, :perturb_tok], gt[:, :perturb_tok]
+                else:
+                    pre_c, pre_g = ct[:perturb_tok], gt[:perturb_tok]
                 if not torch.equal(pre_c, pre_g):
                     n = int((pre_c != pre_g).any(-1).sum())
                     mask_leak.append((tag, name, n))
@@ -396,10 +414,18 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                              f"CAUSAL MASK LEAK: {n} token(s) before the perturbation "
                              f"point differ, and they cannot causally see it"))
     elif perturb_tok is not None:
+        skipped = ", ".join(f"{k} {list(v)}" for k, v in list(mask_skipped.items())[:4])
         notes.append(("(all layers)", "causal mask",
-                      f"tokens 0..{perturb_tok - 1} stayed bit-exact on every tensor "
-                      f"whose dim 1 is the token axis -- the mask is strict, verified "
-                      f"through an amplifier that takes 7.3e-3 to 3e-1"))
+                      f"tokens 0..{perturb_tok - 1} stayed bit-exact on "
+                      f"{len(mask_checked)} tensors carrying a token axis -- "
+                      f"the mask is strict there, verified through an amplifier that "
+                      f"takes 7.3e-3 to 3e-1"))
+        if mask_skipped:
+            notes.append(("(all layers)", "causal mask SCOPE",
+                          f"NOT checked on {len(mask_skipped)} tensor kinds with no token "
+                          f"axis this check can address: {skipped}"
+                          f"{' ...' if len(mask_skipped) > 4 else ''}. A leak confined to "
+                          "those would not be caught here."))
     return results, failures, missing, notes
 
 
