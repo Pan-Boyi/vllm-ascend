@@ -19,6 +19,88 @@ def _supports_dsv4_compressed_cache() -> bool:
     return get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
 
 
+# QuantLightningIndexerV2's ``quant_mode`` selects which quantized kernel
+# variant runs, and each variant fixes BOTH the q/k dtype and the dequant
+# scale dtype. The kernel rejects a mismatch with
+#
+#     Invalid_Argument_Tensor_Dtype(EZ0021): Parameters q and k of
+#     QuantLightningIndexerV2 have incorrect dtypes ... Reason: The dtype of q
+#     and k must match quant_mode.
+#
+# From the operator's own constraints (csrc/attention/quant_lightning_indexer_v2
+# /README.md, "Ascend 950PR/Ascend 950DT"), confirmed by sweeping quant_mode
+# against each dtype pair on A5:
+#
+#     mode  q / k             dequant scale     weights
+#     1     float8_e4m3fn     float32           float32
+#     2     int8              float16           float16
+#     3     float8_e4m3fn     float8_e8m0       float32
+#     4     hifloat8          float32           float32
+#     5     float4_e2m1       float8_e8m0       float32
+#
+# Modes 1 and 3 take the SAME q/k dtype and are told apart only by the scale
+# dtype, so the q/k dtype alone does not determine the mode. Keying on it
+# alone happens to return 1 for today's A5 path (fp8 q/k, fp32 scales), but it
+# would keep returning 1 for an e8m0-scaled caller, handing the kernel mode
+# 1's contract with mode 3's tensors -- wrong values, no error.
+#
+# Modes 3 and 5 also give the scales one more dimension than q/k, trailing
+# (D/64, 2), with D a multiple of 64. Selecting one of those modes is
+# therefore not just a mode change; the caller has to produce scales of that
+# shape as well.
+#
+# A2/A3 support quant_mode 2 only (int8 q/k, float16 scales), which is the
+# (int8, float16) entry below.
+_QLI_V2_QUANT_MODE: dict[tuple[torch.dtype, torch.dtype], int] = {
+    (torch.float8_e4m3fn, torch.float32): 1,
+    (torch.int8, torch.float16): 2,
+    (torch.float8_e4m3fn, torch.float8_e8m0fnu): 3,
+    # Mode 4 is hifloat8, which torch has no dtype for, so it cannot be keyed
+    # here. Do NOT add a stand-in dtype for it: any pair listed becomes a
+    # silent answer for callers that legitimately pass that dtype.
+    (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu): 5,
+}
+
+
+def qli_v2_quant_mode(qk_dtype: torch.dtype, scale_dtype: torch.dtype) -> int:
+    """Return the QLI v2 ``quant_mode`` for this (q/k, dequant scale) pair.
+
+    Raises on any pair the operator has no variant for. Falling back to a
+    default here would be a silent wrong-value bug: the kernel validates the
+    q/k dtype against the mode but not the scale dtype, so a wrong mode with a
+    plausible q/k dtype runs and returns garbage.
+    """
+    try:
+        return _QLI_V2_QUANT_MODE[(qk_dtype, scale_dtype)]
+    except KeyError:
+        supported = ", ".join(f"({q}, {s}) -> {m}" for (q, s), m in sorted(_QLI_V2_QUANT_MODE.items(), key=lambda kv: kv[1]))
+        raise ValueError(
+            f"QuantLightningIndexerV2 has no quant_mode for q/k dtype {qk_dtype} "
+            f"with dequant scale dtype {scale_dtype}. Supported: {supported}. "
+            "Modes 3 and 5 additionally require scales shaped (..., D/64, 2)."
+        ) from None
+
+
+def dsv4_indexer_qk_dtype() -> torch.dtype:
+    """dtype of the DeepSeek-V4 indexer q/k tensors on this hardware.
+
+    Mirrors ``AscendSFAIndexerCache.get_kv_cache_spec``, which pins the indexer
+    cache to fp8_e4m3 exactly when the platform has DSV4_COMPRESSED_CACHE (A5).
+    """
+    return torch.float8_e4m3fn if _supports_dsv4_compressed_cache() else torch.int8
+
+
+def dsv4_indexer_scale_dtype() -> torch.dtype:
+    """dtype of the DeepSeek-V4 indexer dequant scales on this hardware.
+
+    Mirrors the ``scale_dtype`` that ``AscendSFAIndexerCache.get_kv_cache_spec``
+    puts on the cache spec. Used together with ``dsv4_indexer_qk_dtype`` where
+    the quant_mode is needed but no tensor is in hand -- the metadata operator
+    has to be built with the same mode as the call it describes.
+    """
+    return torch.float32 if _supports_dsv4_compressed_cache() else torch.float16
+
+
 def resolve_dsv4_cache_dtype(cache_dtype, model_dtype: str) -> str:
     """Return the KV cache dtype the platform should pin for DeepSeek-V4.
 

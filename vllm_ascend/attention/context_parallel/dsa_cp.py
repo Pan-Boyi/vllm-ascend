@@ -16,8 +16,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
+    dsv4_indexer_qk_dtype,
+    dsv4_indexer_scale_dtype,
     get_dsa_attn_kv_plan,
     is_a5_bf16_kv_enabled,
+    qli_v2_quant_mode,
 )
 from vllm_ascend.attention.dsa_v1 import (
     _dsa_layout_kv,
@@ -1330,7 +1333,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_heads_k=1,
                 head_dim=self.model_config.hf_config.index_head_dim,
                 topk=self.model_config.hf_config.index_topk,
-                quant_mode=2,
+                # Keep in step with the QLI v2 call this metadata describes.
+                quant_mode=qli_v2_quant_mode(dsv4_indexer_qk_dtype(), dsv4_indexer_scale_dtype()),
                 cu_seqlens_q=qli_cu_seqlens_q,
                 seqused_k=qli_seqused_k,
                 cmp_residual_k=qli_cmp_residual_k,
@@ -2125,14 +2129,15 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         assert indexer_kv_scale_metadata.req_metadata is not None
         dsa_meta = indexer_kv_scale_metadata.req_metadata
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(dsa_meta.qli_metadata))
+        cp_key_dequant_scale = DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache)
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=q,
             key=indexer_k_cache,
             weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
             query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
-            key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
+            key_dequant_scale=cp_key_dequant_scale,
             topk=self.index_topk,
-            quant_mode=2,
+            quant_mode=qli_v2_quant_mode(indexer_k_cache.dtype, cp_key_dequant_scale.dtype),
             cu_seqlens_q=dsa_meta.qli_cu_seqlens_q,
             seqused_k=dsa_meta.qli_seqused_k,
             cmp_residual_k=dsa_meta.qli_cmp_residual_k,

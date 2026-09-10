@@ -22,8 +22,11 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
+    dsv4_indexer_qk_dtype,
+    dsv4_indexer_scale_dtype,
     get_dsa_attn_kv_plan,
     is_a5_bf16_kv_enabled,
+    qli_v2_quant_mode,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -972,7 +975,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_heads_k=1,
                 head_dim=self.model_config.hf_config.index_head_dim,  # 128
                 topk=self.model_config.hf_config.index_topk,
-                quant_mode=2,
+                # Must match the quant_mode select_topk passes; see
+                # qli_v2_quant_mode. No tensors here, so derive both dtypes.
+                quant_mode=qli_v2_quant_mode(dsv4_indexer_qk_dtype(), dsv4_indexer_scale_dtype()),
                 cu_seqlens_q=query_start_loc,
                 seqused_k=qli_seqused_k,
                 cmp_residual_k=qli_cmp_residual_k,

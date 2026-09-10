@@ -39,7 +39,7 @@ from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
+from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled, qli_v2_quant_mode
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata, Compressor
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
@@ -216,14 +216,18 @@ class AscendIndexerOps:
         metadata: typing.Any,
     ) -> torch.Tensor:
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(metadata.qli_metadata))
+        key_dequant_scale = self.device_operator.prepare_dsa_indexer_key_scale(scale_cache)
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=query,
             key=key_cache,
             weights=self.device_operator.prepare_dsa_indexer_weights(weights),
             query_dequant_scale=self.device_operator.prepare_dsa_indexer_query_scale(query_scale),
-            key_dequant_scale=self.device_operator.prepare_dsa_indexer_key_scale(scale_cache),
+            key_dequant_scale=key_dequant_scale,
             topk=self.index_topk,
-            quant_mode=2,
+            # quant_mode picks the kernel variant, and the variant fixes both
+            # the q/k dtype and the scale dtype (see qli_v2_quant_mode). The
+            # cache is fp8 on A5 and int8 elsewhere, so it is not a constant.
+            quant_mode=qli_v2_quant_mode(key_cache.dtype, key_dequant_scale.dtype),
             cu_seqlens_q=metadata.qli_cu_seqlens_q,
             seqused_k=metadata.qli_seqused_k,
             cmp_residual_k=metadata.qli_cmp_residual_k,
