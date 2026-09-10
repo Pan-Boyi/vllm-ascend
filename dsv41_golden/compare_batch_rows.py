@@ -139,11 +139,15 @@ def main():
         else:
             print(f"Not a batch bug: the first divergence is {mx:.3e}, below "
                   f"{FIRST_DIVERGENCE_BUG_THRESHOLD:.0e}.")
-            print("  That is fp32 rounding at first touch. Two rows of one batched GEMM")
-            print("  receive different rounding; MoE then amplifies it into an O(1)")
-            print("  difference once a near-tie token routes elsewhere.")
-            print("  => batch rows are NOT bit-comparable. Judge 'same routing implies")
-            print("     same output', or top-1. This is a diagnostic, not a gate.")
+            print("  That is fp32 rounding at first touch: two rows of one batched GEMM")
+            print("  receive different rounding.")
+            print("  What amplifies it is mostly NOT routing. Measured with routing")
+            print("  pinned for both rows, the difference still grows 3.6e-12 -> 1.8e-2")
+            print("  over 40 layers; free routing only takes it to 7.9e-2, a further")
+            print("  4.4x. So the bulk is the bf16-ULP-through-causal-attention spread")
+            print("  of ALIGNMENT_PROTOCOL section 0.2, which needs no discrete event.")
+            print("  => batch rows are NOT bit-comparable, and forcing routing does not")
+            print("     make them so. Judge top-1. This is a diagnostic, not a gate.")
     if routing_diff:
         print()
         print(f"layers where the two halves select different experts: "
