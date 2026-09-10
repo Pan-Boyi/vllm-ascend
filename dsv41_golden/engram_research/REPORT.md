@@ -3,6 +3,36 @@
 调研时间：2026-09-10
 调研目标：判断 `cann/cann-recipes-infer` 的 V4.1 day-0 支持对我们在 vllm-ascend + A5 上适配 V4.1 有多大帮助。
 
+> ## ⚠️ 本报告的两条结论已被实测修正（`dsv41-kernel` 交叉验证，2026-09-10）
+>
+> **1.「MXFP8 离线 broadcast scale 展开成 1×32」—— 这是 CANN 转换后 checkpoint 的状态，
+> 不是我们手上这份。**
+>
+> 官方那句 `# Scales are repeated offline`（`raw/dsv41/models/modeling_deepseek.py:2209`）
+> 服务的是**已转换**的变体。区分器是 `weight_block_size`：
+>
+> | | DeepSeek 原生发布版（**我们手上的**） | CANN `convert_model.py` 转换后 |
+> |---|---|---|
+> | `weight_block_size` | `[32, 32]` | `[1, 32]`（`convert_config.py:136` 写死）|
+> | `wkv.scale`（对 `[512, 5120]` 的权重） | **`[16, 160]`** 每 32×32 一个 | `[512, 160]` 每行每 32 列一个 |
+> | 加载时 | 需要 broadcast 展开 | 只需 `view(uint8)` |
+>
+> 而这两个变体在 vllm-ascend 里**各有一条现成的路**，终点是同一个布局
+> （`w8a8_mxfp8.py:79` 已展开变体 / `:523` 块变体，后者在
+> `process_weights_after_loading` 里展开）。**我们走块变体那条，正确，不需要改。**
+>
+> 这也和原 tilelang kernel 对得上（见 `ALIGNMENT_PROTOCOL.md` 第 10.6 节）：
+> `fp8_gemm` 的权重 scale 本来就是 **2D block×block**（`inference/kernel.py:231-232`），
+> `fp4_gemm` 的才是 **1D `[N, K/32]`**（`:514-515`）。两条路要两种形状。
+>
+> **2.「`hc_pre` 的 d=5120 被官方算子拒绝，华为自己也退回纯 PyTorch」—— 对 CANN 的
+> `MhcPreSinkhorn` 成立，对我们仓内的 `HcPre` 不成立。**
+>
+> 仓内 `csrc/moe/hc_pre/` 是**另一个算子**，实测改一行 `TORCH_CHECK` 就接受 d=5120
+> （重编 42.8 秒），且 4096/5120/7168 全部工作，对照 CPU golden 的 `post` 误差在
+> d=5120 时（3.68e-6 / 9.44e-6）比 d=4096 还好。**我们不需要 fallback。**
+> 别被同名的 CANN 算子文档（「尾轴仅 4096/7168」）误导。
+
 **所有原始文件已存于本目录 `raw/` 下**：
 - `raw/tech_report.md` — 华为官方技术报告全文（23KB / 286 行）
 - `raw/dsv41/` — V4.1 参考实现全部源码（8753 行，22 个文件）
