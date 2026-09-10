@@ -810,8 +810,19 @@ class GoldenModel:
             rec.add("pre_mix.in", pre_mix)
 
             if block.engram is not None:
-                idx = block.engram.layer_hash_index
-                h = block.engram(h, engram_hashes[:, :, idx, :], None)
+                if engram_hashes is None:
+                    # --no-engram: no tokenizer, so no hash ids to look up.  The
+                    # flag promised to skip these layers and did not -- it left
+                    # engram_hashes None and then subscripted it, which is how a
+                    # 40-layer memory measurement died at layer 1.  Skipping is
+                    # what the flag means; the run is then not a numerical
+                    # reference, which is why it says so out loud.
+                    if self.verbose:
+                        print(f"  layer {i:2d}  engram SKIPPED (no tokenizer) -- "
+                              f"this run is not numerically comparable", flush=True)
+                else:
+                    idx = block.engram.layer_hash_index
+                    h = block.engram(h, engram_hashes[:, :, idx, :], None)
 
             h, pre_mix = block(h, start_pos, pre_mix, None)
 

@@ -39,6 +39,12 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--max-seq-len", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=1, metavar="N",
+                    help="replicate the prompt into a batch of N identical sequences. "
+                         "Every row must then come out bit-identical to every other; "
+                         "anything else is a batch-handling bug (a cache slot indexed by "
+                         "the wrong dimension, a broadcast that should have been a gather). "
+                         "The check is bit-exact, so it needs no tolerance")
     ap.add_argument("--window-size", type=int, default=0, metavar="N",
                     help="override args.window_size. Shrinking it below the prompt length "
                          "is how the ring buffer's wrap-around gets exercised at all: with "
@@ -46,7 +52,11 @@ def main():
                          "seqlen>window branch and decode never wraps")
     ap.add_argument("--floor-gb", type=float, default=150.0)
     ap.add_argument("--fp64", action="store_true", help="accumulate the GEMMs in float64")
-    ap.add_argument("--no-engram", action="store_true", help="skip engram layers (no tokenizer needed)")
+    ap.add_argument("--no-engram", action="store_true",
+                    help="skip the engram lookup in layers 1 and 14 (no tokenizer needed). "
+                         "The result is NOT a numerical reference -- those layers are "
+                         "computed without their engram contribution. Use it for capacity "
+                         "and timing measurements only")
     ap.add_argument("--routing-plan", type=str, default=None,
                     help="force the MoE expert choice from this plan (file or dir); "
                          "see ROUTING_INJECTION.md")
@@ -72,7 +82,8 @@ def main():
     t0 = time.time()
     ckpt = Checkpoint(G.MODEL_DIR)
     overrides = {"window_size": args_cli.window_size} if args_cli.window_size else {}
-    args = G.load_args(max_batch_size=1, max_seq_len=args_cli.max_seq_len, **overrides)
+    args = G.load_args(max_batch_size=args_cli.batch, max_seq_len=args_cli.max_seq_len,
+                       **overrides)
     if overrides:
         print(f"OVERRIDE window_size={args.window_size} (real config is 128)", flush=True)
     print(f"config: n_layers={args.n_layers} dim={args.dim} experts={args.n_routed_experts} "
@@ -92,6 +103,8 @@ def main():
         if args_cli.seq_len:
             ids = ids[: args_cli.seq_len]
         input_ids = torch.tensor([ids])
+    if args_cli.batch > 1:
+        input_ids = input_ids.repeat(args_cli.batch, 1)
     print(f"input_ids {tuple(input_ids.shape)}: {input_ids[0].tolist()}", flush=True)
 
     guard = G.MemoryGuard(args_cli.floor_gb)
@@ -126,6 +139,23 @@ def main():
           f"    min avail {guard.min_avail:.1f} GB")
     print(f"  logits    {tuple(logits.shape)} dtype={logits.dtype}")
     print(f"  finite    {bool(torch.isfinite(logits).all())}")
+    if args_cli.batch > 1:
+        # Identical inputs must give identical outputs, row for row.  Compared as
+        # bits, not within a tolerance: there is nothing here that could
+        # legitimately differ between two rows carrying the same tokens.
+        ref = logits[0]
+        same = [bool(torch.equal(logits[b], ref)) for b in range(args_cli.batch)]
+        print(f"  batch     {args_cli.batch} identical sequences; "
+              f"rows bit-identical to row 0: {sum(same)}/{args_cli.batch}")
+        if not all(same):
+            bad = [b for b, ok in enumerate(same) if not ok]
+            for b in bad[:3]:
+                d = (logits[b] - ref).abs()
+                print(f"    row {b}: max|diff| = {d.max().item():.3e} at "
+                       f"token {int(d.max(dim=-1).values.argmax())}")
+            print("  => BATCH BUG: identical inputs produced different outputs")
+        else:
+            print("  => batch handling is consistent")
     print(f"  last-tok  top5 {logits[0, -1].topk(5).indices.tolist()}")
     print(f"            vals {[round(v, 3) for v in logits[0, -1].topk(5).values.tolist()]}")
     if tokenizer is not None:
