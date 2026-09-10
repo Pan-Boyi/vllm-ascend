@@ -5904,6 +5904,12 @@ def _torch_cuda_wrapper():
         torch.cuda.mem_get_info = torch.npu.mem_get_info
         torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
         torch.cuda.CUDAGraph = torch.npu.NPUGraph
+        # Models that size a Triton grid from the device (e.g. DeepSeek-V4.1's
+        # engram lookup) call this; on NPU the CUDA entry point asserts
+        # "Torch not compiled with CUDA enabled". _NPUDeviceProperties exposes
+        # multi_processor_count (56, the vector core count), so the grid gets a
+        # meaningful parallel-unit count rather than a crash.
+        torch.cuda.get_device_properties = torch.npu.get_device_properties
         breakable_cudagraph.weak_ref_tensor = weak_ref_tensor
         breakable_cudagraph.weak_ref_tensors = weak_ref_tensors
         yield
@@ -5922,7 +5928,7 @@ def _torch_cuda_wrapper():
         # Keep the CUDA compatibility entry point backed by a real NPU event so
         # their non-blocking device-to-host copies retain synchronization.
         torch.cuda.Event = torch.npu.Event
-        torch.cuda.Stream = torch.cuda.Stream
+        torch.cuda.Stream = torch.npu.Stream
         torch.cuda.default_stream = torch.npu.default_stream
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream
@@ -5930,6 +5936,7 @@ def _torch_cuda_wrapper():
         torch.cuda.mem_get_info = torch.npu.mem_get_info
         torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
         torch.cuda.CUDAGraph = torch.npu.NPUGraph
+        torch.cuda.get_device_properties = torch.npu.get_device_properties
         breakable_cudagraph.weak_ref_tensor = weak_ref_tensor
         breakable_cudagraph.weak_ref_tensors = weak_ref_tensors
 
