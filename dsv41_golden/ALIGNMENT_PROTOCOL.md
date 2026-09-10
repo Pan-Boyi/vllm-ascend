@@ -743,52 +743,112 @@ indexer 的选择，这些仍然由本次运行自己前面的层产生。所以
 
 ---
 
-## 9. 复现 golden
+## 9. 复现 golden · 完整命令参考
 
 ```bash
 cd <本目录>
 unset LD_PRELOAD          # 必须。jemalloc 在 ~/.bashrc 里，不 unset 会 segfault
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 DU=/workspace/code/dsv4_single_card/vllm_project/golden_dumps
-
-python test_kernel_cpu.py                                   # 6 个 kernel 的单测（9 个测试）
-
-# 1) 基准 golden（fp32 累加、自由路由）—— 已产出，无需重跑
-python run_golden.py --layers 40 --threads 16 --dump $DU/full40
-
-# 2) 从 dump 蒸出 58 KB 的强制路由方案
-python routing_plan.py $DU/full40 --out $DU/plan_full40
-
-# 3) 每层独立的参考跑（噪声地板表的来源，第 6.2 节）
-python run_golden.py --layers 40 --fp64 --threads 16 \
-    --routing-plan $DU/plan_full40 --force-layer-in $DU/full40 \
-    --dump $DU/full40_fp64_iso
-
-# 4) 比对
-python compare_dumps.py $DU/full40 <npu_dump_dir> --tolerance isolated   # 阶段 A1
-python compare_dumps.py $DU/full40 <npu_dump_dir> --tolerance default    # 阶段 B
 ```
 
-已产出的资产（**不在 git 里**，dump 太大）：
+### 9.1 kernel 单测（秒级，不加载权重）
+```bash
+python test_kernel_cpu.py                      # 9 个测试 / ~90 条断言
+```
 
-| 目录 | 内容 |
-|---|---|
-| `$DU/full40` | 基准，fp32 累加、自由路由，40 层，271 MB |
-| `$DU/plan_full40` | 强制路由方案，58 KB |
-| `$DU/full40_fp64_iso` | 每层独立参考跑，fp64 + 强制路由 + 强制 layer.in |
-| `$DU/smoke3`, `$DU/smoke3_fp64`, `$DU/smoke3_fp64_forced` | 3 层，第 0 节那组实验 |
+### 9.2 产出基准与强制路由方案
+```bash
+python run_golden.py --layers 40 --threads 16 --dump $DU/full40_v2       # ~372 s，55 GB
+python routing_plan.py $DU/full40_v2 --out $DU/plan_full40_v2            # 271 MB → 58 KB
+```
 
-实测（27 token，16 线程）：
+### 9.3 每层独立的参考跑（第 6.2 节噪声地板表的来源）
+```bash
+python run_golden.py --layers 40 --fp64 --threads 16 \
+    --routing-plan $DU/plan_full40_v2 --force-layer-in $DU/full40_v2 \
+    --dump $DU/full40_fp64_iso                                          # ~390 s
+```
+
+### 9.4 比对 NPU dump
+```bash
+python compare_dumps.py $DU/full40_v2 <npu_dump> --tolerance isolated   # 阶段 A1
+python compare_dumps.py $DU/full40_v2 <npu_dump> --tolerance default    # 阶段 B
+```
+
+### 9.5 判据 G-1：prefill↔decode 自洽（第 11 节）
+```bash
+python run_decode_check.py --cut 20 --layers 40 \
+    --routing-plan $DU/plan_full40_v2 --force-layer-in $DU/full40_v2    # 逐层，判数值
+python run_decode_check.py --cut 20 --layers 40 \
+    --routing-plan $DU/plan_full40_v2                                   # 端到端，判 top-1
+python run_decode_check.py --cut 10 --layers 40 \
+    --routing-plan $DU/plan_full40_v2                                   # 换 cut 复测对照值
+```
+
+### 9.6 环形缓冲回绕（把滑窗调小，让回绕在 27 token 内发生）
+```bash
+python run_golden.py --layers 3 --threads 16 --window-size 8 --dump $DU/smoke3_win8
+python routing_plan.py $DU/smoke3_win8 --out $DU/plan_win8
+python run_decode_check.py --cut 20 --layers 3 --window-size 8 \
+    --routing-plan $DU/plan_win8 --force-layer-in $DU/smoke3_win8
+```
+覆盖两条否则走不到的分支：**prefill 里 `seqlen > window` 那条（cutoff 拆分写环）**
+和 **decode 的环形回绕**。⚠️ 数值不是真实模型的，但**自洽性仍然成立**（两条路径同一份 config），
+所以它是有效的结构性测试。
+
+### 9.7 batch > 1 一致性（逐位判据，无容差）
+```bash
+python run_golden.py --layers 40 --threads 16 --batch 2
+```
+把同一段 prompt 复制成 N 个序列，**每一行必须与第 0 行逐位相同**。
+不同即 batch 处理 bug（缓存槽按错的维度索引、该 gather 的地方做了 broadcast）。
+**这里没有任何东西可以合法地在两行之间不同，所以判据是逐位的。**
+
+### 9.8 engram 参考（都不需要跑模型、不需要卡）
+```bash
+python engram_hash_ref.py --verify $DU/full40_v2 --decode-from 20   # 整数哈希，9 秒
+python engram_lookup_ref.py --out $DU/engram_lookup_ref            # 查表 + 逐位前提验证
+```
+
+### 9.9 engram 的 `ElasticBuffer` 位保真（**需要 2 张卡**，见 `ENGRAM_NOTES.md`）
+```bash
+source /workspace/code/dsv4_single_card/vllm_project/build_artifacts/env_dsv41.sh golden 3
+export ASCEND_RT_VISIBLE_DEVICES=2,3 HCCL_NPU_SOCKET_PORT_RANGE=17000-17099
+export E_ENG_1_LOCAL_ONLY=1 E_ENG_1_NO_OOB=1        # 远端路径在本机挂，见 ENGRAM_NOTES 3.1c
+torchrun --nproc_per_node=2 --tee 3 e_eng_1_bit_fidelity.py
+```
+
+### 9.10 容量与耗时测量（**不是**数值参考）
+```bash
+python run_golden.py --layers 40 --threads 16 --random-tokens 128 --no-engram
+```
+⚠️ `--no-engram` 会**跳过 layer 1/14 的 engram 查表**，所以结果**不能用于数值对照**。
+随机 token 是刻意的：它命中更多专家，是容量估算的最坏情况。
+
+---
+
+## 实测数据（27 token，16 线程）
 
 | 跑法 | 墙钟 | 峰值 RSS |
 |---|---|---|
-| 40 层 prefill，fp32 累加 | **216 s** | 55 GB |
-| 40 层 prefill，**fp64** 累加 + 双注入 | **390 s** | 55.1 GB |
+| 40 层 prefill，fp32 累加 | **216~372 s**（随机器负载波动） | 55 GB |
+| 40 层，**fp64** 累加 + 双注入 | **390 s** | 55.1 GB |
 | 3 层，fp64 + 强制路由 | 25 s | 7.2 GB |
+| 40 层 decode 检查（1 次 prefill + 7 步） | ~600 s | 59 GB |
 
 读取 52.4 GB 权重、加载 2610 个专家（65/层，共 384）、gather 1296 行 engram。
-详见 REPORT.md。
 
----
+🔴 **「峰值 RSS」这个数会被误读**：它几乎全是 mmap 的 page cache（可回收），不是真实内存压力。
+实测 `VmRSS 59.3 GB = RssAnon 3.6 GB + RssFile 55.6 GB`，而且峰值 RSS ≈ 已读取的
+checkpoint 字节数、逐层单调上升从不下降。**真正随序列长度增长的是匿名内存（3~4 GB）。**
+该看的是 `MemAvailable`（`MemoryGuard` 每层查一次，`--floor-gb` 默认 150），不是 RSS。
+
+⚠️ 而且这台机器是共享的：实测出现过容器外进程把 `MemAvailable` 压到 131 GB
+（`AnonPages 588 GB` vs 容器内 RSS 合计 59 GB），守卫在第 0 层就拒绝启动。
+**约定：等，不降 floor，不碰容器外的东西。**
+
+详见 REPORT.md。
 
 ## 10. 单算子对照（给 kernel 线）
 
