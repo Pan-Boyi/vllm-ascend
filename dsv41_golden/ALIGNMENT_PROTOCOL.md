@@ -158,7 +158,7 @@ The capital of France is Paris. Ascend NPU kernels must match this reference bit
 | `layer.in` | [1, 27, 4, 5120] | bf16 | 进入本层的 hyper-connection 残差流 |
 | `pre_mix.in` | [1, 27, 4] | fp32 | 上一层 FFN 交下来的 pre 系数 |
 | `engram.out` | [1, 27, 4, 5120] | bf16 | **仅 layer 1 / 14**：engram 写入后的残差流 |
-| `hc_mixes.0.0/.1/.2` | [1,27,4] / [1,27,4] / [1,27,4,4] | fp32 | attention 段的 pre / post / comb（Sinkhorn 后） |
+| `hc_mixes.0.0/.1/.2` | [1,27,4] / [1,27,4] / [1,27,4,4] | fp32 | attention 段的 pre / post / comb（Sinkhorn 后）。**⚠️ 见下面的 🔴，别和 `pre_mix.in` 搞混** |
 | `hc_pre.0` | [1, 27, 5120] | bf16 | hc 4 份塌缩成 1 份，attention 的输入 |
 | `attn_norm.out` | [1, 27, 5120] | bf16 | attention 前 RMSNorm |
 | `attn.in` | [1, 27, 5120] | bf16 | 同上（冗余，用于确认 hook 挂对位置） |
@@ -220,6 +220,25 @@ The capital of France is Paris. Ascend NPU kernels must match this reference bit
 | `hc_post.1` | [1, 27, 4, 5120] | bf16 | FFN 结果展回 4 份 |
 | `layer.out` | [1, 27, 4, 5120] | bf16 | 本层输出残差流 |
 | `pre_mix.out` | [1, 27, 4] | fp32 | 交给下一层的 pre 系数 |
+
+> 🔴 **`hc_mixes.0.0` 不是 `pre_mix.in`，但它们 shape 完全相同（都是 `[1,27,4]` fp32）。**
+>
+> - `pre_mix.in` = **上一层 FFN 段交下来的** pre 系数。
+> - `hc_mixes.0.0` = **本层 attention 段自己算出来的** pre 系数。
+>
+> shape 一样，所以 dump 时搞混零成本，而症状要到很多层之后才显现。实测两者相差 **O(1)**
+> （layer 0~3 的 `max|diff|` 分别是 1.00 / 0.76 / 0.80 / 0.55），不是接近的两个量。
+>
+> **两条免费自检**（实测在全部 40 层上**逐位相等**，可以直接 `assert`）：
+>
+> ```
+> pre_mix.out[L]  ==  hc_mixes.1.0[L]        逐位相同 —— 交给下一层的就是 FFN 段产出的 pre
+> pre_mix.in[L]   ==  pre_mix.out[L-1]       逐位相同 —— 层间链路
+> ```
+>
+> 也就是 `pre_mix.out` 在 dump 里是**冗余**的（等于 `hc_mixes.1.0`），它存在的意义正是让
+> 实现方零成本验证「我有没有把 pre 系数接对」。`pre_mix.in[0]` 是
+> `make_identity_pre_mix`（`ref/model.py:1159`）产出的单位 pre-mix。
 
 ### epilogue.safetensors
 | 名字 | 形状 | dtype |
@@ -431,6 +450,7 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 | 张量类 | dtype | rel_l2 | = ? ULP | cos | 实测最大 |
 |---|---|---|---|---|---|
 | `layer.out` / `hc_post.*` / `attn.out` | bf16 | **1.5e-2** | 3.8 | 0.9999 | 5.4e-3 |
+| ↳ ⚠️ `attn.out` 另有一个 **1.8e-3 的固定偏差**，见下 | | | | | |
 | `moe.out` | bf16 | **4e-2** | 10.2 | 0.9995 | 1.64e-2 |
 | `hc_pre.*` / `ffn_norm.out` / `moe.in` / `attn_norm.out` / `layer.in` | bf16 | **1.17e-2**（= `BF16_FLOOR`） | 3.0 | 0.9999 | 4.2e-3 |
 | `hc_mixes.*` / `pre_mix.*` / `moe_gate.out.0` | **fp32** | **5e-3** | ~42000 | 0.9999 | 8.7e-4 |
@@ -446,6 +466,26 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 **校准验证**：用 `--tolerance isolated` 比上面那个**已知无 bug** 的参考跑 → **PASS**，
 唯一的 informational 是 `moe_routing_margin`（诊断项，不 gate）和 layer 28 那 1 个 token。
+
+> ### 🔴 `attn.out` 上有一个「golden 比被参考对象更准」造成的固定偏差
+>
+> 原 tilelang `sparse_attn` **把 softmax 概率舍到 bf16 才做 P·V**（分母仍从 fp32 求和），
+> 而 CPU golden 全程 fp32 —— 详见第 10.6 节的行号引用。
+>
+> **实测**：把 golden 的 P 也舍到 bf16，`sparse_attn` 输出 `rel_l2 = 1.80e-3`、
+> 逐 (token, head) 最大 `3.27e-3`。
+>
+> **⇒ 一个忠实照搬原 kernel 的实现，会和 golden 有 ~1.8e-3 的固定差异，这不是 bug。**
+> 1.5e-2 的阈值有 8 倍余量，**不用改**；但**不要**因为 `attn.out` 有 1e-3 量级的差就去查算子。
+> 要逐位对照时把 `kernel_cpu.SPARSE_ATTN_P_DTYPE` 设成 `torch.bfloat16`。
+>
+> 这条和第 6.0 节那个 `strict = 5e-3` 的错误是**同一类陷阱的两个方向**，两条都会把人
+> 送去查不存在的 bug：
+>
+> | | 表现 |
+> |---|---|
+> | 阈值太严（`strict = 5e-3`）| 已知无 bug 的参考跑，40 层里 26 个张量「失败」|
+> | **参考太准**（P·V 全 fp32）| **忠实的实现看起来「差了 1e-3」** |
 
 ### 6.3 `moe_routing_margin` 不作判据
 
@@ -474,7 +514,31 @@ layer 2 就已经到 2.27e-2（无 bug）。实测 3 层：
 |---|---|---|
 | `moe_gate.out.1`（**第一个分歧层**，按集合比） | 见下 | |
 | `moe_gate.out.1`（后续层） | **不设阈值，不作判据** | 实测 layer 2 起翻转/未翻转的 margin 分布完全重叠，已无区分力 |
-| `logits` | **top-1 必须一致** | 业务判据 |
+| `logits` | **只看 top-1，rel_l2 不作判据** | 见下面的 🔴 |
+
+> ### 🔴 `logits` 的 rel_l2 只在「batch 形状一致」时有意义
+>
+> 实测（40 层，**两次纯 prefill，路由已强制对齐，完全没有 decode 参与**）：
+>
+> ```
+> prefill[0:20] 的 logits  vs  prefill[0:27] 的前 20 个位置
+>   40 层：rel_l2 = 1.028e-01        ← 10%
+>    3 层：rel_l2 = 6.2e-03
+> ```
+>
+> **唯一的区别是每个 GEMM 的 M 维不同**（20 个 token vs 27 个 token），因而求和顺序不同、
+> 舍入不同，再经第 0.2 节那条「bf16 ULP 经因果 attention 扩散」放大 40 层。
+>
+> 对比：**同一个 40 层跑，注入 `layer.in` 之后 `logits` 只差 1.5e-3**（第 6.2 节）。
+> **相差 70 倍。**
+>
+> **⇒ 如果昇腾侧的分批方式和 golden 不同**（chunked prefill、不同 tile、不同 padding），
+> **`logits` 可能差 10% 而实现完全正确。** 所以 v1.0 给的 `logits ≤ 3e-2` 是**低于地板**的，
+> 已作废：**自由累积模式下 `logits` 只看 top-1。**
+> 需要数值判据时用第 6.2 节的 A1（注入 `layer.in`），那里 `logits` 的阈值 1e-2 是有效的。
+>
+> ⚠️ `1.028e-01` 是**单点测量**（一个 cut 值、一组文本），标为「已观测」而非「已确认」。
+> 但它和 3 层的 6.2e-3、以及注入后的 1.5e-3 一起构成的趋势足够清楚。
 
 ⚠️ **v1.0 那条「第一个分歧层不一致 token ≤ 8%」已作废。** 它是从被推翻的 7.4%
 （见第 0.1 节，那 2 个 token 其实是纯顺序调换）推出来的。**按集合比时，本组实验下
