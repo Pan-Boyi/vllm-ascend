@@ -39,7 +39,9 @@
 | `routing_plan.py` | 从 dump 蒸出强制路由方案（271 MB → 58 KB），并提供参考消费实现 |
 | `run_decode_check.py` | **判据 G-1**：prefill↔decode 自洽验证，两个模式 |
 | `engram_hash_ref.py` | **独立**的 n-gram 哈希参考，9 秒，不加载权重 |
-| `engram_lookup_ref.py` | **判据 G-3**：engram 查表参考 + 逐位相同前提的实测验证 |
+| `engram_lookup_ref.py` | **判据 G-3**：engram 查表参考(可 import)+ 逐位相同前提的实测验证 + `--verify` 判据 |
+| `compare_batch_rows.py` | batch>1 的首个分歧定位,把「真 batch bug」的特征做成可执行判据 |
+| `check_docs_interfaces.py` | **文档自检**：文档承诺的每个 flag / 脚本 / 函数 / dump 目录是否真的存在 |
 | `compare_dumps.py` | golden ↔ NPU dump 比对工具（per-tensor 阈值、集合比路由、逐 token 统计）|
 | `ref/` | `/workspace/models/.../inference/` 的**逐字副本**，只把 `kernel.py` 换成 CPU 版 |
 

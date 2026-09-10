@@ -1,7 +1,7 @@
 """Driver: run the CPU golden over a fixed prompt and dump per-layer activations.
 
     python run_golden.py --layers 3 --dump dumps/smoke
-    python run_golden.py --layers 40 --dump dumps/full --prompt-tokens 16
+    python run_golden.py --layers 40 --dump dumps/full --seq-len 16
 
 Always run with LD_PRELOAD unset (jemalloc segfaults) and no NPU env vars set.
 """
