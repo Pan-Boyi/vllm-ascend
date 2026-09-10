@@ -326,6 +326,15 @@ def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:
     vendor_path = os.path.join(_CUSTOM_OP_BASE_DIR, "_cann_ops_custom", "vendors", _CUSTOM_OP_VENDOR_DIR)
     if not os.path.exists(vendor_path):
         return
+    # CANN cannot load an operator package through a symlinked vendor
+    # directory: the kernel binaries resolve, but the OpDef/SoC config lookup
+    # silently misses and every custom op dies at execution time with
+    #     Execution_Error(EZ1009): Failed to execute operator <Op>_0.
+    #     Reason: 1.SoC version ascend950 verification failed. ...
+    # which reads like a missing kernel rather than a path problem.
+    # Handing CANN the resolved path fixes it; realpath is a no-op when the
+    # vendor directory is real, so this cannot change the non-symlink case.
+    vendor_path = os.path.realpath(vendor_path)
     _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_path)
 
     if include_vendor_lib:
