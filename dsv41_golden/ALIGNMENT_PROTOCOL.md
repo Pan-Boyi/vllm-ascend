@@ -679,6 +679,87 @@ python test_kernel_cpu.py
 ⚠️ **fp32 与 fp64 两种参考产出的整模型结果不可混用** —— 第 0 节的实验就是这两者之差，
 它翻转了 22% 的路由。单算子对照不受影响（差异 ~1e-7），但一旦进入整模型逐层比对就要统一。
 
+### 10.6 与原 tilelang kernel 的语义比对结果
+
+本机**没有 GPU、tilelang 也没装**，所以无法运行原 kernel 做数值对照。做的是**语义逐条比对**：
+`/workspace/models/DeepSeek-V4.1-Flash/inference/kernel.py`（原 tilelang，只读）
+对 `kernel_cpu.py`。下面每一条都附了行号，可以自己去查。
+
+#### 🔴 P1 —— 已确认不一致，方向是「CPU golden 更准」，会影响验收阈值
+
+**`sparse_attn` 的 P·V 用 bf16 概率，CPU golden 用 fp32。**
+
+```python
+# inference/kernel.py:339
+acc_s_cast = T.alloc_shared((h, block), BF16)     # ← 概率的 bf16 缓冲
+# :374   分母从 fp32 概率求和
+T.reduce_sum(acc_s, scores_sum, dim=1)
+# :377   概率拷进 bf16
+T.copy(acc_s, acc_s_cast)
+# :380   用 bf16 概率做 P·V
+T.gemm(acc_s_cast, kv_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+```
+
+注意**只有分子受影响，分母（`sum_exp`）两边都从 fp32 概率求和**。
+
+**实测**（不是估算）：把 CPU golden 的 P 也舍到 bf16，`sparse_attn` 输出
+`rel_l2 = 1.80e-3`，逐 (token, head) 最大 `3.27e-3`，884736 个元素里 630387 个逐位相同。
+
+**⇒ 一个忠实照搬 GPU kernel 的实现，会和 CPU golden 有 ~1.8e-3 的固定差异，这不是 bug。**
+第 6.2 节 `attn.out` 的阈值是 1.5e-2，有 8 倍余量，**所以阈值不用改**。
+但**不要**因为看到 `attn.out` 有 1e-3 量级的差就去查算子。
+
+需要逐位对照时，把 `kernel_cpu.SPARSE_ATTN_P_DTYPE` 设成 `torch.bfloat16`，
+golden 就复现 GPU kernel 的行为而不是比它更准。
+
+**两个 GEMM 的累加结构不同，但数学等价。** tilelang 每 32 个 K 做一次部分和 →
+乘 scale → fp32 二级累加（`kernel.py:266-270` / `550-554`）；CPU 先反量化再一次稠密
+fp32 matmul（`kernel_cpu.py:318-322` / `350-354`）。反量化本身**精确无舍入**
+（e8m0 是 2 的幂、e4m3 只有 4 位尾数），所以差别纯是累加误差，相对量级 ~1e-6…1e-5,
+落到 bf16 输出后基本不可见。
+
+#### ⚠️ P0 —— 无法从源码确定，**需要一台有 GPU 的机器实测**
+
+1. **`fp4_act_quant` 的 fp32→e2m1 舍入模式。** tilelang 是隐式 cast
+   （`kernel.py:171/175` 赋值给 FP4 fragment），舍入模式由 codegen 决定，源码里看不到。
+   **CPU 侧已验证是 e2m1 码格上的 round-to-nearest-even**（`kernel_cpu.py:145`，
+   7 个中点逐个验过：0.25→code0、0.75→code2、1.25→code2、1.75→code4、2.5→code4、
+   3.5→code6、5.0→code6，每次都取偶编码）。
+   如果 tilelang 生成的不是 `cvt.rn`，落在中点上的元素最大相对偏差 **33%**（5.0 落 6.0 而非 4.0）。
+   **验证方法**：把 `[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]/scale` 过一遍原 kernel，比码值。
+2. **fp4 的 nibble 打包顺序。** tilelang 的 sub-byte layout 由它自己推导，源码里看不到
+   （`kernel.py:512/537-540`）。
+   **但 CPU 侧与权重的生产者 `convert.py:28-31` 逐字一致**：
+   ```python
+   low = x & 0x0F; high = (x >> 4) & 0x0F
+   torch.stack([FP4_TABLE[low], FP4_TABLE[high]], dim=-1).flatten(2)
+   ```
+   即**低 4 位 = 偶数号元素、高 4 位 = 奇数号元素**（`kernel_cpu.py:162/172-173` 相同）。
+   原 kernel 必须和 `convert.py` 一致才能跑通已发布的权重，所以**实际风险很低**；
+   但形式上只能标「无法确定」。若真反了是灾难性错误（K 维相邻权重两两互换），
+   不是小误差。**验证方法**：一条真实 fp4 权重行 + 已知激活做端到端点乘。
+3. **`act_quant` 除法与 clamp 的中间 dtype。** `x_local` 是 bf16、`s_local` 是 fp32
+   （`kernel.py:65/67/89`），tilelang 的类型提升规则无法从源码确认。提到 fp32 则与 CPU
+   一致；若落回 bf16 则有 double rounding，个别元素差 1 个 e4m3 ulp。
+
+#### ✅ 已确认一致的（可直接引用）
+
+| 语义点 | 依据 |
+|---|---|
+| **三个 amax 下限** | `act_quant` → `1e-4`（`kernel.py:76`）；`fp4` **e4m3** 分支 → `6*(2**-9)`（`:162`，注释「keep even an all-zero group's scale nonzero」）；`fp4` **e8m0** 分支 → `6*(2**-126)`（`:165`）。与 `kernel_cpu.py:202/247/250` 一一对应，**值和分支条件都对** |
+| clamp 边界 | fp8 ±448（`kernel.py:44-45`）、fp4 ±6（`:131`），**都在 cast 之前** |
+| scale 算法 | 存的是 **scale = amax/MAX**，不是 1/scale。`scale_fmt` 非 None → `fast_round_scale` 向上取 2 的幂（`:36-37, 77-80`）|
+| **e4m3 分支用 `amax / 6`、e8m0 分支用 `amax * (1/6)`** | `kernel.py:163` vs `:166`。1/6 不可精确表示，两者可差 1 ulp，经 `ceil(log2)` 可能翻一个指数档（factor 2）—— 这个易错细节 CPU 镜像正确（`kernel_cpu.py:248/251`）|
+| **权重 scale 的两种形状** | `fp8_gemm`：**2D，block×block（实际 32×32）**（`kernel.py:231-232`）；`fp4_gemm`：**1D `[N, K/32]`，N 方向不分块**（`:514-515`，`weight_group_size = 32` 硬编码于 `:505`）。**两个 GEMM 不一样，别抄错** |
+| `sparse_attn` running max 初值 | `T.fill(scores_max, -1e30)`（`kernel.py:355`），注释写了理由：`-inf` 会让全 -1 行产生 `exp(-inf - (-inf)) = NaN` |
+| `sparse_attn` 空槽三条语义 | 越界槽补 -1（`:360`）、KV 行读 0（`:362`）、score 读 -inf（`:364`）|
+| `attn_sink` 只进分母 | `sum_exp[i] += T.exp(attn_sink[i] - scores_max[i])`（`:382-383`），无对应 value |
+| `hc_split_sinkhorn` 迭代结构 | 第 1 轮行方向 softmax 后 `+eps`（`kernel.py:437-443`），列归一化每轮都做含第 1 轮（`:446-448`），之后 `iters-1` 轮行归一化再列归一化（`:450-458`）。**eps 位置也一致**：softmax 后加在结果上，其余全部加在分母里 |
+| `hc` 的 pre/post/comb 拆分 | `+eps` **只加在 pre**（`:427`）；post 有系数 2 且**无 eps**（`:429`）；comb 是 `[hc,hc]` 行主序（`:431`）|
+
+一个无影响的差异：`FP4_TABLE[8]` 官方 `convert.py:13` 是 `0.0`，`kernel_cpu.py:73` 是 `-0.0`。
+`0.0 == -0.0`，参与乘加结果相同。
+
 ---
 
 ## 11. decode 路径与 prefill↔decode 自洽（判据 G-1）
