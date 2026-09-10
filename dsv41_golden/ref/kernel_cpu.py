@@ -1,0 +1,1 @@
+/tmp/claude-0/-workspace-code-dsv4-single-card-vllm-project/298c205d-3644-49b0-9aa2-67d13de183da/scratchpad/cpu_golden/kernel_cpu.py

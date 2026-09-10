@@ -1,0 +1,58 @@
+torch 2.10.0+cpu  threads=16  avail=561.4 GB
+config: n_layers=40 dim=5120 experts=384 engram_layers=[1, 14] kv_source=[2, 8, 14, 20]
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+input_ids (1, 27): [671, 6102, 294, 8760, 344, 11111, 16, 48548, 523, 39675, 55, 87375, 2231, 6614, 566, 6915, 4669, 362, 4669, 295, 4456, 305, 2549, 24030, 295, 1990, 16]
+setup 2.3s, rss 3.5 GB
+  layer  0     7.7s (load   0.0s)  experts  92  rss   3.5G  avail 559.7G
+  layer  1     8.0s (load   0.1s)  experts  84  rss   5.4G  avail 558.9G
+  layer  2     5.6s (load   0.0s)  experts  71  rss   7.3G  avail 561.9G
+  layer  3     7.6s (load   0.1s)  experts  66  rss   8.7G  avail 560.4G
+  layer  4     7.9s (load   0.1s)  experts  66  rss  10.0G  avail 564.0G
+  layer  5     5.2s (load   0.1s)  experts  52  rss  11.3G  avail 564.2G
+  layer  6     4.0s (load   0.1s)  experts  47  rss  12.4G  avail 564.0G
+  layer  7     4.2s (load   0.1s)  experts  46  rss  13.4G  avail 565.4G
+  layer  8     5.1s (load   0.1s)  experts  63  rss  14.4G  avail 565.3G
+  layer  9     5.6s (load   0.1s)  experts  61  rss  15.7G  avail 562.8G
+  layer 10     4.6s (load   0.0s)  experts  53  rss  16.9G  avail 562.9G
+  layer 11     5.0s (load   0.0s)  experts  59  rss  18.0G  avail 562.3G
+  layer 12     5.4s (load   0.1s)  experts  52  rss  19.2G  avail 562.2G
+  layer 13     7.4s (load   0.1s)  experts  73  rss  20.3G  avail 563.1G
+  layer 14     4.2s (load   0.1s)  experts  53  rss  21.7G  avail 563.0G
+  layer 15     8.0s (load   0.1s)  experts  88  rss  23.0G  avail 562.8G
+  layer 16     4.4s (load   0.1s)  experts  46  rss  24.7G  avail 564.4G
+  layer 17     5.4s (load   0.1s)  experts  56  rss  25.7G  avail 564.8G
+  layer 18     4.0s (load   0.1s)  experts  43  rss  26.8G  avail 569.0G
+  layer 19     7.8s (load   0.1s)  experts  92  rss  27.8G  avail 568.1G
+  layer 20     6.6s (load   0.1s)  experts  69  rss  29.5G  avail 567.7G
+  layer 21     4.1s (load   0.1s)  experts  58  rss  31.0G  avail 568.1G
+  layer 22     4.8s (load   0.0s)  experts  68  rss  32.2G  avail 567.6G
+  layer 23     6.3s (load   0.1s)  experts  81  rss  33.5G  avail 567.3G
+  layer 24     3.8s (load   0.1s)  experts  56  rss  35.1G  avail 567.6G
+  layer 25     3.6s (load   0.0s)  experts  53  rss  36.2G  avail 567.3G
+  layer 26     4.1s (load   0.0s)  experts  62  rss  37.3G  avail 567.1G
+  layer 27     5.1s (load   0.0s)  experts  82  rss  38.6G  avail 567.2G
+  layer 28     3.6s (load   0.0s)  experts  60  rss  40.2G  avail 567.0G
+  layer 29     4.5s (load   0.0s)  experts  71  rss  41.4G  avail 566.8G
+  layer 30     4.1s (load   0.0s)  experts  68  rss  42.8G  avail 566.3G
+  layer 31     4.8s (load   0.0s)  experts  75  rss  44.2G  avail 566.5G
+  layer 32     3.8s (load   0.0s)  experts  63  rss  45.7G  avail 566.4G
+  layer 33     3.9s (load   0.0s)  experts  68  rss  46.9G  avail 566.1G
+  layer 34     4.1s (load   0.0s)  experts  70  rss  48.3G  avail 566.2G
+  layer 35     3.7s (load   0.0s)  experts  62  rss  49.7G  avail 566.1G
+  layer 36     4.6s (load   0.0s)  experts  74  rss  50.9G  avail 566.0G
+  layer 37     4.2s (load   0.0s)  experts  64  rss  52.4G  avail 565.2G
+  layer 38     5.6s (load   0.1s)  experts  70  rss  53.7G  avail 570.0G
+  layer 39     6.7s (load   0.1s)  experts  73  rss  55.1G  avail 568.9G
+
+forward: 218.8s over 40 layers (5.5s/layer)
+  read      52.4 GB of weights
+  experts   2610 loaded (65/layer of 384)
+  engram    1296 rows gathered
+  peak RSS  55.1 GB    min avail 558.9 GB
+  logits    (1, 27, 129280) dtype=torch.float32
+  finite    True
+  last-tok  top5 [1, 455, 223, 1162, 48548]
+            vals [15.758, 15.425, 14.54, 14.331, 14.159]
+            toks ['<｜end▁of▁sentence｜>', ' The', ' ', ' This', ' Asc']
+  dumped to dumps/full40
+  files: ['epilogue.safetensors', 'layer_00.safetensors', 'layer_01.safetensors', 'layer_02.safetensors', 'layer_03.safetensors', 'layer_04.safetensors'] ...

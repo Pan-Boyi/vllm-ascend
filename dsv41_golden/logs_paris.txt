@@ -1,0 +1,56 @@
+torch 2.10.0+cpu  threads=16  avail=566.7 GB
+config: n_layers=40 dim=5120 experts=384 engram_layers=[1, 14] kv_source=[2, 8, 14, 20]
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+input_ids (1, 5): [671, 6102, 294, 8760, 344]
+setup 3.0s, rss 3.5 GB
+  layer  0     3.2s (load   0.1s)  experts  24  rss   3.5G  avail 565.1G
+  layer  1     2.8s (load   0.1s)  experts  22  rss   4.2G  avail 565.2G
+  layer  2     2.1s (load   0.1s)  experts  18  rss   4.9G  avail 564.4G
+  layer  3     2.3s (load   0.1s)  experts  18  rss   5.4G  avail 564.1G
+  layer  4     2.9s (load   0.1s)  experts  20  rss   5.9G  avail 564.0G
+  layer  5     2.0s (load   0.1s)  experts  14  rss   6.4G  avail 563.4G
+  layer  6     2.4s (load   0.1s)  experts  15  rss   6.8G  avail 564.3G
+  layer  7     2.4s (load   0.1s)  experts  18  rss   7.2G  avail 564.4G
+  layer  8     2.1s (load   0.1s)  experts  15  rss   7.7G  avail 564.4G
+  layer  9     2.2s (load   0.1s)  experts  16  rss   8.1G  avail 564.1G
+  layer 10     2.3s (load   0.1s)  experts  14  rss   8.6G  avail 564.6G
+  layer 11     2.6s (load   0.1s)  experts  20  rss   9.0G  avail 564.5G
+  layer 12     2.7s (load   0.1s)  experts  16  rss   9.5G  avail 562.6G
+  layer 13     3.0s (load   0.1s)  experts  22  rss   9.9G  avail 562.3G
+  layer 14     3.0s (load   0.1s)  experts  19  rss  10.5G  avail 561.8G
+  layer 15     3.3s (load   0.1s)  experts  21  rss  11.2G  avail 565.6G
+  layer 16     2.2s (load   0.1s)  experts  14  rss  11.6G  avail 563.6G
+  layer 17     3.0s (load   0.1s)  experts  17  rss  12.1G  avail 562.3G
+  layer 18     2.3s (load   0.1s)  experts  15  rss  12.5G  avail 561.4G
+  layer 19     3.7s (load   0.1s)  experts  26  rss  12.9G  avail 560.9G
+  layer 20     3.1s (load   0.1s)  experts  19  rss  13.6G  avail 559.1G
+  layer 21     2.4s (load   0.1s)  experts  17  rss  14.1G  avail 558.5G
+  layer 22     3.0s (load   0.1s)  experts  21  rss  14.5G  avail 558.0G
+  layer 23     3.3s (load   0.1s)  experts  24  rss  15.1G  avail 558.1G
+  layer 24     3.2s (load   0.1s)  experts  21  rss  15.6G  avail 557.9G
+  layer 25     2.8s (load   0.1s)  experts  19  rss  16.2G  avail 558.4G
+  layer 26     2.6s (load   0.1s)  experts  17  rss  16.7G  avail 556.7G
+  layer 27     3.3s (load   0.1s)  experts  22  rss  17.1G  avail 556.9G
+  layer 28     3.0s (load   0.1s)  experts  21  rss  17.7G  avail 556.2G
+  layer 29     3.4s (load   0.1s)  experts  24  rss  18.2G  avail 554.2G
+  layer 30     2.8s (load   0.1s)  experts  20  rss  18.8G  avail 555.6G
+  layer 31     3.5s (load   0.1s)  experts  25  rss  19.3G  avail 555.3G
+  layer 32     3.0s (load   0.1s)  experts  21  rss  19.9G  avail 554.8G
+  layer 33     3.1s (load   0.1s)  experts  21  rss  20.4G  avail 555.2G
+  layer 34     3.3s (load   0.1s)  experts  23  rss  21.0G  avail 556.1G
+  layer 35     2.8s (load   0.1s)  experts  18  rss  21.5G  avail 556.3G
+  layer 36     2.8s (load   0.1s)  experts  20  rss  22.0G  avail 556.9G
+  layer 37     3.0s (load   0.1s)  experts  22  rss  22.5G  avail 556.6G
+  layer 38     2.9s (load   0.1s)  experts  21  rss  23.1G  avail 556.1G
+  layer 39     3.5s (load   0.1s)  experts  26  rss  23.6G  avail 556.5G
+
+forward: 124.6s over 40 layers (3.1s/layer)
+  read      20.5 GB of weights
+  experts   786 loaded (20/layer of 384)
+  engram    240 rows gathered
+  peak RSS  23.6 GB    min avail 554.2 GB
+  logits    (1, 5, 129280) dtype=torch.float32
+  finite    True
+  last-tok  top5 [11111, 223, 1613, 671, 260]
+            vals [19.589, 16.905, 16.485, 16.08, 15.575]
+            toks [' Paris', ' ', '...', 'The', ' a']
