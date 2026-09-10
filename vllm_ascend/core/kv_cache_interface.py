@@ -61,17 +61,43 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # part of the Ascend runner/backend contract.
     indexes_kv_by_block_stride: bool = False
 
-    @property
-    def storage_block_size(self) -> int:
-        """Return the physical block size consumed by Ascend kernels.
+    if vllm_version_is("0.28.0"):
 
-        vLLM #51718 replaced ``MLAAttentionSpec.compress_ratio`` with
-        ``AttentionSpec.tokens_per_state`` on main. Both express how many
-        logical tokens one physical stored state covers.
-        """
-        if vllm_version_is("0.28.0"):
+        @property
+        def storage_block_size(self) -> int:
+            """Return the physical block size consumed by Ascend kernels.
+
+            On 0.28.0 ``storage_block_size`` is not part of the upstream spec,
+            so derive it from the kernel block size and the compression ratio.
+            """
             return self.block_size // self.compress_ratio
-        return self.block_size // self.tokens_per_state
+
+    else:
+
+        def __post_init__(self):
+            """Fill in ``storage_block_size`` when the caller left it unset.
+
+            vLLM #51718 did two things: it replaced
+            ``MLAAttentionSpec.compress_ratio`` with
+            ``AttentionSpec.tokens_per_state`` *and* promoted
+            ``storage_block_size`` from a derived value to a real dataclass
+            field (``vllm/v1/kv_cache_interface.py:560``). Keeping the old
+            read-only property here makes the generated frozen-dataclass
+            ``__init__`` assign to a property with no setter, which raises
+            ``AttributeError``. Derive the value in ``__post_init__`` instead
+            so every construction site keeps the pre-#51718 semantics without
+            having to pass the field explicitly.
+
+            Must run before ``super().__post_init__()``: alignment padding
+            reads ``real_page_size_bytes``, which depends on this value.
+            """
+            if self.storage_block_size is None:
+                object.__setattr__(
+                    self,
+                    "storage_block_size",
+                    self.block_size // self.tokens_per_state,
+                )
+            super().__post_init__()
 
     @property
     def real_page_size_bytes(self) -> int:
