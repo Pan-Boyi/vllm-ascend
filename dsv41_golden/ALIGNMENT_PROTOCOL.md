@@ -347,14 +347,22 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 （fp64 累加 + 注入 `plan_full40` 路由 + 注入 `full40` 的 `layer.in`）。
 390 s / 峰值 55.1 GB / 40 层。路由分歧 **1/1080 行**（仅 layer 28 一个 token）。
 
-40 层的逐层 `rel_l2` 分布：
+40 层的逐层 `rel_l2` 分布。
+
+> # 🔴 读这张表之前必须先读这一句
+>
+> **这是 golden 自身数值敏感度的「地板」，不是对 NPU 能达到多少的预测。**
+> 产生它的实验**只扰动了 `kernel_cpu` 里两个 GEMM 的累加 dtype**，所以计算链上位于
+> 第一个被扰动 GEMM **之前**的张量必然是 `0`。
+> **`0†` 的意思是「这个扰动碰不到它」，不是「昇腾也应该做到 0」。**
+> 拿 `0†` 当 NPU 的验收目标是误用这张表。你的容差必须明显宽于本表。
 
 | 张量 | 中位 | **40 层最大** | 最差层 | 最小逐位相同 token |
 |---|---|---|---|---|
-| `layer.in` / `pre_mix.in` | 0 | **0** | — | 27/27 |
-| `hc_pre.0` / `attn_norm.out` / `attn.in` | 0 | **0** | — | 27/27 |
-| `compressor.out`（4 层） | 0 | **0** | — | 13/13 |
-| `hc_mixes.0.*` | 0 | 1.3e-6 | 14 | 26/27 |
+| `layer.in` / `pre_mix.in` | 0† | **0†** | — | 27/27 |
+| `hc_pre.0` / `attn_norm.out` / `attn.in` | 0† | **0†** | — | 27/27 |
+| `compressor.out`（4 层） | 0† | **0†** | — | 13/13 |
+| `hc_mixes.0.*` | 0† | 1.3e-6 | 14 | 26/27 |
 | `engram.out`（2 层） | 8.6e-6 | 8.6e-6 | 14 | 26/27 |
 | `hc_mixes.1.*` | 4.5e-5 | 8.7e-4 | 26 | 1/27 |
 | `hc_pre.1` / `ffn_norm.out` / `moe.in` | 4.1e-4 | 1.3e-3 | 26 | 2/27 |
@@ -366,10 +374,7 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 | `moe_routing_margin` | 2.0e-3 | 1.25e-2 | 26 | — |
 | `logits`（epilogue） | — | **1.5e-3** | — | 20/27 |
 
-🔴 **这张表是下界，不是对 NPU 的预测。** 上面那个实验**只扰动了两个 GEMM 的累加 dtype**。
-`hc_pre.0` / `attn_norm.out` / `compressor.out` 之所以是 0，是因为它们在计算链上位于第一个
-被扰动的 GEMM **之前** —— 「必然是 0」，不是「昇腾也能做到 0」。**把 0 当成 NPU 的目标是
-误用这张表。**
+**† = 该扰动在计算链上到不了这个张量，所以必然为 0。不是 NPU 的目标值。**
 
 **由此推出的阈值（实测最大值 × 2~3 倍余量）：**
 

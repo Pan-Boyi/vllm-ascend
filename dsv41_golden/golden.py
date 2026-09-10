@@ -372,6 +372,24 @@ def _attach_taps(block, rec: Recorder):
     if block.attn.indexer is not None:
         handles.append(block.attn.indexer.register_forward_hook(hook("indexer_topk")))
 
+    # ``indexer_topk.out`` holds indices into the CONCATENATED [window ; compressed]
+    # KV, so its values are shifted by the window tensor's length -- and that length
+    # is path-dependent: ``seqlen`` during prefill (the chunk is attended directly),
+    # ``window_size`` during decode (the whole ring is).  Prefill and decode
+    # therefore report *different numbers for the same compressed position*, and so
+    # will any implementation whose window KV is laid out differently.  Recording
+    # the offset makes the tensor interpretable instead of only comparable against
+    # an identically-shaped run.
+    if block.attn.compress_ratio:
+        _wkv = block.attn._window_kv
+
+        def _window_kv_tap(*aa, _orig=_wkv, **kw):
+            out = _orig(*aa, **kw)
+            rec.add("indexer_kv_offset", torch.tensor([out[0].size(1)], dtype=torch.int32))
+            return out
+
+        block.attn._window_kv = _window_kv_tap
+
     counters = {"hc_mixes": 0, "hc_pre": 0, "hc_post": 0}
     for nm in list(counters):
         orig = getattr(block, nm)
@@ -384,6 +402,83 @@ def _attach_taps(block, rec: Recorder):
 
         setattr(block, nm, wrapper)
     return handles
+
+
+# --------------------------------------------------------------------------- #
+# decode state                                                                #
+# --------------------------------------------------------------------------- #
+class LayerStateStore:
+    """Keeps a streamed layer's KV state alive after the layer itself is freed.
+
+    Streaming is what makes this model fit: build layer i, fill it from the
+    checkpoint, run it, free it.  That works for prefill, where nothing has to
+    survive a layer teardown.  Decode does: the sliding-window ring, the
+    compressor's partial group, and the indexer's key cache all have to carry from
+    one step to the next, and they live in the block that just got freed.
+
+    Everything at stake is registered ``persistent=False``, so it is exactly the
+    set of buffers that appear in ``named_buffers()`` but not in ``state_dict()``
+    -- the ones the weight loader neither fills nor checks.  Discovering them that
+    way rather than listing them by hand means a new cache in the reference
+    implementation gets carried automatically instead of silently starting at zero
+    on every step.
+
+    ``score_state`` in particular initialises to ``-inf``, not zero (an unfilled
+    slot must take zero softmax weight, and zero would give it a real share), so
+    "just leave it at its constructed value" is not a workable substitute.
+    """
+
+    def __init__(self):
+        self.saved: dict[int, dict[str, torch.Tensor]] = {}
+        self.names: dict[int, tuple[str, ...]] = {}
+
+    @staticmethod
+    def _nonpersistent(block: nn.Module) -> list[str]:
+        persistent = set(block.state_dict().keys())
+        return [n for n, _ in block.named_buffers() if n not in persistent]
+
+    def save(self, layer_id: int, block: nn.Module):
+        names = self._nonpersistent(block)
+        self.names[layer_id] = tuple(names)
+        bufs = dict(block.named_buffers())
+        self.saved[layer_id] = {n: bufs[n].detach().clone() for n in names}
+
+    def restore(self, layer_id: int, block: nn.Module) -> bool:
+        """Copy the stored state back into a freshly built block.  False on first use."""
+        if layer_id not in self.saved:
+            return False
+        names = self._nonpersistent(block)
+        stored = self.saved[layer_id]
+        if set(names) != set(stored):
+            raise RuntimeError(
+                f"layer {layer_id}: buffer set changed between steps -- "
+                f"now {sorted(names)}, stored {sorted(stored)}"
+            )
+        bufs = dict(block.named_buffers())
+        for n in names:
+            src = stored[n]
+            dst = bufs[n]
+            if tuple(src.shape) != tuple(dst.shape):
+                raise RuntimeError(f"layer {layer_id}/{n}: {tuple(src.shape)} vs {tuple(dst.shape)}")
+            dst.copy_(src)
+        return True
+
+    def summary(self) -> dict:
+        """Buffer counts vary by layer -- only kv_source layers carry compressor
+        state, and only the index-key owners carry a key cache -- so report the
+        range rather than one layer's count as if it spoke for all of them."""
+        if not self.saved:
+            return {"layers": 0}
+        nbytes = sum(t.numel() * t.element_size()
+                     for d in self.saved.values() for t in d.values())
+        counts = {lid: len(n) for lid, n in self.names.items()}
+        kinds: dict[str, int] = {}
+        for names in self.names.values():
+            for n in names:
+                kinds[n] = kinds.get(n, 0) + 1
+        return {"layers": len(self.saved), "mb": round(nbytes / 2**20, 1),
+                "buffers_min": min(counts.values()), "buffers_max": max(counts.values()),
+                "carried": kinds}
 
 
 # --------------------------------------------------------------------------- #
@@ -466,7 +561,8 @@ class GoldenModel:
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, rec: Recorder | None = None,
                 n_layers: int | None = None, full_logits: bool = True,
-                start_pos: int = 0, routing_plan=None, layer_in_dir: str | None = None):
+                start_pos: int = 0, routing_plan=None, layer_in_dir: str | None = None,
+                state: "LayerStateStore | None" = None):
         """``layer_in_dir`` turns every block into an independent comparison.
 
         Forced routing removes the discrete verdict but not the *accumulation*: the
@@ -495,12 +591,16 @@ class GoldenModel:
                 f"a routing plan describes one sequence; got batch {input_ids.size(0)}. "
                 "Use one plan per request."
             )
-            if start_pos == 0:
-                routing_plan.check_input_ids(input_ids)
+            # Every call, not just the first: a decode step's tokens are just as
+            # capable of coming from the wrong text.
+            routing_plan.check_input_ids(input_ids, start_pos)
 
         engram_hashes = None
         if self.engram_hash is not None:
-            engram_hashes = self.engram_hash(input_ids, 0, None)
+            # start_pos, not 0: the hash state caches the look-back across the
+            # prefill/decode split, and a decode step's n-grams reach back into
+            # tokens that were never in this call.
+            engram_hashes = self.engram_hash(input_ids, start_pos, None)
 
         h = F.embedding(input_ids, self.embed_weight)
         rec.add("embed.out", h)
@@ -518,17 +618,29 @@ class GoldenModel:
             rss, avail = self.guard.check(f"before layer {i}")
             block = self.build_block(i)
             self.load_block(block, i)
+            if state is not None:
+                state.restore(i, block)
             t_load = time.time() - t0
 
             if layer_in_dir is not None:
                 from safetensors.torch import load_file
                 ref = load_file(os.path.join(layer_in_dir, f"layer_{i:02d}.safetensors"))
-                assert tuple(ref["layer.in"].shape) == tuple(h.shape), (
-                    f"layer {i}: reference layer.in {tuple(ref['layer.in'].shape)} "
+                # Sliced by position, so a decode step gets the golden's input for
+                # the one token it is computing rather than the whole prefill.
+                lo, hi = start_pos, start_pos + h.size(1)
+                rin, rpm = ref["layer.in"], ref["pre_mix.in"]
+                if rin.size(1) < hi:
+                    raise ValueError(
+                        f"layer {i}: reference layer.in covers {rin.size(1)} positions, "
+                        f"this call needs {lo}..{hi - 1}"
+                    )
+                rin, rpm = rin[:, lo:hi], rpm[:, lo:hi]
+                assert tuple(rin.shape) == tuple(h.shape), (
+                    f"layer {i}: reference layer.in slice {tuple(rin.shape)} "
                     f"vs this run {tuple(h.shape)}"
                 )
-                h = ref["layer.in"].to(h.dtype).clone()
-                pre_mix = ref["pre_mix.in"].to(pre_mix.dtype).clone()
+                h = rin.to(h.dtype).clone()
+                pre_mix = rpm.to(pre_mix.dtype).clone()
 
             handles = _attach_taps(block, rec)
             if routing_plan is not None:
@@ -541,7 +653,12 @@ class GoldenModel:
                 idx = block.engram.layer_hash_index
                 h = block.engram(h, engram_hashes[:, :, idx, :], None)
 
-            h, pre_mix = block(h, 0, pre_mix, None)
+            h, pre_mix = block(h, start_pos, pre_mix, None)
+
+            if state is not None:
+                # Before the block is freed: the ring buffer, the compressor's
+                # partial group and the indexer keys all live in it.
+                state.save(i, block)
 
             rec.add("layer.out", h)
             rec.add("pre_mix.out", pre_mix)

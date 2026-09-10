@@ -168,18 +168,28 @@ class RoutingPlan:
             meta = json.load(f)
         return cls(load_file(path), meta)
 
-    def check_input_ids(self, input_ids: torch.Tensor):
-        """Refuse a plan built for different text.
+    def check_input_ids(self, input_ids: torch.Tensor, start_pos: int = 0):
+        """Refuse a plan built for different text, comparing at the given positions.
 
         Cheap, and it catches the mistake that would otherwise look like a
-        catastrophic accuracy regression.
+        catastrophic accuracy regression.  Compared positionally rather than as a
+        whole sequence so that a partial prefill or a single decode step -- both of
+        which legitimately carry a slice of the plan's tokens -- are accepted while
+        a genuinely different text is still rejected.
         """
         got = input_ids.flatten().to(torch.int64)
         want = self.input_ids
-        if got.numel() != want.numel() or not torch.equal(got, want):
+        end = start_pos + got.numel()
+        if start_pos < 0 or end > want.numel():
             raise ValueError(
-                f"routing plan is for {want.numel()} tokens {want[:8].tolist()}... "
-                f"but this run has {got.numel()} tokens {got[:8].tolist()}... -- "
+                f"this call covers positions {start_pos}..{end - 1} but the plan only "
+                f"covers 0..{want.numel() - 1}"
+            )
+        if not torch.equal(got, want[start_pos:end]):
+            raise ValueError(
+                f"routing plan token mismatch at positions {start_pos}..{end - 1}: "
+                f"plan has {want[start_pos:end][:8].tolist()}..., "
+                f"this run has {got[:8].tolist()}... -- "
                 "plans are per-sequence and not transferable"
             )
 
