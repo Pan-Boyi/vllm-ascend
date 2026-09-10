@@ -204,7 +204,13 @@ class QKNormRopeFusionPass(VllmInductorPass):
             logger.debug("QKNorm and Rope fusion enabled, but no Attention layers were discovered.")
             return
         layer = next(iter(attn_layers.values()))
-        for epsilon in [1e-6, 1e-5]:
+        # Imported here rather than at module scope to keep the two passes independent of each
+        # other's import order.
+        from vllm_ascend.compilation.passes.norm_quant_fusion_pass import _epsilons_to_register
+
+        # eps is traced into the pattern as a literal, so a model whose rms_norm_eps is not in this
+        # list never matches and loses the fusion with no diagnostic.
+        for epsilon in _epsilons_to_register(vllm_config):
             if layer.head_size != 128:
                 logger.debug("QKNorm and Rope fusion not enabled: head_dim %d is not equal of 128", layer.head_size)
                 continue

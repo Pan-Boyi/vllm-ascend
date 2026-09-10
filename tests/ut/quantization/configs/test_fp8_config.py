@@ -386,7 +386,8 @@ class TestDispatchAgainstRealCheckpoints(TestBase):
             if not os.path.exists(config_json):
                 self.skipTest(f"checkpoint not available: {path}")
             with self.subTest(path=path):
-                raw = json.load(open(config_json))
+                with open(config_json) as fh:
+                    raw = json.load(fh)
                 self.assertEqual(raw["model_type"], expected_model_type)
                 claimed = AscendDeepseekV4FP8Config.override_quantization_method(
                     raw["quantization_config"], None, hf_config=_hf_config(raw["model_type"])

@@ -304,9 +304,7 @@ def _run_process_weights(scheme, weight_shape, scale_shape, prefix="layers.0.att
     out_features, in_features = weight_shape
     layer = nn.Module()
     layer.prefix = prefix
-    layer.weight = nn.Parameter(
-        torch.zeros(out_features, in_features).to(torch.float8_e4m3fn), requires_grad=False
-    )
+    layer.weight = nn.Parameter(torch.zeros(out_features, in_features).to(torch.float8_e4m3fn), requires_grad=False)
     # A distinct value per tile, so a mis-sized broadcast cannot pass by accident. Exponents are kept
     # in [1, 200] so they stay exactly representable both as e8m0 and as a float32 power of two.
     exponents = (torch.arange(scale_shape[0] * scale_shape[1], dtype=torch.int32).reshape(scale_shape) % 200) + 1

@@ -357,6 +357,20 @@ def _model_uses_w4a4_quant(vllm_config: VllmConfig | None) -> bool:
     )
 
 
+COMMON_EPSILONS = (1e-5, 1e-6)
+
+
+def _epsilons_to_register(vllm_config) -> list[float]:
+    """The model's own rms_norm_eps first, then the common values as a fallback."""
+    epsilons: list[float] = []
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_text_config", None)
+    model_eps = getattr(hf_config, "rms_norm_eps", None) if hf_config is not None else None
+    if isinstance(model_eps, (int, float)) and not isinstance(model_eps, bool):
+        epsilons.append(float(model_eps))
+    epsilons.extend(eps for eps in COMMON_EPSILONS if eps not in epsilons)
+    return epsilons
+
+
 class AddRMSNormQuantFusionPass(VllmInductorPass):
     """
     A pass for fusing AddRMSNorm and W8A8 quantization operations on Ascend.
