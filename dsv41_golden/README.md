@@ -10,7 +10,7 @@
 
 | 文档 | 给谁 | 内容 |
 |---|---|---|
-| [ALIGNMENT_PROTOCOL.md](ALIGNMENT_PROTOCOL.md) | **model 线 + kernel 线** | 逐层对齐协议：喂什么、dump 哪些点、阈值多少。第 10 节是单算子对照（kernel 线专用），第 11 节是 decode |
+| [ALIGNMENT_PROTOCOL.md](ALIGNMENT_PROTOCOL.md) | **model 线 + kernel 线** | 逐层对齐协议：喂什么、dump 哪些点、阈值多少。**先看第 0.4 节的判据清单**（16 条，标了门禁/诊断、跑什么、失败了看哪里）。第 10 节是单算子对照（kernel 线专用），第 11 节是 decode |
 | [ROUTING_INJECTION.md](ROUTING_INJECTION.md) | **model 线** | 强制路由注入的接口规范 |
 | [ENGRAM_NOTES.md](ENGRAM_NOTES.md) | **协调方 + model 线** | engram 的技术底账：G-3 判据的前提验证、两份官方实现的哈希对比、`ElasticBuffer` 为什么用不了、三个待拍板的选项 |
 | [REPORT.md](REPORT.md) | 协调方 | 结论、实测数据、人天估计 |

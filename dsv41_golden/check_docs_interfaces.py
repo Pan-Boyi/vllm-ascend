@@ -182,6 +182,27 @@ def main():
                 if before == "/" or re.match(r":\d", after):
                     continue
                 problems.append(f"{label}:{i+1}: names script `{name}` which does not exist")
+            # A single inline-code span that holds both a script and flags is a
+            # command, even without a leading `python`: `engram_lookup_ref.py
+            # --verify` in a table cell promises that flag.  The false finding this
+            # rule must NOT resurrect had the script and the flag in *separate*
+            # spans, which is why the unit is the span and not the line.
+            for span in re.findall(r"`([^`]+)`", line):
+                sm = SCRIPT_RE.search(span)
+                if not sm or sm.group(1) not in scripts:
+                    continue
+                owner, defined = sm.group(1), flags.get(sm.group(1))
+                if defined is None:
+                    continue
+                for f in FLAG_RE.findall(span):
+                    checked += 1
+                    if f not in defined:
+                        problems.append(
+                            f"{label}:{i+1}: `{owner} {f}` -- {owner} defines no {f} "
+                            f"(has: {' '.join(sorted(defined)) or 'none'})")
+                    elif a.verbose:
+                        print(f"  ok  {label}:{i+1}  {owner} {f}  [inline span]")
+
             for f in FLAG_RE.findall(line):
                 if current is None:
                     continue
