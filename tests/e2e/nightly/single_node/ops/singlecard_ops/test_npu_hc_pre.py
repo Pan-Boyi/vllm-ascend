@@ -11,8 +11,9 @@ enable_custom_op()
 # A5's capability set has no RUNTIME_CUSTOM_OPS, so enable_custom_op() returns False there and never
 # imports the extension -- torch.ops._C_ascend then has no npu_hc_pre_v2 at all. Import it explicitly
 # and point ASCEND_CUSTOM_OPP_PATH at the vendor package so these tests can run on A5 too. Note
-# bootstrap_custom_op_env() is deliberately called without include_vendor_lib: adding the vendor lib
-# to LD_LIBRARY_PATH on top of the .so's rpath has been seen to abort at exit.
+# bootstrap_custom_op_env() is called without include_vendor_lib because that flag only prepends
+# .../custom_transformer/op_api/lib to LD_LIBRARY_PATH, and the extension's rpath already contains
+# that directory (CMakeLists.txt:207), so libcust_opapi.so resolves without it.
 bootstrap_custom_op_env()
 import vllm_ascend.vllm_ascend_C  # noqa: E402,F401
 
