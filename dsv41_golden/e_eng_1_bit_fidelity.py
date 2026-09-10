@@ -115,12 +115,25 @@ def main():
     dist.init_process_group("hccl", rank=rank, world_size=world)
     group = dist.group.WORLD
 
+    # 🔴 A real collective must run before engram_write, or it fails with
+    # "Acquire HCCL channel failed" (measured: ret 11 on rank 0, ret 4 on rank 1).
+    # HCCL establishes its channels lazily -- init_process_group alone is not
+    # enough, and ElasticBuffer's own construction does not force it either
+    # (that step succeeds and hands back a comm name).  Bisected step by step:
+    # every step up to and including the constructor passes, engram_write is the
+    # one that needs the channel.  This warm-up is a prerequisite of the
+    # implementation, not a workaround for the test.
+    warm = torch.ones(8, device="npu") * (rank + 1)
+    dist.all_reduce(warm)
+    torch.npu.synchronize()
+
     from cann_ops_transformer.ops import ElasticBuffer
 
     def log(*a):
         if rank == 0:
             print(*a, flush=True)
 
+    log(f"HCCL warm-up all_reduce -> {warm[0].item()} (required before engram_write)")
     log(f"world_size={world}  ASCEND_RT_VISIBLE_DEVICES="
         f"{os.environ.get('ASCEND_RT_VISIBLE_DEVICES')}")
     log(f"per-rank entries={NUM_ENTRIES}  fp8 row={FP8_HIDDEN}B  "

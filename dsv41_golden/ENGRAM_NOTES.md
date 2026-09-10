@@ -119,6 +119,67 @@ prefix 长度 = 3 / 2 / 0 三种。
 - `num_cpu_bytes` 必须 **2 MB 对齐**，每条目 32 字节对齐（`ElasticBuffer.md:310-317`）。
   我们 `hidden=256`：bf16 = 512 B/条，fp8 = 256 B/条，都天然 32 对齐 —— **对齐不是障碍，dtype 是。**
 
+### 3.1b 🔴 实现前提：`engram_write` 之前必须先跑过一次真实集合通信
+
+**HCCL 通道是惰性建立的。** `init_process_group` 不足以建通道，
+**`ElasticBuffer` 的构造也不足以**（它成功返回、还给出了 comm name）——
+但 `engram_write` 需要通道已经存在。
+
+实测（卡 2+3，2 rank）：
+
+```
+init_process_group → ElasticBuffer(...) → engram_write
+    ❌ RuntimeError: Acquire HCCL channel failed, ret: 11 (rank0) / ret: 4 (rank1)
+       at elastic_buffer.py:529  self._runtime.engram_write(storage)
+
+init_process_group → all_reduce → ElasticBuffer(...) → engram_write
+    ✅ engram_write OK        ✅ engram_fetch OK -> (4, 128) bfloat16
+```
+
+**唯一的变化就是那一次 `all_reduce`。**
+
+**⇒ 正确的初始化序列：**
+```
+init_process_group  →  ★至少一次真实集合通信★  →  ElasticBuffer(...)  →  engram_write
+```
+
+⚠️ **这在真实推理里大概率自然满足**（起服务时早就跑过集合通信），
+**但在单元测试和最小复现里会踩** —— 那些环境往往只 init 不通信。
+所以实现里建议**显式做一次**，而不是依赖调用环境凑巧满足。
+
+#### 定位过程（留给下一个碰到它的人）
+
+逐步探针（每步一个 `print(flush=True)`）：
+```
+1 import torch_npu ✅   2 set_device ✅   3 init_process_group ✅   4 WORLD group ✅
+5 import ElasticBuffer ✅   6 size_hint=2097152 ✅   7 get backend ✅
+8 hccl_comm_name='group_name_0' ✅   9 ElasticBuffer 构造 ✅   10 CPU storage ✅
+11 engram_write ❌
+```
+**不是 dtype、不是 128 对齐、不是构造参数、不是 world_size** —— 那些都过了。
+
+⚠️ **第一次跑时的错误签名是误导性的**：`vector core exception`（由
+`torch_npu/distributed/distributed_c10d.py:500` 的 watchdog 在**拆解路径**上报），
+它会把人引向「AIV 算子故障」。真错是 `Acquire HCCL channel failed`。
+**两个签名来自同一个故障。**
+
+⚠️ 而且第一次跑的真错**被我自己的 `| grep ... | head -40` 吃掉了** ——
+`head` 不 flush，攒不够行数就不输出，进程结束时全丢，日志 0 字节。
+**当时我据此判断「它死在第一行 print 之前」，那是工具假象，不是事实。**
+教训：**过滤器本身可以吃掉证据，而吃掉之后看起来和「证据不存在」一模一样。**
+诊断故障时不要给输出接 `head`。
+
+#### 已排除的（都实测过，不要重试）
+
+| 假设 | 结论 |
+|---|---|
+| UB/URMA 需单独启用或配置 | ❌ 不需要 —— **零 HCCL 环境变量**下通了 |
+| `num_cpu_bytes` 2 MiB 太小 | ❌ 够 —— 就是 `get_engram_storage_size_hint` 自己算的 2097152 |
+| 需要调用方 barrier | ❌ 不需要 —— 文档 `:158` 那个 `Barrier → write → Barrier` 是**算子内部做的**（`elastic_buffer.cpp:943/965` 两处 `EngramBarrier(false, true)`）|
+| `ulimit -l` 锁页限制 | ❌ 已是 `unlimited` |
+| CANN 9.1/9.2 混搭 | ❌ 三个独立来源否掉：本测试的 allreduce、integration 的 EP all2all、kernel 的 9.2 单卡算子 |
+| `nnal/atb/set_env.sh` 没 source | ❌ 不是 HCCL 依赖（`env_dsv41.sh` 刻意剥掉了 nnal，因为 ATB 是对着 9.1 编的）|
+
 ### 3.2 🔴 两条挡住我们的硬约束
 
 **(a) host 存储不支持 fp8。** `ElasticBuffer.md:477`（「Engram dtype约束」）：
