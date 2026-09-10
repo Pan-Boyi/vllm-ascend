@@ -743,6 +743,35 @@ fp32 matmul（`kernel_cpu.py:318-322` / `350-354`）。反量化本身**精确�
 
 #### ⚠️ P0 —— 无法从源码确定，**需要一台有 GPU 的机器实测**
 
+> ### 先读这条：`fp4_act_quant` 的三个调用点，以及哪条路才相关
+>
+> ```
+> ref/model.py:546   Indexer 的 index key  k      block 32   scale_dtype = e8m0（默认）
+> ref/model.py:552   Indexer 的 index query q     block 32   scale_dtype = e8m0（默认）
+> ref/model.py:760   MLA._compress_kv 的 latent   block 16   scale_dtype = e4m3   ← 注意 16
+> ```
+> 官方在 760 行上方自己写了注释：
+> `# Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.`
+>
+> 🔴 **block size 16 是全模型唯一一处**（其他量化点一律 32）。融合算子若硬编码 32，
+> 那不是舍入级差异而是**量化粒度**差异：scale 覆盖范围翻倍、amax 取自两倍宽的组、
+> 组内小值被多压掉几位。**这条应该排在舍入模式之前查 —— 它是「有没有」而不是「差多少」。**
+>
+> **三个点全部 `inplace=True`**，即量化完立刻反量化写回：fp4 在激活上只是「有损压缩再还原」，
+> **从不产出 packed fp4 张量喂 GEMM**。所以下面的 P0-2（打包顺序）**对激活不适用**，
+> 只对权重适用，而权重那条路 `convert.py` 是权威生产者。
+>
+> **舍入模式仍然适用，而且在 indexer 上比在专家上要紧** —— 因为它喂的是一个离散判决：
+> index score 是在 4-bit 量化过的 q/k 上算的（`ref/model.py:557`），然后取 top-k（`:578`）。
+> 舍入差异可能**翻转 top-k 选择**，和 MoE 路由同一类问题。
+> （顺带这解释了第 5.1 节那个观察：fp32↔fp64 扰动下 `indexer_topk.out` 100% 稳定，
+> 很可能是因为 **q/k 已被压到 4 bit，量化步长远大于 1e-7 的扰动**。）
+>
+> **专家路径不相关**（`dsv41-kernel` 实测）：昇腾 W4A8 MXFP4 路径的激活量化成
+> `float8_e4m3fn` 而非 fp4（`w4a8_mxfp4.py:87/285`），且 `npu_dynamic_mx_quant`
+> 实测**不接受 fp4 输出**（`aclnnDynamicMxQuantV2` error 561002）。
+> 专家路径上 fp4 只存在于权重里，而权重是 checkpoint 里离线量化好的。
+
 1. **`fp4_act_quant` 的 fp32→e2m1 舍入模式。** tilelang 是隐式 cast
    （`kernel.py:171/175` 赋值给 FP4 fragment），舍入模式由 codegen 决定，源码里看不到。
    **CPU 侧已验证是 e2m1 码格上的 round-to-nearest-even**（`kernel_cpu.py:145`，
