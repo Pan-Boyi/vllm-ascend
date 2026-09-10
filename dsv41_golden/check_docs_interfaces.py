@@ -17,6 +17,10 @@ against the code.  Run it after editing docs.
 
     python check_docs_interfaces.py            # scans the current directory
     python check_docs_interfaces.py --root DIR # scan somewhere else
+
+Put per-tree configuration in a `.check_docs_skip` file at the scan root (one
+directory name per line) rather than editing SKIP_DIRS -- an edit is undone by the
+next sync of this script, silently.
     python check_docs_interfaces.py -v         # also list what was verified
 
 Exit 1 means either something promised is missing, **or nothing was checked**.
@@ -75,12 +79,25 @@ HEAVY_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "build",
 # Only our own docs and scripts; ref/ is vendor code and engram_research/ is rescued
 # upstream material, neither of which we promise anything about.
 #
-# Per-line additions belong in --skip or $CHECK_DOCS_SKIP, NOT in this set.  Editing
-# it makes every line's copy of this file diverge, which is how one copy ended up
-# with ten extra whitelist names; the same drift then hides whatever the next line
-# needs.  Keeping the file identical everywhere and the configuration outside it is
-# the only version of this that stays true.
+# Per-line additions belong in a `.check_docs_skip` file in the scanned tree (or
+# --skip / $CHECK_DOCS_SKIP), NOT in this set.
+#
+# Editing it makes every line's copy of this file diverge, and the damage is not
+# that the copies differ -- it is that **the next sync silently undoes whatever the
+# previous line got right**.  That already happened here: one line correctly added
+# its vendor trees to this set with a comment explaining why, and a later sync of
+# this file dropped those four lines.  The sync succeeded, the tool ran, only the
+# configuration was gone.
+#
+# `.check_docs_skip` fixes the remaining half: --skip still has to be remembered on
+# every invocation, and a rule you must remember is the class of rule this project
+# has already watched four people break in one day.  A file in the scanned tree
+# needs nobody to remember anything and survives every future sync of this script.
 SKIP_DIRS = {"ref", "engram_research", "__pycache__", ".git"}
+
+# One directory name per line; blank lines and #-comments ignored.  Read from the
+# scan root, so it belongs to the tree being checked, not to this tool.
+SKIP_FILE = ".check_docs_skip"
 
 FLAG_RE = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
 SCRIPT_RE = re.compile(r"\b([a-z_][a-z0-9_]*\.py)\b")
@@ -210,10 +227,6 @@ def main():
     a = ap.parse_args()
 
     global HERE, DUMPS, SKIP_DIRS
-    extra = [x for s in a.skip for x in s.split(",") if x]
-    extra += [x for x in os.environ.get("CHECK_DOCS_SKIP", "").split(",") if x]
-    if extra:
-        SKIP_DIRS = SKIP_DIRS | set(extra)
     if a.root:
         HERE = os.path.abspath(a.root)
         if not os.path.isdir(HERE):
@@ -221,12 +234,34 @@ def main():
             sys.exit(1)
     DUMPS = _find_dumps()
     print(f"root    {HERE}")
+
+    # Read the scanned tree's own skip list first, then the flag and the env var.
+    # Order does not matter (it is a union) but the source does, so each is reported.
+    extra: list[str] = []
+    sources: list[str] = []
+    sf = os.path.join(HERE, SKIP_FILE)
+    if os.path.isfile(sf):
+        names = [ln.split("#", 1)[0].strip() for ln in open(sf)]
+        names = [n for n in names if n]
+        if names:
+            extra += names
+            sources.append(f"{SKIP_FILE} ({len(names)})")
+    flagged = [x.strip() for s in a.skip for x in s.split(",") if x.strip()]
+    if flagged:
+        extra += flagged
+        sources.append(f"--skip ({len(flagged)})")
+    envd = [x.strip() for x in os.environ.get("CHECK_DOCS_SKIP", "").split(",") if x.strip()]
+    if envd:
+        extra += envd
+        sources.append(f"$CHECK_DOCS_SKIP ({len(envd)})")
+    if extra:
+        SKIP_DIRS = SKIP_DIRS | set(extra)
     if extra:
         # A narrowed scan must announce itself: skipping a directory lowers the
         # coverage number, and an unexplained lower number is indistinguishable
-        # from having less to check.
-        print(f"skip    {' '.join(sorted(set(extra)))}  (extra, from "
-              f"--skip/$CHECK_DOCS_SKIP)")
+        # from having less to check.  Naming the source matters too -- a skip list
+        # nobody remembers adding is how coverage quietly erodes.
+        print(f"skip    {' '.join(sorted(set(extra)))}  (from {', '.join(sources)})")
 
     scripts = {os.path.basename(p): p for p in our_files(".py")}
     # vendor scripts resolve, but we make no promises about their flags
