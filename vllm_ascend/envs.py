@@ -41,6 +41,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # scenarios in an environment without an NPU. Do not set it to False in
     # other scenarios.
     "COMPILE_CUSTOM_KERNELS": lambda: bool(int(os.getenv("COMPILE_CUSTOM_KERNELS", "1"))),
+    # Build only the vllm_ascend_C extension and leave vllm_ascend/_cann_ops_custom as it is. Setting
+    # COMPILE_CUSTOM_KERNELS=0 does not achieve this: it also clears ext_modules, so nothing is built
+    # at all. Useful when a change touches only the torch bindings, since rebuilding the aclnn package
+    # wipes and repopulates 132 MB of installed operators for no reason.
+    "SKIP_ACLNN_BUILD": lambda: bool(int(os.getenv("SKIP_ACLNN_BUILD", "0"))),
     # The CXX compiler used for compiling the package. If not set, the default
     # value is None, which means the system default CXX compiler will be used.
     "CXX_COMPILER": lambda: os.getenv("CXX_COMPILER", None),

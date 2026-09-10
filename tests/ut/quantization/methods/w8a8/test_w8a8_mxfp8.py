@@ -11,6 +11,7 @@ from tests.ut.quantization.conftest_quantization import (
     create_mxfp_moe_layer,
 )
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
+    AscendW8A8MXFP8DSDynamicLinearMethod,
     AscendW8A8MXFP8DynamicFusedMoEMethod,
     AscendW8A8MXFP8DynamicLinearMethod,
 )
@@ -249,3 +250,162 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
             shared_experts_input=None,
         )
         mock_comm.fused_experts.assert_called_once()
+
+
+# Real (weight, scale) shapes read out of the checkpoint safetensors headers. Both revisions store one
+# e8m0 scale per square weight_block_size tile; only the tile size differs.
+V40_REAL_SHAPES = [  # DeepSeek-V4-Flash-0731, weight_block_size [128, 128]
+    ("layers.0.attn.wkv", (512, 4096), (4, 32)),
+    ("layers.0.attn.wo_b", (4096, 8192), (32, 64)),
+    ("layers.0.attn.wq_b", (32768, 1024), (256, 8)),
+]
+V41_REAL_SHAPES = [  # DeepSeek-V4.1-Flash, weight_block_size [32, 32]
+    ("layers.0.attn.wkv", (512, 5120), (16, 160)),
+    ("layers.0.attn.wo_b", (5120, 8192), (160, 256)),
+    ("layers.0.ffn.shared_experts.w1", (2304, 5120), (72, 160)),
+    ("layers.0.ffn.shared_experts.w2", (5120, 2304), (160, 72)),
+]
+
+GROUP_SIZE = 32
+
+
+def _ds_linear_scheme(block_size, o_groups=8, o_lora_rank=1024, tp_size=1):
+    """Build AscendW8A8MXFP8DSDynamicLinearMethod without a live vllm config."""
+    return _ds_linear_scheme_from_block_size([block_size, block_size], o_groups, o_lora_rank, tp_size)
+
+
+def _ds_linear_scheme_from_block_size(weight_block_size, o_groups=8, o_lora_rank=1024, tp_size=1):
+    vllm_config = SimpleNamespace(
+        quant_config=SimpleNamespace(quant_description={"group_size": GROUP_SIZE}),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(o_groups=o_groups, o_lora_rank=o_lora_rank)),
+    )
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.get_current_vllm_config",
+            return_value=vllm_config,
+        ),
+        patch(
+            "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.get_dynamic_mx_quant_scale_alg",
+            return_value=0,
+        ),
+    ):
+        return AscendW8A8MXFP8DSDynamicLinearMethod(weight_block_size)
+
+
+def _run_process_weights(scheme, weight_shape, scale_shape, prefix="layers.0.attn.wkv", scale_dtype=None):
+    """Feed one layer through process_weights_after_loading; returns it plus the uint8 exponents fed in.
+
+    The checkpoint stores ``.scale`` as F8_E8M0, which is what the e8m0 branch of
+    process_weights_after_loading expects; ``scale_dtype=torch.float32`` exercises the other branch,
+    which recovers the same exponents out of float32 scales.
+    """
+    scale_dtype = scale_dtype or torch.float8_e8m0fnu
+    out_features, in_features = weight_shape
+    layer = nn.Module()
+    layer.prefix = prefix
+    layer.weight = nn.Parameter(
+        torch.zeros(out_features, in_features).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    # A distinct value per tile, so a mis-sized broadcast cannot pass by accident. Exponents are kept
+    # in [1, 200] so they stay exactly representable both as e8m0 and as a float32 power of two.
+    exponents = (torch.arange(scale_shape[0] * scale_shape[1], dtype=torch.int32).reshape(scale_shape) % 200) + 1
+    if scale_dtype == torch.float32:
+        # float32 with mantissa 0: the bias-127 exponent field is what the else branch reads back.
+        scale = (exponents.to(torch.int32) << 23).view(torch.float32)
+    else:
+        scale = exponents.to(torch.uint8).view(scale_dtype)
+    layer.weight_scale = nn.Parameter(scale, requires_grad=False)
+    scheme.process_weights_after_loading(layer)
+    return layer, exponents.to(torch.uint8)
+
+
+class TestAscendW8A8MXFP8DSDynamicLinearMethodBlockSize(TestBase):
+    """The block-scale broadcast must follow weight_block_size, not V4.0's constants.
+
+    ``process_weights_after_loading`` used to hard-code ``repeat_interleave(4, dim=1)`` and
+    ``repeat_interleave(128, dim=0)`` -- the factors for V4.0's 128 x 128 tiles. DeepSeek-V4.1-Flash
+    ships 32 x 32 tiles, so both factors were wrong by 4x.
+    """
+
+    def _expected_expansion(self, scale, block_size):
+        """The layout npu_quant_matmul consumes: one scale per group_size elements along K."""
+        return scale.repeat_interleave(block_size // GROUP_SIZE, dim=1).repeat_interleave(block_size, dim=0)
+
+    def test_v41_real_shapes_expand_to_the_gemm_layout(self):
+        scheme = _ds_linear_scheme(32)
+        for name, weight_shape, scale_shape in V41_REAL_SHAPES:
+            with self.subTest(tensor=name):
+                out_features, in_features = weight_shape
+                # The allocated parameter must match the checkpoint exactly, or loading cannot work.
+                allocated = scheme.get_pergroup_param(in_features, out_features, torch.bfloat16)
+                self.assertEqual(tuple(allocated["weight_scale"].shape), scale_shape)
+
+                layer, scale = _run_process_weights(scheme, weight_shape, scale_shape)
+                expected = self._expected_expansion(scale, 32)
+                self.assertEqual(tuple(expected.shape), (out_features, in_features // GROUP_SIZE))
+                # process_weights_after_loading finishes with reshape(N, K//2, 2) then transpose(0, 1).
+                expected = expected.reshape(out_features, in_features // GROUP_SIZE // 2, 2).transpose(0, 1)
+                self.assertEqual(layer.weight_scale.data.shape, expected.shape)
+                self.assertTrue(torch.equal(layer.weight_scale.data, expected))
+
+    def test_v40_real_shapes_still_match_the_old_hard_coded_factors(self):
+        """V4.0 behaviour must be bit-identical to the constants that were replaced."""
+        scheme = _ds_linear_scheme(128)
+        for name, weight_shape, scale_shape in V40_REAL_SHAPES:
+            with self.subTest(tensor=name):
+                out_features, in_features = weight_shape
+                allocated = scheme.get_pergroup_param(in_features, out_features, torch.bfloat16)
+                self.assertEqual(tuple(allocated["weight_scale"].shape), scale_shape)
+
+                layer, scale = _run_process_weights(scheme, weight_shape, scale_shape)
+                # Literally the replaced expression.
+                legacy = scale.repeat_interleave(4, dim=1).repeat_interleave(128, dim=0)
+                legacy = legacy.reshape(out_features, in_features // GROUP_SIZE // 2, 2).transpose(0, 1)
+                self.assertTrue(torch.equal(layer.weight_scale.data, legacy))
+
+    def test_each_tile_scale_lands_on_its_own_rows_and_k_groups(self):
+        """Shape alone is not enough -- check the values land where the GEMM will look for them."""
+        block_size = 32
+        scheme = _ds_linear_scheme(block_size)
+        out_features, in_features = 128, 256
+        scale_shape = (out_features // block_size, in_features // block_size)
+        layer, scale = _run_process_weights(scheme, (out_features, in_features), scale_shape)
+
+        expanded = layer.weight_scale.data.transpose(0, 1).reshape(out_features, in_features // GROUP_SIZE)
+        for tile_row in range(scale_shape[0]):
+            for tile_col in range(scale_shape[1]):
+                rows = slice(tile_row * block_size, (tile_row + 1) * block_size)
+                groups_per_tile = block_size // GROUP_SIZE
+                cols = slice(tile_col * groups_per_tile, (tile_col + 1) * groups_per_tile)
+                self.assertTrue(
+                    torch.equal(
+                        expanded[rows, cols],
+                        scale[tile_row, tile_col].expand(block_size, groups_per_tile),
+                    ),
+                    f"tile ({tile_row}, {tile_col}) was broadcast to the wrong place",
+                )
+
+    def test_float32_scales_recover_the_same_exponents(self):
+        """The non-e8m0 branch reads the exponent field out of float32 and must agree."""
+        scheme = _ds_linear_scheme(32)
+        weight_shape, scale_shape = (512, 5120), (16, 160)
+        e8m0_layer, _ = _run_process_weights(scheme, weight_shape, scale_shape)
+        f32_layer, _ = _run_process_weights(scheme, weight_shape, scale_shape, scale_dtype=torch.float32)
+        self.assertTrue(torch.equal(e8m0_layer.weight_scale.data, f32_layer.weight_scale.data))
+
+    def test_wo_a_keeps_its_block_diagonal_grouping(self):
+        """wo_a is a grouped (block-diagonal) projection, so its scales get regrouped as well."""
+        o_groups, o_lora_rank = 8, 1024
+        scheme = _ds_linear_scheme(32, o_groups=o_groups, o_lora_rank=o_lora_rank)
+        layer, _ = _run_process_weights(scheme, (8192, 4096), (256, 128), prefix="layers.0.attn.wo_a")
+        self.assertEqual(layer.weight_scale.data.shape[0], o_groups)
+        self.assertEqual(layer.weight.data.shape[0], o_groups)
+
+    def test_rejects_non_square_blocks(self):
+        with self.assertRaises(NotImplementedError):
+            _ds_linear_scheme_from_block_size([32, 64])
+
+    def test_rejects_block_smaller_than_the_group(self):
+        with self.assertRaises(NotImplementedError):
+            _ds_linear_scheme_from_block_size([16, 16])

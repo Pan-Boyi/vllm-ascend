@@ -489,9 +489,11 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
 
 @register_scheme(FP8_METHOD, "ds_linear")
 class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
-    """Linear method for DS original W8A8 mxfp(blocksize: 128 * 128) quantization.
+    """Linear method for DS W8A8 mxfp quantization with square block scales.
 
-    scales are reorganize as blocksize 32 * 1 in process_weights_after_loading
+    The checkpoint stores one e8m0 scale per ``weight_block_size`` tile -- 128 x 128 for DeepSeek-V4,
+    32 x 32 for V4.1 -- and ``process_weights_after_loading`` broadcasts those out to the
+    ``group_size``-along-K layout (32 x 1) that the GEMM consumes.
     """
 
     model_dtype = None
@@ -507,6 +509,14 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
 
     def __init__(self, weight_block_size):
         super().__init__()
+        # Only square tiles are handled, and the broadcast below needs whole groups per tile.
+        if weight_block_size[0] != weight_block_size[1]:
+            raise NotImplementedError(f"Non-square FP8 weight blocks are unsupported: {weight_block_size}.")
+        if weight_block_size[0] % self.group_size != 0:
+            raise NotImplementedError(
+                f"FP8 weight block size {weight_block_size[0]} is not a multiple of the mx group size "
+                f"{self.group_size}, so block scales cannot be broadcast to the GEMM's layout."
+            )
         self.block_size = weight_block_size[0]
         vllm_config = get_current_vllm_config()
         tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -532,7 +542,12 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         else:
             layer.weight_scale.data = layer.weight_scale.data.view(torch.int32) >> 23 & 0xFF
             layer.weight_scale.data = layer.weight_scale.data.to(torch.uint8)
-        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(4, dim=1).repeat_interleave(128, dim=0)
+        # Broadcast the [out/block, in/block] tile scales out to [out, in/group_size], which is what
+        # npu_quant_matmul consumes. Both factors follow weight_block_size: V4.0's 128 gives (4, 128) --
+        # the constants that used to be hard-coded here -- and V4.1's 32 gives (1, 32).
+        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(
+            self.block_size // self.group_size, dim=1
+        ).repeat_interleave(self.block_size, dim=0)
         n_dim, k_dim = layer.weight_scale.data.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)

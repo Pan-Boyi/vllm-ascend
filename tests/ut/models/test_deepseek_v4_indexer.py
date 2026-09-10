@@ -370,7 +370,7 @@ class TestIndexerForward:
 
 class TestIndexerOps:
     def test_quantize_scatter_then_select_topk(self):
-        indexer_ops = AscendIndexerOps(index_topk=3)
+        indexer_ops = AscendIndexerOps(index_topk=3, compress_ratio=4)
         key_cache = torch.empty((1, 1, 1, 4), dtype=torch.int8)
         scale_cache = torch.empty((1, 1, 1, 1), dtype=torch.float16)
         full_cache = torch.empty((1, 1, 1, 4), dtype=torch.uint8)
@@ -454,3 +454,22 @@ class TestIndexerOps:
         assert qli_kwargs["layout_k"] == "PA_BBND"
         assert qli_kwargs["mask_mode"] == 3
         assert qli_kwargs["cmp_ratio"] == 4
+
+
+class TestIndexerOpsCompressRatio:
+    """The compression ratio must reach the operator from the layer, not a hard-coded 4.
+
+    DeepSeek-V4 compresses by 4 on every layer, so the call site simply passed 4. V4.1 varies it per
+    layer -- 2 on layers 2..19 -- which that literal would silently override.
+    """
+
+    @pytest.mark.parametrize("ratio", [1, 2, 4, 128])
+    def test_ratio_reaches_the_operator(self, ratio):
+        assert AscendIndexerOps(index_topk=3, compress_ratio=ratio).compress_ratio == ratio
+
+    def test_uncompressed_layers_fall_back_to_one(self):
+        """The operator rejects cmp_ratio <= 0; ratio 0 means 'no compression', which is 1 to it."""
+        assert AscendIndexerOps(index_topk=3, compress_ratio=0).compress_ratio == 1
+
+    def test_defaults_to_uncompressed(self):
+        assert AscendIndexerOps(index_topk=3).compress_ratio == 1

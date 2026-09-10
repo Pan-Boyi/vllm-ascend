@@ -4,13 +4,21 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
 torch_npu.npu.config.allow_internal_format = True
 enable_custom_op()
+# A5's capability set has no RUNTIME_CUSTOM_OPS, so enable_custom_op() returns False there and never
+# imports the extension -- torch.ops._C_ascend then has no npu_hc_pre_v2 at all. Import it explicitly
+# and point ASCEND_CUSTOM_OPP_PATH at the vendor package so these tests can run on A5 too. Note
+# bootstrap_custom_op_env() is deliberately called without include_vendor_lib: adding the vendor lib
+# to LD_LIBRARY_PATH on top of the .so's rpath has been seen to abort at exit.
+bootstrap_custom_op_env()
+import vllm_ascend.vllm_ascend_C  # noqa: E402,F401
 
 HC_MULT = 4
 DSV4_FLASH_HIDDEN_SIZE = 4096
+DSV41_FLASH_HIDDEN_SIZE = 5120
 HIDDEN_SIZE = DSV4_FLASH_HIDDEN_SIZE
 EXTENDED_HIDDEN_SIZE = 7168
 MIX_HC = 24
@@ -168,6 +176,24 @@ def test_npu_hc_pre_v2_bf16_4d_input():
 @torch.inference_mode()
 def test_npu_hc_pre_v2_bf16_dsv4_flash_hidden_size():
     _compare_hc_pre_with_cpu((4, HC_MULT, DSV4_FLASH_HIDDEN_SIZE))
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_npu_hc_pre_v2_bf16_dsv41_flash_hidden_size():
+    """DeepSeek-V4.1-Flash's hidden size. Unlike 4096 and 7168 it is not a power of two, so this also
+    covers the k-axis split leaving a partial tail (k = hc_mult * d = 20480)."""
+    _compare_hc_pre_with_cpu((4, HC_MULT, DSV41_FLASH_HIDDEN_SIZE))
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_npu_hc_pre_v2_bf16_dsv41_flash_hidden_size_4d_input():
+    _compare_hc_pre_with_cpu((1, 2, HC_MULT, DSV41_FLASH_HIDDEN_SIZE))
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
