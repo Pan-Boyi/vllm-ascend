@@ -253,10 +253,19 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 ## 8. 收敛顺序
 
-| 阶段 | `FORCE_ROUTE` | 容差 | 判据 |
+| 阶段 | 开关 | 容差 | 判据 |
 |---|---|---|---|
-| A | `moe` | `strict`（rel_l2 5e-3 / cos 0.9999） | `moe_gate.forced.1` 逐位相同 → 逐层数值。超标即真 bug |
-| B | `off` | `default` | `moe_gate.out.0/1` + logits top-1。单独验 gate 本身 |
+| **A1** | `moe` + `layer_in` | **`isolated`**（per-tensor，见协议第 6.2 节）| `moe_gate.forced.1` 逐位相同 → 每层独立比数值。超标即真 bug |
+| A2 | `moe` | 见协议第 6.4 节 | 验证跨层累积是否符合预期，**不是找 bug** |
+| B | `off` | `default` | `moe_gate.out.0/1`（**按集合比**）+ logits **top-1**。单独验 gate 本身 |
 
 阶段 A 一趟同时产出阶段 B 需要的 gate 数据（`moe_gate.out.*` 记的是实现自己算的值），
 所以不用跑两遍。
+
+🔴 **本节 v1.0 说阶段 A 用 `strict`（rel_l2 5e-3），那是错的，已撤回。**
+`5e-3` 正好压在 bf16 的表示地板上（1 ULP = 3.9e-3），拿它比一个**已知无 bug** 的参考跑，
+40 层里 26 个张量「失败」。**现在的阈值按 dtype 取地板**（bf16 至少 3 ULP = 1.17e-2），
+见协议第 6.0 / 6.2 节。
+
+🔴 **而且「强制路由 + `strict`」这个组合本身是不够的**：实测强制路由只把误差减半，
+`layer.in` 注入才是切断主力路径的那个开关 —— **A1 必须两个开关都开**，见协议第 0.2 节。

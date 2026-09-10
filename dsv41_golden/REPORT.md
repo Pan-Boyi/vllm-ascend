@@ -105,9 +105,11 @@
 耗时几乎完全由**专家权重读盘**主导（每层非专家权重加载只要 0.0–0.1 s）。
 磁盘实测：顺序 1.6 GB/s（冷）、24.6 GB/s（page cache）、随机 4K 11389 IOPS。
 
-RSS 随层数线性上涨约 1.3 GB/层（27 token）。这**不是泄漏**，是 glibc malloc 在反复
-分配/释放 GB 级张量后的堆碎片——每层结束都 `del` + `gc.collect()`，系统可用内存
-始终稳定在 558–570 GB。要压这个数，设 `MALLOC_TRIM_THRESHOLD_` 或显式 `malloc_trim()` 即可。
+RSS 随层数线性上涨约 1.3 GB/层（27 token）。这**不是泄漏**，也**不是堆碎片**
+（v1.0 归因为 glibc malloc 碎片，并建议设 `MALLOC_TRIM_THRESHOLD_` —— **那是错的**，
+见 §3.4）：它是 **mmap 的 file-backed page cache**，可回收，`MemAvailable` 本来就算作可用。
+实测分项 `RssAnon 2.2 GB + RssFile 53.5 GB`，而且峰值 RSS ≈ 已读取的 checkpoint 字节数。
+系统可用内存始终稳定在 558–570 GB。**不需要 malloc_trim。**
 
 ### 3.2 内存策略（关键设计）
 

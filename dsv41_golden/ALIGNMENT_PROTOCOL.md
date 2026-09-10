@@ -1231,7 +1231,9 @@ prefill 不需要任何东西跨层存活，**decode 需要，而它们就在刚
 **端到端模式**（默认）：比 decode 的 logits 和整段 prefill 的 logits。
 
 它的噪声地板**不小**：20 token 的 prefill 和 27 token prefill 的前 20 个位置**本来就不同** ——
-每个 GEMM 的 M 维不同、舍入方式就不同，再叠加第 0.2 节那条「bf16 ULP 经因果 attention 扩散」。
+**滑窗索引张量的宽度不同**（`min(seqlen, window_size)`，见第 6.5 节；**不是 GEMM 的 M 维，
+那个解释已被 `window_size=8` 时对照值降到 `0.000e+00` 推翻**），
+再叠加第 0.2 节那条「bf16 ULP 经因果 attention 扩散」。
 所以这个模式**在同一次运行里测出这个地板**（两段共享的 prefill 前缀）并作为**对照**报出来。
 
 **⇒ 端到端模式的判据是 top-1 一致，不是 rel_l2。** rel_l2 报出来但不 gate，
