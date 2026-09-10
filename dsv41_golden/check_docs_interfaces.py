@@ -15,8 +15,13 @@ This script is layer 3 made executable.  It reads every flag, script name, funct
 and dump path the markdown and the module docstrings promise, and checks each one
 against the code.  Run it after editing docs.
 
-    python check_docs_interfaces.py            # exit 1 if anything promised is missing
+    python check_docs_interfaces.py            # scans the current directory
+    python check_docs_interfaces.py --root DIR # scan somewhere else
     python check_docs_interfaces.py -v         # also list what was verified
+
+Exit 1 means either something promised is missing, **or nothing was checked**.
+A check that scans an empty tree and prints a pass is the exact failure this
+script exists to catch, so zero coverage is a failure, not a silent success.
 """
 
 from __future__ import annotations
@@ -27,7 +32,13 @@ import os
 import re
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# The tree to scan.  Set from --root; it deliberately does NOT default to the
+# directory holding this script.  "scan wherever the script happens to sit" is an
+# implicit convention that silently changes behaviour when the file is copied --
+# it made a copy under build_artifacts/gate_checks/ report a clean pass over the
+# three files next to it while ignoring all 8 markdown documents it was meant to
+# check.  See the zero-coverage guard in main().
+HERE = os.getcwd()
 
 
 def _find_dumps() -> str:
@@ -41,7 +52,7 @@ def _find_dumps() -> str:
     return os.path.join(HERE, "golden_dumps")
 
 
-DUMPS = _find_dumps()
+DUMPS = ""      # set in main(), after --root is known
 
 # Files the docs legitimately name that are not ours to define: vendor code under
 # ref/, and upstream sources quoted from the CANN / HF trees.  Naming one is a
@@ -135,7 +146,19 @@ def doc_sources() -> list[tuple[str, str]]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--root", default=None,
+                    help="tree to scan (default: the current directory). Explicit "
+                         "because 'scan next to the script' breaks silently when copied")
     a = ap.parse_args()
+
+    global HERE, DUMPS
+    if a.root:
+        HERE = os.path.abspath(a.root)
+        if not os.path.isdir(HERE):
+            print(f"--root {a.root} is not a directory")
+            sys.exit(1)
+    DUMPS = _find_dumps()
+    print(f"root    {HERE}")
 
     scripts = {os.path.basename(p): p for p in our_files(".py")}
     # vendor scripts resolve, but we make no promises about their flags
@@ -236,8 +259,31 @@ def main():
             elif a.verbose:
                 print(f"  ok  {label}  golden_dumps/{d}")
 
-    print(f"checked {checked} promises across {len(doc_sources())} documents "
-          f"and {len(scripts)} scripts")
+    nmd = len(our_files(".md"))
+    ndocs = len(doc_sources())
+    print(f"checked {checked} promises across {ndocs} documents "
+          f"({nmd} markdown + {ndocs - nmd} docstrings) and {len(scripts)} scripts")
+
+    # Zero coverage is a failure.  This tool's whole argument is that silence is
+    # not correctness, so it must not pass by having looked at nothing -- and the
+    # signal is that the count is implausible, not that a check failed.  The
+    # coverage number is printed unconditionally for the same reason: a drop in
+    # what gets checked otherwise looks exactly like an improvement in quality.
+    # The markdown count is guarded separately from the total.  A copy of this
+    # script sitting alone in a directory still supplies its OWN docstring, so
+    # "documents > 0" and "promises > 0" can both hold while not one of the
+    # markdown files this is meant to check was seen.  Markdown is the subject;
+    # docstrings alone are the tool talking to itself.
+    if nmd == 0 or not scripts or checked == 0:
+        print()
+        print(f"NOTHING CHECKED -- {nmd} markdown files, {len(scripts)} scripts, "
+              f"{checked} promises under {HERE}")
+        print("This is a failure, not a pass.  Most likely --root points at the")
+        print("wrong tree (it defaults to the CURRENT DIRECTORY, not to wherever")
+        print("this script was copied).  Point --root at the directory that holds")
+        print("the markdown you want checked.")
+        sys.exit(1)
+
     if problems:
         print()
         for p in problems:
