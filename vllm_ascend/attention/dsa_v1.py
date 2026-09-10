@@ -961,14 +961,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_reqs = seq_lens_i32.shape[0]
             qli_seqused_k = self.qli_seqused_k[:num_reqs]
             qli_cmp_residual_k = self.qli_cmp_residual_k[:num_reqs]
-            torch.div(seq_lens_i32, 4, rounding_mode="floor", out=qli_seqused_k)
+            # DeepSeek-V4 compresses by 4 throughout, but V4.1 varies the ratio per layer (2 on layers
+            # 2..19). Everything below has to agree on one value: the compressed length, the residual
+            # the operator checks against cmp_ratio, max_seqlen_k, and cmp_ratio itself. A ratio of 0
+            # or 1 means no compression, for which 1 is the identity.
+            cmp_ratio = max(self.compressor_ratio, 1)
+            torch.div(seq_lens_i32, cmp_ratio, rounding_mode="floor", out=qli_seqused_k)
             torch.remainder(
                 seq_lens_i32,
-                4,
+                cmp_ratio,
                 out=qli_cmp_residual_k,
             )
             qli_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
-                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
+                num_heads_q=self.model_config.hf_config.index_n_heads,
                 num_heads_k=1,
                 head_dim=self.model_config.hf_config.index_head_dim,  # 128
                 topk=self.model_config.hf_config.index_topk,
@@ -978,11 +983,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cmp_residual_k=qli_cmp_residual_k,
                 batch_size=len(seq_lens),
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_kv // 4,
+                max_seqlen_k=max_seqlen_kv // cmp_ratio,
                 layout_q="TND",
                 layout_k="PA_BBND",
                 mask_mode=3,
-                cmp_ratio=4,
+                cmp_ratio=cmp_ratio,
                 device=str(self.seqused_q.device),
             )
             metadata_cache["qli"] = qli_metadata

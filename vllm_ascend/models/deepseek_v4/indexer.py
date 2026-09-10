@@ -168,11 +168,15 @@ class IndexerOverlapPlan:
 
 
 class AscendIndexerOps:
-    def __init__(self, index_topk: int) -> None:
+    def __init__(self, index_topk: int, compress_ratio: int = 1) -> None:
         from vllm_ascend.device.device_op import DeviceOperator
 
         self.device_operator = DeviceOperator
         self.index_topk = index_topk
+        # DeepSeek-V4 compresses by 4 everywhere; V4.1 varies it per layer (2 on layers 2..19), so the
+        # ratio has to travel with the layer rather than being written into the operator call. 0 and 1
+        # both mean no compression, for which the operator takes 1.
+        self.compress_ratio = max(compress_ratio, 1)
 
     def unpack_dsa_indexer_kv_cache(self, kv_cache: tuple[torch.Tensor, ...]):
         return self.device_operator.unpack_dsa_indexer_kv_cache(kv_cache)
@@ -232,7 +236,7 @@ class AscendIndexerOps:
             layout_q="TND",
             layout_k="PA_BBND",
             mask_mode=3,
-            cmp_ratio=4,
+            cmp_ratio=self.compress_ratio,
             return_value=0,
         )
         return topk_idxs
@@ -305,7 +309,7 @@ class DeepseekV4Indexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         if self.skip_topk and self.topk_indices_buffer is None:
             raise ValueError("skip_topk requires topk_indices_buffer")
-        self.ops = AscendIndexerOps(index_topk=self.index_topk)
+        self.ops = AscendIndexerOps(index_topk=self.index_topk, compress_ratio=self.compress_ratio)
         self.weights_proj = ReplicatedLinear(
             config.hidden_size,
             self.n_heads,
