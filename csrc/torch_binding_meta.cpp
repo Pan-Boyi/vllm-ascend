@@ -1347,6 +1347,96 @@ at::Tensor npu_kv_quant_sparse_attn_sharedkv_metadata_meta(
         torch::dtype(torch::kInt32).device(at::Device(device_str)));
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_mixed_quant_sparse_flash_mla_meta(
+    const at::Tensor& q,
+    int64_t quant_mode,
+    const c10::optional<at::Tensor>& ori_kv,
+    const c10::optional<at::Tensor>& cmp_kv,
+    const c10::optional<at::Tensor>& ori_sparse_indices,
+    const c10::optional<at::Tensor>& cmp_sparse_indices,
+    const c10::optional<at::Tensor>& ori_block_table,
+    const c10::optional<at::Tensor>& cmp_block_table,
+    const c10::optional<at::Tensor>& cu_seqlens_q,
+    const c10::optional<at::Tensor>& cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor>& cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor>& seqused_q,
+    const c10::optional<at::Tensor>& seqused_ori_kv,
+    const c10::optional<at::Tensor>& seqused_cmp_kv,
+    const c10::optional<at::Tensor>& cmp_residual_kv,
+    const c10::optional<at::Tensor>& ori_topk_length,
+    const c10::optional<at::Tensor>& cmp_topk_length,
+    const c10::optional<at::Tensor>& sinks,
+    const c10::optional<at::Tensor>& metadata,
+    int64_t rope_head_dim,
+    double softmax_scale,
+    int64_t cmp_ratio,
+    int64_t ori_mask_mode,
+    int64_t cmp_mask_mode,
+    int64_t ori_win_left,
+    int64_t ori_win_right,
+    c10::string_view layout_q,
+    c10::string_view layout_kv,
+    int64_t topk_value_mode,
+    bool return_softmax_lse)
+{
+    std::string layout_q_str = std::string(layout_q);
+    return construct_output_tensor(q, layout_q_str, return_softmax_lse);
+}
+
+at::Tensor npu_mixed_quant_sparse_flash_mla_metadata_meta(
+    int64_t num_heads_q,
+    int64_t num_heads_kv,
+    int64_t head_dim,
+    int64_t quant_mode,
+    const c10::optional<at::Tensor>& cu_seqlens_q,
+    const c10::optional<at::Tensor>& cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor>& cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor>& seqused_q,
+    const c10::optional<at::Tensor>& seqused_ori_kv,
+    const c10::optional<at::Tensor>& seqused_cmp_kv,
+    const c10::optional<at::Tensor>& cmp_residual_kv,
+    const c10::optional<at::Tensor>& ori_topk_length,
+    const c10::optional<at::Tensor>& cmp_topk_length,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_ori_kv,
+    int64_t max_seqlen_cmp_kv,
+    int64_t ori_topk,
+    int64_t cmp_topk,
+    int64_t rope_head_dim,
+    int64_t cmp_ratio,
+    int64_t ori_mask_mode,
+    int64_t cmp_mask_mode,
+    int64_t ori_win_left,
+    int64_t ori_win_right,
+    c10::string_view layout_q,
+    c10::string_view layout_kv,
+    bool has_ori_kv,
+    bool has_cmp_kv,
+    const c10::string_view device)
+{
+    // Matches MQSMLA_METADATA_SIZE in CANN's own wrapper.
+    constexpr int64_t OUTPUT_SIZE = 1024;
+    for (const auto& hint : {cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv,
+                             seqused_q, seqused_ori_kv, seqused_cmp_kv}) {
+        if (hint.has_value()) {
+            return at::empty_symint(
+                c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
+                torch::dtype(torch::kInt32).device(hint.value().device()));
+        }
+    }
+
+    auto device_ori = at::Device(std::string(device));
+    std::string device_str = "meta";
+    if (device_ori.has_index()) {
+        device_str += ":";
+        device_str += std::to_string(device_ori.index());
+    }
+    return at::empty_symint(
+        c10::SymDimVector{c10::SymInt(OUTPUT_SIZE)},
+        torch::dtype(torch::kInt32).device(at::Device(device_str)));
+}
+
 int64_t get_type_code(at::ScalarType dst_type)
 {
     switch (dst_type) {
@@ -2148,6 +2238,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_kv_quant_sparse_attn_sharedkv", &vllm_ascend::meta::npu_kv_quant_sparse_attn_sharedkv_meta);
     ops.impl("npu_kv_quant_sparse_attn_sharedkv_metadata",
              &vllm_ascend::meta::npu_kv_quant_sparse_attn_sharedkv_metadata_meta);
+    ops.impl("npu_mixed_quant_sparse_flash_mla", &vllm_ascend::meta::npu_mixed_quant_sparse_flash_mla_meta);
+    ops.impl("npu_mixed_quant_sparse_flash_mla_metadata",
+             &vllm_ascend::meta::npu_mixed_quant_sparse_flash_mla_metadata_meta);
     ops.impl("npu_swiglu_group_quant", &vllm_ascend::meta::npu_swiglu_group_quant_meta);
     ops.impl("indexer_compress_epilog_v2", &vllm_ascend::meta::indexer_compress_epilog_v2_meta);
     ops.impl("npu_dequant_swiglu_quant", &vllm_ascend::meta::npu_dequant_swiglu_quant_meta);
