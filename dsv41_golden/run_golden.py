@@ -121,7 +121,9 @@ def main():
     print(f"  experts   {st['experts_loaded']} loaded "
           f"({st['experts_loaded'] / max(args_cli.layers, 1):.0f}/layer of {args.n_routed_experts})")
     print(f"  engram    {st['engram_rows']} rows gathered")
-    print(f"  peak RSS  {guard.peak_rss:.1f} GB    min avail {guard.min_avail:.1f} GB")
+    print(f"  peak RSS  {guard.peak_rss:.1f} GB "
+          f"({guard.peak_anon:.1f} anon + {guard.peak_file:.1f} file-backed/reclaimable)"
+          f"    min avail {guard.min_avail:.1f} GB")
     print(f"  logits    {tuple(logits.shape)} dtype={logits.dtype}")
     print(f"  finite    {bool(torch.isfinite(logits).all())}")
     print(f"  last-tok  top5 {logits[0, -1].topk(5).indices.tolist()}")

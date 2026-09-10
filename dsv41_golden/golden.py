@@ -59,6 +59,31 @@ def rss_gb() -> float:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGESIZE") / 2**30
 
 
+def rss_split_gb() -> tuple[float, float]:
+    """(anonymous, file-backed) resident GB.
+
+    Total RSS badly overstates what this process actually costs the machine.  The
+    checkpoint is read through an mmap, so every weight page touched lands in RSS
+    as *file-backed* -- reclaimable page cache that the kernel drops under
+    pressure and that ``MemAvailable`` already counts as available.  Measured
+    mid-run on the 27-token prompt: 33.9 GB resident, of which 2.2 GB anonymous
+    and 31.7 GB file.
+
+    The distinction decides how this scales.  File-backed grows with how much of
+    the 510 GB checkpoint has been touched and saturates; **anonymous** is the
+    activations, and that is what grows with sequence length.  Extrapolating a
+    memory limit from total RSS therefore measures the wrong thing.
+    """
+    anon = file = 0.0
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("RssAnon:"):
+                anon = int(line.split()[1]) / 2**20
+            elif line.startswith("RssFile:"):
+                file = int(line.split()[1]) / 2**20
+    return anon, file
+
+
 def sys_available_gb() -> float:
     with open("/proc/meminfo") as f:
         for line in f:
@@ -77,17 +102,23 @@ class MemoryGuard:
     def __init__(self, floor_gb: float = 150.0):
         self.floor_gb = floor_gb
         self.peak_rss = 0.0
+        self.peak_anon = 0.0        # the part that actually scales with seqlen
+        self.peak_file = 0.0        # reclaimable mmap page cache
         self.min_avail = float("inf")
 
     def check(self, where: str):
         avail = sys_available_gb()
         rss = rss_gb()
+        anon, file = rss_split_gb()
         self.peak_rss = max(self.peak_rss, rss)
+        self.peak_anon = max(self.peak_anon, anon)
+        self.peak_file = max(self.peak_file, file)
         self.min_avail = min(self.min_avail, avail)
         if avail < self.floor_gb:
             raise MemoryError(
                 f"aborting at {where}: {avail:.1f} GB available, floor is {self.floor_gb:.0f} GB "
-                f"(own RSS {rss:.1f} GB). Nothing was killed; reduce the prompt or layer count."
+                f"(own RSS {rss:.1f} GB = {anon:.1f} anon + {file:.1f} file-backed). "
+                "Nothing was killed; reduce the prompt or layer count."
             )
         return rss, avail
 

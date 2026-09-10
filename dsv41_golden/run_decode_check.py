@@ -342,7 +342,8 @@ def main():
         print(" reach the same value by different arithmetic. top-1 is the verdict.)")
         result = {"control_rel_l2": control, "top1_all_agree": all_top1}
 
-    print(f"peak RSS                 {guard.peak_rss:.1f} GB   "
+    print(f"peak RSS                 {guard.peak_rss:.1f} GB "
+          f"({guard.peak_anon:.1f} anon + {guard.peak_file:.1f} file-backed)   "
           f"min avail {guard.min_avail:.1f} GB")
     if plan is not None:
         print(f"routing                  {plan.summary()}")
