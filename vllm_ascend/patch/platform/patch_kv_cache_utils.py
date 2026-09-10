@@ -215,6 +215,28 @@ def _kv_cache_config_has_mamba_layers(self: KVCacheConfig) -> bool:
     return any(get_kv_cache_spec_kind(group.kv_cache_spec) == KVCacheSpecKind.MAMBA for group in self.kv_cache_groups)
 
 
+def _num_layer_tuples(group_spec: "UniformTypeKVCacheSpecs") -> int:
+    """Number of layer tuples in one uniform-type group.
+
+    vLLM #53896 (e126687a9a) renamed
+    ``UniformTypeKVCacheSpecs.get_num_layer_tuples`` to
+    ``get_max_layers_per_page_size``; the body is unchanged
+    (``vllm/v1/kv_cache_interface.py:1144``).
+    """
+    if vllm_version_is("0.28.0"):
+        return group_spec.get_num_layer_tuples()
+    return group_spec.get_max_layers_per_page_size()
+
+
+def has_deepseek_v4_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
+    """Spec-level counterpart of :func:`_is_deepseek_v4_groups`.
+
+    That one answers the same question about groups, so it cannot be used
+    before grouping has happened.
+    """
+    return any(getattr(spec, "model_version", None) == "deepseek_v4" for spec in kv_cache_spec.values())
+
+
 def group_and_unify_kv_cache_specs(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[UniformTypeKVCacheSpecs] | None:
@@ -278,7 +300,7 @@ def _get_kv_cache_groups_uniform_groups(
     # The other uniform KV cache specs will be similarly partitioned into layer tuples.
     # Say we have 21 SWA layers, all with the same page size, then we will have "21"
     # layer tuples.
-    num_layer_tuples_per_group: list[int] = [g_spec.get_num_layer_tuples() for g_spec in grouped_specs]
+    num_layer_tuples_per_group: list[int] = [_num_layer_tuples(g_spec) for g_spec in grouped_specs]
     # Choose `num_layer_tuples` to minimize total padding across groups.
     num_layer_tuples = _approximate_gcd(num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0])
     # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
@@ -530,7 +552,7 @@ def _ascend_max_memory_usage_bytes_from_groups(
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     layer_tuple_bytes = sum(_page_sizes(full_mla_spec))
     num_layer_tuples = max(
-        group.kv_cache_spec.get_num_layer_tuples()
+        _num_layer_tuples(group.kv_cache_spec)
         for group in kv_cache_groups
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
     )
@@ -541,13 +563,64 @@ def _ascend_max_memory_usage_bytes_from_groups(
     )
 
 
-def _get_glm5_next_kv_cache_groups(
+def _ascend_get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    """Route GLM-5.3-Next and DeepSeek-V4 to their Ascend grouping.
+
+    DSV4 deliberately runs two page sizes side by side -- the main MLA cache
+    and the indexer K cache -- and they do not divide each other:
+
+        main MLA   storage_block_size * num_kv_heads * head_size * itemsize
+                   = 128 * 1 * (512 + 128) * 1                  = 81920
+        indexer    128 * 1 * (128 * 1 + scale_dim 1 * fp32 4)   = 16896
+        81920 % 16896 = 14336
+
+    Both land exactly on the (page_size_padded_t1, page_size_padded_t2) pair
+    hardcoded in ``DSV4_BLOCK_SIZES``
+    (``vllm_ascend/models/layer/attention/layer.py:40``), so two page sizes
+    is the design, not an accident to be unified away.
+
+    vLLM used to give this its own branch in ``get_kv_cache_groups``, which
+    ``group_and_unify_kv_cache_specs`` / ``_get_kv_cache_groups_uniform_groups``
+    above replace. vLLM #53896 (e126687a9a, "Support Qwen3.8-Flash-Next")
+    deleted both functions and their call site, leaving the two patches at the
+    bottom of this module bound to names nothing calls any more. DSV4 then
+    falls through to ``unify_kv_cache_spec_page_size``, whose two escape
+    hatches both decline it:
+
+      * ``_get_packed_kv_cache_groups`` wants a block-outermost layout
+        (``vllm/v1/core/kv_cache_utils.py:1955``); Ascend resolves to LBNHC,
+        which is layer-outermost.
+      * ``_try_get_full_allocation_fallback_groups`` returns None for any
+        SlidingWindowMLASpec (``kv_cache_utils.py:1852``), and DSV4's SWA and
+        compressor caches are exactly that.
+
+    so it raises
+
+        NotImplementedError: Layer model.layers.2.self_attn.indexer.k_cache:
+        page size is not divisible by the maximum page size and cannot be
+        padded. Padding is only supported for non-MLA attention layers.
+
+    Restore the branch here instead of upstream. It is gated on the DSV4
+    marker rather than on ``group_and_unify_kv_cache_specs`` alone, whose
+    SlidingWindowMLASpec test is broad enough to catch other models.
+
+    The downstream config-stage planner already assumes this grouping ran:
+    ``_get_deepseek_v4_cache_layout`` documents "Non-full-MLA groups must have
+    been page_size-padded upstream (see _get_kv_cache_groups_uniform_groups)".
+    """
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
+    if not vllm_version_is("0.28.0") and has_deepseek_v4_specs(kv_cache_spec):
+        if grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+            return _get_kv_cache_groups_uniform_groups(grouped_specs)
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
+# Kept as an alias: this was the patch's name while it only handled GLM5.
+_get_glm5_next_kv_cache_groups = _ascend_get_kv_cache_groups
 
 
 def _ascend_get_kv_cache_config_from_groups(
@@ -575,6 +648,10 @@ def _ascend_get_kv_cache_config_from_groups(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+# On vLLM > 0.28.0 these two names no longer exist upstream (deleted by
+# #53896), so these assignments only add unread attributes; the functions are
+# reached through _ascend_get_kv_cache_groups instead. Kept for 0.28.0, where
+# get_kv_cache_groups still calls them.
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
@@ -583,7 +660,7 @@ vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cac
 # main uses _ascend_get_kv_cache_config_from_groups and the stride-aware planner.
 if vllm_version_is("0.28.0"):
     vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed = _get_kv_cache_config_deepseek_v4
-vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _get_glm5_next_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _ascend_get_kv_cache_groups
 KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )
