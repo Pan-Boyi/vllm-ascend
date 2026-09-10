@@ -1,4 +1,7 @@
+import json
+import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -257,6 +260,142 @@ class TestAscendFp8Config(TestBase):
         ):
             method = config.get_quant_method(MagicMock(spec=LinearBase), "model.layers.0.mlp.gate_proj")
         self.assertEqual(method, "block-fp8")
+
+
+# Real checkpoint layouts, transcribed from config.json. Kept as literals so the tests run without
+# the weights present; ``TestDispatchAgainstRealCheckpoints`` re-reads them from disk when available.
+V40_QUANT_CFG = {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "scale_fmt": "ue8m0",
+    "weight_block_size": [128, 128],
+}
+V41_QUANT_CFG = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [32, 32],
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+}
+# A plain HF fp8 export: float32 weight_scale_inv, no e8m0 scales, no expert dtype.
+GENERIC_FP8_QUANT_CFG = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [128, 128],
+}
+
+
+def _hf_config(model_type):
+    return SimpleNamespace(model_type=model_type)
+
+
+class TestDeepseekV4FP8Override(TestBase):
+    """``AscendDeepseekV4FP8Config`` must claim every DeepSeek V4-family checkpoint.
+
+    Upstream tested ``model_type == "deepseek_v4"`` exactly, so DeepSeek-V4.1-Flash
+    (``deepseek_v41``) fell through to the generic ``AscendFp8Config`` and its MXFP4 routed
+    experts were served as FP8 -- roughly double the weight memory, with nothing raised.
+    """
+
+    def _override(self, quant_cfg, model_type, user_quant=None):
+        return AscendDeepseekV4FP8Config.override_quantization_method(
+            quant_cfg, user_quant, hf_config=_hf_config(model_type)
+        )
+
+    def test_claims_v41(self):
+        """The regression this fix exists for."""
+        self.assertEqual(self._override(V41_QUANT_CFG, "deepseek_v41"), "deepseek_v4_fp8")
+
+    def test_still_claims_v40(self):
+        """V4.0 behaviour must not change."""
+        self.assertEqual(self._override(V40_QUANT_CFG, "deepseek_v4"), "deepseek_v4_fp8")
+
+    def test_claims_text_only_towers(self):
+        for model_type in ("deepseek_v4_text", "deepseek_v41_text"):
+            with self.subTest(model_type=model_type):
+                self.assertEqual(self._override(V41_QUANT_CFG, model_type), "deepseek_v4_fp8")
+
+    def test_claims_future_family_member_by_prefix(self):
+        """A revision we have never heard of must not silently regress the way v41 did."""
+        self.assertEqual(self._override(V41_QUANT_CFG, "deepseek_v42"), "deepseek_v4_fp8")
+
+    def test_claims_renamed_revision_by_layout(self):
+        """Renamed out of the prefix, but the e8m0 + expert_dtype layout still gives it away."""
+        self.assertEqual(self._override(V41_QUANT_CFG, "deepseek_next"), "deepseek_v4_fp8")
+
+    def test_ignores_generic_fp8_checkpoint(self):
+        """A plain fp8 export from another model family must be left to AscendFp8Config."""
+        self.assertIsNone(self._override(GENERIC_FP8_QUANT_CFG, "llama"))
+
+    def test_ignores_foreign_checkpoint_with_e8m0_scales(self):
+        """e8m0 scales alone are not enough to claim a non-DeepSeek model."""
+        foreign = dict(V41_QUANT_CFG)
+        self.assertIsNone(self._override(foreign, "some_other_moe"))
+
+    def test_ignores_non_fp8_quant_method(self):
+        self.assertIsNone(self._override({"quant_method": "awq"}, "deepseek_v41"))
+
+    def test_ignores_non_dict(self):
+        self.assertIsNone(self._override(None, "deepseek_v41"))
+
+    def test_explicit_user_quant_still_wins(self):
+        """Upstream's ``--quantization deepseek_v4_fp8`` escape hatch must keep working."""
+        self.assertEqual(
+            self._override(GENERIC_FP8_QUANT_CFG, "llama", user_quant="deepseek_v4_fp8"),
+            "deepseek_v4_fp8",
+        )
+
+
+class TestGenericFp8RejectsMisdispatch(TestBase):
+    """The generic path must fail loudly rather than silently doubling expert memory."""
+
+    def test_raises_on_fp4_experts(self):
+        with self.assertRaises(ValueError) as ctx:
+            AscendFp8Config.from_config(dict(V41_QUANT_CFG))
+        self.assertIn("expert_dtype", str(ctx.exception))
+
+    def test_accepts_v40_layout(self):
+        """V4.0 declares no expert_dtype, so the guard must not fire on it."""
+        config = AscendFp8Config.from_config(dict(V40_QUANT_CFG))
+        self.assertEqual(config.weight_block_size, [128, 128])
+
+    def test_accepts_generic_fp8(self):
+        config = AscendFp8Config.from_config(dict(GENERIC_FP8_QUANT_CFG))
+        self.assertEqual(config.weight_block_size, [128, 128])
+
+    def test_accepts_explicit_fp8_experts(self):
+        """``expert_dtype: fp8`` is exactly what the generic block-wise path serves."""
+        cfg = dict(V41_QUANT_CFG, expert_dtype="fp8")
+        self.assertIsNotNone(AscendFp8Config.from_config(cfg))
+
+
+class TestDispatchAgainstRealCheckpoints(TestBase):
+    """End-to-end over the registry, using the checkpoints on this machine when they are present."""
+
+    CHECKPOINTS = {
+        "/workspace/models/DeepSeek-V4/DeepSeek-V4-Flash-0731": "deepseek_v4",
+        "/workspace/models/DeepSeek-V4.1-Flash": "deepseek_v41",
+    }
+
+    def test_both_revisions_resolve_to_the_deepseek_config(self):
+        import vllm.model_executor.layers.quantization as me_quant
+
+        for path, expected_model_type in self.CHECKPOINTS.items():
+            config_json = os.path.join(path, "config.json")
+            if not os.path.exists(config_json):
+                self.skipTest(f"checkpoint not available: {path}")
+            with self.subTest(path=path):
+                raw = json.load(open(config_json))
+                self.assertEqual(raw["model_type"], expected_model_type)
+                claimed = AscendDeepseekV4FP8Config.override_quantization_method(
+                    raw["quantization_config"], None, hf_config=_hf_config(raw["model_type"])
+                )
+                self.assertEqual(claimed, "deepseek_v4_fp8")
+                self.assertIs(
+                    me_quant.get_quantization_config(claimed),
+                    AscendDeepseekV4FP8Config,
+                )
 
 
 if __name__ == "__main__":
