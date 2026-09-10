@@ -68,6 +68,12 @@ ISOLATED_LIMITS = {
 #     quantity to compare.
 NEVER_GATE = ("moe_routing_margin", "indexer_kv_offset")
 
+# Below this, a differing expert selection is a numerical near-tie rather than a
+# bug -- ALIGNMENT_PROTOCOL.md section 5 step 2.  Measured for scale: at layer 22
+# the median margin is 2.7e-2 and the one token whose routing flipped between the
+# prefill and decode paths had 9.3e-5, the smallest of all 27.
+NEAR_TIE_MARGIN = 1e-3
+
 
 def limit_for(name: str) -> float:
     best, best_len = ISOLATED_LIMITS["_default"], -1
@@ -123,11 +129,12 @@ class MemoryRecorder:
         pass
 
 
-def compare_step_to_golden(rec: MemoryRecorder, dump_dir: str, pos: int, n_layers: int):
+def compare_step_to_golden(rec: MemoryRecorder, dump_dir: str, pos: int, n_layers: int,
+                           forced: bool = False):
     """Every recorded layer tensor against the golden prefill's slice at ``pos``."""
     from safetensors.torch import load_file
 
-    rows, failures = [], []
+    rows, failures, near_ties = [], [], []
     for i in range(n_layers):
         tag = f"layer_{i:02d}"
         if tag not in rec.tags:
@@ -171,6 +178,33 @@ def compare_step_to_golden(rec: MemoryRecorder, dump_dir: str, pos: int, n_layer
                     wi, gi = wi.sort(-1).values, gi.sort(-1).values
                 same = bool(torch.equal(wi, gi))
                 gated = not name.startswith(NEVER_GATE)
+                if not same and name == "moe_gate.out.1" and forced:
+                    # Under forced routing the layer's own top-k is not what reached
+                    # the experts, so its disagreement cannot break the numerical
+                    # comparison.  Run the protocol's own step-2 diagnostic instead
+                    # of either gating on it or waving it through: a near-tie is
+                    # expected, a comfortable margin picked differently is a bug.
+                    margin = ref.get("moe_routing_margin")
+                    mval = None if margin is None else float(margin.float()[pos])
+                    med = None if margin is None else float(margin.float().median())
+                    near_tie = mval is not None and mval < NEAR_TIE_MARGIN
+                    note = (f"own gate differs (injection overrode it): "
+                            f"{gi.flatten().tolist()} vs golden {wi.flatten().tolist()}; "
+                            f"margin={mval:.2e} vs layer median {med:.2e}"
+                            if mval is not None else "own gate differs, no margin recorded")
+                    if near_tie:
+                        rows.append((i, name, 0.0, 0.0, False))
+                        near_ties.append((i, name, note))
+                        continue
+                    failures.append((i, name, f"NOT a near-tie: {note}"))
+                    rows.append((i, name, float("nan"), 0.0, True))
+                    continue
+                if not same and name == "moe_gate.out.0" and forced:
+                    # Weights follow the selection, so they inherit its verdict.
+                    near_ties.append((i, name, f"own gate weights differ, rel_l2="
+                                               f"{rel_l2(got, want):.2e} (follows out.1)"))
+                    rows.append((i, name, 0.0, 0.0, False))
+                    continue
                 if not same and gated:
                     failures.append((i, name, f"int mismatch: {gi.flatten()[:8].tolist()} "
                                               f"vs golden {wi.flatten()[:8].tolist()}"))
@@ -179,10 +213,18 @@ def compare_step_to_golden(rec: MemoryRecorder, dump_dir: str, pos: int, n_layer
             r = rel_l2(got, want)
             lim = limit_for(name)
             gated = not name.startswith(NEVER_GATE)
+            if forced and name == "moe_gate.out.0" and r > lim:
+                # Same reasoning as out.1: these are the layer's own weights, not
+                # the ones the experts used.  A near-tie flip moves them a lot.
+                near_ties.append((i, name, f"own gate weights differ, rel_l2={r:.2e} "
+                                           "(follows out.1; the injected weights are "
+                                           "what the experts used)"))
+                rows.append((i, name, r, lim, False))
+                continue
             rows.append((i, name, r, lim, gated))
             if gated and r > lim:
                 failures.append((i, name, f"rel_l2={r:.3e} > {lim:.1e}"))
-    return rows, failures
+    return rows, failures, near_ties
 
 
 def main():
@@ -285,6 +327,7 @@ def main():
 
     per_pos: dict[int, dict] = {}
     all_failures: list = []
+    all_near_ties: list = []
     for p in range(cut, n):
         t0 = time.time()
         rec = MemoryRecorder() if isolated else None
@@ -295,8 +338,10 @@ def main():
         dt = time.time() - t0
 
         if isolated:
-            rows, failures = compare_step_to_golden(rec, a.force_layer_in, p, a.layers)
+            rows, failures, near_ties = compare_step_to_golden(
+                rec, a.force_layer_in, p, a.layers, forced=plan is not None)
             all_failures += [(p, *f) for f in failures]
+            all_near_ties += [(p, *t) for t in near_ties]
             gated = [r for r in rows if r[4] and r[2] == r[2]]
             worst = max(gated, key=lambda r: r[2] / max(r[3], 1e-30)) if gated else None
             per_pos[p] = {"seconds": round(dt, 1), "n_tensors": len(rows),
@@ -329,7 +374,12 @@ def main():
         print(f"tensors over their per-layer limit: {len(all_failures)}")
         for p, i, name, why in all_failures[:15]:
             print(f"  pos {p} layer {i} {name}: {why}")
-        result = {"failures": [[p, i, nm, w] for p, i, nm, w in all_failures]}
+        if all_near_ties:
+            print(f"near-ties (informational, not gated): {len(all_near_ties)}")
+            for p, i, name, why in all_near_ties[:10]:
+                print(f"  pos {p} layer {i} {name}: {why}")
+        result = {"failures": [[p, i, nm, w] for p, i, nm, w in all_failures],
+                  "near_ties": [[p, i, nm, w] for p, i, nm, w in all_near_ties]}
     else:
         all_top1 = all(v["top1_same"] for v in per_pos.values())
         worst = max(per_pos.values(), key=lambda v: v["rel_l2"])

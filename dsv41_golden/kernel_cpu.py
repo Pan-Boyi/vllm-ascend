@@ -408,6 +408,19 @@ def hc_split_sinkhorn(
 # Queries processed per chunk, to bound the [chunk, h, topk] score tensor.
 SPARSE_ATTN_Q_CHUNK = 64
 
+# Probability dtype for the P*V product.  The golden keeps it fp32; the original
+# tilelang kernel does not -- it copies the fp32 probabilities into a bf16 shared
+# buffer before the second gemm (inference/kernel.py:339 declares
+# ``acc_s_cast = T.alloc_shared((h, block), BF16)``, :377 does ``T.copy(acc_s,
+# acc_s_cast)``, :380 feeds that to ``T.gemm``).  The *denominator* is summed from
+# the fp32 probabilities in both (kernel.py:374), so only the numerator is affected.
+#
+# Set this to torch.bfloat16 to reproduce the GPU kernel instead of being more
+# accurate than it.  Which one you want depends on what you are comparing against:
+# an implementation that follows the GPU kernel will differ from the fp32 golden by
+# a fixed amount that is not a bug.
+SPARSE_ATTN_P_DTYPE = torch.float32
+
 
 def sparse_attn(
     q: torch.Tensor,
@@ -470,7 +483,10 @@ def sparse_attn(
         p = torch.exp(scores - mx.unsqueeze(-1))
         denom = p.sum(dim=-1) + torch.exp(sink.view(1, 1, h) - mx)
 
-        o = torch.einsum("bcht,bctd->bchd", p, kv_g) / denom.unsqueeze(-1)
+        # Only the numerator: the denominator is summed from the fp32 probabilities
+        # in the tilelang kernel too, so rounding it here would not match it.
+        pv = p if SPARSE_ATTN_P_DTYPE == torch.float32 else p.to(SPARSE_ATTN_P_DTYPE).float()
+        o = torch.einsum("bcht,bctd->bchd", pv, kv_g) / denom.unsqueeze(-1)
         out[:, start:stop] = o.to(q.dtype)
 
     return out
