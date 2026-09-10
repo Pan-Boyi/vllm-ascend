@@ -74,6 +74,12 @@ HEAVY_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "build",
 
 # Only our own docs and scripts; ref/ is vendor code and engram_research/ is rescued
 # upstream material, neither of which we promise anything about.
+#
+# Per-line additions belong in --skip or $CHECK_DOCS_SKIP, NOT in this set.  Editing
+# it makes every line's copy of this file diverge, which is how one copy ended up
+# with ten extra whitelist names; the same drift then hides whatever the next line
+# needs.  Keeping the file identical everywhere and the configuration outside it is
+# the only version of this that stays true.
 SKIP_DIRS = {"ref", "engram_research", "__pycache__", ".git"}
 
 FLAG_RE = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
@@ -191,6 +197,10 @@ def doc_sources() -> list[tuple[str, str]]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--skip", action="append", default=[],
+                    help="extra directory names to skip, comma-separated or repeated "
+                         "(also $CHECK_DOCS_SKIP). Use this instead of editing "
+                         "SKIP_DIRS, so every line can run the same file")
     ap.add_argument("--project-root", default=None,
                     help="tree searched to answer 'does this file exist anywhere' "
                          "(default: nearest ancestor holding build_artifacts/ or .git)")
@@ -199,7 +209,11 @@ def main():
                          "because 'scan next to the script' breaks silently when copied")
     a = ap.parse_args()
 
-    global HERE, DUMPS
+    global HERE, DUMPS, SKIP_DIRS
+    extra = [x for s in a.skip for x in s.split(",") if x]
+    extra += [x for x in os.environ.get("CHECK_DOCS_SKIP", "").split(",") if x]
+    if extra:
+        SKIP_DIRS = SKIP_DIRS | set(extra)
     if a.root:
         HERE = os.path.abspath(a.root)
         if not os.path.isdir(HERE):
@@ -207,6 +221,12 @@ def main():
             sys.exit(1)
     DUMPS = _find_dumps()
     print(f"root    {HERE}")
+    if extra:
+        # A narrowed scan must announce itself: skipping a directory lowers the
+        # coverage number, and an unexplained lower number is indistinguishable
+        # from having less to check.
+        print(f"skip    {' '.join(sorted(set(extra)))}  (extra, from "
+              f"--skip/$CHECK_DOCS_SKIP)")
 
     scripts = {os.path.basename(p): p for p in our_files(".py")}
     # vendor scripts resolve, but we make no promises about their flags
