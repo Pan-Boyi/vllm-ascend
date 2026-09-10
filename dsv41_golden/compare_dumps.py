@@ -33,6 +33,29 @@ from safetensors.torch import load_file
 # ``isolated`` is derived from that run -- the measured maximum over 40 layers,
 # times 2-3x headroom.  See ALIGNMENT_PROTOCOL.md section 6 for the table and for
 # why these are a FLOOR on agreement, not a prediction of what an NPU will hit.
+#
+# A hard floor applies to every bf16 tensor, independent of what was measured.
+# 1 bf16 ULP is 2**-8 = 3.9e-3 *relative, per element*, so a difference that is
+# merely systematic -- e.g. the producing GEMM summing in a different order,
+# nudging essentially every element by one ULP -- already lands at ~3.9e-3 with
+# nothing wrong.  A threshold below a few ULP therefore fails correct code.
+#
+# This bit was gotten wrong once already: six bf16 tensors (layer.in, hc_pre.*,
+# attn_norm.out, ffn_norm.out, moe.in) were set to 5e-3 = 1.28 ULP, derived from
+# their measured fp32-vs-fp64 floor of 1.3e-3 while ignoring the representation
+# floor underneath it.  dsv41-kernel's first real NPU measurement of hc_pre at
+# d=5120 came in at 6.85e-3 = 1.75 ULP -- correct, and over that limit.
+BF16_ULP = 2 ** -8
+BF16_FLOOR = 3 * BF16_ULP        # 1.17e-2
+
+# bf16 in the dump.  fp32 quantities (hc_mixes, moe_gate.out.0, pre_mix, logits)
+# are not subject to the floor: 5e-3 is ~42000 fp32 ULP, nowhere near tight.
+BF16_TENSORS = (
+    "layer.in", "layer.out", "hc_pre", "hc_post", "attn_norm.out", "attn.in",
+    "attn.out", "ffn_norm.out", "moe.in", "moe.out", "engram.out",
+    "compressor.out", "embed.out", "final_norm.out",
+)
+
 TOLERANCES = {
     "loose":    {"_default": (5e-2, 0.995)},
     "default":  {"_default": (2e-2, 0.9990),
@@ -56,12 +79,15 @@ NEVER_GATE = ("moe_routing_margin",)
 
 
 def tol_for(name: str, tol: dict) -> tuple:
-    """Longest-prefix match on the tensor name, falling back to ``_default``."""
+    """Longest-prefix match on the tensor name, then apply the bf16 floor."""
     best, best_len = tol["_default"], -1
     for key, val in tol.items():
         if key != "_default" and name.startswith(key) and len(key) > best_len:
             best, best_len = val, len(key)
-    return best
+    rel, cos = best
+    if name.startswith(BF16_TENSORS):
+        rel = max(rel, BF16_FLOOR)
+    return rel, cos
 # Elements below this fraction of the tensor's RMS are excluded from max-rel-error:
 # a near-zero golden value makes relative error meaningless.
 REL_FLOOR_FRAC = 1e-2

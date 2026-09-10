@@ -75,11 +75,23 @@ NEVER_GATE = ("moe_routing_margin", "indexer_kv_offset")
 NEAR_TIE_MARGIN = 1e-3
 
 
+# See compare_dumps.BF16_FLOOR: 1 bf16 ULP is 3.9e-3 relative per element, so a
+# purely systematic one-ULP shift already reaches that with nothing wrong.
+BF16_FLOOR = 3 * 2 ** -8         # 1.17e-2
+BF16_TENSORS = (
+    "layer.in", "layer.out", "hc_pre", "hc_post", "attn_norm.out", "attn.in",
+    "attn.out", "ffn_norm.out", "moe.in", "moe.out", "engram.out",
+    "compressor.out",
+)
+
+
 def limit_for(name: str) -> float:
     best, best_len = ISOLATED_LIMITS["_default"], -1
     for k, v in ISOLATED_LIMITS.items():
         if k != "_default" and name.startswith(k) and len(k) > best_len:
             best, best_len = v, len(k)
+    if name.startswith(BF16_TENSORS):
+        best = max(best, BF16_FLOOR)
     return best
 
 
