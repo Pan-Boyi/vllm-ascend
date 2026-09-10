@@ -745,15 +745,28 @@ class GoldenModel:
         # Absolute sequence position of every token in this call -- the key the
         # forced-routing plan is addressed by.  Deliberately *not* the row index:
         # see section 0 of ROUTING_INJECTION.md.
+        # One entry per row of the flattened [batch*seqlen, dim] gate input, in that
+        # order.  For a batch of identical sequences (``--batch N``) every row maps
+        # to the same plan position, so the positions tile.
         positions = torch.arange(start_pos, start_pos + input_ids.size(1))
+        if input_ids.size(0) > 1:
+            positions = positions.repeat(input_ids.size(0))
         if routing_plan is not None:
-            assert input_ids.size(0) == 1, (
-                f"a routing plan describes one sequence; got batch {input_ids.size(0)}. "
-                "Use one plan per request."
-            )
+            if input_ids.size(0) > 1:
+                # A plan describes one sequence.  A mixed batch would need one plan
+                # per row, which this runner does not carry; a batch of identical
+                # rows is the same sequence N times, which is exactly what the
+                # batch-consistency check feeds it.
+                first = input_ids[0]
+                assert all(torch.equal(input_ids[b], first)
+                           for b in range(input_ids.size(0))), (
+                    f"batch {input_ids.size(0)} with a routing plan is only supported "
+                    "when every row carries the same sequence."
+                )
             # Every call, not just the first: a decode step's tokens are just as
             # capable of coming from the wrong text.
-            routing_plan.check_input_ids(input_ids, start_pos)
+            # Row 0 stands for all of them, their identity having just been asserted.
+            routing_plan.check_input_ids(input_ids[:1], start_pos)
 
         engram_hashes = None
         if self.engram_hash is not None:
