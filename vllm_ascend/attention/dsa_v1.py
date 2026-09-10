@@ -207,6 +207,46 @@ def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int
     return max(compress_ratio, 1)
 
 
+# Compression ratios the *currently bound* attention operator can honour.
+#
+# This is a property of KvQuantSparseAttnSharedkv, not of the hardware: its
+# host-side check rejects everything else outright -- see
+# csrc/attention/kv_quant_sparse_attn_sharedkv/op_host/
+# kv_quant_sparse_attn_sharedkv_check_existance.cpp:154-166, where SWA accepts
+# {1, 4, 128} and CFA/SCFA accept {4, 128}. That whitelist predates A5; the
+# operator is vendored here rather than shipped by CANN.
+#
+# A5 itself does support ratio 2: CANN 9.2.0's MixedQuantSparseFlashMla accepts
+# 1/2/4/128 and has been measured doing so. It is not bound in this repo yet,
+# so ratio 2 still cannot run -- but the limit moves when that binding lands,
+# and the error below must not leave anyone concluding the hardware cannot do it.
+#
+# 0 is deliberately in this set even though the operator's whitelist has no
+# such value: it means "no compressed stream at all", and _dsa_swa_only_cmp_ratio
+# converts it before anything is dispatched, so 0 never reaches the operator.
+SUPPORTED_COMPRESS_RATIOS = (0, 1, 4, 128)
+
+
+def validate_compress_ratio(compress_ratio: int, where: str) -> int:
+    """Reject compression ratios that no dispatch path implements.
+
+    DeepSeek-V4.1 asks for ratio 2 on layers 2..19. Every dispatch site here
+    used to fall through to a default instead of rejecting it -- the cmp_ratio
+    mapping to 128, the backend selection to SWA -- so an unsupported ratio
+    produced quietly wrong numbers rather than an error, and would surface far
+    downstream as "accuracy is a bit off".
+    """
+    if compress_ratio not in SUPPORTED_COMPRESS_RATIOS:
+        raise ValueError(
+            f"{where}: compress_ratio={compress_ratio} is not supported by the "
+            f"bound attention operator; it accepts "
+            f"{list(SUPPORTED_COMPRESS_RATIOS)}. DeepSeek-V4.1 needs ratio 2 on "
+            "layers 2..19. This is a binding gap, not a hardware limit -- CANN's "
+            "MixedQuantSparseFlashMla accepts ratio 2 on A5 but is not bound in "
+            "this repo yet.")
+    return compress_ratio
+
+
 class AscendDSABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -903,6 +943,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
             index_topk = self.model_config.hf_config.index_topk
+            validate_compress_ratio(self.compressor_ratio, layer_name)
             cmp_ratio = (
                 _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
                 if self.compressor_ratio <= 1
@@ -2208,6 +2249,12 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if swa_req_metadata.vision_swa_indices is not None:
             attn_kwargs["ori_sparse_indices"] = swa_req_metadata.vision_swa_indices
 
+        # NOTE(dsv41): ratio <= 1 means "no compressed stream" for V4.0, but
+        # V4.1 gives layers 20..39 ratio 1 to mean "compressed, pooling
+        # disabled" -- a compressed stream that this branch would skip. Which
+        # operator mode those layers are meant to use is still open, so the
+        # V4.0 reading is kept rather than guessed at; validate_compress_ratio
+        # does not catch this because ratio 1 is a legitimate V4.0 value.
         if self.compress_ratio <= 1:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices

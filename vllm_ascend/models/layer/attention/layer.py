@@ -24,6 +24,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC4Backend,
     AscendDSAC128Backend,
     AscendDSASWABackend,
+    validate_compress_ratio,
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -124,6 +125,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        validate_compress_ratio(self.compress_ratio, prefix)
         if self.compress_ratio == 4:
             self.attn_backend = AscendDSAC4Backend
         elif self.compress_ratio == 128:
