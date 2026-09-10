@@ -54,11 +54,23 @@ def _find_dumps() -> str:
 
 DUMPS = ""      # set in main(), after --root is known
 
-# Files the docs legitimately name that are not ours to define: vendor code under
-# ref/, and upstream sources quoted from the CANN / HF trees.  Naming one is a
-# reference, not a promise, so absence here is not a finding.
+# Files the docs legitimately name that are not ours to define: upstream sources
+# quoted from the CANN / HF trees.  Naming one is a reference, not a promise.
+#
+# 🔴 The whitelist is ONLY for "this really is someone else's file".  It must never
+# be used to silence a name this script failed to resolve -- that is a parse gap,
+# i.e. a bug in here, and adding the name hides the gap while looking like a fix.
+# One line's copy of this script had ten names appended after ten findings; the
+# findings went away and the gap stayed, so the next document written the same way
+# will report them again.  Those two cases now have separate exits and separate
+# counters (see `external` vs `unlocated` below), and the whitelist's use is
+# reported so shrinking coverage cannot pass for improving quality.
 EXTERNAL_SCRIPTS = {"modeling_deepseek.py", "elastic_buffer.py", "convert.py",
                     "fp8_cast_bf16.py", "setup.py"}
+
+# Directories never worth indexing when answering "does this file exist anywhere".
+HEAVY_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "build",
+              "dist", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 
 # Only our own docs and scripts; ref/ is vendor code and engram_research/ is rescued
 # upstream material, neither of which we promise anything about.
@@ -69,6 +81,39 @@ SCRIPT_RE = re.compile(r"\b([a-z_][a-z0-9_]*\.py)\b")
 # ``mod.func`` / ``Class.method`` inside backticks, with or without parentheses
 DOTTED_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\(\)`")
 DUMPDIR_RE = re.compile(r"golden_dumps/([A-Za-z0-9_]+)")
+
+
+def project_root() -> str:
+    """The tree that answers "does this file exist at all", not just "is it ours".
+
+    Walked up from the scan root looking for a repository or project marker, so a
+    filename mentioned without a path can be found where it actually lives.
+    """
+    # build_artifacts/ wins over .git at ANY level, checked in two passes: a git
+    # worktree carries its own .git file, so a per-level "first marker found" search
+    # stops inside the worktree and never sees the project that contains it.
+    chain = []
+    d = HERE
+    for _ in range(6):
+        chain.append(d)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    for marker in ("build_artifacts", ".git"):
+        for cand in chain:
+            if os.path.exists(os.path.join(cand, marker)):
+                return cand
+    return HERE
+
+
+def index_filenames(root: str) -> set[str]:
+    """Every .py basename under ``root`` -- used to tell "absent" from "unlocated"."""
+    names: set[str] = set()
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in HEAVY_DIRS]
+        names |= {f for f in files if f.endswith(".py")}
+    return names
 
 
 def our_files(ext: str) -> list[str]:
@@ -146,6 +191,9 @@ def doc_sources() -> list[tuple[str, str]]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--project-root", default=None,
+                    help="tree searched to answer 'does this file exist anywhere' "
+                         "(default: nearest ancestor holding build_artifacts/ or .git)")
     ap.add_argument("--root", default=None,
                     help="tree to scan (default: the current directory). Explicit "
                          "because 'scan next to the script' breaks silently when copied")
@@ -171,7 +219,15 @@ def main():
     for s in names.values():
         all_names |= s
 
+    proot = os.path.abspath(a.project_root) if a.project_root else project_root()
+    elsewhere = index_filenames(proot)
+
     problems: list[str] = []
+    # Three outcomes, not one.  "you promised a thing that does not exist" and
+    # "I could not work out where you said it lives" have very different severity,
+    # and merging them is what pushed another line to widen the whitelist.
+    unlocated: list[str] = []
+    external_used: set[str] = set()
     checked = 0
 
     for label, text in doc_sources():
@@ -195,7 +251,10 @@ def main():
                 current = invoked.group(1)
             for mt in SCRIPT_RE.finditer(line):
                 name = mt.group(1)
-                if name in scripts or name in vendor or name in EXTERNAL_SCRIPTS:
+                if name in scripts or name in vendor:
+                    continue
+                if name in EXTERNAL_SCRIPTS:
+                    external_used.add(name)
                     continue
                 # A citation is not a promise.  `torch_npu/.../distributed_c10d.py:500`
                 # and `w4a8_mxfp4.py:87` point at someone else's source; only a bare
@@ -203,6 +262,13 @@ def main():
                 before = line[:mt.start()][-1:]
                 after = line[mt.end():mt.end() + 2]
                 if before == "/" or re.match(r":\d", after):
+                    continue
+                # A file that exists somewhere in the project was not a false
+                # promise -- the doc just did not say where.  That is a style note,
+                # never a failure, and it needs no whitelist entry.
+                if name in elsewhere:
+                    unlocated.append(f"{label}:{i+1}: `{name}` exists in the project "
+                                     f"but is named without a path")
                     continue
                 problems.append(f"{label}:{i+1}: names script `{name}` which does not exist")
             # A single inline-code span that holds both a script and flags is a
@@ -261,8 +327,34 @@ def main():
 
     nmd = len(our_files(".md"))
     ndocs = len(doc_sources())
+    nsh = len(our_files(".sh"))
     print(f"checked {checked} promises across {ndocs} documents "
           f"({nmd} markdown + {ndocs - nmd} docstrings) and {len(scripts)} scripts")
+    print(f"project {proot}  ({len(elsewhere)} .py files indexed for name resolution)")
+
+    # Say what is NOT covered, in the same breath as what is.  Otherwise "every
+    # promise exists" reads as "these documents have been checked", and a line whose
+    # switches all live in shell comments would take a clean pass for a verdict.
+    if nsh:
+        print(f"NOT PARSED: {nsh} shell script(s) -- only Python argparse is read, so "
+              f"switches promised in .sh comments (PORT=, --watch-cards, ...) are "
+              f"NOT checked")
+    if external_used:
+        print(f"whitelist:  {len(external_used)} name(s) resolved only by "
+              f"EXTERNAL_SCRIPTS: {' '.join(sorted(external_used))}")
+        print(f"            each must be someone else's file -- never a name this "
+              f"script failed to parse")
+    unused = EXTERNAL_SCRIPTS - external_used
+    if unused:
+        print(f"whitelist:  {len(unused)} unused entr(ies): {' '.join(sorted(unused))} "
+              f"-- an entry no document needs is either dead or was added to "
+              f"silence a parse gap")
+    if unlocated:
+        print(f"style:      {len(unlocated)} name(s) exist in the project but are "
+              f"named without a path (not a failure)")
+        if a.verbose:
+            for u in unlocated:
+                print(f"  note  {u}")
 
     # Zero coverage is a failure.  This tool's whole argument is that silence is
     # not correctness, so it must not pass by having looked at nothing -- and the
@@ -290,6 +382,10 @@ def main():
             print(f"MISSING  {p}")
         print()
         print(f"{len(problems)} promised interface(s) do not exist.")
+        print(f"Names were searched for under {proot} only.  A document may point")
+        print("outside that tree -- eval_tools/ sits one level above the directory")
+        print("holding build_artifacts/, for instance -- in which case widen the")
+        print("search with --project-root instead of adding the name to a whitelist.")
         print("A promised-but-absent interface contradicts nothing, so grepping for")
         print("stale claims cannot find it -- only running it can.  That is why this")
         print("check exists.")
