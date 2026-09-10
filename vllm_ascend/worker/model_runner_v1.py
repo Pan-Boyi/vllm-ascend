@@ -341,6 +341,19 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
+        # vLLM #56078 ("Unify XD-RoPE into M-RoPE and derive the channel
+        # count") removed GPUModelRunner.uses_xdrope_dim / .xdrope_positions
+        # and folded XD-RoPE models into the M-RoPE path, where
+        # mrope_positions is now sized by ModelConfig.mrope_num_dims instead
+        # of a hardcoded 3. Feature-detect rather than version-gate: both the
+        # pre- and post-#56078 trees report VLLM_VERSION 0.28.1.
+        #
+        # 0 is the faithful value on the new API -- an XD-RoPE model now
+        # reports uses_mrope=True, so every `elif self.uses_xdrope_dim > 0`
+        # below is dead code there, exactly as upstream intends.
+        if not hasattr(self, "uses_xdrope_dim"):
+            self.uses_xdrope_dim = 0
+
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
         self.device_metadata_providers: dict[int, DeviceMetadataTaskProvider] | None = None
         self.pin_memory = PIN_MEMORY

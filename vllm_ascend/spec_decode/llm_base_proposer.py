@@ -161,6 +161,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
 
+        # See NPUModelRunner.__init__ -- vLLM #56078 removed
+        # SpecDecodeBaseProposer.uses_xdrope_dim / .draft_uses_xdrope_dim and
+        # routes XD-RoPE models through the M-RoPE path instead.
+        if not hasattr(self, "uses_xdrope_dim"):
+            self.uses_xdrope_dim = 0
+        if not hasattr(self, "draft_uses_xdrope_dim"):
+            self.draft_uses_xdrope_dim = 0
+
         # Assign runner before it's used in the methods below
         self.runner = runner
 
