@@ -39,6 +39,11 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--max-seq-len", type=int, default=512)
+    ap.add_argument("--window-size", type=int, default=0, metavar="N",
+                    help="override args.window_size. Shrinking it below the prompt length "
+                         "is how the ring buffer's wrap-around gets exercised at all: with "
+                         "the real 128 and a 27-token prompt, prefill never takes the "
+                         "seqlen>window branch and decode never wraps")
     ap.add_argument("--floor-gb", type=float, default=150.0)
     ap.add_argument("--fp64", action="store_true", help="accumulate the GEMMs in float64")
     ap.add_argument("--no-engram", action="store_true", help="skip engram layers (no tokenizer needed)")
@@ -66,7 +71,10 @@ def main():
 
     t0 = time.time()
     ckpt = Checkpoint(G.MODEL_DIR)
-    args = G.load_args(max_batch_size=1, max_seq_len=args_cli.max_seq_len)
+    overrides = {"window_size": args_cli.window_size} if args_cli.window_size else {}
+    args = G.load_args(max_batch_size=1, max_seq_len=args_cli.max_seq_len, **overrides)
+    if overrides:
+        print(f"OVERRIDE window_size={args.window_size} (real config is 128)", flush=True)
     print(f"config: n_layers={args.n_layers} dim={args.dim} experts={args.n_routed_experts} "
           f"engram_layers={args.engram_layer_ids} kv_source={args.kv_source_layers}", flush=True)
 

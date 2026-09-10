@@ -163,7 +163,37 @@ The capital of France is Paris. Ascend NPU kernels must match this reference bit
 | `attn_norm.out` | [1, 27, 5120] | bf16 | attention 前 RMSNorm |
 | `attn.in` | [1, 27, 5120] | bf16 | 同上（冗余，用于确认 hook 挂对位置） |
 | `compressor.out` | [1, 13, 512] | bf16 | **仅 kv_source 层 2/8/14/20**：RoPE 前的压缩 latent |
-| `indexer_topk.out` | [1, 27, K] | int32 | **仅 index_source 层**：选中的压缩位置，**-1 表示空槽** |
+| `indexer_topk.out` | [1, 27, K] | int32 | **仅 index_source 层**：见下面的 🔴 警告，值**不是**压缩位置编号 |
+| `indexer_kv_offset` | [1] | int32 | **仅 index_source 层**：`indexer_topk.out` 的基准偏移，用来归一化 |
+
+> 🔴 **`indexer_topk.out` 的值是「拼接后 `[window ; compressed]` KV 的下标」，不是压缩位置编号，
+> 而且偏移量是路径相关的 —— 不归一化就逐位比，会在实现完全正确的情况下报 100% 不一致。**
+>
+> ```python
+> # ref/model.py:775-778
+> kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+> compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))  # ← offset
+> kv = torch.cat([kv, compress_kv], dim=1)
+> # ref/model.py:580
+> return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+> ```
+>
+> `offset = kv.size(1)` 是滑窗 KV 张量的长度，而它在两条路径上不同（`ref/model.py:709-719`）：
+>
+> | 路径 | 滑窗张量 | offset |
+> |---|---|---|
+> | prefill（`seqlen ≤ window_size`） | `window_kv = kv`，就是本段本身 | **`seqlen`（本组输入 = 27）** |
+> | decode | `window_kv = window_kv_cache`，整个环 | **`window_size` = 128** |
+>
+> 实测：同一个压缩位置，golden 的 prefill 记成 `27..39`，decode 记成 `128..140` ——
+> **差 101，但两边都对**。任何滑窗 KV 布局与 golden 不同的实现（paged KV、prefill 也走满
+> 128 槽的环）都会整体偏移一个常数。
+>
+> **⇒ 比对前必须先归一化**：`compressed_pos = where(raw < 0, raw, raw - offset)`
+> （`-1` 保持 `-1`）。参考实现 `run_decode_check.py:_unoffset()`。
+> **⇒ 实现方也必须 dump 自己的 `indexer_kv_offset`**（concat 时用的那个 offset），
+> 否则无法归一化。
+> **⇒ `indexer_kv_offset` 本身不作判据** —— 它*应当*在两条路径间不同。
 | `attn.out` | [1, 27, 5120] | bf16 | attention 输出（已做逆 RoPE + wo 投影） |
 
 > 🔴 **`attn_sink` 参与 attention，golden 已实现**（v1.0 漏写）。
@@ -338,7 +368,7 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 | `input_ids` | 输入 |
 | `engram_hash_ids` | 纯整数哈希（素数取模 + XOR），零浮点 |
 | `moe_gate.forced.1`（vs golden 的 `moe_gate.out.1`，按集合） | 注入是否生效，见第 1.5 步 |
-| `indexer_topk.out` | 见第 5.1 节：不可达位置统一映射成 `-1`，输出完全确定 |
+| `indexer_topk.out`（**归一化后**） | 见第 5.1 节：不可达位置统一映射成 `-1`，输出完全确定。⚠️ 必须先减掉 `indexer_kv_offset`，见第 3 节警告 |
 | `compressor.out` | 实测 4 个 kv_source 层全 40 层偏差 **0.00e+00** |
 
 ### 6.2 阶段 A1 —— 强制路由 + 强制 `layer.in`（`--tolerance isolated`）
@@ -498,9 +528,9 @@ indexer 的选择，这些仍然由本次运行自己前面的层产生。所以
 - **vision tower（ViT + Aligner）**：本 golden 未跑，纯文本路径。
 - **DSpark / MTP 草稿头**（`mtp.*`，3 层）：未跑。参考实现里 `forward_spec` 没有被
   推理循环调用，属于另一个工作项。
-- **decode（`start_pos > 0`）**：本 golden 目前只验证了 prefill。滑窗环形缓冲、
-  compressor 的跨步状态（`kv_state`/`score_state`）、indexer 的单 query 分支都**没有**
-  被覆盖，是明确的缺口（见 REPORT.md 人天估计）。
+- **decode（`start_pos > 0`）**：**v1.1 起已覆盖**，见第 11 节。滑窗环形缓冲、
+  compressor 跨步状态（`kv_state`/`score_state`）、indexer 单 query 分支、
+  engram 哈希 cache 都已验证。
 - **`-1` 索引语义**：`sparse_attn` 里 `topk_idxs == -1` 表示空槽，其 KV 行读作 0、
   score 读作 -inf；整行全 -1 时输出**必须是全 0 而不是 NaN**（running max 用有限的
   -1e30 而非 -inf 兜底）。NPU 实现如果这里返回 NaN，会在滑窗刚开始填充时炸掉。
@@ -648,3 +678,86 @@ python test_kernel_cpu.py
 
 ⚠️ **fp32 与 fp64 两种参考产出的整模型结果不可混用** —— 第 0 节的实验就是这两者之差，
 它翻转了 22% 的路由。单算子对照不受影响（差异 ~1e-7），但一旦进入整模型逐层比对就要统一。
+
+---
+
+## 11. decode 路径与 prefill↔decode 自洽（判据 G-1）
+
+```bash
+DU=/workspace/code/dsv4_single_card/vllm_project/golden_dumps
+python run_decode_check.py --cut 20 --layers 40 \
+    --routing-plan $DU/plan_full40_v2 --force-layer-in $DU/full40_v2    # 逐层
+python run_decode_check.py --cut 20 --layers 40 \
+    --routing-plan $DU/plan_full40_v2                                   # 端到端
+```
+
+同一段文本喂两遍：一次整段 prefill，一次「短 prefill + 逐 token decode」，然后比。
+
+### 11.1 decode 会碰到 prefill 完全不碰的东西
+
+| 状态 | 在哪 | 谁有 |
+|---|---|---|
+| `attn.window_kv_cache` [1,128,512] | 滑窗环形缓冲 | **全部 40 层** |
+| `attn.compress_kv_cache` [1,256 或 512,512] | 压缩 latent | kv_source 层 2/8/14/20 |
+| `attn.compressor.kv_state` [1,2,512] fp32 | 未满组的 kv | ratio>1 的 kv_source 层 2/8/14 |
+| `attn.compressor.score_state` [1,2,512] fp32 | 未满组的 gate 分数，**初值 `-inf`** | 同上 |
+| `attn.indexer.k_cache` [1,256 或 512,128] | index key | index-key **owner** 层（2/8/14/20；24/28/32/36 复用 `shared_attn.index_k`，自己不持有） |
+
+**这些全部注册为 `persistent=False`**，也就是权重加载器既不填它们、也不检查它们
+（`load_block` 遍历的是 `state_dict()`）。而 golden 是**流式**的：建层 → 灌权重 → 跑 → 释放。
+prefill 不需要任何东西跨层存活，**decode 需要，而它们就在刚被释放的那个 block 里**。
+
+`golden.LayerStateStore` 负责搬运，并且是**按「在 `named_buffers()` 里但不在 `state_dict()` 里」
+自动发现**，不是手写清单 —— 参考实现哪天多一个 cache，会被自动带上，而不是静默地每步从零开始。
+
+⚠️ **`score_state` 初值是 `-inf` 而不是 0**（未填的槽必须拿到零 softmax 权重，0 会给它真实份额）。
+所以「让 buffer 保持构造时的值」不是可行的替代方案。
+
+### 11.2 两个模式，因为端到端模式单独回答不了这个问题
+
+**端到端模式**（默认）：比 decode 的 logits 和整段 prefill 的 logits。
+
+它的噪声地板**不小**：20 token 的 prefill 和 27 token prefill 的前 20 个位置**本来就不同** ——
+每个 GEMM 的 M 维不同、舍入方式就不同，再叠加第 0.2 节那条「bf16 ULP 经因果 attention 扩散」。
+所以这个模式**在同一次运行里测出这个地板**（两段共享的 prefill 前缀）并作为**对照**报出来。
+
+**⇒ 端到端模式的判据是 top-1 一致，不是 rel_l2。** rel_l2 报出来但不 gate，
+只标注它是对照的多少倍。
+
+**逐层模式**（`--force-layer-in <golden_dump>`）：每个 block 都拿 golden 在**被解码那个位置**
+的 `layer.in`，跨层累积消失，每层独立判定，用第 6.2 节的逐层阈值。**这是能定位 decode bug 的模式。**
+
+**两个模式都强制路由**（`--routing-plan`）。prefill 和 decode 用不同的算术得到同一个量，
+差 ~1e-7 —— 而这个量级的差异到 layer 2 会翻转两成 token 的路由。不强制的话，两个模式测的
+都是路由分歧而不是 decode 路径。**路由方案按绝对序列位置寻址，所以对 decode 步原样可用** ——
+这正是第 0 节那条设计约束的回报。
+
+### 11.3 实测（3 层，路由 + 层输入双注入）
+
+| 项 | 结果 |
+|---|---|
+| 每个 decode 步比对的张量数 | 71~72 |
+| 超出逐层阈值的 | **0** |
+| 最差 | `moe.out` @ L2 = 1.70e-2（阈值 4e-2）|
+| decode 自己的 gate 选择 vs golden | **81/81 行相同**（`rows_changed: 0`）|
+| 端到端对照（两段 prefill 的共享前缀）| 6.2e-3 |
+| 端到端 top-1 | 7/7 位置一致 |
+
+**decode 路径的 gate 是对的**：注入进去的和它自己算的是同一组专家。
+
+### 11.4 这个检查暴露的两个「比对方法本身」的错
+
+都不是模型的 bug，是判据的 bug —— 但都会表现为「实现有问题」：
+
+1. **`indexer_topk.out` 的路径相关偏移**（见第 3 节的 🔴 警告）。不归一化就逐位比 →
+   在实现完全正确的情况下报 100% 不一致。
+2. **忘了按集合比 `moe_gate.out.1`**。我在新写的比对里漏了这一步，立刻报出一个「路由不一致」
+   —— 查下去是**纯顺序调换**。第 0.1 节那两个被推翻的数字是同一个原因。
+   **凡是比 `moe_gate.out.1` 的地方都要先 `sort(-1)`。**
+
+### 11.5 仍未覆盖
+
+- **多步生成**（decode 到 `start_pos > window_size = 128`）：环形缓冲的**回绕**还没测。
+  27 token 的标准输入到不了那里。需要另一组长输入。
+- **batch > 1** 的 decode。
+- MTP / DSpark 草稿头的 `forward_spec`（本来就在范围外，见第 8 节）。

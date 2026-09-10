@@ -192,6 +192,11 @@ def main():
     ap.add_argument("--layers", type=int, default=40)
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--max-seq-len", type=int, default=512)
+    ap.add_argument("--window-size", type=int, default=0, metavar="N",
+                    help="override args.window_size, to make the ring buffer wrap inside a "
+                         "27-token prompt. Self-consistency still holds -- both paths use "
+                         "the same config -- so this is a valid structural test even though "
+                         "the numbers are not the real model's")
     ap.add_argument("--floor-gb", type=float, default=150.0)
     ap.add_argument("--fp64", action="store_true")
     ap.add_argument("--routing-plan", type=str, default=None)
@@ -219,7 +224,8 @@ def main():
         plan = RoutingPlan.load(a.routing_plan)
 
     ckpt = Checkpoint(G.MODEL_DIR)
-    args = G.load_args(max_batch_size=1, max_seq_len=a.max_seq_len)
+    overrides = {"window_size": a.window_size} if a.window_size else {}
+    args = G.load_args(max_batch_size=1, max_seq_len=a.max_seq_len, **overrides)
     tokenizer = AutoTokenizer.from_pretrained(G.MODEL_DIR)
     ids = tokenizer(a.prompt or GOLDEN_PROMPT)["input_ids"]
     input_ids = torch.tensor([ids])
