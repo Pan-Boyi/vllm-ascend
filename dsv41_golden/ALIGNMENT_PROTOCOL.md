@@ -938,6 +938,18 @@ batch=2 时 MoE 输入是 `[54, 5120]` 而不是 `[27, 5120]`，BLAS 的分块/�
 
 ## 9. 复现 golden · 完整命令参考
 
+> ⚠️ **本节的命令请用 `run` 跑,不要自己接 `| head` / `| tail`。**
+> ```bash
+> source run_logged.sh
+> run python run_golden.py --layers 40 --dump $DU/full40
+> ```
+> `cmd | tail -8; echo rc=$?` 拿到的是 `tail` 的退出码,**永远是 0** ——
+> 一个失败的命令会读成通过的;`| head` 还会因 SIGPIPE 截掉你真正要看的输出。
+> 这两个错的方向相同:**报成功,并且给你看得更少**。
+> 本项目四条线在一天内各踩一次,所以做成了默认路径而不是一条纪律
+> (`run_logged.sh`,6 个自测对照)。`run` 用重定向而非管道,`$?` 是命令自己的,
+> 全量输出落盘,摘要在**退出码记录之后**才打印 —— 看摘要不会改变报告的结果。
+
 ```bash
 cd <本目录>
 unset LD_PRELOAD          # 必须。jemalloc 在 ~/.bashrc 里，不 unset 会 segfault

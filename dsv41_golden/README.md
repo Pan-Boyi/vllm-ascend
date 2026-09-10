@@ -41,7 +41,8 @@
 | `engram_hash_ref.py` | **独立**的 n-gram 哈希参考，9 秒，不加载权重 |
 | `engram_lookup_ref.py` | **判据 G-3**：engram 查表参考(可 import)+ 逐位相同前提的实测验证 + `--verify` 判据 |
 | `compare_batch_rows.py` | batch>1 的首个分歧定位,把「真 batch bug」的特征做成可执行判据 |
-| `check_docs_interfaces.py` | **文档自检**：文档承诺的每个 flag / 脚本 / 函数 / dump 目录是否真的存在 |
+| `check_docs_interfaces.py` | **文档自检**：文档承诺的每个 flag / 脚本 / 函数 / dump 目录是否真的存在（`--root` 指定扫描树，零覆盖显式失败）|
+| `run_logged.sh` | `source` 它拿到 `run` —— 正确取退出码 + 全量落盘变成默认路径，不再靠「记得别用 head/tail」。`bash run_logged.sh --self-test` 有 6 个对照 |
 | `compare_dumps.py` | golden ↔ NPU dump 比对工具（per-tensor 阈值、集合比路由、逐 token 统计）|
 | `ref/` | `/workspace/models/.../inference/` 的**逐字副本**，只把 `kernel.py` 换成 CPU 版 |
 
