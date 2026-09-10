@@ -1,0 +1,94 @@
+{
+ "binFileName": "EngramFetchWait_d0d79eb2bff4e4017a7357a79be6e344",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "VectorCore",
+ "core_type": "AIV",
+ "intercoreSync": 0,
+ "kernelName": "EngramFetchWait_d0d79eb2bff4e4017a7357a79be6e344",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+ "memoryStamping": [],
+ "opParaSize": 9,
+ "parameters": [
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "c6d53c6eb1ccd220366a1ccf70ef2146d9f8b6f38e4af7a5bbf66967df1db0d2",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "kernelName": "EngramFetchWait_d0d79eb2bff4e4017a7357a79be6e344_0"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "platformInfo": {
+  "deterministicLevel": 0
+ },
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "EngramFetchWait/d=0,p=1/3,2/27,2/27,2",
+   "EngramFetchWait/d=0,p=0/3,2/27,2/27,2",
+   "EngramFetchWait/d=1,p=1/3,2/27,2/27,2",
+   "EngramFetchWait/d=1,p=0/3,2/27,2/27,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "ced2fd025dab3a6223d8950119b48c6d40ea5c333bc82bfff706719006f5bf5a,76db64a01a0b08deefb1f07bb2e857bda3d7037a3ca5ee3a350241353c473503",
+  "inputs": [
+   {
+    "name": "commContext",
+    "index": 0,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "fetched",
+    "index": 1,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "fetched",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend950/bin/engram_fetch_wait/EngramFetchWait_d0d79eb2bff4e4017a7357a79be6e344.json"
+}

@@ -470,6 +470,41 @@ def _attach_taps(block, rec: Recorder):
     # will any implementation whose window KV is laid out differently.  Recording
     # the offset makes the tensor interpretable instead of only comparable against
     # an identically-shaped run.
+    # ``indexer_score`` -- the scores the indexer takes its top-k of.  Needed
+    # because the indexer's selection is a *discrete* verdict computed on
+    # quantised q/k (fp4 in the reference, fp8 on Ascend), so a quantisation
+    # difference can flip which positions win.  With only the chosen indices, a
+    # comparison can say "N positions changed" but not "did it matter" -- exactly
+    # where MoE routing was before moe_routing_margin existed.
+    #
+    # The score is a local in ``Indexer.forward``, so rather than duplicate ~25
+    # lines of the reference (which would then be free to drift from it), capture
+    # it by noting what ``topk`` was called on.  The scoping is deliberately
+    # narrow: the patch is installed only for the duration of that one forward and
+    # always removed.  ``select_candidate_blocks`` also calls topk, and it runs
+    # *before* the final ``index_score.topk``, so the last capture is the one.
+    if block.attn.indexer is not None:
+        _ifwd = block.attn.indexer.forward
+
+        def _indexer_tap(*aa, _orig=_ifwd, **kw):
+            seen = []
+            real_topk = torch.Tensor.topk
+
+            def spy(self, *a, **k):
+                seen.append(self)
+                return real_topk(self, *a, **k)
+
+            torch.Tensor.topk = spy
+            try:
+                out = _orig(*aa, **kw)
+            finally:
+                torch.Tensor.topk = real_topk
+            if seen:
+                rec.add("indexer_score", seen[-1].float())
+            return out
+
+        block.attn.indexer.forward = _indexer_tap
+
     if block.attn.compress_ratio:
         _wkv = block.attn._window_kv
 

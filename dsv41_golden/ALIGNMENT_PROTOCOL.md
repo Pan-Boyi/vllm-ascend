@@ -374,6 +374,55 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
   → **第 0 行整行是 `-1`**，即第 8 节那条「整行全 -1 必须输出全 0 而非 NaN」
   **在标准输入上就被触发**，不需要构造 case。
 
+### 5.2 🔴 `indexer_topk.out` 需要自己的判据，不能用张量容差
+
+**参考实现和昇腾侧的 q/k 位宽不同**（`dsv41-kernel` 实测）：
+
+| | 官方参考实现 | 昇腾侧实际 |
+|---|---|---|
+| 压缩 KV | fp4 e2m1，block **16**，scale e4m3 | **MXFP8**：fp8 e4m3 + e8m0，group **64**，rope 段 bf16 |
+| Indexer q/k | fp4 e2m1，block **32**，scale e8m0 | **mode 1**：fp8 e4m3 + fp32 per-token-head scale |
+
+**参考 4 bit，昇腾 8 bit —— 量化步长差 4 倍。**
+
+而 index score 是**在量化过的 q/k 上算出来、然后取 top-k**（`ref/model.py:557` → `:578`）——
+**离散判决**。步长差异可能**翻转选择**，而翻转不是数值误差，**放宽容差收敛不了**：
+你会看到「逐层张量都在容差内，但 `indexer_topk.out` 的索引集合不同」，
+而下游一切都建在那个集合上。
+
+（这也给了第 5.1 节那个观察一个机制：fp32↔fp64 扰动下 `indexer_topk.out` 100% 稳定，
+**是因为 q/k 已被压到低位宽，量化步长远大于 1e-7 的扰动**。当时记的是现象，现在有原因了。）
+
+#### 判据（三段，`compare_dumps.py:indexer_agreement()`）
+
+```
+1. 归一化   两侧各自减掉自己的 indexer_kv_offset（见第 3 节警告）
+2. 换了多少  逐 query 算集合对称差 |A △ B|，报换掉的槽数 / 总槽数
+3. 有害吗    对每个被换掉的位置，用 indexer_score 算
+             「被顶掉的最低分」vs「顶上来的最高分」的间隙
+               间隙极小 → 无害（和 MoE 的近似平局同型）
+               间隙不小 → 真错，去查量化粒度 / scale 类型
+```
+
+**第 3 步是这套判据的全部价值，而它需要一个新的 dump 点。**
+
+| 键 | 形状 | dtype | 含义 |
+|---|---|---|---|
+| `indexer_score` | [1, 27, n_compressed] | fp32 | **top-k 之前**的原始分数。layer 2 是 `[1,27,13]` |
+
+**没有它，比对只能报「换了 N 个」，说不出「有害吗」** —— 那正是 MoE 路由在
+`moe_routing_margin` 出现之前的困境。`compare_dumps.py` 在缺它时会 graceful degrade
+并**把 `have_scores: false` 显式写进输出**，而不是静默给一个数字。
+
+> 类比是这套判据成立的理由：`moe_routing_margin` 的价值就是把「平局」和「真 bug」分开。
+> 实测例：40 层 decode 检查里 pos 23 / layer 22 有一个 token 路由不同，
+> 它的 margin 是 **9.3e-5，全层 27 个里最小、比中位数 2.7e-2 低 290 倍** → 判为近似平局。
+> indexer 需要同一个机制，只是量名从 margin 换成 index_score 间隙。
+
+⚠️ **现在还没有实测的间隙分布** —— 需要昇腾侧的 `indexer_score` dump。
+所以「4 倍步长会不会真的翻转、翻转有没有害」目前是**先验，不是证据**。
+判据先建好，是为了第一次比对就能直接给结论，而不是先花一轮争论怎么判。
+
 ---
 
 ## 6. 阈值与理由

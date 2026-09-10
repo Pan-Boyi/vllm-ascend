@@ -78,6 +78,88 @@ TOLERANCES = {
 NEVER_GATE = ("moe_routing_margin",)
 
 
+def indexer_agreement(a: torch.Tensor, b: torch.Tensor,
+                      a_off: torch.Tensor | None, b_off: torch.Tensor | None,
+                      score: torch.Tensor | None) -> dict:
+    """Compare two ``indexer_topk.out`` selections as sets, and say whether the
+    difference matters.
+
+    Two things make a raw comparison wrong here.  First, the values index the
+    concatenated [window ; compressed] KV, and the window part is ``seqlen`` long
+    in prefill but ``window_size`` long in decode -- so the same compressed
+    position carries a different number in each path, and any implementation with
+    a different window layout differs by a constant.  Both sides are normalised by
+    their own recorded offset before anything is compared.
+
+    Second, and the reason this needs its own criterion rather than a tolerance:
+    the index scores are computed on *quantised* q and k -- fp4 in the reference
+    implementation, fp8 on Ascend -- and then top-k'd.  A quantisation-step
+    difference can flip which positions win, and a flipped selection is not a
+    numerical error that a looser threshold absorbs; everything downstream is
+    built on the chosen set.
+
+    So the useful question is the same one ``moe_routing_margin`` answers for MoE
+    routing: was it a near-tie?  Given the pre-top-k scores, a position that got
+    displaced by one scoring almost the same is harmless, while one displaced by a
+    clearly lower-scoring position is a real bug.  Without the scores this can
+    only report *how many* changed, not whether it mattered -- which was exactly
+    the position MoE routing was in before ``moe_routing_margin`` existed.
+    """
+    ai = _unoffset_idx(a.to(torch.int64), a_off)
+    bi = _unoffset_idx(b.to(torch.int64), b_off)
+    if ai is None or bi is None:
+        return {"kind": "indexer", "comparable": False,
+                "why": "no indexer_kv_offset recorded on one side; values index the "
+                       "concatenated [window ; compressed] KV and are not comparable raw"}
+
+    # Flatten to one row per query; -1 is an empty slot and is not a position.
+    ai = ai.reshape(-1, ai.shape[-1])
+    bi = bi.reshape(-1, bi.shape[-1])
+    n_rows = ai.shape[0]
+    n_sym, n_rows_diff, worst = 0, 0, None
+    per_row = []
+    for r in range(n_rows):
+        sa = set(int(x) for x in ai[r].tolist() if x >= 0)
+        sb = set(int(x) for x in bi[r].tolist() if x >= 0)
+        sym = sa ^ sb
+        if not sym:
+            continue
+        n_rows_diff += 1
+        n_sym += len(sym)
+        gap = None
+        if score is not None:
+            sc = score.reshape(-1, score.shape[-1])[r].double()
+            # The gap that matters: the worst-scoring position kept by one side
+            # against the best-scoring position it displaced on the other.
+            dropped = sorted(sa - sb)
+            added = sorted(sb - sa)
+            if dropped and added:
+                lo = min(sc[i].item() for i in dropped if i < sc.numel())
+                hi = max(sc[i].item() for i in added if i < sc.numel())
+                gap = abs(hi - lo)
+        entry = {"row": r, "n_sym_diff": len(sym), "kept_len": len(sa),
+                 "score_gap": gap}
+        per_row.append(entry)
+        if gap is not None and (worst is None or gap > worst["score_gap"]):
+            worst = entry
+    total_slots = int((ai >= 0).sum())
+    return {"kind": "indexer", "comparable": True,
+            "exact": n_sym == 0,
+            "rows": n_rows, "rows_differing": n_rows_diff,
+            "slots_symmetric_diff": n_sym, "slots_total": total_slots,
+            "frac_slots_changed": n_sym / max(total_slots, 1),
+            "have_scores": score is not None,
+            "worst_row_by_gap": worst,
+            "rows_detail": per_row[:8]}
+
+
+def _unoffset_idx(idxs: torch.Tensor, offset: torch.Tensor | None):
+    if offset is None:
+        return None
+    off = int(offset.flatten()[0])
+    return torch.where(idxs < 0, idxs, idxs - off)
+
+
 def tol_for(name: str, tol: dict) -> tuple:
     """Longest-prefix match on the tensor name, then apply the bf16 floor."""
     best, best_len = tol["_default"], -1
