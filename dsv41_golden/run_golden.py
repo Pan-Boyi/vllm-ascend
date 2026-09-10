@@ -39,6 +39,11 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--max-seq-len", type=int, default=512)
+    ap.add_argument("--perturb-ulp", type=str, default=None, metavar="TOK,DIM",
+                    help="move one element of embed.out by exactly one bf16 ULP "
+                         "(the smallest difference the residual stream can hold, and the "
+                         "size two different implementations start with). Measures what "
+                         "that becomes after N layers")
     ap.add_argument("--batch", type=int, default=1, metavar="N",
                     help="replicate the prompt into a batch of N identical sequences. "
                          "Every row must then come out bit-identical to every other; "
@@ -120,8 +125,11 @@ def main():
 
     rec = G.Recorder(args_cli.dump, enabled=args_cli.dump is not None)
     t1 = time.time()
+    pert = None
+    if args_cli.perturb_ulp:
+        pert = tuple(int(x) for x in args_cli.perturb_ulp.split(","))
     logits = model.forward(input_ids, rec, n_layers=args_cli.layers, routing_plan=plan,
-                           layer_in_dir=args_cli.force_layer_in)
+                           layer_in_dir=args_cli.force_layer_in, perturb_ulp=pert)
     dt = time.time() - t1
     if plan is not None:
         print(f"  routing   {plan.summary()}")

@@ -722,7 +722,8 @@ class GoldenModel:
     def forward(self, input_ids: torch.Tensor, rec: Recorder | None = None,
                 n_layers: int | None = None, full_logits: bool = True,
                 start_pos: int = 0, routing_plan=None, layer_in_dir: str | None = None,
-                state: "LayerStateStore | None" = None):
+                state: "LayerStateStore | None" = None,
+                perturb_ulp: tuple[int, int] | None = None):
         """``layer_in_dir`` turns every block into an independent comparison.
 
         Forced routing removes the discrete verdict but not the *accumulation*: the
@@ -776,6 +777,25 @@ class GoldenModel:
             engram_hashes = self.engram_hash(input_ids, start_pos, None)
 
         h = F.embedding(input_ids, self.embed_weight)
+        if perturb_ulp is not None:
+            # Move ONE element of the embedding by exactly one bf16 ULP, by
+            # incrementing its bit pattern.  This is the smallest difference the
+            # residual stream can represent, and it is the size of the difference
+            # two *different implementations* start with -- nine orders of
+            # magnitude above the 3.6e-12 that two rows of one batched GEMM start
+            # with.  Running it forward measures what that becomes after 40
+            # layers, which decides whether end-to-end layer-wise numerical
+            # comparison between implementations is possible at all.
+            tok, dim = perturb_ulp
+            bits = h.view(torch.int16)
+            before = float(h[0, tok, 0, dim]) if h.dim() == 4 else float(h[0, tok, dim])
+            flat = bits[0, tok, dim] if bits.dim() == 3 else bits[0, tok, 0, dim]
+            bits[0, tok, dim] = flat + 1
+            after = float(h[0, tok, dim])
+            if self.verbose:
+                print(f"perturbed embed.out[0,{tok},{dim}]: {before!r} -> {after!r} "
+                      f"(one bf16 ULP, rel {abs(after - before) / max(abs(before), 1e-30):.3e})",
+                      flush=True)
         rec.add("embed.out", h)
         h = h.unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
         pre_mix = M.make_identity_pre_mix(h, args.hc_mult)
