@@ -10,7 +10,7 @@ import math
 
 import pytest
 import torch
-import torch_npu
+import torch_npu  # noqa: F401 -- registers the npu device
 
 # torch.ops.cann_ops_transformer is empty until the package is imported.
 cann_ops_transformer = pytest.importorskip("cann_ops_transformer")
@@ -48,19 +48,22 @@ MASK_KWARGS = dict(
 def _scatter_to_paged(kv_bnsd, block_size, num_blocks, max_blocks_per_batch):
     batch, num_kv_heads, seq, dim = kv_bnsd.shape
     expanded = torch.zeros(
-        batch, num_kv_heads, max_blocks_per_batch * block_size, dim,
-        dtype=kv_bnsd.dtype, device=kv_bnsd.device,
+        batch,
+        num_kv_heads,
+        max_blocks_per_batch * block_size,
+        dim,
+        dtype=kv_bnsd.dtype,
+        device=kv_bnsd.device,
     )
     expanded[:, :, :seq, :] = kv_bnsd
-    paged = torch.zeros(num_blocks, block_size, num_kv_heads, dim,
-                        dtype=kv_bnsd.dtype, device=kv_bnsd.device)
+    paged = torch.zeros(num_blocks, block_size, num_kv_heads, dim, dtype=kv_bnsd.dtype, device=kv_bnsd.device)
     block_table = torch.zeros(batch, max_blocks_per_batch, dtype=torch.int32, device=kv_bnsd.device)
     block_id = 0
     for b in range(batch):
         for i in range(max_blocks_per_batch):
             block_table[b, i] = block_id
             for h in range(num_kv_heads):
-                paged[block_id, :, h, :] = expanded[b, h, i * block_size:(i + 1) * block_size, :]
+                paged[block_id, :, h, :] = expanded[b, h, i * block_size : (i + 1) * block_size, :]
             block_id += 1
     return paged, block_table
 
@@ -81,51 +84,134 @@ def _make_inputs(cmp_ratio):
     ori_blocks = math.ceil(SEQ_ORI_KV / BLOCK_SIZE)
     inputs["ori_kv"], inputs["ori_block_table"] = _scatter_to_paged(
         torch.randn(BATCH, NUM_HEADS_KV, SEQ_ORI_KV, KV_DIM, dtype=torch.bfloat16, device="npu").to(
-            torch.float8_e4m3fn),
-        BLOCK_SIZE, ori_blocks * BATCH, ori_blocks)
+            torch.float8_e4m3fn
+        ),
+        BLOCK_SIZE,
+        ori_blocks * BATCH,
+        ori_blocks,
+    )
     cmp_blocks = math.ceil(seq_cmp_kv / BLOCK_SIZE)
     inputs["cmp_kv"], inputs["cmp_block_table"] = _scatter_to_paged(
         torch.randn(BATCH, NUM_HEADS_KV, seq_cmp_kv, KV_DIM, dtype=torch.bfloat16, device="npu").to(
-            torch.float8_e4m3fn),
-        BLOCK_SIZE, cmp_blocks * BATCH, cmp_blocks)
+            torch.float8_e4m3fn
+        ),
+        BLOCK_SIZE,
+        cmp_blocks * BATCH,
+        cmp_blocks,
+    )
     return inputs
 
 
 def _run_via_cann_wrapper(t):
     metadata = torch.ops.cann_ops_transformer.mixed_quant_sparse_flash_mla_metadata(
-        num_heads_q=NUM_HEADS_Q, num_heads_kv=NUM_HEADS_KV, head_dim=HEAD_DIM,
-        quant_mode=QUANT_MODE, seqused_q=t["seqused_q"], seqused_ori_kv=t["seqused_ori_kv"],
-        seqused_cmp_kv=t["seqused_cmp_kv"], cmp_residual_kv=t["cmp_residual_kv"], batch_size=BATCH,
-        max_seqlen_q=int(t["seqused_q"].max()), max_seqlen_ori_kv=int(t["seqused_ori_kv"].max()),
-        max_seqlen_cmp_kv=int(t["seqused_cmp_kv"].max()), ori_topk=0, cmp_topk=0,
-        rope_head_dim=ROPE_HEAD_DIM, cmp_ratio=t["cmp_ratio"], has_ori_kv=True, has_cmp_kv=True,
-        **MASK_KWARGS)
+        num_heads_q=NUM_HEADS_Q,
+        num_heads_kv=NUM_HEADS_KV,
+        head_dim=HEAD_DIM,
+        quant_mode=QUANT_MODE,
+        seqused_q=t["seqused_q"],
+        seqused_ori_kv=t["seqused_ori_kv"],
+        seqused_cmp_kv=t["seqused_cmp_kv"],
+        cmp_residual_kv=t["cmp_residual_kv"],
+        batch_size=BATCH,
+        max_seqlen_q=int(t["seqused_q"].max()),
+        max_seqlen_ori_kv=int(t["seqused_ori_kv"].max()),
+        max_seqlen_cmp_kv=int(t["seqused_cmp_kv"].max()),
+        ori_topk=0,
+        cmp_topk=0,
+        rope_head_dim=ROPE_HEAD_DIM,
+        cmp_ratio=t["cmp_ratio"],
+        has_ori_kv=True,
+        has_cmp_kv=True,
+        **MASK_KWARGS,
+    )
     attn_out, _ = torch.ops.cann_ops_transformer.mixed_quant_sparse_flash_mla(
-        q=t["q"], ori_kv=t["ori_kv"], cmp_kv=t["cmp_kv"], ori_block_table=t["ori_block_table"],
-        cmp_block_table=t["cmp_block_table"], seqused_q=t["seqused_q"],
-        seqused_ori_kv=t["seqused_ori_kv"], seqused_cmp_kv=t["seqused_cmp_kv"],
-        cmp_residual_kv=t["cmp_residual_kv"], sinks=t["sinks"], metadata=metadata,
-        quant_mode=QUANT_MODE, rope_head_dim=ROPE_HEAD_DIM,
-        softmax_scale=1.0 / math.sqrt(HEAD_DIM), cmp_ratio=t["cmp_ratio"], topk_value_mode=1,
-        return_softmax_lse=False, **MASK_KWARGS)
+        q=t["q"],
+        ori_kv=t["ori_kv"],
+        cmp_kv=t["cmp_kv"],
+        ori_block_table=t["ori_block_table"],
+        cmp_block_table=t["cmp_block_table"],
+        seqused_q=t["seqused_q"],
+        seqused_ori_kv=t["seqused_ori_kv"],
+        seqused_cmp_kv=t["seqused_cmp_kv"],
+        cmp_residual_kv=t["cmp_residual_kv"],
+        sinks=t["sinks"],
+        metadata=metadata,
+        quant_mode=QUANT_MODE,
+        rope_head_dim=ROPE_HEAD_DIM,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+        cmp_ratio=t["cmp_ratio"],
+        topk_value_mode=1,
+        return_softmax_lse=False,
+        **MASK_KWARGS,
+    )
     return attn_out
 
 
 def _run_via_binding(t):
     metadata = torch.ops._C_ascend.npu_mixed_quant_sparse_flash_mla_metadata(
-        NUM_HEADS_Q, NUM_HEADS_KV, HEAD_DIM, QUANT_MODE, None, None, None, t["seqused_q"],
-        t["seqused_ori_kv"], t["seqused_cmp_kv"], t["cmp_residual_kv"], None, None, BATCH,
-        int(t["seqused_q"].max()), int(t["seqused_ori_kv"].max()), int(t["seqused_cmp_kv"].max()),
-        0, 0, ROPE_HEAD_DIM, t["cmp_ratio"], MASK_KWARGS["ori_mask_mode"],
-        MASK_KWARGS["cmp_mask_mode"], MASK_KWARGS["ori_win_left"], MASK_KWARGS["ori_win_right"],
-        MASK_KWARGS["layout_q"], MASK_KWARGS["layout_kv"], True, True, "npu")
+        NUM_HEADS_Q,
+        NUM_HEADS_KV,
+        HEAD_DIM,
+        QUANT_MODE,
+        None,
+        None,
+        None,
+        t["seqused_q"],
+        t["seqused_ori_kv"],
+        t["seqused_cmp_kv"],
+        t["cmp_residual_kv"],
+        None,
+        None,
+        BATCH,
+        int(t["seqused_q"].max()),
+        int(t["seqused_ori_kv"].max()),
+        int(t["seqused_cmp_kv"].max()),
+        0,
+        0,
+        ROPE_HEAD_DIM,
+        t["cmp_ratio"],
+        MASK_KWARGS["ori_mask_mode"],
+        MASK_KWARGS["cmp_mask_mode"],
+        MASK_KWARGS["ori_win_left"],
+        MASK_KWARGS["ori_win_right"],
+        MASK_KWARGS["layout_q"],
+        MASK_KWARGS["layout_kv"],
+        True,
+        True,
+        "npu",
+    )
     attn_out, _ = torch.ops._C_ascend.npu_mixed_quant_sparse_flash_mla(
-        t["q"], QUANT_MODE, t["ori_kv"], t["cmp_kv"], None, None, t["ori_block_table"],
-        t["cmp_block_table"], None, None, None, t["seqused_q"], t["seqused_ori_kv"],
-        t["seqused_cmp_kv"], t["cmp_residual_kv"], None, None, t["sinks"], metadata,
-        ROPE_HEAD_DIM, 1.0 / math.sqrt(HEAD_DIM), t["cmp_ratio"], MASK_KWARGS["ori_mask_mode"],
-        MASK_KWARGS["cmp_mask_mode"], MASK_KWARGS["ori_win_left"], MASK_KWARGS["ori_win_right"],
-        MASK_KWARGS["layout_q"], MASK_KWARGS["layout_kv"], 1, False)
+        t["q"],
+        QUANT_MODE,
+        t["ori_kv"],
+        t["cmp_kv"],
+        None,
+        None,
+        t["ori_block_table"],
+        t["cmp_block_table"],
+        None,
+        None,
+        None,
+        t["seqused_q"],
+        t["seqused_ori_kv"],
+        t["seqused_cmp_kv"],
+        t["cmp_residual_kv"],
+        None,
+        None,
+        t["sinks"],
+        metadata,
+        ROPE_HEAD_DIM,
+        1.0 / math.sqrt(HEAD_DIM),
+        t["cmp_ratio"],
+        MASK_KWARGS["ori_mask_mode"],
+        MASK_KWARGS["cmp_mask_mode"],
+        MASK_KWARGS["ori_win_left"],
+        MASK_KWARGS["ori_win_right"],
+        MASK_KWARGS["layout_q"],
+        MASK_KWARGS["layout_kv"],
+        1,
+        False,
+    )
     return attn_out
 
 
@@ -140,8 +226,8 @@ def test_binding_matches_cann_wrapper(cmp_ratio):
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype
     assert torch.equal(actual, expected), (
-        f"cmp_ratio={cmp_ratio}: max abs diff "
-        f"{(actual.float() - expected.float()).abs().max().item():.3e}")
+        f"cmp_ratio={cmp_ratio}: max abs diff {(actual.float() - expected.float()).abs().max().item():.3e}"
+    )
 
 
 @torch.inference_mode()
