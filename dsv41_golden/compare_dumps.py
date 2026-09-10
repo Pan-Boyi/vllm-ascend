@@ -254,8 +254,16 @@ def metrics(a: torch.Tensor, b: torch.Tensor, name: str = "") -> dict:
     return out
 
 
+# Tensors that ``--force-layer-in`` overwrites from the reference.  If injection
+# landed they are bit-identical by construction; if it silently did not, per-layer
+# rel_l2 jumps wholesale to the 1e-1 saturation level and every layer looks broken
+# at once.  Checking the injected tensors directly is cheaper and says which.
+INJECTED_KEYS = ("layer.in", "pre_mix.in")
+
+
 def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
-                force_route: str = "off"):
+                force_route: str = "off", forced_layer_in: bool = False,
+                perturb_tok: int | None = None, n_tokens: int | None = None):
     """``force_route`` comes from the candidate's manifest (see ROUTING_INJECTION.md).
 
     With routing forced, the candidate's *own* gate output is expected to disagree
@@ -269,6 +277,7 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                   if f.endswith(".safetensors"))
     results, failures, missing, notes = {}, [], [], []
     forced = force_route.startswith("moe")
+    mask_leak = []
 
     for tag in tags:
         gpath = os.path.join(golden, tag + ".safetensors")
@@ -290,6 +299,33 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                 continue
             m = metrics(ct, gt, name)
             tag_res[name] = m
+
+            if forced_layer_in and name in INJECTED_KEYS and not torch.equal(ct, gt):
+                failures.append((tag, name,
+                                 "LAYER-IN INJECTION DID NOT LAND: this tensor is "
+                                 "overwritten from the reference, so it is bit-identical "
+                                 "when injection works. Check --force-layer-in before "
+                                 "reading any other number: without it every layer "
+                                 "carries the whole accumulated history and the numbers "
+                                 "saturate near 3e-1."))
+
+            # Only where dim 1 really is the token axis.  ``compressor.out`` is
+            # [1, 13, 512] -- one latent per compress_ratio tokens -- so latent 2
+            # legitimately covers the perturbed token 5 and legitimately differs.
+            # Checked against the token count rather than a list of exempt names,
+            # for the same reason the dtype floor is not a name list.
+            if (perturb_tok is not None and gt.dim() >= 3 and gt.size(0) == 1
+                    and n_tokens is not None and gt.size(1) == n_tokens
+                    and gt.size(1) > perturb_tok):
+                # A token before the perturbation point is causally unable to see
+                # it, so it must stay bit-exact through all 40 layers.  With a
+                # 7.3e-3 perturbation amplified to 3e-1 downstream, any mask leak
+                # at all shows up here -- which makes this the most sensitive
+                # causal-mask check available, and it comes for free.
+                pre_c, pre_g = ct[:, :perturb_tok], gt[:, :perturb_tok]
+                if not torch.equal(pre_c, pre_g):
+                    n = int((pre_c != pre_g).any(-1).sum())
+                    mask_leak.append((tag, name, n))
             if m["kind"] == "routing":
                 if m["exact"]:
                     pass
@@ -354,6 +390,16 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                                f" max_tok={worst['max_token_rel_l2']:.2e}")
                 print(f"  {flag} {tag:12s} worst={wname:22s} "
                       f"rel_l2={worst['rel_l2']:.3e} cos={worst['cos']:.6f}{tokinfo}")
+    if mask_leak:
+        for tag, name, n in mask_leak[:6]:
+            failures.append((tag, name,
+                             f"CAUSAL MASK LEAK: {n} token(s) before the perturbation "
+                             f"point differ, and they cannot causally see it"))
+    elif perturb_tok is not None:
+        notes.append(("(all layers)", "causal mask",
+                      f"tokens 0..{perturb_tok - 1} stayed bit-exact on every tensor "
+                      f"whose dim 1 is the token axis -- the mask is strict, verified "
+                      f"through an amplifier that takes 7.3e-3 to 3e-1"))
     return results, failures, missing, notes
 
 
@@ -373,24 +419,34 @@ def main():
     print(f"tolerance {a.tolerance}: default rel_l2 <= {dflt[0]:.0e}, cos >= {dflt[1]}"
           + (f"\n          per-tensor: {extra}" if extra else ""))
 
-    force_route = "off"
+    force_route, forced_layer_in, perturb_tok, n_tokens = "off", False, None, None
     for d in (a.golden, a.candidate):
         mp = os.path.join(d, "manifest.json")
         if os.path.exists(mp):
             with open(mp) as f:
                 man = json.load(f)
+            n_tokens = len(man.get("input_ids") or []) or None
             print(f"  {os.path.basename(d)}: input_ids={man.get('input_ids')} "
                   f"layers={man.get('n_layers_run')} accum={man.get('accum_dtype')} "
                   f"force_route={man.get('force_route', 'off')}")
             if d == a.candidate:
                 force_route = man.get("force_route", "off") or "off"
+                forced_layer_in = bool(man.get("force_layer_in"))
+                pu = man.get("perturb_ulp")
+                perturb_tok = int(pu[0]) if pu else None
 
     if force_route != "off":
         print(f"\nforced routing ({force_route}): the candidate's own moe_gate.out.1 is "
               f"informational;\nthe gate is moe_gate.forced.1 == golden's selection.")
     print()
-    results, failures, missing, notes = compare_dir(a.golden, a.candidate, tol,
-                                                    force_route=force_route)
+    if perturb_tok is not None:
+        print(f"\ncandidate carries a one-ULP perturbation at token {perturb_tok}: "
+              f"tokens 0..{perturb_tok - 1} must stay bit-exact on every layer\n"
+              f"          (they cannot causally see it -- this doubles as a strict "
+              f"causal-mask check)")
+    results, failures, missing, notes = compare_dir(
+        a.golden, a.candidate, tol, force_route=force_route,
+        forced_layer_in=forced_layer_in, perturb_tok=perturb_tok, n_tokens=n_tokens)
 
     print()
     if notes:

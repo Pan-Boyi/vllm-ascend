@@ -186,6 +186,10 @@ def main():
         "force_route": ("off" if plan is None else "moe") + (
             "+layer_in" if args_cli.force_layer_in else ""),
         "force_layer_in": args_cli.force_layer_in,
+        # Recorded so a comparison can run the causal-mask check automatically:
+        # tokens before a perturbation can never see it, so they must stay
+        # bit-exact for all 40 layers. See ALIGNMENT_PROTOCOL.md section 0.2.
+        "perturb_ulp": list(pert) if pert else None,
         "routing_plan": args_cli.routing_plan,
         "routing_plan_accum_dtype": None if plan is None else plan.meta.get("accum_dtype"),
         "torch_version": torch.__version__,
