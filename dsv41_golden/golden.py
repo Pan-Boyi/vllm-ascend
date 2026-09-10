@@ -470,6 +470,41 @@ def _attach_taps(block, rec: Recorder):
     # will any implementation whose window KV is laid out differently.  Recording
     # the offset makes the tensor interpretable instead of only comparable against
     # an identically-shaped run.
+    # The attention output before the o-projection.  ``attn.out`` is what comes
+    # out the far side of three steps -- inverse RoPE, the block-diagonal wo_a
+    # einsum, then wo_b -- so when it disagrees, those three plus the sparse
+    # attention itself are indistinguishable.  Two of the four fail *quietly*: an
+    # inverse RoPE with the wrong convention (GPT-J interleaved vs half-rotated)
+    # and a wo_a treated as dense instead of block-diagonal both produce
+    # plausible numbers rather than an error.
+    #
+    # ``apply_rotary_emb(o[..., -rd:], freqs_cis, True)`` mutates in place, so
+    # o_raw has to be cloned before it runs; o_unroped is the same storage read
+    # afterwards (``.view`` rebinds the name without copying and the einsum does
+    # not write back).
+    _afwd = block.attn.forward
+
+    def _attn_o_tap(*aa, _orig=_afwd, **kw):
+        holder = {}
+        real_sa = M.sparse_attn
+
+        def sa_spy(*a, **k):
+            out = real_sa(*a, **k)
+            rec.add("attn.o_raw", out.clone())      # before the in-place inverse RoPE
+            holder["o"] = out
+            return out
+
+        M.sparse_attn = sa_spy
+        try:
+            res = _orig(*aa, **kw)
+        finally:
+            M.sparse_attn = real_sa
+        if "o" in holder:
+            rec.add("attn.o_unroped", holder["o"])   # after it
+        return res
+
+    block.attn.forward = _attn_o_tap
+
     # ``indexer_score`` -- the scores the indexer takes its top-k of.  Needed
     # because the indexer's selection is a *discrete* verdict computed on
     # quantised q/k (fp4 in the reference, fp8 on Ascend), so a quantisation

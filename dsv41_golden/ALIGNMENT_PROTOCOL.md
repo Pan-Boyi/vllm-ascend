@@ -207,7 +207,31 @@ The capital of France is Paris. Ascend NPU kernels must match this reference bit
 > **⇒ 实现方也必须 dump 自己的 `indexer_kv_offset`**（concat 时用的那个 offset），
 > 否则无法归一化。
 > **⇒ `indexer_kv_offset` 本身不作判据** —— 它*应当*在两条路径间不同。
+| `attn.o_raw` | [1, 27, 64, 512] | bf16 | **sparse attention 的原始输出，逆 RoPE 之前** |
+| `attn.o_unroped` | [1, 27, 64, 512] | bf16 | **逆 RoPE 之后、`wo_a` 之前** |
 | `attn.out` | [1, 27, 5120] | bf16 | attention 输出（已做逆 RoPE + wo 投影） |
+
+> 🔴 **为什么 `attn.out` 一个键不够**（`dsv41-model` 提的，理由成立）。
+> 从 sparse attention 的输出到 `attn.out` 之间有三步：
+> ```
+> o  [T,64,512]                       ← attn.o_raw
+>   → 逆 GPT-J RoPE（末 64 维，就地修改）  → attn.o_unroped
+>   → view [T,8,4096]
+>   → einsum("bsgd,grd->bsgr", ·, wo_a)   ← 块对角，8 组各自独立
+>   → flatten → wo_b                    → attn.out
+> ```
+> `attn.out` 对不上时，**四个候选无法区分**：sparse attention 本身 / 逆 RoPE 的旋转约定 /
+> 块对角分组是否错位 / `wo_b`。**而其中两个是静默失败**：
+> - **逆 RoPE 的约定写错**（GPT-J 交错 vs 半旋转）→ 输出仍是「合理的数」，不报错。
+> - **把 `wo_a` 当稠密矩阵乘**（而它是块对角，`ref/model.py:786-788`）→ 每组会看到全部
+>   32768 维输入 → 结果同样是「合理的数」。
+>
+> 有这两个键，`_o_proj` 就能二分到具体一步。
+> 成本：每层 2 × 1.7 MB，40 层约 +133 MB（dump 从 271 MB 到约 404 MB）。
+>
+> 实现上：`apply_rotary_emb(o[..., -rd:], freqs_cis, True)`（`ref/model.py:781`）
+> **就地修改**，所以 `o_raw` 必须在它之前 clone；`o_unroped` 是同一块存储在之后读到的值
+> （`.view` 只改名不拷贝，einsum 不写回）。
 
 > 🔴 **`attn_sink` 参与 attention，golden 已实现**（v1.0 漏写）。
 > `ref/model.py:639` 声明 `attn_sink [n_local_heads] fp32`，`:780` / `:1067` 传入

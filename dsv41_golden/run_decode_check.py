@@ -374,10 +374,11 @@ def main():
             per_pos[p] = {"seconds": round(dt, 1), "rel_l2": r,
                           "top1_ref": t_ref, "top1_got": t_got,
                           "top1_same": t_ref == t_got,
-                          "vs_control": r / control if control else None}
+                          "vs_control": (r / control) if control else None}
             flag = "ok  " if t_ref == t_got else "FAIL"
+            vc = f"{r / control:5.1f}x control" if control else "control is 0"
             print(f"      {flag} decode pos {p:3d}  rel_l2={r:.3e} "
-                  f"({r / control:5.1f}x control)  top1 {t_got}"
+                  f"({vc})  top1 {t_got}"
                   f"{'' if t_ref == t_got else f' != {t_ref}'}  ({dt:.1f}s)")
 
     print()
@@ -397,8 +398,16 @@ def main():
         worst = max(per_pos.values(), key=lambda v: v["rel_l2"])
         ok = all_top1
         print(f"control (two prefills)   {control:.3e}")
-        print(f"worst decode rel_l2      {worst['rel_l2']:.3e}  "
-              f"({worst['rel_l2'] / control:.1f}x control)")
+        if control:
+            print(f"worst decode rel_l2      {worst['rel_l2']:.3e}  "
+                  f"({worst['rel_l2'] / control:.1f}x control)")
+        else:
+            # A zero control is informative, not a division problem: it means the
+            # two prefills agreed bit for bit, so any decode difference is the
+            # decode path's alone rather than sitting on top of a shared floor.
+            print(f"worst decode rel_l2      {worst['rel_l2']:.3e}  "
+                  f"(control is exactly 0 -- the two prefills were bit-identical, "
+                  f"so this is decode's own contribution with nothing subtracted)")
         print(f"top-1 all agree          {all_top1}")
         print("(rel_l2 is reported against the control, not gated: prefill and decode")
         print(" reach the same value by different arithmetic. top-1 is the verdict.)")

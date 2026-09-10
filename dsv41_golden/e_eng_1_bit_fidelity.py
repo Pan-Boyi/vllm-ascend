@@ -167,7 +167,12 @@ def main():
     interesting = [0, 1, 2, 3, NUM_ENTRIES - 1]              # incl. the two special rows
     local = [rank * NUM_ENTRIES + i for i in interesting]
     remote = [((rank + 1) % world) * NUM_ENTRIES + i for i in interesting]
-    oob = [world * NUM_ENTRIES, world * NUM_ENTRIES + 12345]
+    # Out-of-range indices are documented as silently returning zeros
+    # (ElasticBuffer.md:230), but that is exactly the sort of claim worth
+    # isolating: if the kernel traps instead, including them here would crash the
+    # whole test and look like a byte-fidelity failure.
+    oob = ([] if os.environ.get("E_ENG_1_NO_OOB") else
+           [world * NUM_ENTRIES, world * NUM_ENTRIES + 12345])
     idx_list = local + remote + oob
     idx = torch.tensor(idx_list, dtype=torch.int32).npu()
 
