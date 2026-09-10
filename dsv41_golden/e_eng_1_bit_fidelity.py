@@ -295,6 +295,13 @@ def main():
                            "results": results, "pass": verdict}, f, indent=2)
             print(f"wrote {out}")
 
+    # 🔴 destroy() before tearing down the process group.  Without it both ranks
+    # SIGSEGV at exit -- after all the work, so the verdict is unaffected, but a
+    # passing test gets labelled FAILED by torchrun and the crash looks like it
+    # belongs to the measurement.  The buffer holds host pinned memory and HCCL
+    # memory handles; freeing the process group out from under it is the fault.
+    # Like the warm-up, this is a prerequisite of any implementation.
+    eb.destroy()
     dist.barrier()
     dist.destroy_process_group()
     sys.exit(0 if not failures else 1)

@@ -7,9 +7,19 @@
 
 ## 0. 一句话
 
-**CANN 官方的 `ElasticBuffer` host 存储不支持 fp8，且要求 engram 通信域 `world_size ≥ 2`。
-我们「189 GiB fp8 表放单卡 host」的方案没法直接用它。** 技报描述的正是我们要的那条 fp8 路，
-但它**没有开源**；开源的是 bf16 变体（≈393 GB）。
+**`ElasticBuffer` 的 engram 路径是字节透明的（已实测），所以 fp8 字节可以装进 bf16 外衣
+存 203 GB 而不是 393 GB。但它的远端（URMA/RDMA）取行在本机不可用（kernel 内断言），
+所以分片表这条官方形态走不通。**
+
+| 结论 | 强度 |
+|---|---|
+| fp8 字节装 bf16 外衣不被解释 | ✅ **已实测确认**（源码 3 层 + 位保真 1 层，见第 3.1d 节）|
+| 本地 host gather 可用 | ✅ 已实测 |
+| 远端 RDMA 取行可用 | ❌ **已实测证伪**（第 3.1c 节）|
+| 分片表的 engram offload | ❌ 被上一条挡住 |
+
+官方 host 存储的 dtype 白名单里没有 fp8（第 3.2 节），技报描述的 fp8 路**没有开源**；
+开源的是 bf16 变体（≈393 GB，**且是 pinned 不可回收**）。
 
 ---
 
@@ -242,6 +252,81 @@ AIV 是异步的，错误要到下一个同步点才浮现。我曾经拿到 `en
 
 ⚠️ 注意「fp8 字节能不能装进 bf16 外衣」（AD2 的核心问题）**与这条独立** ——
 兜底路径同样要面对存 fp8 还是 bf16 的选择，所以那个结论无论如何都有用。
+
+### 3.1d ✅ E-ENG-1：字节透明性已实测确认（本地路径）
+
+`e_eng_1_bit_fidelity.py`，卡 2+3，2 rank：
+
+```
+cann_ops_transformer from .../cann-9.2.0-beta.2/...          ← 树断言通过
+HCCL warm-up all_reduce -> 3.0                               ← 前提 1
+128-alignment check: 128 % 128 == 0                          ← 前提 2（压线）
+storage carries 2080 NaN and 16 Inf bf16 values              ← 刻意的病态数据
+engram_write OK
+engram_fetch OK -> (5, 128) bfloat16 (as bytes (5, 256))
+  ok idx 0 / 1 / 2 / 3 / 4095   local   byte-identical
+local rows byte-identical : 5/5
+hostile-pattern row       : 1/1          <-- NaN/Inf/denormal 字节模式
+E-ENG-1 byte fidelity: PASS               exit=0（加了 destroy() 之后干净退出）
+```
+
+**为什么这个 PASS 强**：storage 里刻意埋了 **2080 个 NaN + 16 个 Inf**（读作 bf16）——
++Inf / -Inf / quiet NaN / signalling NaN / 全尾数 NaN / 负零 / 最小最大 denormal /
+最小 normal / 最大有限 / 交替位，另加一整行 0..255 全字节值。
+**任何 dtype-aware 的处理（NaN 规范化、denormal 冲零、值域检查）只会破坏这些、
+而且只破坏这些** —— 正常数值全测一遍也看不出来。**它们全部逐位存活。**
+
+🔴 **比对按字节（`.view(torch.uint8)`），绝不按值。** NaN ≠ NaN，按值比会
+**恰好在最有意思的地方假通过**。（反向也成立：我在一个快速探针里用 fp64 算期望值，
+bf16 在 1000 附近 ULP = 4 装不下 1001/1002/1003，**正确的结果被判成失败** ——
+见第 5 节的坑列表。）
+
+**⇒ 加上源码三层证据**（`elastic_buffer.py` 的 bf16 白名单、`elastic_buffer.cpp` 的裸
+`uint8_t*` memcpy 且 `engramDtype_` 只写不读、`EngramFetch` 里 `dtypeEnum` **根本没传给**
+`aclnnEngramFetch`），**四层一致：写入、取回、AIV kernel 都不解释数值。**
+
+### 3.1e 🔴 三个实现前提（缺一个就挂，且症状都误导）
+
+```
+init_process_group
+  → ★1. 至少一次真实集合通信★        缺 → Acquire HCCL channel failed, ret 11/4
+  → ElasticBuffer(...)                （★2. hidden % 128 == 0，压线无余量★）
+  → engram_write → engram_fetch → ...
+  → ★3. eb.destroy()★                 缺 → 两个 rank 都 SIGSEGV（exitcode -11）
+  → destroy_process_group
+```
+
+**前提 3 的症状最误导**：崩在**所有工作之后** —— 判决已完整算出并写盘，
+但 torchrun 把一个通过的测试标成 `FAILED`，而崩溃看起来像是测量本身出的问题。
+`ElasticBuffer` 持着 host pinned 内存和 HCCL 内存句柄（`destroy()` 在
+`elastic_buffer.py:830`），把 process group 从它脚下抽走就是这个 segfault。
+
+🔴 **教训：进程退出码不是判据。** 一个在结论落盘之后崩溃的测试，和一个失败的测试，
+**退出码一模一样**。我当时是靠 JSON 文件才分辨出来的 —— 如果只打印到 stdout，
+SIGSEGV 会连输出一起吞掉，就与真失败完全不可区分。
+**⇒ 判据必须落盘，而且要落在崩溃可能发生的地方之前。**
+
+### 3.1f 访问模式实测：去重在 decode 里收益为零（构造决定）
+
+用 `engram_hash_ref.py`（9 秒、不加载权重）测 layer 1 的 id：
+
+| 文本 | token | ids/层 | unique | **去重收益** | index/行 字节比 |
+|---|---|---|---|---|---|
+| golden prompt | 27 | 648 | 648 | **0.0%** | **1.6%** |
+| 自然英文散文 | 52 | 1248 | 1224 | **1.9%** | **1.6%** |
+| 高度重复文本 | 281 | 6744 | 240 | 96.4% | 43.9% |
+
+🔴 **单个 token 的 24 个 id 必然互不相同**，实测 27/27 个 token 都是 24 个不同 id。
+原因是结构性的：24 列 = 3 个 n-gram 尺寸 × 8 head，**每列有自己的素数桶区间且互不重叠**
+（`offsets` 是各列素数的累积和；实测两两区间无重叠）。
+
+**⇒ decode 每步只有 1 个 token → 去重买到的是零，官方的 `unique_local_entry` 也一样。**
+**⇒ 自然文本的 prefill 上去重收益 0~2%；只有病态重复文本才有 96%。**
+**⇒ 索引交换只占数据量的 1.6%** —— 24 个 int32 = 96 B vs 24 行 × 256 B = 6 KB。
+
+对「自己用 all_to_all 替代 URMA」这个形态（AD2'）的意义：**不去重的代价是 0~2%，
+不是一个数量级**；而每步每层的数据量是 6 KB、两层 12 KB，**极小消息** ——
+**所以成本主项会是 a2a 的固定延迟 × 4 次，不是带宽。** 该测的是延迟不是吞吐。
 
 ### 3.2 🔴 两条挡住我们的硬约束
 
