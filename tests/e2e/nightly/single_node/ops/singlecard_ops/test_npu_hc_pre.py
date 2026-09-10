@@ -11,6 +11,7 @@ enable_custom_op()
 
 HC_MULT = 4
 DSV4_FLASH_HIDDEN_SIZE = 4096
+DSV41_FLASH_HIDDEN_SIZE = 5120
 HIDDEN_SIZE = DSV4_FLASH_HIDDEN_SIZE
 EXTENDED_HIDDEN_SIZE = 7168
 MIX_HC = 24
@@ -168,6 +169,24 @@ def test_npu_hc_pre_v2_bf16_4d_input():
 @torch.inference_mode()
 def test_npu_hc_pre_v2_bf16_dsv4_flash_hidden_size():
     _compare_hc_pre_with_cpu((4, HC_MULT, DSV4_FLASH_HIDDEN_SIZE))
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_npu_hc_pre_v2_bf16_dsv41_flash_hidden_size():
+    """DeepSeek-V4.1-Flash's hidden size. Unlike 4096 and 7168 it is not a power of two, so this also
+    covers the k-axis split leaving a partial tail (k = hc_mult * d = 20480)."""
+    _compare_hc_pre_with_cpu((4, HC_MULT, DSV41_FLASH_HIDDEN_SIZE))
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_npu_hc_pre_v2_bf16_dsv41_flash_hidden_size_4d_input():
+    _compare_hc_pre_with_cpu((1, 2, HC_MULT, DSV41_FLASH_HIDDEN_SIZE))
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()

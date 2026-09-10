@@ -1423,7 +1423,14 @@ at::Tensor npu_hc_post_npu(
 }
 
 constexpr int64_t HC_PRE_HC_LIMIT = 4;
+// Hidden sizes hc_pre is known to serve: 4096 (DeepSeek-V4-Flash), 5120 (DeepSeek-V4.1-Flash) and
+// 7168. The op itself carries no size assumption -- tiling and kernel read d straight off the shape,
+// align it to 16, and never divide by it -- so this list is a tested-configurations gate rather than
+// a capability limit. It was originally copied from the upstream CANN recipe binding, which lists
+// only 4096 and 7168. Keep it an explicit list: an alignment-only rule would also admit hidden sizes
+// large enough to exhaust UB and fall into the d-splitting path, which is far less exercised.
 constexpr int64_t HC_PRE_D_LIMIT = 4096;
+constexpr int64_t HC_PRE_D_LIMIT_V41 = 5120;
 constexpr int64_t HC_PRE_D_LIMIT_EXTEND = 7168;
 constexpr int64_t HC_PRE_MIX_HC_LIMIT = 24;
 
@@ -1474,8 +1481,9 @@ void check_hc_pre_shape_and_dtype(
     auto d = x_dims == 4 ? x.size(3) : x.size(2);
     TORCH_CHECK(hc_mult == HC_PRE_HC_LIMIT, "hc_mult only supports ", HC_PRE_HC_LIMIT, ", actual ", hc_mult, ".");
     TORCH_CHECK(hc == HC_PRE_HC_LIMIT, "The hc of x only supports ", HC_PRE_HC_LIMIT, ", actual ", hc, ".");
-    TORCH_CHECK(d == HC_PRE_D_LIMIT || d == HC_PRE_D_LIMIT_EXTEND, "The d of x only supports ", HC_PRE_D_LIMIT,
-                " or ", HC_PRE_D_LIMIT_EXTEND, ", actual ", d, ".");
+    TORCH_CHECK(d == HC_PRE_D_LIMIT || d == HC_PRE_D_LIMIT_V41 || d == HC_PRE_D_LIMIT_EXTEND,
+                "The d of x only supports ", HC_PRE_D_LIMIT, ", ", HC_PRE_D_LIMIT_V41, " or ",
+                HC_PRE_D_LIMIT_EXTEND, ", actual ", d, ".");
     TORCH_CHECK(hc_fn.dim() == 2, "Input tensor hc_fn's dim num should be 2, actual ", hc_fn.dim(), ".");
     TORCH_CHECK(hc_fn.size(0) == HC_PRE_MIX_HC_LIMIT, "The hc_fn.shape[0] only supports ",
                 HC_PRE_MIX_HC_LIMIT, ", actual ", hc_fn.size(0), ".");
