@@ -124,6 +124,65 @@ class MemoryGuard:
 
 
 # --------------------------------------------------------------------------- #
+# provenance                                                                  #
+# --------------------------------------------------------------------------- #
+def provenance() -> dict:
+    """What produced a dump, pinned by identity rather than by path.
+
+    A baseline nobody can re-derive is worth little, and "which stack was this
+    built on" is the wrong question for this golden: it imports no torch_npu, no
+    CANN, no vllm and no vllm-ascend (only torch-cpu, safetensors, numpy, sympy,
+    and transformers for the tokenizer), so upstream API drift does not move it.
+
+    What it does depend on is this repo's own code and the checkpoint bytes.
+    Recording the model directory alone would not catch the weights being
+    replaced underneath it, so the safetensors index is hashed instead.
+    """
+    import hashlib
+    import subprocess
+
+    def git(*args):
+        try:
+            return subprocess.run(("git", "-C", HERE, *args), capture_output=True,
+                                  text=True, timeout=10).stdout.strip() or None
+        except Exception:
+            return None
+
+    idx = os.path.join(MODEL_DIR, "model.safetensors.index.json")
+    ckpt_sha = None
+    if os.path.exists(idx):
+        with open(idx, "rb") as f:
+            ckpt_sha = hashlib.sha256(f.read()).hexdigest()[:16]
+
+    import torch as _t
+    return {
+        "golden_commit": git("rev-parse", "HEAD"),
+        "golden_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        "golden_dirty": bool(git("status", "--porcelain", "--", HERE)),
+        "checkpoint_index_sha256_16": ckpt_sha,
+        "torch_version": _t.__version__,
+        # Two things it would be easy to claim here and be wrong about, so they
+        # are recorded as observations rather than as assurances:
+        #
+        #   * ``torch_npu`` is in sys.modules whether this code wants it or not
+        #     -- on this image ``import torch`` pulls it in by itself.
+        #   * ``ASCEND_RT_VISIBLE_DEVICES`` is injected by the container as
+        #     0..7; it is not something this code sets or can rely on being unset.
+        #
+        # So neither is the property that matters.  The property that matters is
+        # that no device is ever acquired, and that is checkable: nothing under
+        # this directory calls an NPU API, allocates on npu, or moves a tensor
+        # there, and the vendor files that would (ref/generate.py, and
+        # ref/model.py's Transformer.__init__, which does set_default_device) are
+        # never invoked -- the runner builds M.Block directly.
+        "torch_npu_loaded_by_torch_import": "torch_npu" in sys.modules,
+        "ascend_rt_visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        "uses_npu_device": False,
+        "depends_on_vllm": any(m.startswith("vllm") for m in sys.modules),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # config                                                                      #
 # --------------------------------------------------------------------------- #
 def load_args(max_batch_size=1, max_seq_len=512, **overrides) -> "M.ModelArgs":

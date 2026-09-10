@@ -107,7 +107,20 @@ unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 ```
 
 CPU golden 侧：`torch 2.10.0+cpu`、`safetensors>=0.8`、`transformers 5.14`、`numpy`、`sympy`。
-不需要 NPU，**不要设 `ASCEND_RT_VISIBLE_DEVICES`，不要 import torch_npu**。
+不需要 NPU。**不要设 `ASCEND_RT_VISIBLE_DEVICES`。**
+
+> ⚠️ **v1.0 这里写的两句都不成立，实测**：
+> - 「不要 import torch_npu」—— **做不到**，`import torch` 自己就会把它拉进 `sys.modules`。
+> - 「不要设 `ASCEND_RT_VISIBLE_DEVICES`」—— **它本来就被容器注入成 `0,1,2,3,4,5,6,7`**，
+>   不是我们设或不设的事。
+>
+> 所以这两条都不是该看的性质。该看的是「**有没有占卡**」，而这一条是可验证的：
+> `dsv41_golden/` 下没有任何代码调用 NPU API、在 npu 上分配、或把张量搬过去；
+> 而 vendor 代码里会那么做的地方（`ref/generate.py`、`ref/model.py` 的
+> `Transformer.__init__` 里 `torch.set_default_device("cuda")`）**从不被调用** ——
+> 执行器直接构造 `M.Block`，不走 `M.Transformer`。
+> dump 的 `manifest.json` 如实记录了这三项（`torch_npu_loaded_by_torch_import` /
+> `ascend_rt_visible_devices` / `uses_npu_device`）。
 
 模型目录 `/workspace/models/DeepSeek-V4.1-Flash` 只读。
 

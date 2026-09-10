@@ -132,6 +132,12 @@ def main():
         print(f"            toks {[tokenizer.decode([i]) for i in logits[0, -1].topk(5).indices.tolist()]}")
 
     rec.write_manifest({
+        # Provenance.  A dump is only usable as a baseline if you can tell what
+        # produced it -- and "which stack" is the wrong question here: the golden
+        # imports neither torch_npu nor CANN nor vllm, so it does not move when
+        # those do.  What it *does* depend on is this repo's code and the
+        # checkpoint bytes, so both are pinned by identity rather than by path.
+        **G.provenance(),
         "prompt": None if args_cli.random_tokens else (args_cli.prompt or GOLDEN_PROMPT),
         "input_ids": input_ids[0].tolist(),
         "n_layers_run": args_cli.layers,
