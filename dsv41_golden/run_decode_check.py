@@ -15,8 +15,8 @@ Two modes, because one of them cannot answer the question on its own
 **End-to-end** (default) compares the decode logits against the full prefill's.
 It answers "does decode produce the same answer", but its noise floor is not
 small: a 20-token prefill and the first 20 positions of a 27-token prefill are
-*already* different, because every GEMM runs with a different M and rounds
-differently, and bf16 plus causal attention spreads that (see
+*already* different, because the sliding-window index tensor is a different width
+and its reduction rounds differently, and bf16 plus causal attention spreads that (see
 ALIGNMENT_PROTOCOL.md section 0.2).  So this mode measures that floor in the same
 run -- the shared prefill prefix -- and reports it as the control.  Its verdict is
 **top-1 agreement**, which is the business-level reading of G-1.
