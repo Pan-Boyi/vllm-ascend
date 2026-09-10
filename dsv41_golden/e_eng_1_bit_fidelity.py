@@ -80,6 +80,42 @@ HOSTILE_U16 = [
 ]
 
 
+def assert_cann_92():
+    """Refuse to run against a cann_ops_transformer that has no ElasticBuffer.
+
+    ``ElasticBuffer`` exists only in CANN 9.2 (grepping the installed 9.1 tree for
+    the name returns nothing), and the 9.2 tree is reached through PYTHONPATH,
+    which ``env_dsv41.sh`` sets.  Today the failure without it is a loud
+    ImportError, but two same-named packages are on this box and the loud version
+    is not guaranteed: silently importing a 9.1 module that lacks the operator is
+    the shape of failure worth an assertion.
+
+    dsv41-integration hit the same class of problem from the other side -- an
+    editable .pth pointing at a different vllm-ascend tree, so fixes silently did
+    not apply -- and its point applies here with more force: their version at
+    least had observable consequences.
+    """
+    import cann_ops_transformer as c
+
+    path = os.path.abspath(c.__file__)
+    if "cann-9.2" not in path:
+        raise RuntimeError(
+            f"cann_ops_transformer came from {path}, which is not a CANN 9.2 tree. "
+            "ElasticBuffer exists only in 9.2. Did you source env_dsv41.sh?"
+        )
+    try:
+        from cann_ops_transformer.ops import ElasticBuffer as _EB
+    except ImportError as e:
+        raise RuntimeError(
+            f"cann_ops_transformer at {path} has no ElasticBuffer ({e}). "
+            "It exists only in CANN 9.2."
+        ) from e
+    for attr in ("engram_write", "engram_fetch", "get_engram_storage_size_hint"):
+        if not hasattr(_EB, attr):
+            raise RuntimeError(f"ElasticBuffer from {path} has no {attr}")
+    return path
+
+
 def build_storage_bytes(rank: int) -> torch.Tensor:
     """A [NUM_ENTRIES, ROW_BYTES] uint8 table whose every byte is predictable.
 
@@ -127,12 +163,16 @@ def main():
     dist.all_reduce(warm)
     torch.npu.synchronize()
 
+    # Before the import, not after: on the 9.1 tree the import itself raises a bare
+    # ImportError, which says nothing about why. The assertion names the cause.
+    cann_path = assert_cann_92()
     from cann_ops_transformer.ops import ElasticBuffer
 
     def log(*a):
         if rank == 0:
             print(*a, flush=True)
 
+    log(f"cann_ops_transformer from {cann_path}")
     log(f"HCCL warm-up all_reduce -> {warm[0].item()} (required before engram_write)")
     log(f"world_size={world}  ASCEND_RT_VISIBLE_DEVICES="
         f"{os.environ.get('ASCEND_RT_VISIBLE_DEVICES')}")
