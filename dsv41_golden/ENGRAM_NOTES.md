@@ -199,6 +199,50 @@ AIV 是异步的，错误要到下一个同步点才浮现。我曾经拿到 `en
 | CANN 9.1/9.2 混搭 | ❌ 三个独立来源否掉：本测试的 allreduce、integration 的 EP all2all、kernel 的 9.2 单卡算子 |
 | `nnal/atb/set_env.sh` 没 source | ❌ 不是 HCCL 依赖（`env_dsv41.sh` 刻意剥掉了 nnal，因为 ATB 是对着 9.1 编的）|
 
+### 3.1c 🔴🔴 远端（URMA/RDMA）取行在本机不可用 —— kernel 内部断言失败
+
+**这是目前挡住 engram offload 的硬阻塞。**
+
+同一个 `engram_fetch` 调用，只改 indices 落在本地还是远端（卡 2+3，2 rank，同 UB 平面）：
+
+| indices | 结果 |
+|---|---|
+| **只含本 rank 的行** | ✅ 两个 rank 都成功，**数据正确** |
+| **只含远端 rank 的行** | ❌ 两个 rank 都挂 |
+| **本地 + 远端混合** | ❌ 两个 rank 都挂 —— **没有部分成功，整次调用失败** |
+
+```
+[AIV Block 1/56] [ASSERT]
+  .../ops-transformer/build/binary/ascend950/src/engram_fetch_wait/op_kernel/arch35/
+  engram_fetch_wait_arch35.h:99
+  void Mc2Kernel::EngramFetchWaitArch35::Process(): Assertion `ret == 0' failed.
+  Urma drain failed, ret=255, globalChannelIdx=1
+→ RuntimeError: npuSynchronizeDevice ... device error type 3, error code 507035
+```
+
+**`Urma drain failed`** 就是技报 `:200-210` 描述的那条 **URMA→UBMem** 通路
+（`aclrtHostRegisterV2` 映射 + RDMA one-sided read），在**闭源 kernel 内部**失败。
+`ret=255` 的含义查不到。
+
+#### ⇒ 分片的 engram 表在本机走不通
+
+表按 `engram_tp_size == world_size` 分片，**任何 hash id 都可能落在远端 rank**
+—— 远端取行不是可选优化，是必需路径。
+
+| 布局 | 可行性 |
+|---|---|
+| 表分片到 N 个 rank（官方设计） | ❌ 远端取行必需，而它挂 |
+| 整表压一个 rank、其余持 0 行（`num_entries=0` 官方支持） | ⚠️ **只有持表的 rank 能本地取**，其余 rank 取任何行都是远端 → 同样挂。除非只让持表的 rank 查表、结果用普通集合通信分发 —— 那 `ElasticBuffer` 只剩「本地 host gather」一个功能 |
+| 每个 rank 持完整一份 | ❌ 203 GB × 4 = 812 GB pinned，机器只有 755 GB |
+
+#### 兜底路径
+
+`vllm_ascend/attention/sfa_kv_offload.py`（1156 行）：显式 D2H/H2D + 常驻 topk 缓冲，
+**不依赖 URMA**，访问形态与 engram 同构。**兜底是「改造现成机制」而不是「从零写 gather」。**
+
+⚠️ 注意「fp8 字节能不能装进 bf16 外衣」（AD2 的核心问题）**与这条独立** ——
+兜底路径同样要面对存 fp8 还是 bf16 的选择，所以那个结论无论如何都有用。
+
 ### 3.2 🔴 两条挡住我们的硬约束
 
 **(a) host 存储不支持 fp8。** `ElasticBuffer.md:477`（「Engram dtype约束」）：

@@ -206,7 +206,15 @@ def main():
     # Global index space is [0, world*NUM_ENTRIES); rank r owns [r*N, (r+1)*N).
     interesting = [0, 1, 2, 3, NUM_ENTRIES - 1]              # incl. the two special rows
     local = [rank * NUM_ENTRIES + i for i in interesting]
-    remote = [((rank + 1) % world) * NUM_ENTRIES + i for i in interesting]
+    # The remote path is broken on this machine: the fetch kernel asserts
+    # "Urma drain failed, ret=255" inside
+    # engram_fetch_wait/op_kernel/arch35/engram_fetch_wait_arch35.h:99, on both
+    # ranks, while the same call with local-only indices succeeds and returns the
+    # right data.  So byte fidelity is testable on the local path today, and
+    # E_ENG_1_LOCAL_ONLY exists to test it without the remote path taking the
+    # whole run down with it.
+    remote = ([] if os.environ.get("E_ENG_1_LOCAL_ONLY") else
+              [((rank + 1) % world) * NUM_ENTRIES + i for i in interesting])
     # Out-of-range indices are documented as silently returning zeros
     # (ElasticBuffer.md:230), but that is exactly the sort of claim worth
     # isolating: if the kernel traps instead, including them here would crash the
