@@ -4,10 +4,17 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
 torch_npu.npu.config.allow_internal_format = True
 enable_custom_op()
+# A5's capability set has no RUNTIME_CUSTOM_OPS, so enable_custom_op() returns False there and never
+# imports the extension -- torch.ops._C_ascend then has no npu_hc_pre_v2 at all. Import it explicitly
+# and point ASCEND_CUSTOM_OPP_PATH at the vendor package so these tests can run on A5 too. Note
+# bootstrap_custom_op_env() is deliberately called without include_vendor_lib: adding the vendor lib
+# to LD_LIBRARY_PATH on top of the .so's rpath has been seen to abort at exit.
+bootstrap_custom_op_env()
+import vllm_ascend.vllm_ascend_C  # noqa: E402,F401
 
 HC_MULT = 4
 DSV4_FLASH_HIDDEN_SIZE = 4096
