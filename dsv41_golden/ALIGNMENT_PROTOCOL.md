@@ -165,6 +165,19 @@ The capital of France is Paris. Ascend NPU kernels must match this reference bit
 | `compressor.out` | [1, 13, 512] | bf16 | **仅 kv_source 层 2/8/14/20**：RoPE 前的压缩 latent |
 | `indexer_topk.out` | [1, 27, K] | int32 | **仅 index_source 层**：选中的压缩位置，**-1 表示空槽** |
 | `attn.out` | [1, 27, 5120] | bf16 | attention 输出（已做逆 RoPE + wo 投影） |
+
+> 🔴 **`attn_sink` 参与 attention，golden 已实现**（v1.0 漏写）。
+> `ref/model.py:639` 声明 `attn_sink [n_local_heads] fp32`，`:780` / `:1067` 传入
+> `sparse_attn`，`kernel_cpu.py:445-473` 消费。它是 **per-head 的学习 logit，
+> 只进 softmax 分母，不贡献 value**：
+> ```python
+> mx    = scores.amax(-1).clamp_min(-1e30)
+> p     = torch.exp(scores - mx)
+> denom = p.sum(-1) + torch.exp(sink.view(1,1,h) - mx)   # ← sink 只在这里
+> o     = einsum(p, kv_g) / denom
+> ```
+> checkpoint 里 `layers.#.attn.attn_sink [64]` fp32，40 层 + 3 个 MTP 层全有。
+> 实现漏掉它 → 所有行的分母系统性偏小，`attn.out` 每层都分叉。
 | `hc_post.0` | [1, 27, 4, 5120] | bf16 | attention 结果展回 4 份并混入残差 |
 | `hc_mixes.1.0/.1/.2` | 同上 | fp32 | FFN 段的 pre / post / comb |
 | `hc_pre.1` | [1, 27, 5120] | bf16 | FFN 的输入 |
@@ -303,26 +316,120 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 ## 6. 阈值与理由
 
-阈值不是拍脑袋来的：下限取自 golden 自身的数值敏感度实测（fp32 vs fp64 累加），
-NPU 的容差必须**明显宽于**这个不可约噪声，否则测的是浮点抖动不是实现正确性。
+阈值全部来自实测，不是拍脑袋。**下限取自 golden 自身的数值敏感度**（同一份代码，只把
+`kernel_cpu` 里两个 GEMM 的累加 dtype 从 fp32 换成 fp64），NPU 的容差必须**明显宽于**
+这个不可约噪声，否则测的是浮点抖动而不是实现正确性。
+
+### 6.0 两条先决认识
+
+**(a) bf16 的相对 ULP 是 `2**-8` = 3.9e-3。** 残差流和大部分中间量都是 bf16，所以
+**对 bf16 张量设 5e-3 以下的阈值没有意义** —— 那是在测舍入。
+（v1.0 的全局 `strict = 5e-3` 正好压在这个地板上：用它去比一个**已知无 bug** 的参考跑，
+40 层里有 26 个张量「失败」。阈值定错会让人去查不存在的 bug。）
+
+**(b) 一个全局阈值管不了所有张量。** fp32 的 `hc_mixes` 实测在 1e-4 量级，bf16 的
+`moe.out` 天然在 5e-3 量级 —— 相差 50 倍。同一个数要么放过前者，要么冤枉后者。
+`compare_dumps.py` 现在按张量名做**最长前缀匹配**取阈值（`TOLERANCES` + `tol_for()`）。
+
+### 6.1 逐位相同（没有容差可言）
+
+| 检查项 | 理由 |
+|---|---|
+| `input_ids` | 输入 |
+| `engram_hash_ids` | 纯整数哈希（素数取模 + XOR），零浮点 |
+| `moe_gate.forced.1`（vs golden 的 `moe_gate.out.1`，按集合） | 注入是否生效，见第 1.5 步 |
+| `indexer_topk.out` | 见第 5.1 节：不可达位置统一映射成 `-1`，输出完全确定 |
+| `compressor.out` | 实测 4 个 kv_source 层全 40 层偏差 **0.00e+00** |
+
+### 6.2 阶段 A1 —— 强制路由 + 强制 `layer.in`（`--tolerance isolated`）
+
+**实测参考跑**：`golden_dumps/full40`（fp32，自由）vs `golden_dumps/full40_fp64_iso`
+（fp64 累加 + 注入 `plan_full40` 路由 + 注入 `full40` 的 `layer.in`）。
+390 s / 峰值 55.1 GB / 40 层。路由分歧 **1/1080 行**（仅 layer 28 一个 token）。
+
+40 层的逐层 `rel_l2` 分布：
+
+| 张量 | 中位 | **40 层最大** | 最差层 | 最小逐位相同 token |
+|---|---|---|---|---|
+| `layer.in` / `pre_mix.in` | 0 | **0** | — | 27/27 |
+| `hc_pre.0` / `attn_norm.out` / `attn.in` | 0 | **0** | — | 27/27 |
+| `compressor.out`（4 层） | 0 | **0** | — | 13/13 |
+| `hc_mixes.0.*` | 0 | 1.3e-6 | 14 | 26/27 |
+| `engram.out`（2 层） | 8.6e-6 | 8.6e-6 | 14 | 26/27 |
+| `hc_mixes.1.*` | 4.5e-5 | 8.7e-4 | 26 | 1/27 |
+| `hc_pre.1` / `ffn_norm.out` / `moe.in` | 4.1e-4 | 1.3e-3 | 26 | 2/27 |
+| `hc_post.0` | 3.0e-4 | 3.4e-3 | 26 | 1/27 |
+| `moe_gate.out.0` | 1.2e-4 | 4.2e-3 | 1 | — |
+| `layer.out` / `hc_post.1` | 1.5e-3 | **5.3e-3** | 26 | 1/27 |
+| `attn.out` | 6.1e-4 | **5.4e-3** | 26 | 0/27 |
+| **`moe.out`** | 4.8e-3 | **1.64e-2** | 26 | 2/27 |
+| `moe_routing_margin` | 2.0e-3 | 1.25e-2 | 26 | — |
+| `logits`（epilogue） | — | **1.5e-3** | — | 20/27 |
+
+🔴 **这张表是下界，不是对 NPU 的预测。** 上面那个实验**只扰动了两个 GEMM 的累加 dtype**。
+`hc_pre.0` / `attn_norm.out` / `compressor.out` 之所以是 0，是因为它们在计算链上位于第一个
+被扰动的 GEMM **之前** —— 「必然是 0」，不是「昇腾也能做到 0」。**把 0 当成 NPU 的目标是
+误用这张表。**
+
+**由此推出的阈值（实测最大值 × 2~3 倍余量）：**
+
+| 张量类 | rel_l2 | cos | 实测最大 |
+|---|---|---|---|
+| `layer.out` / `hc_post.*` / `attn.out` | **1.5e-2** | 0.9999 | 5.4e-3 |
+| `moe.out` | **4e-2** | 0.9995 | 1.64e-2 |
+| `hc_mixes.*`（fp32） | **5e-3** | 0.9999 | 8.7e-4 |
+| `hc_pre.*` / `ffn_norm.out` / `moe.in` / `moe_gate.out.0` | **5e-3** | 0.9999 | 4.2e-3 |
+| `logits` | **1e-2** + **top-1 必须一致** | 0.9999 | 1.5e-3 |
+| 其余 | 5e-3 | 0.9999 | |
+
+**`moe.out` 为什么单独放宽到 4e-2**：它是 6 个加权专家 + shared expert 求和后
+`type_as(x)` 回 bf16，抵消较多，天然坐在 ~1 个 bf16 ULP 上（中位 4.8e-3 ≈ 3.9e-3）。
+而且它未经残差平滑 —— 进了残差之后的 `layer.out` 立刻回到 1.5e-3。
+
+**校准验证**：用 `--tolerance isolated` 比上面那个**已知无 bug** 的参考跑 → **PASS**，
+唯一的 informational 是 `moe_routing_margin`（诊断项，不 gate）和 layer 28 那 1 个 token。
+
+### 6.3 `moe_routing_margin` 不作判据
+
+它是「第 k 名与第 k+1 名选择分数之差」—— 两个相近量之差，相对噪声天然大（实测最大
+1.25e-2，无 bug）。它的用途是在**自由路由**下区分「近似平局」和「真 bug」，
+不是数值阈值。`compare_dumps.py` 把它列进 `NEVER_GATE`：报告但永不判失败。
+
+### 6.4 阶段 A2 —— 只强制路由，不强制 `layer.in`
+
+**这个模式下 `rel_l2` 不能作为逐层判据**，原因见第 0.2 节：误差跨层累积，
+layer 2 就已经到 2.27e-2（无 bug）。实测 3 层：
+
+| | fp64 自由路由 | fp64 强制路由 |
+|---|---|---|
+| L0 `layer.out` | 4.28e-4 | 3.97e-4 |
+| L1 `layer.out` | 1.14e-2 | 7.98e-3 |
+| L2 `layer.out` | 3.75e-2 | **2.27e-2** |
+
+**⇒ A2 的用途是「验证跨层累积是否符合预期」，不是找 bug。找 bug 用 A1。**
+如果一定要在 A2 下判定，只能用 `--tolerance loose`（5e-2 / 0.995）做首次打通的粗筛，
+并且**只看第一个越界的层**。
+
+### 6.5 阶段 B —— 自由路由
 
 | 检查项 | 阈值 | 理由 |
 |---|---|---|
-| `input_ids`、`engram_hash_ids` | **逐位相同** | 纯整数运算，没有容差可言 |
-| `indexer_topk.out` | **逐位相同**（允许 <1% 差异） | 实测 fp32↔fp64 下 100% 稳定；top-512 选择裕度大 |
-| `moe_gate.out.1` 路由（**第一个分歧层**） | 不一致 token ≤ **8%**，且这些 token 的 margin 中位数 < 5e-3 | 实测 fp64 扰动下第一个分歧层（layer 1）为 7.4%、翻转 margin 中位 1.2e-3 |
-| `moe_gate.out.1` 路由（后续层） | **不设阈值，不作判据** | 实测 layer 2 起翻转/未翻转 margin 完全重叠，已无区分力；请改用强制路由模式（第 7 节） |
-| 单层 `layer.out` | rel_l2 ≤ **2e-2**，cos ≥ **0.999** | 激活是 bf16（尾数 8 位，~4e-3），叠加 fp8/fp4 GEMM 累加差异 |
-| `attn.out` / `moe.out` | rel_l2 ≤ **3e-2** | 子层输出未经残差平滑，波动比 `layer.out` 大 |
-| `hc_mixes.*`（fp32） | rel_l2 ≤ **5e-3**，cos ≥ 0.9999 | 全程 fp32，且 Sinkhorn 20 轮是收缩映射，应该很稳 |
-| `logits` | rel_l2 ≤ **3e-2**，**top-1 必须一致** | 与 `layer.out` 同量级；top-1 是业务判据 |
+| `moe_gate.out.1`（**第一个分歧层**，按集合比） | 见下 | |
+| `moe_gate.out.1`（后续层） | **不设阈值，不作判据** | 实测 layer 2 起翻转/未翻转的 margin 分布完全重叠，已无区分力 |
+| `logits` | **top-1 必须一致** | 业务判据 |
 
-`--tolerance strict`（rel_l2 5e-3 / cos 0.9999）用于**路由已强制对齐后**的纯算子比对。
-`--tolerance loose`（5e-2 / 0.995）只用于首次打通、允许路由有分歧时的粗筛。
+⚠️ **v1.0 那条「第一个分歧层不一致 token ≤ 8%」已作废。** 它是从被推翻的 7.4%
+（见第 0.1 节，那 2 个 token 其实是纯顺序调换）推出来的。**按集合比时，本组实验下
+第一个分歧层是 layer 2，比例 22.2%。**
 
-**通过的定义**：第 1、2 步全过，第 3 步所有层在 `default` 容差内，第 4 步 top-1 一致。
+重推：一个「严格更准」的扰动在第一个分歧层造成 22.2% 的集合改变，所以
 
----
+> **第一个分歧层的集合不一致比例 ≤ 25%，且不一致 token 的 `moe_routing_margin`
+> 中位数 < 5e-3** → 视为数值近似平局，放行并记录。
+> 超过 → 停在这一层查 gate（`ref/model.py:809-827`）。
+
+⚠️ 这条阈值的**置信度低于第 6.2 节那张表**：它只有 27 个 token、一组扰动的样本。
+它是「不要在这里浪费时间」的软门槛，**不要当验收线用**。真正的验收线是 A1。
 
 ## 7. 必做项：两个注入开关
 
@@ -392,6 +499,16 @@ indexer 的选择，这些仍然由本次运行自己前面的层产生。所以
 - **`-1` 索引语义**：`sparse_attn` 里 `topk_idxs == -1` 表示空槽，其 KV 行读作 0、
   score 读作 -inf；整行全 -1 时输出**必须是全 0 而不是 NaN**（running max 用有限的
   -1e30 而非 -inf 兜底）。NPU 实现如果这里返回 NaN，会在滑窗刚开始填充时炸掉。
+
+  🔴 **这条 fail-safe 和 `attn_sink` 是同一件事，不是两个独立的补丁。**
+  整行全 -1 → scores 全 `-inf` → `mx = clamp_min(-1e30) = -1e30`
+  → `p = exp(-inf + 1e30) = 0` → `denom = 0 + exp(sink + 1e30) = inf`
+  → `o = 0 / inf = 0`。**是 sink 项让分母非零，从而避免 0/0。**
+
+  所以：若实现单独加了个「空行输出 0」的特判、但 sink 漏了，标准输入 layer 2 第 0 行会
+  「看起来对」，而**其他所有行的分母全都偏小** —— 系统性偏差，极难查。
+  反之若 `mx` 用了 `-inf` 而不是 `-1e30`，即使 sink 在，也会得到 NaN。
+  ⚠️ 实测这条**在标准输入上就被触发**（第 5.1 节：layer 2 第 0 行整行是 -1）。
 - **fp8 溢出行为**：torch CPU 的 `to(float8_e4m3fn)` 溢出返回 **NaN 而非饱和**，所以
   必须先 clamp 到 ±448 再转。原 tilelang kernel 同样依赖调用方先 clamp。
 
@@ -401,13 +518,45 @@ indexer 的选择，这些仍然由本次运行自己前面的层产生。所以
 
 ```bash
 cd <本目录>
-unset LD_PRELOAD
-python test_kernel_cpu.py                                   # 6 个 kernel 的单测
-python run_golden.py --layers 40 --threads 16 --dump dumps/full40
-python compare_dumps.py dumps/full40 <npu_dump_dir>
+unset LD_PRELOAD          # 必须。jemalloc 在 ~/.bashrc 里，不 unset 会 segfault
+DU=/workspace/code/dsv4_single_card/vllm_project/golden_dumps
+
+python test_kernel_cpu.py                                   # 6 个 kernel 的单测（9 个测试）
+
+# 1) 基准 golden（fp32 累加、自由路由）—— 已产出，无需重跑
+python run_golden.py --layers 40 --threads 16 --dump $DU/full40
+
+# 2) 从 dump 蒸出 58 KB 的强制路由方案
+python routing_plan.py $DU/full40 --out $DU/plan_full40
+
+# 3) 每层独立的参考跑（噪声地板表的来源，第 6.2 节）
+python run_golden.py --layers 40 --fp64 --threads 16 \
+    --routing-plan $DU/plan_full40 --force-layer-in $DU/full40 \
+    --dump $DU/full40_fp64_iso
+
+# 4) 比对
+python compare_dumps.py $DU/full40 <npu_dump_dir> --tolerance isolated   # 阶段 A1
+python compare_dumps.py $DU/full40 <npu_dump_dir> --tolerance default    # 阶段 B
 ```
 
-实测：40 层单次 prefill（27 token）**216 秒 / 峰值 RSS 55 GB / 读取 52 GB 权重**。
+已产出的资产（**不在 git 里**，dump 太大）：
+
+| 目录 | 内容 |
+|---|---|
+| `$DU/full40` | 基准，fp32 累加、自由路由，40 层，271 MB |
+| `$DU/plan_full40` | 强制路由方案，58 KB |
+| `$DU/full40_fp64_iso` | 每层独立参考跑，fp64 + 强制路由 + 强制 layer.in |
+| `$DU/smoke3`, `$DU/smoke3_fp64`, `$DU/smoke3_fp64_forced` | 3 层，第 0 节那组实验 |
+
+实测（27 token，16 线程）：
+
+| 跑法 | 墙钟 | 峰值 RSS |
+|---|---|---|
+| 40 层 prefill，fp32 累加 | **216 s** | 55 GB |
+| 40 层 prefill，**fp64** 累加 + 双注入 | **390 s** | 55.1 GB |
+| 3 层，fp64 + 强制路由 | 25 s | 7.2 GB |
+
+读取 52.4 GB 权重、加载 2610 个专家（65/层，共 384）、gather 1296 行 engram。
 详见 REPORT.md。
 
 ---

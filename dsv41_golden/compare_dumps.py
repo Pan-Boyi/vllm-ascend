@@ -23,12 +23,45 @@ import sys
 import torch
 from safetensors.torch import load_file
 
-# name -> (rel_l2 max, cosine min).  Tightened by --tolerance strict, loosened by loose.
+# Per-tensor thresholds, because one global number cannot serve both an fp32
+# quantity like ``hc_mixes`` and a bf16 one like ``moe.out``: bf16's relative ULP
+# is 2**-8 = 3.9e-3, so any threshold below ~5e-3 on a bf16 tensor is measuring
+# rounding, not correctness.  Running the old global strict=5e-3 against a
+# known-good reference (fp64 accumulator, routing and layer inputs both forced)
+# "failed" 26 of 40 layers for exactly that reason.
+#
+# ``isolated`` is derived from that run -- the measured maximum over 40 layers,
+# times 2-3x headroom.  See ALIGNMENT_PROTOCOL.md section 6 for the table and for
+# why these are a FLOOR on agreement, not a prediction of what an NPU will hit.
 TOLERANCES = {
-    "loose":   {"rel_l2": 5e-2, "cos": 0.995},
-    "default": {"rel_l2": 2e-2, "cos": 0.9990},
-    "strict":  {"rel_l2": 5e-3, "cos": 0.9999},
+    "loose":    {"_default": (5e-2, 0.995)},
+    "default":  {"_default": (2e-2, 0.9990),
+                 "moe.out": (3e-2, 0.9985), "attn.out": (3e-2, 0.9985),
+                 "hc_mixes": (5e-3, 0.9999)},
+    "strict":   {"_default": (5e-3, 0.9999),
+                 "moe.out": (1e-2, 0.9995)},
+    "isolated": {"_default": (5e-3, 0.9999),
+                 "layer.out": (1.5e-2, 0.9999), "hc_post": (1.5e-2, 0.9999),
+                 "attn.out": (1.5e-2, 0.9999),
+                 "moe.out": (4e-2, 0.9995),
+                 "hc_mixes": (5e-3, 0.9999),
+                 "logits": (1e-2, 0.9999)},
 }
+
+# Diagnostic-only tensors: reported, never a failure.  ``moe_routing_margin`` is a
+# difference of two adjacent selection scores, so its relative noise is large by
+# construction (measured up to 1.25e-2 with no bug present); it exists to tell a
+# near-tie from a real routing bug, not to be a threshold.
+NEVER_GATE = ("moe_routing_margin",)
+
+
+def tol_for(name: str, tol: dict) -> tuple:
+    """Longest-prefix match on the tensor name, falling back to ``_default``."""
+    best, best_len = tol["_default"], -1
+    for key, val in tol.items():
+        if key != "_default" and name.startswith(key) and len(key) > best_len:
+            best, best_len = val, len(key)
+    return best
 # Elements below this fraction of the tensor's RMS are excluded from max-rel-error:
 # a near-zero golden value makes relative error meaningless.
 REL_FLOOR_FRAC = 1e-2
@@ -159,11 +192,18 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                 if not m["exact"]:
                     failures.append((tag, name, f"{100 * (1 - m['match_frac']):.2f}% indices differ"))
             else:
+                lim_rel, lim_cos = tol_for(name, tol)
+                m["limit_rel_l2"], m["limit_cos"] = lim_rel, lim_cos
                 if m["nonfinite"]:
                     failures.append((tag, name, f"{m['nonfinite']} non-finite values"))
-                elif m["rel_l2"] > tol["rel_l2"] or m["cos"] < tol["cos"]:
+                elif name.startswith(NEVER_GATE):
+                    if m["rel_l2"] > lim_rel:
+                        notes.append((tag, name,
+                                      f"rel_l2={m['rel_l2']:.3e} (diagnostic only, not gated)"))
+                elif m["rel_l2"] > lim_rel or m["cos"] < lim_cos:
                     failures.append((tag, name,
-                                     f"rel_l2={m['rel_l2']:.3e} cos={m['cos']:.6f}"))
+                                     f"rel_l2={m['rel_l2']:.3e} (limit {lim_rel:.1e}) "
+                                     f"cos={m['cos']:.6f} (limit {lim_cos})"))
         # Did the injection actually reach the experts?  Cross-name on purpose: the
         # candidate records what it fed the experts, the golden records what it chose.
         if "moe_gate.forced.1" in c and "moe_gate.out.1" in g:
@@ -182,8 +222,12 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
         results[tag] = tag_res
 
         if verbose:
+            # Rank by rel_l2 relative to that tensor's own limit, not by raw
+            # rel_l2: moe.out is always the largest number and would otherwise
+            # always be named "worst" even when it is well inside tolerance.
             worst = max((v for v in tag_res.values() if v.get("kind") == "float"),
-                        key=lambda v: v.get("rel_l2", 0), default=None)
+                        key=lambda v: v.get("rel_l2", 0) / max(v.get("limit_rel_l2", 1), 1e-30),
+                        default=None)
             if worst is not None:
                 wname = [k for k, v in tag_res.items() if v is worst][0]
                 flag = "FAIL" if any(f[0] == tag for f in failures) else "ok  "
@@ -207,7 +251,10 @@ def main():
     tol = TOLERANCES[a.tolerance]
     print(f"golden    {a.golden}")
     print(f"candidate {a.candidate}")
-    print(f"tolerance {a.tolerance}: rel_l2 <= {tol['rel_l2']:.0e}, cos >= {tol['cos']}")
+    dflt = tol["_default"]
+    extra = ", ".join(f"{k}<={v[0]:.1e}" for k, v in tol.items() if k != "_default")
+    print(f"tolerance {a.tolerance}: default rel_l2 <= {dflt[0]:.0e}, cos >= {dflt[1]}"
+          + (f"\n          per-tensor: {extra}" if extra else ""))
 
     force_route = "off"
     for d in (a.golden, a.candidate):
