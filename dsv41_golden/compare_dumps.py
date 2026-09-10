@@ -46,15 +46,18 @@ from safetensors.torch import load_file
 # floor underneath it.  dsv41-kernel's first real NPU measurement of hc_pre at
 # d=5120 came in at 6.85e-3 = 1.75 ULP -- correct, and over that limit.
 BF16_ULP = 2 ** -8
-BF16_FLOOR = 3 * BF16_ULP        # 1.17e-2
+BF16_FLOOR = 3 * BF16_ULP        # 1.17e-2 -- kept for reference in section 6 of the protocol
 
-# bf16 in the dump.  fp32 quantities (hc_mixes, moe_gate.out.0, pre_mix, logits)
-# are not subject to the floor: 5e-3 is ~42000 fp32 ULP, nowhere near tight.
-BF16_TENSORS = (
-    "layer.in", "layer.out", "hc_pre", "hc_post", "attn_norm.out", "attn.in",
-    "attn.out", "ffn_norm.out", "moe.in", "moe.out", "engram.out",
-    "compressor.out", "embed.out", "final_norm.out",
-)
+# Which tensors the floor applies to is decided from the *actual dtype*, not from
+# a list of names.  A hand-kept list is the same kind of thing as a duplicated
+# reference implementation: it drifts, silently, in the direction of being too
+# tight.  It already did -- attn.o_raw and attn.o_unroped were added to the dump
+# and inherited 5e-3 = 1.28 ULP, the exact mistake the floor exists to prevent,
+# because nobody remembered to extend the list.  fp32 quantities are exempt: 5e-3
+# there is some 42000 fp32 ULP, nowhere near tight.
+ULP = {torch.bfloat16: 2 ** -8, torch.float16: 2 ** -10, torch.float32: 2 ** -23,
+       torch.float64: 2 ** -52}
+FLOOR_ULP = 3        # a purely systematic one-ULP shift already costs 1 ULP
 
 TOLERANCES = {
     "loose":    {"_default": (5e-2, 0.995)},
@@ -160,15 +163,21 @@ def _unoffset_idx(idxs: torch.Tensor, offset: torch.Tensor | None):
     return torch.where(idxs < 0, idxs, idxs - off)
 
 
-def tol_for(name: str, tol: dict) -> tuple:
-    """Longest-prefix match on the tensor name, then apply the bf16 floor."""
+def tol_for(name: str, tol: dict, dtype: "torch.dtype | None" = None) -> tuple:
+    """Longest-prefix match on the tensor name, floored by the dtype's own ULP.
+
+    The floor is what keeps a threshold from landing below the point where a
+    correct implementation can even represent agreement.  Passing the dtype makes
+    it automatic for tensors nobody thought about.
+    """
     best, best_len = tol["_default"], -1
     for key, val in tol.items():
         if key != "_default" and name.startswith(key) and len(key) > best_len:
             best, best_len = val, len(key)
     rel, cos = best
-    if name.startswith(BF16_TENSORS):
-        rel = max(rel, BF16_FLOOR)
+    ulp = ULP.get(dtype)
+    if ulp is not None:
+        rel = max(rel, FLOOR_ULP * ulp)
     return rel, cos
 # Elements below this fraction of the tensor's RMS are excluded from max-rel-error:
 # a near-zero golden value makes relative error meaningless.
@@ -300,7 +309,7 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                 if not m["exact"]:
                     failures.append((tag, name, f"{100 * (1 - m['match_frac']):.2f}% indices differ"))
             else:
-                lim_rel, lim_cos = tol_for(name, tol)
+                lim_rel, lim_cos = tol_for(name, tol, gt.dtype)
                 m["limit_rel_l2"], m["limit_cos"] = lim_rel, lim_cos
                 if m["nonfinite"]:
                     failures.append((tag, name, f"{m['nonfinite']} non-finite values"))

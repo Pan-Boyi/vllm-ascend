@@ -75,23 +75,23 @@ NEVER_GATE = ("moe_routing_margin", "indexer_kv_offset")
 NEAR_TIE_MARGIN = 1e-3
 
 
-# See compare_dumps.BF16_FLOOR: 1 bf16 ULP is 3.9e-3 relative per element, so a
-# purely systematic one-ULP shift already reaches that with nothing wrong.
-BF16_FLOOR = 3 * 2 ** -8         # 1.17e-2
-BF16_TENSORS = (
-    "layer.in", "layer.out", "hc_pre", "hc_post", "attn_norm.out", "attn.in",
-    "attn.out", "ffn_norm.out", "moe.in", "moe.out", "engram.out",
-    "compressor.out",
-)
+# The floor comes from the tensor's own dtype rather than a list of names, for the
+# reason spelled out in compare_dumps: a hand-kept list drifts, and it drifts
+# towards being too tight.  1 bf16 ULP is 3.9e-3 relative per element, and a
+# purely systematic one-ULP shift already costs that with nothing wrong.
+ULP = {torch.bfloat16: 2 ** -8, torch.float16: 2 ** -10, torch.float32: 2 ** -23,
+       torch.float64: 2 ** -52}
+FLOOR_ULP = 3
 
 
-def limit_for(name: str) -> float:
+def limit_for(name: str, dtype: "torch.dtype | None" = None) -> float:
     best, best_len = ISOLATED_LIMITS["_default"], -1
     for k, v in ISOLATED_LIMITS.items():
         if k != "_default" and name.startswith(k) and len(k) > best_len:
             best, best_len = v, len(k)
-    if name.startswith(BF16_TENSORS):
-        best = max(best, BF16_FLOOR)
+    ulp = ULP.get(dtype)
+    if ulp is not None:
+        best = max(best, FLOOR_ULP * ulp)
     return best
 
 
@@ -223,7 +223,7 @@ def compare_step_to_golden(rec: MemoryRecorder, dump_dir: str, pos: int, n_layer
                 rows.append((i, name, 0.0 if same else float("nan"), 0.0, gated))
                 continue
             r = rel_l2(got, want)
-            lim = limit_for(name)
+            lim = limit_for(name, want.dtype)
             gated = not name.startswith(NEVER_GATE)
             if forced and name == "moe_gate.out.0" and r > lim:
                 # Same reasoning as out.1: these are the layer's own weights, not
