@@ -10,50 +10,94 @@ clamp 和 amax 下限在哪）与原 kernel **逐条对齐**；归约（GEMM 累
 
 ---
 
-## 0. 先读这一节：本模型对齐的头号难点是 MoE 路由，不是算子精度
+## 0. 先读这一节：本模型对齐有**两个**独立难点
 
-实测（本仓库 `dumps/smoke3` vs `dumps/smoke3_fp64`）：**只把 GEMM 累加器从 fp32 换成 fp64**
-——一个让结果严格更准、单个 GEMM 上相对误差只有 ~1e-7 的改动——就造成：
+历史注记：本节 v1.0 只讲了 MoE 路由，且引用的数字（layer 1 翻转 7.4%、layer 2 翻转 55.6%）
+**被交叉验证推翻**。v1.1 修正了数字，并补上了第二个、在路由被钉住之后仍然存在的难点。
 
-| 位置 | 效果 |
-|---|---|
-| layer 0 输出 | rel_l2 = 1.0e-3（正常） |
-| layer 1 专家选择 | **2.47% 的 token 选中了不同专家** |
-| layer 1 输出 | rel_l2 = 2.9e-2 |
-| layer 2 专家选择 | **16.67% 的 token 选中了不同专家** |
-| layer 2 输出 | rel_l2 = 1.0e-1 |
-| 最终 logits | rel_l2 = 5.6e-2 |
+### 0.1 难点一：MoE 路由是离散判决（数字已修正）
 
-原因：`Gate` 用 `(scores + bias).topk(k)` 选专家，这是**连续值上的离散判决**。当第 k 名和
-第 k+1 名分数接近时，任意微小扰动都会翻转选择，而两个不同专家的输出差异是 O(1) 的。
+`Gate` 用 `(scores + bias).topk(k)` 选专家 —— 连续值上的离散判决。当第 k 名与第 k+1 名
+分数接近时，任意微小扰动都会翻转选择，而两个不同专家的输出差异是 O(1) 的。
 
-### 而且它会滚雪球
+实测（`golden_dumps/smoke3` fp32 累加 vs `golden_dumps/smoke3_fp64` fp64 累加，
+一个让结果**严格更准**、单 GEMM 相对误差只有 ~1e-7 的改动）：
 
-同一次 fp32↔fp64 实验，按 **token** 统计（27 个 token，`moe_routing_margin` 实测）：
-
-| 层 | 路由被翻转的 token | 翻转 token 的 margin | 未翻转 token 的 margin |
+| 层 | 按元素逐位比 topk（**旧的、错的算法**） | 其中纯顺序调换 | **真实集合改变（正确）** |
 |---|---|---|---|
-| layer 0 | 0 / 27 (0.0%) | — | min 4.7e-4, 中位 4.3e-3 |
-| layer 1 | 2 / 27 (7.4%) | max 1.5e-2, 中位 1.2e-3 | min 9.4e-5, 中位 3.7e-3 |
-| layer 2 | 15 / 27 (**55.6%**) | max 6.0e-3, 中位 2.1e-3 | min 1.4e-3, 中位 6.6e-3 |
+| layer 0 | 0/27 = 0% | 0 | **0/27 = 0%** |
+| layer 1 | 2/27 = 7.4% | **2** | **0/27 = 0%** |
+| layer 2 | 15/27 = 55.6% | **9** | **6/27 = 22.2%** |
 
-两点必须注意：
+**为什么旧数字是错的**：`topk` 返回的顺序对结果**没有任何影响**。MoE 对选中的专家求和，
+而累加顺序是按**专家编号**循环的（`MoE.forward` 里 `for i in range(n_routed_experts)`），
+与 `topk` 的返回顺序无关。所以「专家集合相同、只是顺序调换」必须计为**一致**。
+旧算法把 9 个纯顺序调换算成了翻转。
 
-1. **layer 0 完全一致，layer 1 就有 7%，layer 2 已经过半。** 路由一旦在某层分叉，
-   下游层的 gate 输入本身就带了 3e-2 量级的误差，翻转不再是"平局"而是误差累积的结果。
-2. **到 layer 2，翻转 token 的 margin（≤6.0e-3）和未翻转 token 的 margin（≥1.4e-3）已经完全重叠。**
-   也就是说 **margin 阈值只在最前面一两层能区分"平局"和"真 bug"，再往后就失效了。**
+**⇒ 比较专家选择必须按集合比**（`sort(-1)` 之后再比）。`compare_dumps.py` 已按此实现
+（`SET_VALUED` + `routing_agreement()`），并把「纯顺序调换」单独计数而不计为失败。
 
-**结论（协议的核心）：**
+**结论方向不变**：22.2% 的 token 在一个严格更准的扰动下路由到不同专家，照样让逐层
+数值比对失去意义。所以第 7 节的强制路由注入仍然是**必做项**。
 
-1. **专家路由不一致时，隐藏态的 rel_l2 数字没有意义。** 不要用它判定算子对错。
-2. 判定顺序永远是：**先比路由 → 路由一致再比数值**。
-3. 只有**第一个**出现路由分歧的层是有诊断价值的。在那一层看 `moe_routing_margin`：
-   margin 极小 = 数值近似平局，属于可接受差异；margin 不小却选错 = **真 bug**。
-4. **因此第 7 节的"强制路由"调试开关不是可选项，是逐层比对能否进行下去的前提。**
-   没有它，layer 2 之后的所有数值比对都是在测噪声。
+### 0.2 难点二：一个 bf16 ULP 经因果 attention 扩散（v1.1 新增）
 
----
+这是**路由被完全钉住之后依然存在**的误差传播路径，而且在深层它是主导项。
+
+实测（fp64 累加 + 注入 fp32 路由方案，`golden_dumps/smoke3_fp64_forced`，
+注入已验证逐位精确：`moe_gate.forced.1` 与 golden 完全相同、`forced.0` 差 0）：
+
+| 张量（基线 = `smoke3`，fp32 自由路由） | fp64 **自由**路由 | fp64 **强制**路由 |
+|---|---|---|
+| layer 0 `layer.out` | 4.28e-4 | 3.97e-4 |
+| layer 1 `layer.out` | 1.14e-2 | 7.98e-3 |
+| layer 2 `layer.out` | 3.75e-2 | **2.27e-2** |
+| `logits` | 5.60e-2 | 3.01e-2 |
+
+**强制路由只把误差减半，没有消掉误差增长。** 注意 layer 2 那个 2.27e-2 ——
+它已经**超过了本协议第 6 节自己定的 `layer.out ≤ 2e-2`**，而此时并不存在任何 bug。
+
+机制（逐 token 定位，layer 1、强制路由）：
+
+```
+hc_pre.0  (attention 输入) : 27 个 token 里只有 2 个有任何差异
+                             token 3 : 5120 个元素里 1358 个差 恰好 1~2 个 bf16 ULP
+                             token 10: 1 个元素差 1 ULP（该元素值本身是 0）
+attn.out  (attention 输出) : 24/27 个 token 被污染
+                             token 0/1/2 保持逐位相同 —— 它们因果上在 token 3 之前
+```
+
+链条：
+
+1. fp64 累加让 layer 0 的输出动了 ~1e-7（相对）。
+2. **残差流是 bf16（8 位尾数，ULP ≈ 4e-3 相对）**。25/27 个 token 四舍五入后**完全相同** ——
+   但 token 3 恰好落在进位边界上，1358 个元素各翻 1~2 个 ULP。
+3. **因果 attention 把 token 3 的误差扩散给所有 j ≥ 3 的 token** → 24/27 被污染。
+4. 每层重复一次，被污染 token 的比例饱和到 100%，逐 token 幅度再逐层累加。
+
+**⇒ 整张量的 `rel_l2` 增长，主要来自「被污染 token 的比例变大」，不是来自「算子把噪声放大」。**
+
+这解释了一个否则很诡异的现象：layer 1 路由 0 翻转、注入权重逐位相同，`moe.out` 却有
+2.33e-2 —— 因为它的输入里早就有一个 token 是脏的。
+
+**⇒ 所以 `rel_l2` 不是好的单一判据。** 必须同时看**逐 token** 统计：
+`compare_dumps.py` 现在报 `tokens_bit_exact` 和 `max_token_rel_l2`。
+「27 个 token 里 26 个逐位相同、1 个差 1 个 ULP」和「27 个 token 全都差 4e-3」
+的 `rel_l2` 可以一样，但前者是舍入、后者是 bug。
+
+**⇒ 并且逐层比对需要第二个开关：注入 `layer.in`（第 7 节）。**
+
+### 0.3 判定顺序（协议的核心）
+
+1. **专家路由不一致时，隐藏态的 rel_l2 没有意义。** 不要用它判定算子对错。
+2. 顺序永远是：**先验注入是否生效 → 再比路由 → 路由一致再比数值**。
+3. 自由累积模式下，只有**第一个**出现分歧的层有诊断价值。
+   **注入 `layer.in` 之后这条限制解除**，每层可独立定位。
+4. **强制路由（第 7 节）不是可选项**，没有它 layer 2 之后的数值比对是在测噪声。
+5. **强制路由不够**，还要强制 `layer.in`，否则阈值必须逐层放宽（第 6 节）。
+
+（对比：indexer 的 top-512 在本组实验下 100% 稳定，**但见第 5.1 节的适用边界** ——
+27 token 时实际 K=13 且「13 选 13」，几乎没有选择余地，这个结论不能外推到长序列。）
 
 ## 1. 环境
 
@@ -170,19 +214,44 @@ python compare_dumps.py  <golden_dir>  <npu_dir>  [--tolerance default|strict|lo
 `engram_hash_ids` 必须**逐位完全相同**。它是纯整数哈希（素数取模 + XOR），没有任何浮点，
 不一致就是 hash 实现或 compressed token map 错了。
 
-### 第 2 步 — 逐层路由
-对每层比 `moe_gate.out.1`：
+### 第 1.5 步 — 注入是否真的生效（只在 `force_route != off` 时）
+候选侧的 `moe_gate.forced.1` 必须与 golden 的 `moe_gate.out.1` **逐位相同**（按集合，见下）。
+代价是每层 27×6 个 int32 的比较，挡掉的是「环境变量拼错 / 方案文件没找到 / 注入被静默跳过」。
 
-- **完全一致** → 进第 3 步。
-- **不一致** → 取出不一致的 token，查它们的 `moe_routing_margin`：
-  - margin < 1e-3 → 近似平局，记录后放行（但要统计比例，见第 6 节阈值）。
-  - margin ≥ 1e-3 → **真 bug**，停在这一层查 gate：`linear(x.float(), weight.float())`
+**这一步不能省。** 没有它，一个没生效的注入表现为「strict 容差下逐层全面超标」——
+和真算子 bug 完全同一个症状，而你会去查算子。
+
+`compare_dumps.py` 自动做这一步（读候选 `manifest.json` 的 `force_route`）。
+
+### 第 2 步 — 逐层路由（**必须按集合比**）
+对每层比 `moe_gate.out.1`，**先 `sort(-1)` 再比**：
+
+> `topk` 的返回顺序对结果没有任何影响（MoE 对选中专家求和，累加顺序按专家编号循环）。
+> 按元素逐位比会把纯顺序调换算成翻转 —— 第 0.1 节那两个被推翻的数字就是这么来的。
+
+- **集合完全一致** → 进第 3 步。（顺序不同不算问题，`compare_dumps.py` 单独计数。）
+- **不一致，且 `force_route` 含 `moe`** → 这是**预期的**，仅供参考，不作判据；
+  真正的判据是第 1.5 步。
+- **不一致，且自由路由** → 取出不一致的 token，查它们的 `moe_routing_margin`：
+  - margin 很小 → 近似平局，记录后放行（比例阈值见第 6 节）。
+  - margin 不小却选错 → **真 bug**，停在这一层查 gate：`linear(x.float(), weight.float())`
     是否真的用 fp32、`sqrtsoftplus`（`F.softplus(x).sqrt()`）是否实现一致、
-    `bias`（`e_score_correction_bias`）是否只参与选择不参与加权。
+    `bias`（`e_score_correction_bias`）是否只参与选择不参与加权（`ref/model.py:822-823`）。
+  - ⚠️ **margin 判据只在最前面一两层有效**：实测 layer 2 起翻转与未翻转 token 的 margin
+    分布已经重叠。再往后请改用强制路由模式。
 
 ### 第 3 步 — 逐层数值
-按层号从小到大看 `layer.out` 的 rel_l2 / cos。**只有第一个越界的层是有诊断价值的**，
-后面的层都在继承上游误差。定位到第一个失败层后，在该层内按下面顺序二分：
+按层号从小到大看 `layer.out` 的 rel_l2 / cos，**同时看逐 token 的
+`tokens_bit_exact` 和 `max_token_rel_l2`**。
+
+> 为什么要看逐 token：第 0.2 节的机制说明整张量 rel_l2 的增长主要来自「被污染 token 的
+> 比例变大」。「26/27 个 token 逐位相同、1 个差 1 个 bf16 ULP」和「27 个 token 全都差 4e-3」
+> 可以有相同的 rel_l2，但前者是舍入、后者是 bug。
+
+**在自由累积模式下，只有第一个越界的层有诊断价值**，后面的层都在继承上游误差。
+**注入 `layer.in` 之后（第 7.2 节）这条限制解除**，每层独立可判。
+
+定位到第一个失败层后，在该层内按下面顺序二分：
 
 ```
 layer.in → hc_mixes.0.* → hc_pre.0 → attn_norm.out
@@ -196,6 +265,39 @@ layer.in → hc_mixes.0.* → hc_pre.0 → attn_norm.out
 ### 第 4 步 — 输出
 `logits`：比 rel_l2、cos，以及 **top-1 / top-5 token 是否一致**。
 top-1 一致是最低要求。
+
+### 5.1 `indexer_topk.out` 的实际形状与「100% 稳定」的适用边界
+
+```python
+topk = min(self.index_topk, end_pos // ratio)          # ref/model.py:577
+idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+```
+
+`index_topk = 512`，但 **K 是逐层、随序列长度变的**。27 token 标准输入实测
+（取自 `golden_dumps/full40/manifest.json`）：
+
+| 层 | `compressor.out` | `indexer_topk.out` |
+|---|---|---|
+| 2 / 8 / 14（ratio 2，kv_source） | [1, 13, 512] | [1, 27, **13**] |
+| 20（ratio 1，kv_source） | [1, 27, 512] | [1, 27, **27**] |
+| 24 / 28 / 32 / 36（ratio 1，非 kv_source） | —— | [1, 27, **27**] |
+
+`compress_ratios` 是**逐层**列表（长度 43 = 40 层 + 3 个 MTP），layer 0/1 是 0。
+
+⚠️ **「fp64 扰动下 100% 一致」是在 K=13 且「13 个里选 13 个」的退化条件下测出来的** ——
+几乎没有选择余地，所以稳定是必然的，不是裕度大。**这个结论不能外推到长序列。**
+
+两个可以依赖的性质：
+
+- **`indexer_topk.out` 完全确定**，尽管底层 `topk` 在 -inf 平局上不确定：
+  被选中的不可达位置无论是哪几个，都统一映射成 `-1`。所以可以要求**逐位相同**。
+- **`-1` 补在尾部，且逐行连续**（先按位置升序 `sort`，不可达下标必然 ≥ `compress_lens`，
+  排序后落尾部）。**每行尾部长度不同**：prefill 时 `compress_lens` 是 per-row 的 `[seqlen,1]`。
+  实测 `full40/layer_02` 每行 `-1` 个数
+  `[13,12,12,11,11,10,10,9,9,8,8,7,7,6,6,5,5,4,4,3,3,2,2,1,1,0,0]`
+  → **第 0 行整行是 `-1`**，即第 8 节那条「整行全 -1 必须输出全 0 而非 NaN」
+  **在标准输入上就被触发**，不需要构造 case。
 
 ---
 
@@ -222,27 +324,62 @@ NPU 的容差必须**明显宽于**这个不可约噪声，否则测的是浮点
 
 ---
 
-## 7. 必做项："强制路由"模式
+## 7. 必做项：两个注入开关
 
-第 0 节的数据说明：不消掉路由这个离散判决，逐层数值比对在 layer 2 之后就没有信噪比了。
-解法是把它从等式里去掉：
+完整接口规范见 **`ROUTING_INJECTION.md`**（含签名、寻址方式、fail-safe 要求、环境变量）。
+本节只讲为什么要两个、以及各自解决什么。
 
-> 在 NPU 实现里加一个调试开关，允许**从外部注入专家编号**（直接读 golden dump 的
-> `moe_gate.out.1`），跳过自己的 top-k；同时也注入 `moe_gate.out.0` 的路由权重。
+### 7.1 强制路由（消掉离散判决）
 
-这样比对就变成纯算子比对，可以直接上 `--tolerance strict`，一旦超标必定是真 bug。
-分两阶段收敛：
+> 在实现里加一个调试开关，允许**从外部注入专家编号和路由权重**（读 golden 的
+> `moe_gate.out.1` / `.0`），跳过自己的 top-k。
 
-- **阶段 A（强制路由）**：注入 golden 的专家编号+权重，逐层比数值。定位所有算子精度问题。
-- **阶段 B（自由路由）**：放开 top-k，只比 `moe_gate.out.0/1` 和最终 logits 的 top-1，
-  单独验证 gate 本身。
+- **weights 必须和 indices 一起注入。** `norm_topk_prob` 按选中集合重新归一化
+  （`ref/model.py:824-826`），只注入 indices 等于换了归一化分母，数值依然不可比。
+- **按绝对序列位置寻址，不能按张量行号。** 详见 `ROUTING_INJECTION.md` 第 0 节 ——
+  这是唯一一个「在 smoke case 上必然通过、只在真实调度下暴露、且暴露形式伪装成待测对象」
+  的坑。
+- **注入点在 dispatch 与 global→local expert 映射之前。**
+- 必须 dump `moe_gate.forced.0/.1`（实际喂给 expert 的值），供第 1.5 步验证注入生效。
 
-同理，`indexer_topk.out` 也建议支持注入——虽然实测它比 MoE 路由稳得多（fp64 扰动下
-100% 一致），但它同样是 top-k 离散判决，长序列下裕度会变小。
+**效果实测**：把 layer 2 的 `layer.out` 从 3.75e-2 降到 2.27e-2。**有效，但不够。**
 
-这个开关是本协议里**投入产出比最高的一项，请优先做**。
+### 7.2 强制层输入（消掉跨层累积）—— v1.1 新增
 
----
+第 0.2 节的数据说明：路由钉住之后，主导误差路径变成「一个 bf16 ULP 经因果 attention
+扩散」，误差仍然逐层累积，layer 2 就已经越过 2e-2。
+
+> 在每个 block 入口，用 golden dump 的 `layer.in` [1,27,4,5120] 和
+> `pre_mix.in` [1,27,4] **覆盖**残差流，然后再跑这一层。
+
+这样每层都拿到 golden 的输入，误差不再跨层累积，**每层的偏差回到「单层噪声」量级**，
+`strict` 容差这时才真正可用，而且**任意一层都能独立定位**，不必再遵守
+「只有第一个越界的层有诊断价值」。
+
+CPU golden 侧已实现：`run_golden.py --force-layer-in <golden_dump_dir>`
+（`GoldenModel.forward(layer_in_dir=...)`）。
+
+**⚠️ 这个方法的边界（必须说明，否则会被过度信任）**：它**不隔离跨层状态** ——
+KV cache、layer 2/8/14/20 的 compressor latent、layer 20 的 candidate blocks、
+indexer 的选择，这些仍然由本次运行自己前面的层产生。所以是**部分隔离**，不是完全隔离。
+但它切断了主导的那条累积路径。
+
+### 7.3 indexer 注入（低优先，接口先留）
+
+`indexer_topk.out` 同样是 top-k 离散判决。本组实验下它 100% 一致，**但见第 5.1 节的
+适用边界**：27 token 时实际 K=13 且「13 选 13」，几乎没有选择余地。长序列下 K 逼近 512、
+候选远多于 512 时它会变回真正的离散判决。**接口先留好，实现排在 7.1/7.2 之后；
+长序列那组上线时必须重测再决定。**
+
+### 7.4 收敛顺序
+
+| 阶段 | 开关 | 容差 | 判据 |
+|---|---|---|---|
+| **A1** | `moe` + `layer_in` | `strict` | 每层独立比数值。超标即真 bug，直接指向算子 |
+| **A2** | `moe` | 见第 6 节逐层放宽表 | 验证跨层累积是否符合预期（不是找 bug） |
+| **B** | `off` | `default` | `moe_gate.out.0/1`（按集合）+ logits top-1。单独验 gate |
+
+阶段 A 照常 dump 自己算的 `moe_gate.out.*`，所以一趟同时产出阶段 B 需要的 gate 数据。
 
 ## 8. 已知不可比 / 超出范围
 
@@ -272,3 +409,88 @@ python compare_dumps.py dumps/full40 <npu_dump_dir>
 
 实测：40 层单次 prefill（27 token）**216 秒 / 峰值 RSS 55 GB / 读取 52 GB 权重**。
 详见 REPORT.md。
+
+---
+
+## 10. 单算子对照（给 kernel 线）
+
+第 1~9 节讲整模型逐层对照。kernel 线要的是**单个算子**的 rel_err，方法不同：不需要跑模型，
+也不需要 dump。
+
+### 10.1 参考实现在哪
+
+`kernel_cpu.py` 的六个函数就是参考，与原 tilelang kernel **逐条对齐量化语义**
+（哪个值落到哪个 fp8/fp4 码、block scale 怎么算、clamp 和 amax 下限在哪），
+只把归约换成 fp32/fp64 全精度：
+
+| 函数 | 签名要点 |
+|---|---|
+| `act_quant(x, block_size=128, scale_fmt=None, scale_dtype=fp32, inplace=False)` | → `(y_e4m3, s)`，s 形状 `[..., N//block_size]` |
+| `fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=e8m0)` | → `(y_packed_e2m1_x2, s)` |
+| `fp8_gemm(a, a_s, b, b_s, scale_dtype=fp32)` | 累加 dtype 由 `GOLDEN_DOT_DTYPE` 控制 |
+| `fp4_gemm(a, a_s, b, b_s, scale_dtype=fp32)` | 同上 |
+| `hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, iters, eps)` | → `(pre, post, comb)`；最后一轴布局 `[0:hc]`=pre、`[hc:2hc]`=post、`[2hc:]`=comb（row-major hc×hc） |
+| `sparse_attn(q, kv, attn_sink, topk_idxs, ...)` | `topk_idxs == -1` 是空槽 |
+
+`test_kernel_cpu.py`（~90 条断言，9 个测试，全过）就是**调用范例**，包括每个 kernel 的
+边界情形。要新增对照，照它的结构加即可：
+
+```bash
+unset LD_PRELOAD          # 必须，jemalloc 在 ~/.bashrc 里，不 unset 会 segfault
+python test_kernel_cpu.py
+```
+
+### 10.2 用两个参考，不要只用一个
+
+单算子必须同时对两个基准比，两个数字回答不同问题：
+
+| 基准 | 怎么造 | 回答什么 | 量级 |
+|---|---|---|---|
+| **A. CPU golden kernel** | 同一份量化输入喂 `kernel_cpu.py` | **实现是否正确**（量化语义、scale、布局） | 应当很紧：差异只来自累加顺序 |
+| **B. 未量化 fp64 参考** | 用原始 bf16/fp32 输入直接做 `@`，`GOLDEN_DOT_DTYPE=torch.float64` | **量化本身损失多少** | 大得多，且是预期的 |
+
+**只比 B 会把量化误差当成 bug；只比 A 会漏掉「两边用同样错误的量化语义」。**
+`test_kernel_cpu.py` 里 `test_fp8_gemm` / `test_fp4_gemm` 就是这么写的：
+`< 5e-3` 对 naive 循环（A），`< 0.1` 对未量化 bf16（B）。
+
+### 10.3 喂什么输入
+
+**不要只用随机张量。** 随机数落在激活分布的尾部，会放大 amax 下限、clamp 边界这些分支的
+触发概率，也可能反过来根本触发不到。建议三组一起：
+
+1. **真实激活**：从 `golden_dumps/full40` 取对应张量当输入（形状和分布都是真的）。
+2. **随机张量**：固定种子，覆盖一般情形。
+3. **边界构造**：全零组、单元素超大、正好落在 fp4 码中点、amax 触及下限。
+   `test_kernel_cpu.py` 已覆盖一部分。
+
+### 10.4 已知的语义陷阱（会静默给出错结果）
+
+- **fp8 溢出**：torch CPU 的 `to(float8_e4m3fn)` 溢出返回 **NaN 而非饱和**，
+  所以必须**先 clamp 到 ±448 再转**。原 tilelang kernel 同样依赖调用方先 clamp。
+- **amax 下限，三个不同的值**，抄错会在小激活上分叉：
+  - `act_quant`（fp8）：`amax.clamp_min(1e-4)`
+  - `fp4_act_quant` + `e8m0` scale（indexer）：`amax` 下限 `6 * 2**-126`，
+    scale = `2 ** ceil(log2(amax/6))`
+  - `fp4_act_quant` + `e4m3` scale（压缩 KV）：`amax` 下限 `6 * 2**-9`，
+    scale = `amax/6` **再舍入到 e4m3** —— 为了让全零组也拿到非零 scale，是训练侧的约定
+- **`scale_fmt` 非 None** 时 scale 向上取到 2 的幂（MXFP 风格），与非 None 时不同。
+- **`sparse_attn` 的 `-1`**：该 KV 行读作 0、score 读作 -inf；**整行全 -1 时输出必须是
+  全 0 而不是 NaN** —— running max 要用有限的 `-1e30` 兜底。
+  ⚠️ 这条**在标准输入上就会被触发**（见第 5.1 节：layer 2 第 0 行整行是 -1），
+  不是理论边界。
+- **RMSNorm 的 eps**：config 是 `1e-20`，golden 全程用它（`ref/model.py:933-934` 等处都
+  显式传 `args.norm_eps`；`RMSNorm.__init__` 的默认值 1e-6 从不生效），计算在 fp32 下做。
+  实测全部 40 层 × 27 token 的 `mean(x²)` 最小值 = **3.95e-4**（layer 2 attention 输入），
+  所以融合算子若把 eps 钳到 1e-6，最坏相对偏差 = `1e-6/(2·3.95e-4)` = **1.3e-3**，
+  与 bf16 ULP 同量级，**不可接受**。
+  **判据：eps 下限必须 ≤ 8e-10**（由 `eps/(2·3.95e-4) < 1e-6` 反解）。
+  适用边界：只测了 dim=5120 的两个 norm；`q_norm` / `kv_norm` / indexer `k_norm` 维度小得多，
+  未测。
+
+### 10.5 GEMM 累加精度
+
+`kernel_cpu.GOLDEN_DOT_DTYPE` 默认 `torch.float32`，设成 `torch.float64` 得到更紧的参考
+（约慢 8 倍、内存约 2 倍）。`run_golden.py --fp64` 就是这么切的。
+
+⚠️ **fp32 与 fp64 两种参考产出的整模型结果不可混用** —— 第 0 节的实验就是这两者之差，
+它翻转了 22% 的路由。单算子对照不受影响（差异 ~1e-7），但一旦进入整模型逐层比对就要统一。

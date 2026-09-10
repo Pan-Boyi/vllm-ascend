@@ -182,6 +182,11 @@ class StreamingMoE(nn.Module):
         self.experts_loaded = 0
         self.expert_bytes = 0
         self.record_margin = None      # set by _attach_taps when dumping
+        # Forced routing (ROUTING_INJECTION.md).  Both are set together by
+        # GoldenModel.forward when a plan is supplied; see the note in forward().
+        self.routing_override = None   # (layer_id, positions, weights, indices) -> (weights, indices)
+        self.routing_positions = None  # [n_rows] absolute sequence position of each gate row
+        self.record_forced = None      # set by _attach_taps when dumping
 
     def _bind_expert(self, i: int):
         p = f"{self.prefix}ffn.experts.{i}."
@@ -231,6 +236,20 @@ class StreamingMoE(nn.Module):
         if self.record_margin is not None:
             self.record_margin(self.routing_margin(x, None if image_mask is None else image_mask.flatten()))
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
+        if self.routing_override is not None:
+            # Substitute the plan's expert choice for this layer's own top-k.  This
+            # sits before the dispatch loop below and before any expert id is used,
+            # which is the injection point the NPU side has to match: an override
+            # applied after dispatch would not change which experts ran.
+            assert self.routing_positions is not None, (
+                "routing_override was set without routing_positions -- a row-index "
+                "lookup is exactly the misalignment ROUTING_INJECTION.md forbids"
+            )
+            weights, indices = self.routing_override(
+                self.layer_id, self.routing_positions, weights, indices
+            )
+            if self.record_forced is not None:
+                self.record_forced(weights, indices)
         y = torch.zeros_like(x, dtype=torch.float32)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.n_routed_experts):
@@ -337,6 +356,15 @@ def _attach_taps(block, rec: Recorder):
     handles.append(block.ffn.register_forward_hook(hook("moe", want_input=True)))
     handles.append(block.ffn.gate.register_forward_hook(hook("moe_gate")))
     block.ffn.record_margin = lambda t: rec.add("moe_routing_margin", t)
+
+    def _forced(w, i):
+        # Recorded AFTER the override returns, so it is evidence the experts really
+        # ran on these ids -- not merely that a plan file was readable.  Absent when
+        # routing is free, which is how a comparison tells the two phases apart.
+        rec.add("moe_gate.forced.0", w)
+        rec.add("moe_gate.forced.1", i)
+
+    block.ffn.record_forced = _forced
     if block.engram is not None:
         handles.append(block.engram.register_forward_hook(hook("engram")))
     if block.attn.compressor is not None:
@@ -437,10 +465,38 @@ class GoldenModel:
     # -- forward -----------------------------------------------------------
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, rec: Recorder | None = None,
-                n_layers: int | None = None, full_logits: bool = True):
+                n_layers: int | None = None, full_logits: bool = True,
+                start_pos: int = 0, routing_plan=None, layer_in_dir: str | None = None):
+        """``layer_in_dir`` turns every block into an independent comparison.
+
+        Forced routing removes the discrete verdict but not the *accumulation*: the
+        residual stream is bf16, so a ~1e-7 arithmetic difference occasionally moves
+        one token by one ULP, and causal attention then spreads that token into every
+        later one.  Measured over 3 layers, that alone takes ``layer.out`` from 4.0e-4
+        to 2.3e-2 with routing pinned -- past the protocol's own 2e-2 threshold, with
+        no bug present.
+
+        Pointing this at a golden dump overwrites ``layer.in``/``pre_mix.in`` at each
+        block entry, so each layer is judged on the golden's input instead of on its
+        own predecessors' output.  It does NOT isolate cross-layer state (KV cache,
+        the compressor latents from layers 2/8/14/20, layer 20's candidate blocks),
+        which still come from this run -- partial isolation, not total.
+        """
         args = self.args
         rec = rec or Recorder(None, enabled=False)
         n_layers = args.n_layers if n_layers is None else n_layers
+
+        # Absolute sequence position of every token in this call -- the key the
+        # forced-routing plan is addressed by.  Deliberately *not* the row index:
+        # see section 0 of ROUTING_INJECTION.md.
+        positions = torch.arange(start_pos, start_pos + input_ids.size(1))
+        if routing_plan is not None:
+            assert input_ids.size(0) == 1, (
+                f"a routing plan describes one sequence; got batch {input_ids.size(0)}. "
+                "Use one plan per request."
+            )
+            if start_pos == 0:
+                routing_plan.check_input_ids(input_ids)
 
         engram_hashes = None
         if self.engram_hash is not None:
@@ -464,7 +520,20 @@ class GoldenModel:
             self.load_block(block, i)
             t_load = time.time() - t0
 
+            if layer_in_dir is not None:
+                from safetensors.torch import load_file
+                ref = load_file(os.path.join(layer_in_dir, f"layer_{i:02d}.safetensors"))
+                assert tuple(ref["layer.in"].shape) == tuple(h.shape), (
+                    f"layer {i}: reference layer.in {tuple(ref['layer.in'].shape)} "
+                    f"vs this run {tuple(h.shape)}"
+                )
+                h = ref["layer.in"].to(h.dtype).clone()
+                pre_mix = ref["pre_mix.in"].to(pre_mix.dtype).clone()
+
             handles = _attach_taps(block, rec)
+            if routing_plan is not None:
+                block.ffn.routing_override = routing_plan.override
+                block.ffn.routing_positions = positions
             rec.add("layer.in", h)
             rec.add("pre_mix.in", pre_mix)
 

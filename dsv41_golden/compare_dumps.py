@@ -34,8 +34,33 @@ TOLERANCES = {
 REL_FLOOR_FRAC = 1e-2
 
 
-def metrics(a: torch.Tensor, b: torch.Tensor) -> dict:
+# Expert selection is a *set*, not a sequence: MoE sums over the chosen experts and
+# the golden accumulates them in expert-id order (``for i in range(n_routed_experts)``),
+# so the order ``topk`` happens to return them in changes nothing.  Comparing these
+# element-wise counts pure order swaps as routing flips -- which is how the
+# fp32-vs-fp64 experiment came to be reported as 7.4%/55.6% when the real figures
+# are 0%/22.2% (9 of the 15 "flipped" tokens at layer 2 were order swaps only).
+SET_VALUED = ("moe_gate.out.1", "moe_gate.forced.1")
+
+
+def routing_agreement(a: torch.Tensor, b: torch.Tensor) -> dict:
+    """Per-token set comparison of two [n_tokens, topk] expert selections."""
+    ai, bi = a.to(torch.int64), b.to(torch.int64)
+    same_set = (ai.sort(-1).values == bi.sort(-1).values).all(-1)
+    same_seq = (ai == bi).all(-1)
+    n = int(same_set.numel())
+    return {"kind": "routing", "n": n,
+            "exact": bool(same_set.all()),
+            "tokens_set_differ": int((~same_set).sum()),
+            "tokens_order_only": int((same_set & ~same_seq).sum()),
+            "match_frac": float(same_set.sum()) / max(n, 1),
+            "differing_tokens": (~same_set).nonzero().flatten().tolist()[:16]}
+
+
+def metrics(a: torch.Tensor, b: torch.Tensor, name: str = "") -> dict:
     """a = candidate, b = golden."""
+    if name in SET_VALUED and a.dim() == 2:
+        return routing_agreement(a, b)
     if a.dtype in (torch.int32, torch.int64, torch.int16, torch.uint8, torch.bool):
         same = int((a == b).sum())
         total = a.numel()
@@ -61,13 +86,39 @@ def metrics(a: torch.Tensor, b: torch.Tensor) -> dict:
     denom = af.norm() * bf.norm()
     out["cos"] = float((af @ bf) / denom) if denom > 0 else 1.0
     out["golden_rms"] = rms
+
+    # Per-token view.  The dominant divergence path in this model is one token
+    # crossing a bf16 rounding boundary and causal attention then spreading it to
+    # every later token, so "how many tokens are still bit-identical" separates a
+    # local arithmetic difference from one that has already been broadcast.  A
+    # whole-tensor rel_l2 hides that completely.
+    if a.dim() >= 3 and a.shape[0] == 1 and b.shape[0] == 1:
+        av = a.double().reshape(a.shape[1], -1)
+        bv = b.double().reshape(b.shape[1], -1)
+        tok_exact = int((av == bv).all(-1).sum())
+        bn_tok = bv.norm(dim=-1)
+        rel_tok = (av - bv).norm(dim=-1) / bn_tok.clamp(min=1e-30)
+        out["tokens"] = int(av.shape[0])
+        out["tokens_bit_exact"] = tok_exact
+        out["max_token_rel_l2"] = float(rel_tok.max())
     return out
 
 
-def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True):
+def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
+                force_route: str = "off"):
+    """``force_route`` comes from the candidate's manifest (see ROUTING_INJECTION.md).
+
+    With routing forced, the candidate's *own* gate output is expected to disagree
+    with the golden -- that disagreement is the thing being designed out, not a
+    failure -- so it drops to informational.  What becomes a hard gate instead is
+    that the injection actually landed: ``moe_gate.forced.1`` must equal the
+    golden's selection.  Without that check a typo'd env var reads as a broad
+    numerical failure, i.e. exactly like an operator bug.
+    """
     tags = sorted(f[:-len(".safetensors")] for f in os.listdir(golden)
                   if f.endswith(".safetensors"))
-    results, failures, missing = {}, [], []
+    results, failures, missing, notes = {}, [], [], []
+    forced = force_route.startswith("moe")
 
     for tag in tags:
         gpath = os.path.join(golden, tag + ".safetensors")
@@ -87,9 +138,24 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True):
                                  "candidate": list(ct.shape)}
                 failures.append((tag, name, "shape mismatch"))
                 continue
-            m = metrics(ct, gt)
+            m = metrics(ct, gt, name)
             tag_res[name] = m
-            if m["kind"] == "int":
+            if m["kind"] == "routing":
+                if m["exact"]:
+                    pass
+                elif forced and name == "moe_gate.out.1":
+                    # informational: the candidate's free-running gate, which the
+                    # injection deliberately overrode
+                    notes.append((tag, name,
+                                  f"{m['tokens_set_differ']}/{m['n']} tokens route elsewhere "
+                                  f"(expected under force_route={force_route})"))
+                else:
+                    failures.append((tag, name,
+                                     f"{m['tokens_set_differ']}/{m['n']} tokens select a "
+                                     f"different expert SET "
+                                     f"(+{m['tokens_order_only']} order-only, not counted); "
+                                     f"first: {m['differing_tokens'][:6]}"))
+            elif m["kind"] == "int":
                 if not m["exact"]:
                     failures.append((tag, name, f"{100 * (1 - m['match_frac']):.2f}% indices differ"))
             else:
@@ -98,6 +164,21 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True):
                 elif m["rel_l2"] > tol["rel_l2"] or m["cos"] < tol["cos"]:
                     failures.append((tag, name,
                                      f"rel_l2={m['rel_l2']:.3e} cos={m['cos']:.6f}"))
+        # Did the injection actually reach the experts?  Cross-name on purpose: the
+        # candidate records what it fed the experts, the golden records what it chose.
+        if "moe_gate.forced.1" in c and "moe_gate.out.1" in g:
+            r = routing_agreement(c["moe_gate.forced.1"], g["moe_gate.out.1"])
+            tag_res["moe_gate.forced.1_vs_golden"] = r
+            if not r["exact"]:
+                failures.append((tag, "moe_gate.forced.1",
+                                 f"INJECTION DID NOT LAND: {r['tokens_set_differ']}/{r['n']} "
+                                 "tokens went to the experts with a different expert set than "
+                                 "the golden chose. Check the plan path and FORCE_ROUTE before "
+                                 "looking at any operator."))
+        elif forced and "moe_gate.out.1" in g and "moe_gate.forced.1" not in c:
+            notes.append((tag, "moe_gate.forced.1",
+                          "absent: cannot verify the injection landed (see ROUTING_INJECTION.md s3)"))
+
         results[tag] = tag_res
 
         if verbose:
@@ -106,9 +187,13 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True):
             if worst is not None:
                 wname = [k for k, v in tag_res.items() if v is worst][0]
                 flag = "FAIL" if any(f[0] == tag for f in failures) else "ok  "
+                tokinfo = ""
+                if "tokens_bit_exact" in worst:
+                    tokinfo = (f" tok_exact={worst['tokens_bit_exact']}/{worst['tokens']}"
+                               f" max_tok={worst['max_token_rel_l2']:.2e}")
                 print(f"  {flag} {tag:12s} worst={wname:22s} "
-                      f"rel_l2={worst['rel_l2']:.3e} cos={worst['cos']:.6f}")
-    return results, failures, missing
+                      f"rel_l2={worst['rel_l2']:.3e} cos={worst['cos']:.6f}{tokinfo}")
+    return results, failures, missing, notes
 
 
 def main():
@@ -124,18 +209,31 @@ def main():
     print(f"candidate {a.candidate}")
     print(f"tolerance {a.tolerance}: rel_l2 <= {tol['rel_l2']:.0e}, cos >= {tol['cos']}")
 
+    force_route = "off"
     for d in (a.golden, a.candidate):
         mp = os.path.join(d, "manifest.json")
         if os.path.exists(mp):
             with open(mp) as f:
                 man = json.load(f)
             print(f"  {os.path.basename(d)}: input_ids={man.get('input_ids')} "
-                  f"layers={man.get('n_layers_run')}")
+                  f"layers={man.get('n_layers_run')} accum={man.get('accum_dtype')} "
+                  f"force_route={man.get('force_route', 'off')}")
+            if d == a.candidate:
+                force_route = man.get("force_route", "off") or "off"
+
+    if force_route != "off":
+        print(f"\nforced routing ({force_route}): the candidate's own moe_gate.out.1 is "
+              f"informational;\nthe gate is moe_gate.forced.1 == golden's selection.")
+    print()
+    results, failures, missing, notes = compare_dir(a.golden, a.candidate, tol,
+                                                    force_route=force_route)
 
     print()
-    results, failures, missing = compare_dir(a.golden, a.candidate, tol)
-
-    print()
+    if notes:
+        print(f"{len(notes)} informational (not failures):")
+        for tag, name, why in notes[:10]:
+            print(f"  {tag}/{name}: {why}")
+        print()
     if missing:
         print(f"MISSING from candidate ({len(missing)}): {missing[:10]}")
     if failures:
@@ -149,8 +247,10 @@ def main():
 
     if a.json:
         with open(a.json, "w") as f:
-            json.dump({"tolerance": a.tolerance, "results": results,
-                       "failures": [list(x) for x in failures], "missing": missing}, f, indent=2)
+            json.dump({"tolerance": a.tolerance, "force_route": force_route,
+                       "results": results,
+                       "failures": [list(x) for x in failures],
+                       "notes": [list(x) for x in notes], "missing": missing}, f, indent=2)
         print(f"wrote {a.json}")
     sys.exit(verdict)
 

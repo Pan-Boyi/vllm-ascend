@@ -42,6 +42,12 @@ def main():
     ap.add_argument("--floor-gb", type=float, default=150.0)
     ap.add_argument("--fp64", action="store_true", help="accumulate the GEMMs in float64")
     ap.add_argument("--no-engram", action="store_true", help="skip engram layers (no tokenizer needed)")
+    ap.add_argument("--routing-plan", type=str, default=None,
+                    help="force the MoE expert choice from this plan (file or dir); "
+                         "see ROUTING_INJECTION.md")
+    ap.add_argument("--force-layer-in", type=str, default=None, metavar="GOLDEN_DUMP_DIR",
+                    help="overwrite layer.in/pre_mix.in at each block entry from this "
+                         "golden dump, making every layer an independent comparison")
     args_cli = ap.parse_args()
 
     torch.set_num_threads(args_cli.threads)
@@ -84,10 +90,20 @@ def main():
     model = G.GoldenModel(args, ckpt, tokenizer, guard)
     print(f"setup {time.time() - t0:.1f}s, rss {G.rss_gb():.1f} GB", flush=True)
 
+    plan = None
+    if args_cli.routing_plan:
+        from routing_plan import RoutingPlan
+        plan = RoutingPlan.load(args_cli.routing_plan)
+        print(f"forced routing: {args_cli.routing_plan}  layers={len(plan.layers)} "
+              f"topk={plan.topk} plan_accum={plan.meta.get('accum_dtype')}", flush=True)
+
     rec = G.Recorder(args_cli.dump, enabled=args_cli.dump is not None)
     t1 = time.time()
-    logits = model.forward(input_ids, rec, n_layers=args_cli.layers)
+    logits = model.forward(input_ids, rec, n_layers=args_cli.layers, routing_plan=plan,
+                           layer_in_dir=args_cli.force_layer_in)
     dt = time.time() - t1
+    if plan is not None:
+        print(f"  routing   {plan.summary()}")
 
     st = model.stats
     print()
@@ -111,6 +127,13 @@ def main():
         "n_layers_run": args_cli.layers,
         "seed": args_cli.seed,
         "accum_dtype": str(kernel_cpu.GOLDEN_DOT_DTYPE),
+        # Consumed by compare_dumps.py to pick the judgment order: with routing
+        # forced, a routing mismatch is expected and must not gate the comparison.
+        "force_route": ("off" if plan is None else "moe") + (
+            "+layer_in" if args_cli.force_layer_in else ""),
+        "force_layer_in": args_cli.force_layer_in,
+        "routing_plan": args_cli.routing_plan,
+        "routing_plan_accum_dtype": None if plan is None else plan.meta.get("accum_dtype"),
         "torch_version": torch.__version__,
         "model_dir": G.MODEL_DIR,
         "wall_seconds": round(dt, 2),
