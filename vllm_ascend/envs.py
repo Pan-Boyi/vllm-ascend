@@ -76,6 +76,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # DeepSeek-V4.1 layer-by-layer alignment against the CPU golden reference.
+    # All four are debug-only and off by default; they cost nothing when unset.
+    # Directory to write NPU dumps into, named per the alignment protocol.
+    "VLLM_ASCEND_DSV41_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_DSV41_DUMP_DIR", ""),
+    # Golden's full dump directory (golden_dumps/full40). Required for
+    # 'layer_in' injection; also the fallback routing source.
+    "VLLM_ASCEND_DSV41_GOLDEN_DIR": lambda: os.getenv("VLLM_ASCEND_DSV41_GOLDEN_DIR", ""),
+    # Golden's compact routing plan (golden_dumps/plan_full40), 58 KB versus
+    # 271 MB for the full dump; preferred source for routing injection.
+    "VLLM_ASCEND_DSV41_ROUTING_PLAN": lambda: os.getenv("VLLM_ASCEND_DSV41_ROUTING_PLAN", ""),
+    # Which decisions to take from golden instead of computing them:
+    # "off" (default) | "moe" | "moe+layer_in" | "moe+indexer"; flags join with "+".
+    "VLLM_ASCEND_DSV41_FORCE_ROUTE": lambda: os.getenv("VLLM_ASCEND_DSV41_FORCE_ROUTE", "off"),
 }
 
 # end-env-vars-definition
