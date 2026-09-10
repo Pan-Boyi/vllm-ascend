@@ -43,18 +43,92 @@ out = (row.float() * sc.float()).bfloat16()
 ⚠️ **适用边界**：这是对**实际用到的 648 行**验证的，不是对全部 3.84 亿行的证明。
 论证是结构性的（指数 × 3 位尾数），我认为对全表成立，但只测了用到的那些。
 
+### 参考可以直接 import，不必走 CLI
+
+```python
+from engram_lookup_ref import lookup, lookup_raw, dequantize, compare
+
+rows = lookup(ckpt, layer_id, hash_ids)        # [*hash_ids.shape, 256] bf16，形状保持
+fp8, sc = lookup_raw(ckpt, layer_id, hash_ids) # 原始字节，用来分开「取错行 / 反量化错」
+verdict = compare(rows, npu_rows)              # 判据 G-3：字节相同，模掉带符号零
+```
+
+`lookup` 对 `hash_ids` 是**形状保持**的 —— 单 token、整个 batch、或者 NPU kernel
+递过来的展平行布局都能直接用，不需要先 reshape 成 `[B, L, 24]`。
+表 189.1 GiB **从不整体加载**：只按 `hash_ids` 去 mmap 里 seek 出那些行，
+只有被碰到的页会 fault in（标准输入每层 648 行 / 3.84 亿行）。
+
 ### 参考产出
 
 ```bash
 python engram_hash_ref.py   --verify $DU/full40_v2 --decode-from 20   # 整数哈希，9 秒，不加载权重
-python engram_lookup_ref.py --out $DU/engram_lookup_ref               # 查表结果
+python engram_lookup_ref.py --out $DU/engram_lookup_ref               # 查表结果 + 原始 fp8/scale 行
+python engram_lookup_ref.py --verify NPU_PRODUCED.safetensors         # 判据 G-3，exit 1 即失败
+python engram_lookup_ref.py --scan                                    # 重做字节位型普查（见 1a）
 ```
 
 | | 指纹 |
 |---|---|
 | `engram_hash_ids` `[1,27,2,24]` int64（dim=2 顺序 = **[layer 1, layer 14]**）| sha `39fa11acd920fafd` |
-| layer 1 查表结果 `[27,24,256]` bf16 | sha `132146ac8219dd43` |
-| layer 14 查表结果 `[27,24,256]` bf16 | sha `ca89820962d7bbfa` |
+| layer 1 查表结果 `[1,27,24,256]` bf16 | sha `132146ac8219dd43` |
+| layer 1 **原始 fp8 行** `[1,27,24,256]` e4m3 | sha `51a5102c9d4a442e` |
+| layer 1 **原始 scale 行** `[1,27,24,8]` e8m0 | sha `8fb7b44f74d9b780` |
+| layer 14 查表结果 `[1,27,24,256]` bf16 | sha `ca89820962d7bbfa` |
+| layer 14 **原始 fp8 行** `[1,27,24,256]` e4m3 | sha `fc34fa39ae1ce07e` |
+| layer 14 **原始 scale 行** `[1,27,24,8]` e8m0 | sha `3da698cb88d9d6c6` |
+
+**为什么连原始 fp8/scale 行一起给**：查表能错的地方有两处 —— **取错行**（哈希、
+索引、分片）和**反量化错**（scale 布局、block 大小）。只比最终输出时,两者的症状
+完全一样。原始行一起比就能一步分开,`--verify` 会直接说是哪一半错。
+实测三个对照(见下)确认它真的分得开。
+
+### 1a. 🔴 判据是「字节相同,**模掉带符号零**」——不是裸字节相同
+
+`compare()` 的逐元素通过条件是「**字节相同 或 值相同**」。一个条件同时覆盖两个方向
+相反的陷阱,不需要两套逻辑:
+
+| 陷阱 | 形态 | 裸比对的后果 | 本表里是否存在 |
+|---|---|---|---|
+| `NaN` | 字节相同、**值不等** | 按值比 → **假报警** | ❌ **不存在**(实测) |
+| **负零** | **值相等**、字节不同 | 按字节比 → **假报警** | ✅ **存在,而且会命中** |
+
+实测(`--scan`,每表取 60 万行三段):
+
+- **e4m3 的两个 NaN 位型 `0x7F`/`0xFF` 一次都没出现。** 256 个字节值里出现了 **254 个**,
+  没出现的正好就是这两个 → 量化时被夹到了 ±448。**所以「NaN != NaN 让按值比对假通过」
+  这个方向在本模型上不成立**,不必为它设计。
+- **`0x80`(负零)真实存在**:每 20 万行约 174 个字节,即约 **1/1150 行**含一个。
+  27 token 一层取 648 行 → **标准输入下每层正好命中 1 个**(不是构造出来的边角)。
+  `-0.0 × 2^k = -0.0`,活到 bf16 输出就是 `0x8000`。
+
+⇒ 一个把 `-0` 规范化成 `+0` 的实现是**数值上完全正确**的(`-0.0 + x == +0.0 + x`
+对所有 x 成立,查表输出只参与加和乘),但**裸字节比对会判它失败**。
+所以判据必须模掉带符号零,并把个数报出来(系统性的符号差异仍然看得见,只是不算失败)。
+
+> 这条是协调方提醒「按字节读 fp8,别经过会规范化的路径」时顺着查出来的。
+> **读的一侧本来就已经是字节路径**(`Checkpoint.gather_rows` 切 mmap 成 `uint8`
+> 再 `.view(dtype)` 重解释,没有任何转换)。**危险在比对的一侧,而且方向和预想的相反。**
+
+### 1b. 护栏本身用三个对照验过
+
+只看「参考跑自己通过」不算验证(它和目标共享全部实现)。三个人造变体:
+
+| 变体 | 期望 | 实测 |
+|---|---|---|
+| 把 `-0` 规范化成 `+0`(数值完全正确) | **通过**,并报 forgiven 数 | ✅ 通过,`differs only in the sign of zero (1 elements)`,exit 0 |
+| scale block 用 16 而不是 32(形状对、答案错) | 失败,定位到**反量化** | ✅ `57951 elements differ` + `the DEQUANTIZE is wrong, not the gather`,exit 1 |
+| 取行索引偏一行 | 失败,定位到**取行** | ✅ `1 rows touched` + `the GATHER is wrong; do not look at the dequantize`,exit 1 |
+
+### 1c. ⛔ 不要用 `ckpt.dequant_fp8_2d` 反量化 engram
+
+那个 helper 是给**权重**用的,权重的 scale 是**二维 block 网格**,它对两个轴都做
+`repeat_interleave`。**engram 的 scale 是逐行一维的**:`[nrows, 8]`,只沿 `dim` 每 32 个值
+一个指数。拿它喂 engram 张量会**静默产出一个形状正确的错答案** —— 这正是上面第二个
+对照模拟的故障。`dequantize()` 里有一条断言专门挡这个。
+
+另外实测 scale 的指数只跨 `2**-10 ~ 2**-5`(layer 1 五种、layer 14 六种取值),
+`scale.float()` 与 `2**(byte-127)` **逐位相同** —— 所以参考实现不依赖 torch 的 fp8
+转换语义,这一条也在 `--verify` 里每次报。
 
 实测表规模：`layers.1.engram.embed.weight [384006168, 256]` float8_e4m3fn
 + scale `[.., 8]` float8_e8m0fnu；layer 14 是 `[384016682, 256]`。**1D block-32。**
