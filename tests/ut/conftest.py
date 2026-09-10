@@ -34,7 +34,14 @@ from unittest.mock import MagicMock
 
 try:
     # Note: do not import torch here for cpu env, which will lead to circle import error.
-    subprocess.run(["npu-smi", "info"], capture_output=True, check=True)
+    # `npu-smi info` walks every card, so one unhealthy card hangs it -- and with capture_output the
+    # hang has no symptom at all: collection simply never finishes. Bound it.
+    subprocess.run(["npu-smi", "info"], capture_output=True, check=True, timeout=30)
+    _npu_available = True
+except subprocess.TimeoutExpired:
+    # npu-smi is installed and the driver answered far enough to hang, so this is an NPU machine with
+    # a sick card rather than a CPU one. Keep the real modules: falling back to the mocks here would
+    # quietly test something else entirely.
     _npu_available = True
 except (subprocess.CalledProcessError, FileNotFoundError):
     _npu_available = False
