@@ -71,15 +71,30 @@ def get_value_from_lines(lines: list[str], key: str) -> str:
     return ""
 
 
+NPU_SMI_TIMEOUT_SECONDS = 30
+
+
 def get_chip_type() -> str:
     try:
         # Get NPU ID
-        npu_info_lines = subprocess.check_output(["npu-smi", "info", "-l"]).decode().strip().split("\n")
+        # Every npu-smi call here is bounded: `-l` walks the cards, so one unhealthy card hangs it,
+        # and check_output buffers the partial output, which leaves the build stuck with no message.
+        npu_info_lines = (
+            subprocess.check_output(["npu-smi", "info", "-l"], timeout=NPU_SMI_TIMEOUT_SECONDS)
+            .decode()
+            .strip()
+            .split("\n")
+        )
         npu_id = int(get_value_from_lines(npu_info_lines, "NPU ID"))
 
         # Stage 1: query board info without -c flag
         board_info_lines = (
-            subprocess.check_output(["npu-smi", "info", "-t", "board", "-i", str(npu_id)]).decode().strip().split("\n")
+            subprocess.check_output(
+                ["npu-smi", "info", "-t", "board", "-i", str(npu_id)], timeout=NPU_SMI_TIMEOUT_SECONDS
+            )
+            .decode()
+            .strip()
+            .split("\n")
         )
 
         # Check if Chip Name exists (Ascend950 includes it directly)
@@ -88,7 +103,10 @@ def get_chip_type() -> str:
         # Stage 2: query with -c flag only if Chip Name not found (A2/A3/310P)
         if not chip_name:
             chip_info_lines = (
-                subprocess.check_output(["npu-smi", "info", "-t", "board", "-i", str(npu_id), "-c", "0"])
+                subprocess.check_output(
+                    ["npu-smi", "info", "-t", "board", "-i", str(npu_id), "-c", "0"],
+                    timeout=NPU_SMI_TIMEOUT_SECONDS,
+                )
                 .decode()
                 .strip()
                 .split("\n")
@@ -123,6 +141,12 @@ def get_chip_type() -> str:
             return "ascend910b1"
         else:
             raise ValueError(f"Unable to recognize chip name: {chip_name}, please manually set env SOC_VERSION")
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"npu-smi did not answer within {NPU_SMI_TIMEOUT_SECONDS}s ({e.cmd}). A single unhealthy "
+            "card is enough to hang a query that walks all of them. Set SOC_VERSION explicitly to "
+            "skip the probe, for example SOC_VERSION=ascend950dt_9582."
+        ) from e
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Get chip info failed: {e}")
     except FileNotFoundError:
