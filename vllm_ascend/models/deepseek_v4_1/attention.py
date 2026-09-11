@@ -71,6 +71,15 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
     # CANN's MixedQuantSparseFlashMla in quant_mode=2 *is* byte-identical to
     # fp8_ds_mla; once that operator is bound, this flips to True and the KV
     # budget drops from 1930 to 1790 B/token.
+    #
+    # Flipping it is not a one-line change. Upstream's two fused prologs differ
+    # by more than the cache layout: the fp8_ds_mla one
+    # (fused_..._rope_quant_insert) also zeroes the padding head slots during
+    # Q-side RoPE and returns a padded q it allocated itself, where the bf16 one
+    # (fused_..._full_cache_bf16_insert, which is what this False selects)
+    # rewrites q in place with no padding at all. Nobody has found where that
+    # padding lands on Ascend. So this flips together with quant_mode=2, or the
+    # padding heads carry whatever was in them.
     use_fp8_ds_mla_layout: ClassVar[bool] = False
 
     # A _RATIO_BACKENDS map used to sit here, recording that ratio 2 had no
