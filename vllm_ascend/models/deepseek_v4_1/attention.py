@@ -31,6 +31,7 @@ from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
 from vllm_ascend.models.deepseek_v4_1.o_proj import check_grouped_wo_a_layout
 from vllm_ascend.models.deepseek_v4_1.platform_patches import \
     assert_ready_for_ratio_two
+from vllm_ascend.models.deepseek_v4_1.rope_groups import register_rope_groups
 from vllm_ascend.models.deepseek_v4_1.rope import \
     inverse_rope_from_cos_sin_cache
 from vllm_ascend.utils import oproj_tp_enable
@@ -186,6 +187,23 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=None,
             candidate_block_buffer=candidate_block_buffer,
+        )
+
+        # The compressor metadata builder looks its frequency table up by group
+        # name -- dsa_v1 builds f"c{ratio}" for every layer with ratio > 1 --
+        # and that registry is populated only by constructing an Ascend
+        # ComplexExpRotaryEmbedding. V4.1 builds upstream's rope instead, so
+        # nothing ever registered and a ratio-2 layer failed with
+        # "RoPE group c2 is not registered". Registered from the parameters of
+        # the rope upstream just built, never from a second derivation of them:
+        # the base differs per layer (compress_rope_theta 160000 against
+        # rope_theta 10000 here) and getting it wrong raises nothing.
+        register_rope_groups(
+            vllm_config,
+            layername=prefix,
+            rotary_emb=self.rotary_emb,
+            compress_ratio=self.compress_ratio,
+            head_size=self.rope_head_dim,
         )
 
     # -- upstream's abstract surface ---------------------------------------
