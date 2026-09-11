@@ -381,6 +381,46 @@ class StreamingMoE(nn.Module):
         return y.type_as(x).view(shape)
 
 
+def _wrap_indexer_post_rope(block, args):
+    """--indexer-post-rope: feed the indexer a RoPE'd copy of the latent.
+
+    ``ref/model.py:749`` states the order as a requirement: *"the indexer needs the
+    latent before RoPE, so it runs before the cache is written"*.  Getting it wrong
+    raises nothing -- the indexer just returns top-k over different scores, i.e. it
+    **selects different tokens**, which is indistinguishable from a correct run
+    unless something compares the selections.  And moving RoPE one step earlier looks
+    like a pure optimisation (one less pass over the latent), so whoever does it will
+    not think they changed semantics.
+
+    This is the negative arm.  It hands the indexer a *clone* with RoPE applied and
+    leaves the real latent untouched, so exactly one thing differs: what the indexer
+    saw.  Everything downstream -- the cache write, the quantization, the attention --
+    is bit-identical to a normal run.
+
+    ⚠️ The ``freqs`` slicing below mirrors ``ref/model.py:752-757`` and must stay in
+    step with it.  A latent stands for the FIRST token of its group, so group j takes
+    position ``j * ratio`` -- not its own index, which is the intuition everyone has.
+    """
+    attn = block.attn
+    if not getattr(attn, "is_kv_source", False):
+        return
+    ratio = attn.compress_ratio
+    _orig = attn._compress_topk_idxs
+
+    def _spy(x, qr, latent, start_pos, offset, compress_len, _o=_orig):
+        if latent is not None:
+            seqlen = x.size(1)
+            freqs = (attn.freqs_cis[: seqlen - seqlen % ratio : ratio]
+                     if start_pos == 0
+                     else attn.freqs_cis[start_pos + 1 - ratio].unsqueeze(0))
+            roped = latent.clone()
+            M.apply_rotary_emb(roped[..., -attn.rope_head_dim:], freqs)
+            latent = roped
+        return _o(x, qr, latent, start_pos, offset, compress_len)
+
+    attn._compress_topk_idxs = _spy
+
+
 def _record_ep_sim(layer_id, y_seq, parts, shared, out_dtype):
     """Compare the golden's id-order sum against every plausible all_reduce order.
 
@@ -561,6 +601,18 @@ def _attach_taps(block, rec: Recorder):
         real_sa = M.sparse_attn
 
         def sa_spy(*a, **k):
+            # Record what actually reached sparse_attn, not just what came out.  A
+            # sha on the output tells a comparison "different" without saying where;
+            # with the inputs the other side can compare pointwise and localise.
+            # Signature: sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale).
+            if len(a) >= 4:
+                rec.add("sa_in.q", a[0].clone())
+                rec.add("sa_in.kv", a[1].clone())        # already the concatenated
+                rec.add("sa_in.attn_sink", a[2].clone())  # [window ; compressed]
+                rec.add("sa_in.topk_idxs", a[3].clone())
+                if len(a) >= 5:
+                    rec.add("sa_in.softmax_scale",
+                            torch.tensor([float(a[4])], dtype=torch.float32))
             out = real_sa(*a, **k)
             rec.add("attn.o_raw", out.clone())      # before the in-place inverse RoPE
             holder["o"] = out
@@ -790,6 +842,8 @@ class GoldenModel:
         # set by run_golden.py --ep-sim; diagnostic only, the dumped values are
         # unchanged because the golden's own sum is still the one that is returned
         block.ffn.ep_sim = getattr(self, "ep_sim", 0) or None
+        if getattr(self, "indexer_post_rope", False):
+            _wrap_indexer_post_rope(block, self.args)
         return block
 
     # -- forward -----------------------------------------------------------

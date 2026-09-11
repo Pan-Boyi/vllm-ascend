@@ -46,6 +46,17 @@ def main():
                          "(the smallest difference the residual stream can hold, and the "
                          "size two different implementations start with). Measures what "
                          "that becomes after N layers")
+    ap.add_argument("--no-quant", action="store_true",
+                    help="bypass act_quant/fp4_act_quant so the two KV streams carry "
+                         "NO quantization noise. The dump is then NOT the model's real "
+                         "path -- it isolates the attention merge semantics from the "
+                         "per-stream quantization, so a reference can be checked one "
+                         "thing at a time")
+    ap.add_argument("--indexer-post-rope", action="store_true",
+                    help="DELIBERATELY WRONG ORDER: let the indexer see the latent "
+                         "AFTER RoPE instead of before (ref/model.py:749 requires "
+                         "before). Produces no error, only different top-k -- which is "
+                         "the point: it is the negative arm for that ordering")
     ap.add_argument("--ep-sim", type=int, default=0,
                     help="also sum the experts the way EP=N would (per-rank partial "
                          "sums + all_reduce) and report the spread against the "
@@ -122,6 +133,36 @@ def main():
     guard = G.MemoryGuard(args_cli.floor_gb)
     model = G.GoldenModel(args, ckpt, tokenizer, guard)
     model.ep_sim = args_cli.ep_sim
+
+    if args_cli.no_quant:
+        # Monkeypatched rather than edited into ref/kernel_cpu.py on purpose: the
+        # golden's real numerics must stay untouched, and a flag leaves a trace in
+        # the manifest where an edit would not.
+        # Patch the names in the MODEL module, not in kernel_cpu: model.py does
+        # `from kernel import act_quant, fp4_act_quant` (ref/model.py:13-14), so the
+        # call sites resolve against model's own namespace and rebinding the source
+        # module would have no effect.
+        import model as _mm
+        _real_aq, _real_fq = _mm.act_quant, _mm.fp4_act_quant
+
+        def _aq(x, *a, **k):
+            return x if (k.get("inplace") or (len(a) >= 4 and a[3])) else _real_aq(x, *a, **k)
+
+        def _fq(x, *a, **k):
+            return x if (k.get("inplace") or (len(a) >= 2 and a[1])) else _real_fq(x, *a, **k)
+
+        _mm.act_quant, _mm.fp4_act_quant = _aq, _fq
+        print("!!! --no-quant: act_quant/fp4_act_quant bypassed. This dump is NOT the "
+              "model's real path and is NOT comparable to a normal dump. It exists to "
+              "isolate the attention merge semantics from per-stream quantization.",
+              flush=True)
+
+    if args_cli.indexer_post_rope:
+        model.indexer_post_rope = True
+        print("!!! --indexer-post-rope: the indexer will see the latent AFTER RoPE. "
+              "ref/model.py:749 requires BEFORE. This is the negative arm for that "
+              "ordering -- the run will not error, it will just select different "
+              "tokens.", flush=True)
     print(f"setup {time.time() - t0:.1f}s, rss {G.rss_gb():.1f} GB", flush=True)
 
     plan = None
@@ -198,6 +239,10 @@ def main():
         # tokens before a perturbation can never see it, so they must stay
         # bit-exact for all 40 layers. See ALIGNMENT_PROTOCOL.md section 0.2.
         "perturb_ulp": list(pert) if pert else None,
+        # Both of these make the dump deliberately unlike the model; recorded so a
+        # comparison cannot mistake one for a normal reference.
+        "no_quant": args_cli.no_quant,
+        "indexer_post_rope": args_cli.indexer_post_rope,
         "routing_plan": args_cli.routing_plan,
         "routing_plan_accum_dtype": None if plan is None else plan.meta.get("accum_dtype"),
         "torch_version": torch.__version__,
