@@ -352,6 +352,15 @@ class StreamingMoE(nn.Module):
             )
             if self.record_forced is not None:
                 self.record_forced(weights, indices)
+        if getattr(self, "probs_bf16", False):
+            # Models the AllGather combine path as it stands today: the fp32 routing
+            # weights are handed to npu_moe_token_unpermute as
+            # ``probs=topk_weights.to(hidden_states.dtype)``, i.e. rounded to bf16
+            # (token_dispatcher.py:98).  The MC2 path passes ``.to(torch.float32)``
+            # instead, so the two paths disagree.  Everything else is unchanged --
+            # accumulation stays fp32 and the output is rounded once -- because that
+            # part was measured to match the operator already.
+            weights = weights.to(torch.bfloat16).float()
         y = torch.zeros_like(x, dtype=torch.float32)
         # --ep-sim only: one extra fp32 accumulator per simulated rank.  The expert
         # outputs are computed once and added into both, so this costs no expert
@@ -949,6 +958,7 @@ class GoldenModel:
         # set by run_golden.py --ep-sim; diagnostic only, the dumped values are
         # unchanged because the golden's own sum is still the one that is returned
         block.ffn.ep_sim = getattr(self, "ep_sim", 0) or None
+        block.ffn.probs_bf16 = getattr(self, "probs_bf16", False)
         if getattr(self, "indexer_post_rope", False):
             _wrap_indexer_post_rope(block, self.args)
         return block

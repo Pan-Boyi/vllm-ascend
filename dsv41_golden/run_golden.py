@@ -57,6 +57,11 @@ def main():
                          "AFTER RoPE instead of before (ref/model.py:749 requires "
                          "before). Produces no error, only different top-k -- which is "
                          "the point: it is the negative arm for that ordering")
+    ap.add_argument("--probs-bf16", action="store_true",
+                    help="round the fp32 routing weights to bf16 before weighting the "
+                         "experts, modelling the AllGather combine path's "
+                         "probs=topk_weights.to(hidden.dtype). Diagnostic: it makes "
+                         "the dump deliberately unlike the reference")
     ap.add_argument("--ep-sim", type=int, default=0,
                     help="also sum the experts the way EP=N would (per-rank partial "
                          "sums + all_reduce) and report the spread against the "
@@ -133,6 +138,10 @@ def main():
     guard = G.MemoryGuard(args_cli.floor_gb)
     model = G.GoldenModel(args, ckpt, tokenizer, guard)
     model.ep_sim = args_cli.ep_sim
+    model.probs_bf16 = args_cli.probs_bf16
+    if args_cli.probs_bf16:
+        print("!!! --probs-bf16: routing weights rounded to bf16 before the expert "
+              "weighting. Models one NPU path, NOT the reference.", flush=True)
 
     if args_cli.no_quant:
         # Monkeypatched rather than edited into ref/kernel_cpu.py on purpose: the
@@ -242,6 +251,7 @@ def main():
         # Both of these make the dump deliberately unlike the model; recorded so a
         # comparison cannot mistake one for a normal reference.
         "no_quant": args_cli.no_quant,
+        "probs_bf16": args_cli.probs_bf16,
         "indexer_post_rope": args_cli.indexer_post_rope,
         "routing_plan": args_cli.routing_plan,
         "routing_plan_accum_dtype": None if plan is None else plan.meta.get("accum_dtype"),

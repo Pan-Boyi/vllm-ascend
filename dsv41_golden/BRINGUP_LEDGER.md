@@ -95,8 +95,10 @@
 |---|---|
 | ✅ | EP=3 **和** EP=4 实测:同一批贡献在 **fp32** 里以任意顺序/分组求和,`moe.out` 上是 **0.000e+00,40 层每层都是 0**。**这条与数据流无关** ⇒ 「我们分片、golden 不分片」不能解释 `moe.out` 的任何不一致 `[golden 实测]` |
 | ✅ | **本部署下 MoE 那条 `all_reduce` 是 no-op**:TP 组 `world_size == 1`(A5 硬约束),`vllm/distributed/parallel_state.py:737-739` 原样返回输入 ⇒ `fused_moe.py` 的 200/241/259 三处一个字节都不动;昇腾在自己的 dispatch/combine 里归约(`fused_moe.py:245` 注释)`[golden 自核,integration 首先指出]` |
-| ❌ | **`npu_moe_distribute_combine_v2` 内部的累加精度,没人测过** |
-| ❌ | **`moe.out` 在 NPU 上的误差由哪个算子产生,未定位** |
+| ✅ | **AllGather 路(prefill)已定位并已测:`npu_moe_token_unpermute` = 权重先舍 bf16 → 累加在 fp32 → 输出只舍一次。⇒ 我那条「中间部分和不能舍到残差 dtype」在这条路上满足**(「逐次舍 bf16」这个候选只对上 51.74%,被明确排除)`[integration 实测,4 卡真跑,未经我复核]` |
+| ✅ | 四条 combine 里**只有两条可达**:`num_tokens ≤ mc2_tokens_capacity(512)` → MC2(decode),否则 → AllGather(prefill);ALLTOALL 要 `world_size > num_experts_per_tok = 6` 而我们是 4,FUSED_MC2 默认关 `[integration 读代码]` |
+| ❌ | **MC2 路(decode)没测** —— 而 decode 正是明账第 7 条那个「NPU 侧完全没有逐层对照」的路径 |
+| 🔴 | **新发现的一处可独立修掉的精度损失**:AllGather 路把 fp32 的路由权重舍成 bf16(`token_dispatcher.py:98` `probs=topk_weights.to(hidden_states.dtype)`),**而 MC2 路传 `.to(torch.float32)`** ⇒ **同一个模型在 prefill 和 decode 上用不同精度的路由权重。** 算子本身收 fp32 的 `probs`,所以这是可改的 `[integration 实测]`。**真实数据上的后果我正在测(`--probs-bf16`)** |
 | ⚠️ | 🔴 **我先前把这条写成「`all_reduce` 必须在 fp32」,并在消息里说过「现在知道 NPU 侧确实走的就是 bf16 那条路」—— 后半句是错的,已撤回。** 我把一个「`dist.all_reduce` 在 bf16 张量上按 bf16 累加」的测量,顺着滑成了「`moe.out` 的误差来自它」;**那是两个主张**,第二个需要「那条路径在本配置下存在」,而它不成立。 |
 | ⚠️ | 那个 **5.00e-01** 仍然是一个真实的代价,但它模拟的是**一种实现选择**(把每组部分和先舍到残差 dtype),**不是 NPU 的已测属性**。⇒ **先定位算子,再谈改。** 顺序反了会改错东西,而改错东西之后「没变好」会被当成「这条结论错了」 |
 
