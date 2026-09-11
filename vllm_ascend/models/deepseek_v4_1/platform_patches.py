@@ -76,21 +76,24 @@ def assert_ready_for_ratio_two(where: str) -> None:
             "something re-imported the module afterwards.")
 
 
-#: Cache layers upstream constructs by bare name, and the module whose globals
-#: the construction site reads. Both are built inline inside an ``__init__``,
-#: so subclassing the owner cannot replace them -- and subclassing the cache
-#: itself is worse than useless here: ``sparse_swa`` raises on a duplicate
-#: prefix, so a second instance would abort rather than shadow the first.
-CACHE_REBINDS = (
+#: Classes upstream constructs by bare name, and the module whose globals the
+#: construction site reads. All three are built inline inside an ``__init__``,
+#: so subclassing the owner cannot replace them -- and for the caches,
+#: subclassing the cache itself is worse than useless: ``sparse_swa`` raises on
+#: a duplicate prefix, so a second instance would abort rather than shadow the
+#: first.
+CLASS_REBINDS = (
     ("vllm.models.deepseek_v4_1.attention", "DeepseekV4SWACache",
      "AscendDeepseekV41SWACache"),
     ("vllm.models.deepseek_v4_1.compressor", "CompressorStateCache",
      "AscendDeepseekV41CompressorStateCache"),
+    ("vllm.models.deepseek_v4_1.common.engram", "ParallelEngramEmbedding",
+     "AscendEngramEmbedding"),
 )
 
 
-def rebind_cache_classes() -> list[str]:
-    """Point the two V4.1 cache construction sites at the Ascend subclasses.
+def rebind_upstream_classes() -> list[str]:
+    """Point the V4.1 construction sites at the Ascend subclasses.
 
     Returns the names rebound. Refuses rather than skipping when a name is
     gone: these sites are reached during KV cache setup, and a patch that
@@ -102,17 +105,18 @@ def rebind_cache_classes() -> list[str]:
     from vllm_ascend.models.deepseek_v4_1 import caches
 
     rebound = []
-    for module_name, upstream_name, ascend_name in CACHE_REBINDS:
+    for module_name, upstream_name, ascend_name in CLASS_REBINDS:
         module = importlib.import_module(module_name)
         # Checked before reading: a bare getattr raises Python's own terse
         # AttributeError and this explanation is never reached.
         if not hasattr(module, upstream_name):
             raise AttributeError(
                 f"{module_name} no longer defines {upstream_name!r}. The V4.1 "
-                "cache layer it names may have been renamed or moved; until "
-                "this is repointed, that cache is built from upstream's class, "
-                "which on Ascend means either a kv-cache spec the runner "
-                "cannot reshape or a backend with no get_kv_cache_shape.")
+                "class it names may have been renamed or moved. Until this is "
+                "repointed the site builds upstream's class, which on Ascend "
+                "means a kv-cache spec the runner cannot reshape, a backend "
+                "with no get_kv_cache_shape, or -- for the engram table -- an "
+                "attempt to hold 188.83 GiB in device memory.")
         replacement = getattr(caches, ascend_name)
         if getattr(module, upstream_name) is replacement:
             continue
@@ -138,7 +142,7 @@ def apply_all() -> list[str]:
         applied.append(JOIN_FLAG)
     apply_attn_selector_patch()
     applied.append("_select_dsv4_attn_cls")
-    applied.extend(rebind_cache_classes())
+    applied.extend(rebind_upstream_classes())
 
     if not applied:
         raise RuntimeError(

@@ -16,6 +16,7 @@ one replacement for both.
 from __future__ import annotations
 
 from vllm.config import VllmConfig
+from vllm.models.deepseek_v4_1.common.engram import ParallelEngramEmbedding
 from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
@@ -23,6 +24,8 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+from vllm_ascend.models.deepseek_v4_1.engram_gather import \
+    AscendParallelEngramEmbedding
 
 
 class AscendCompressorStateBackend(AscendDSABackend):
@@ -100,3 +103,24 @@ class AscendDeepseekV41SWACache(DeepseekV4SWACache):
             alignment=None,
             state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
         )
+
+
+class AscendEngramEmbedding(AscendParallelEngramEmbedding,
+                            ParallelEngramEmbedding):
+    """Upstream's engram table, looked up from host memory.
+
+    The mixin comes first so its ``_storage`` and ``lookup`` win the MRO; it
+    overrides exactly those two and inherits construction and weight loading.
+
+    This is the class that decides whether the model fits. The engram tables
+    are 188.83 GiB -- 39.8% of the checkpoint -- and upstream reads them
+    through a UVA view of device memory, which is not available here and would
+    not have room for them if it were. The Ascend lookup reads a shared
+    host mapping instead, with the device address travelling as an int64
+    inside an ordinary tensor because Triton's launcher admits only DEVICE and
+    HOST_NUMA pointer arguments.
+
+    If the host tables have not been bound, ``_storage`` raises rather than
+    falling back. There is no fallback worth having: the alternative is
+    allocating 188.83 GiB on a device that does not have it.
+    """

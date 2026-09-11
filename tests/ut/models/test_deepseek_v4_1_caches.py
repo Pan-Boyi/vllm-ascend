@@ -147,15 +147,15 @@ def test_the_construction_sites_see_the_ascend_classes():
     import vllm.models.deepseek_v4_1.attention as attention_mod
     import vllm.models.deepseek_v4_1.compressor as compressor_mod
 
-    platform_patches.rebind_cache_classes()
+    platform_patches.rebind_upstream_classes()
     assert attention_mod.DeepseekV4SWACache is caches.AscendDeepseekV41SWACache
     assert (compressor_mod.CompressorStateCache
             is caches.AscendDeepseekV41CompressorStateCache)
 
 
 def test_rebinding_is_idempotent():
-    platform_patches.rebind_cache_classes()
-    assert platform_patches.rebind_cache_classes() == []
+    platform_patches.rebind_upstream_classes()
+    assert platform_patches.rebind_upstream_classes() == []
 
 
 def test_a_vanished_name_is_refused_rather_than_skipped(monkeypatch):
@@ -163,7 +163,7 @@ def test_a_vanished_name_is_refused_rather_than_skipped(monkeypatch):
 
     monkeypatch.delattr(attention_mod, "DeepseekV4SWACache")
     with pytest.raises(AttributeError, match="no longer defines"):
-        platform_patches.rebind_cache_classes()
+        platform_patches.rebind_upstream_classes()
 
 
 def test_apply_all_reports_both_rebinds():

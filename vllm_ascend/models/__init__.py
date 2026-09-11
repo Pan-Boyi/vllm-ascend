@@ -35,6 +35,13 @@ def register_model():
         "DeepseekV4ForConditionalGeneration",
         "vllm_ascend.models.deepseek_v4.vl_model:AscendDeepseekV4ForConditionalGeneration",
     )
+    # V4.1 is a separate architecture string, not a version of the above. The
+    # target module lives inside the deepseek_v4_1 package, so importing it
+    # applies that package's platform patches before the model is built.
+    ModelRegistry.register_model(
+        "DeepseekV41ForCausalLM",
+        "vllm_ascend.models.deepseek_v4_1.model:AscendDeepseekV41ForCausalLM",
+    )
     ModelRegistry.register_model(
         "MiniMaxM3SparseForCausalLM",
         "vllm_ascend.models.minimax_m3:MiniMaxM3SparseForCausalLM",
