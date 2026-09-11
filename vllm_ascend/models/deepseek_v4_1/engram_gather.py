@@ -19,6 +19,19 @@ an error that reads like the hardware refusing the access.
 Non-expert weights use 32x32 tiles and engram does not; feeding a row of engram
 scales to a 2-D dequantiser produces a correctly shaped, entirely wrong answer.
 
+The kernel below carries upstream's semantics (vocab range, head sharding,
+zeros for padded heads, tail masking) on an access shape that a host mapping
+tolerates. Upstream's own shape does not: its 2-D block load faults there, and
+its ``cols // QUANT_BLOCK`` scale gather reads the wrong values while staying
+correct on HBM -- so HBM-only verification cannot see it. Measured on A5 the
+per-row shape is also about twice as fast on HBM, so there is one kernel rather
+than one per address space.
+
+Registration is not idempotent: re-registering the same range returns 507910.
+A table whose ``.data`` is replaced must be unregistered before it is
+registered again, which is the opposite failure direction from CUDA, where a
+stale view is silently reused.
+
 Dequantisation is exact by construction: ue8m0 is a bare exponent, so the
 multiplier is a power of two and the fp32 product carries no rounding. The
 exponent is turned into a float by writing the bits rather than by ``exp2``,
@@ -36,44 +49,60 @@ import triton.language as tl
 
 #: ``aclrtHostRegisterV2`` flag: map the host range into device address space.
 ACL_HOST_REG_MAPPED = 0x2
-#: Exponent bias of ue8m0, and the fp32 exponent field offset. Both are
-#: tl.constexpr because a @triton.jit body cannot read a plain module global.
-E8M0_BIAS = 127
-FP32_EXPONENT_SHIFT = tl.constexpr(23)
-#: One scale per this many values along a row.
+#: One scale per this many values along a row. Engram's scale is 1-D -- one
+#: exponent per block along the row -- unlike the 32x32 grid used for weights.
 SCALE_BLOCK = 32
 
 
 @triton.jit
-def _gather_engram_rows(
-    table_addr_ptr,      # int64 scalar tensor: device address of the fp8 table
-    scale_addr_ptr,      # int64 scalar tensor: device address of the e8m0 table
-    hash_ids_ptr,        # [n] int64
-    out_ptr,             # [n, DIM] bf16
+def engram_lookup_hostptr(
+    weight_addr,          # 1-element int64 tensor: device address of the fp8 table
+    scales_addr,          # 1-element int64 tensor: device address of the ue8m0 scales
+    ids,
+    out,
+    vocab_start,
+    vocab_end,
+    num_rows,
+    ids_stride_t,
+    ids_stride_h,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    TOTAL_HEADS: tl.constexpr,
     DIM: tl.constexpr,
-    BLOCK: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    GRID: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    row = tl.load(hash_ids_ptr + pid).to(tl.int64)
+    """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
-    table = tl.load(table_addr_ptr).to(tl.pointer_type(tl.uint8))
-    scales = tl.load(scale_addr_ptr).to(tl.pointer_type(tl.uint8))
-
-    off = tl.arange(0, DIM)
-    raw = tl.load(table + row * DIM + off)
-    values = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-
-    # ue8m0 byte -> 2**(byte - 127), written as an fp32 bit pattern so the
-    # multiplier is exactly a power of two with no transcendental involved.
-    n_scales: tl.constexpr = DIM // BLOCK
-    s_off = tl.arange(0, n_scales)
-    s_raw = tl.load(scales + row * n_scales + s_off).to(tl.uint32)
-    s_val = (s_raw << FP32_EXPONENT_SHIFT).to(tl.float32, bitcast=True)
-
-    # broadcast each scale across its BLOCK values
-    scaled = tl.reshape(values, (n_scales, BLOCK)) * s_val[:, None]
-    tl.store(out_ptr + pid * DIM + off,
-             tl.reshape(scaled, (DIM, )).to(tl.bfloat16))
+    Only this rank's heads are read; padded heads write zeros for all-gather.
+    `weight_addr`/`scales_addr` hold device addresses of host memory registered with
+    aclrtHostRegisterV2; HBM addresses work unchanged.
+    """
+    n_scales: tl.constexpr = DIM // QUANT_BLOCK
+    weight = tl.load(weight_addr).to(tl.pointer_type(tl.uint8))
+    scales = tl.load(scales_addr).to(tl.pointer_type(tl.uint8))
+    cols = tl.arange(0, DIM)
+    scale_off = tl.arange(0, n_scales)
+    for row in tl.range(tl.program_id(0), num_rows, GRID):
+        head = HEAD_START + row % LOCAL_HEADS
+        token = (row // LOCAL_HEADS).to(tl.int64)
+        index = tl.load(
+            ids + token * ids_stride_t + head * ids_stride_h,
+            mask=head < TOTAL_HEADS,
+            other=-1,
+        ).to(tl.int64)
+        owned = (head < TOTAL_HEADS) & (index >= vocab_start) & (index < vocab_end)
+        local = tl.where(owned, index - vocab_start, 0)
+        raw = tl.load(weight + local * DIM + cols, mask=owned, other=0)
+        values = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        # Contiguous, one scale per QUANT_BLOCK, then broadcast across the block. Indexing these
+        # with cols // QUANT_BLOCK instead reads the same values from HBM and the wrong ones from a
+        # host mapping.
+        scale = tl.load(scales + local * n_scales + scale_off, mask=owned, other=0)
+        # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
+        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        scaled = tl.reshape(values, (n_scales, QUANT_BLOCK)) * scale[:, None]
+        tl.store(out + row * DIM + cols, tl.reshape(scaled, (DIM,)).to(tl.bfloat16))
 
 
 @dataclass
@@ -133,21 +162,36 @@ def gather(table: HostTable,
            hash_ids: torch.Tensor,
            dim: int,
            num_rows: int,
-           block: int = SCALE_BLOCK) -> torch.Tensor:
+           block: int = SCALE_BLOCK,
+           grid: int | None = None) -> torch.Tensor:
     """Look up ``hash_ids`` and dequantise, returning ``[*shape, dim]`` bf16.
 
     ``hash_ids`` must already be bounds-checked; see :func:`check_in_range`.
+    ``grid`` defaults to the device's parallel-unit count. Upstream halves it
+    when gathering in the background, which costs about 2x here: a vector core
+    handed back is not one a cube core can use.
     """
     flat = hash_ids.reshape(-1).to(torch.int64)
     if flat.device.type != "npu":
         flat = flat.npu()
-    out = torch.empty((flat.numel(), dim), dtype=torch.bfloat16, device="npu")
+    rows = flat.numel()
+    out = torch.empty((rows, dim), dtype=torch.bfloat16, device="npu")
 
+    # The address travels as data inside an ordinary device tensor. Passing it
+    # as a pointer argument is rejected by Triton's launcher, which only admits
+    # DEVICE and HOST_NUMA locations -- a registered host mapping reports HOST.
     addr = torch.tensor([table.device_addr], dtype=torch.int64, device="npu")
     s_addr = torch.tensor([scale_table.device_addr], dtype=torch.int64,
                           device="npu")
-    _gather_engram_rows[(flat.numel(), )](addr, s_addr, flat, out,
-                                          DIM=dim, BLOCK=block)
+    ids_2d = flat.view(rows, 1)
+    if grid is None:
+        grid = torch.npu.get_device_properties(0).multi_processor_count
+
+    engram_lookup_hostptr[(grid, )](
+        addr, s_addr, ids_2d, out, 0, num_rows, rows,
+        ids_2d.stride(0), ids_2d.stride(1),
+        HEAD_START=0, LOCAL_HEADS=1, TOTAL_HEADS=1,
+        DIM=dim, QUANT_BLOCK=block, GRID=grid)
     return out.view(*hash_ids.shape, dim)
 
 
