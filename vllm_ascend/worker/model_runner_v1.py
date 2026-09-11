@@ -333,8 +333,27 @@ class NPUModelRunner(GPUModelRunner):
         # _allocate_kv_cache_tensors which accesses self.use_compress.
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None) if model_config else None
-        self.use_compress = (
-            hf_config is not None and hasattr(hf_config, "compress_ratios")
+        # 🔴 必须两个对象都看。V4.1 的 config 有多模态外壳:
+        #      顶层 model_type=deepseek_v41,只有 architectures/vision_config/text_config...
+        #      compress_ratios（43 条）在 text_config 里，【顶层没有】。
+        #    原来只判 hf_config ⇒ V4.1 上 use_compress 恒 False,
+        #    于是 _uses_page_strided_kv_layout 恒 False、整条 compressed KV 布局
+        #    静默不启用,所有 DSV4 层掉进给别的模型写的通用 (K,V) 二元组通路。
+        #    V4.0 没有外壳,所以这条在 V4.0 上一直是对的 —— 是"到 V4.1 才退化",
+        #    不是"一直坏的",两者在 V4.0 的日志里长得一模一样。
+        #    ⚠️ 这个开关有 11 处读取点(seq_lens 同步 / positions buffer /
+        #       强制 attention / KV 分配 ...),翻转它是一次改 11 个判断
+        #       ⇒ 把取值和来源打出来,别让它再当一个没人看见的默认值。
+        text_config = getattr(model_config, "hf_text_config", None) if model_config else None
+        _compress_src = None
+        for _name, _cfg in (("hf_text_config", text_config), ("hf_config", hf_config)):
+            if _cfg is not None and hasattr(_cfg, "compress_ratios"):
+                _compress_src = _name
+                break
+        self.use_compress = _compress_src is not None
+        logger.info_once(
+            "use_compress=%s（compress_ratios 来自 %s）", self.use_compress,
+            _compress_src or "两个 config 都没有", scope="local",
         )
 
         with _torch_cuda_wrapper():
@@ -4200,6 +4219,30 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        # 🔴 这一段整整三分多钟【一行日志都不打】。2026-09-11 第十八/十九次起飞
+        #    就死在这个窗口里:主机匿名内存从 2.8 GiB 线性涨到 223 GiB
+        #    (0.55 GiB/s,不收敛),而日志里看不出它走到哪一步。
+        #    「卡住了」「在慢慢做」「在漏内存」三者在静默的日志里完全一样。
+        #    ⇒ 每一步都报 耗时 + 本进程 RssAnon,让下一次一眼看出是哪一步。
+        import time as _t
+
+        def _rss_anon_gib() -> float:
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("RssAnon:"):
+                            return int(line.split()[1]) / 1048576
+            except OSError:
+                pass
+            return float("nan")
+
+        _t0 = _t.monotonic()
+
+        def _step(name: str) -> None:
+            logger.info("initialize_kv_cache[%s] +%.1fs RssAnon=%.1f GiB",
+                        name, _t.monotonic() - _t0, _rss_anon_gib())
+
+        _step("进入")
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
@@ -4207,14 +4250,17 @@ class NPUModelRunner(GPUModelRunner):
         self.may_add_encoder_only_layers_to_kv_cache_config()
         apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config)
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        _step("分组/计划完成")
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
+        _step("attn backend 就绪")
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # K3's packed layout keeps Mamba specs inside UniformType groups, so the
         # old first-spec scan over attn_groups cannot recognize them.
         self.need_accepted_tokens = kv_cache_config.has_mamba_layers
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        _step("input batch 就绪")
         if self.sparse_kv_offload_enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config,
@@ -4222,6 +4268,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.sparse_kv_offload_config,
             )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        _step("kv cache tensors 就绪")
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4356,6 +4403,30 @@ class NPUModelRunner(GPUModelRunner):
             self.use_compress
             or getattr(kv_cache_spec, "indexes_kv_by_block_stride", False)
         )
+
+    def _mla_split_is_applicable(self, layer_name: str, kv_cache_spec: AttentionSpec) -> bool:
+        """这一层能不能按 MLA 的 nope/rope 拆成两个逻辑张量。
+
+        🔴 判据是【这一层本身是不是 MLA 注意力层】，不是它的 spec 类型。
+        拆分要用的 ``kv_lora_rank`` / ``qk_rope_head_dim`` 只长在 ``MLAAttention``
+        上；spec 是不是 ``AscendMLAAttentionSpec`` 说明不了这件事 ——
+        V4.1 的 indexer K cache（``AscendDeepseekV41IndexerCache``）用的正是
+        ``AscendMLAAttentionSpec``，而它压根不是 MLA：它是一路 K（外加一段 scale），
+        没有 nope/rope 可分。
+
+        2026-09-11 第二十六次起飞：层 20 的 indexer compress_ratio=1，
+        于是满足了调用点那个 ``ratio == 1`` 的条件、走进拆分分支，
+        撞上 ``TypeError: Expected MLAAttention layer ... got
+        AscendDeepseekV41IndexerCache``。⇒ 那条 TypeError 报的是症状，
+        真正缺的是【调用之前没有检查前提】。
+        """
+        if not isinstance(kv_cache_spec, AscendMLAAttentionSpec):
+            return False
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config, AttentionLayerBase, [layer_name],
+        )
+        layer = attn_layers.get(layer_name)
+        return isinstance(layer, (MLAAttention, CacheOnlyAttentionLayer))
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
         if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
@@ -5001,6 +5072,10 @@ class NPUModelRunner(GPUModelRunner):
                     if (
                         isinstance(current_kv_cache_spec, AscendMLAAttentionSpec)
                         and get_kv_cache_compression_ratio(current_kv_cache_spec) == 1
+                        # ⚠️ 前提：这一层真的是 MLA 注意力层。indexer 的 K cache 同样用
+                        #    AscendMLAAttentionSpec、ratio 也可以是 1，但它没有
+                        #    nope/rope 可分 —— 它由下面 scale_dim != 0 那一支处理。
+                        and self._mla_split_is_applicable(layer_name, current_kv_cache_spec)
                     ):
                         k_dim, v_dim = self._get_attention_kv_cache_dims(
                             layer_name, current_kv_cache_spec
@@ -5188,9 +5263,96 @@ class NPUModelRunner(GPUModelRunner):
                         kv_caches[layer_name] = k_cache
                         continue  # Skip the rest of the AttentionSpec handling
                     else:
-                        raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
-                            layer_name
-                        ]
+                        _raw = kv_cache_raw_tensors[layer_name]
+                        if isinstance(_raw, torch.Tensor):
+                            # 单张量。DSV4 的 shared-tuple planner 给【每一层】一段连续切片
+                            # （descriptor 的 block_stride 就等于该层的 page_size_bytes），
+                            # 所以在这条模型上"单张量"是常态，(K, V) 二元组才是例外：
+                            # compressor 的环、以及主 MLA / indexer 的层都走这里。
+                            #
+                            # 🔴 绝不能直接对它做 `k, v = _raw` 解包。那【不会】快速失败：
+                            #    Python 先走 Tensor.__iter__ → unbind(0)，把 dim0 上每个切片
+                            #    都造成一个新张量对象，【然后】才抛 "too many values to unpack"。
+                            #    这里 dim0 = num_blocks*page_size ≈ 10.7 亿 ⇒ 它要先造十亿个对象。
+                            #    2026-09-11 第十八/十九次起飞就死在这里：主机匿名内存
+                            #    以 0.55 GiB/s 线性涨到 223 GiB、整机 OOM，
+                            #    而那三分半日志里一个字都没有 —— 一个 arity 错误伪装成了内存泄漏。
+                            #    有界复现见 build_artifacts/repro/repro_tensor_unpack_trap.py。
+                            #
+                            # 形状用 backend 声明的那个，且【不】做 use_hybrid_blocks 的分块：
+                            # planner 是按 spec.block_size 的整页排的布，再按 kernel block size
+                            # 切一次会和已经落地的分配对不上。
+                            page = current_kv_cache_spec.page_size_bytes
+                            if _raw.numel() % page != 0:
+                                raise NotImplementedError(
+                                    f"{layer_name} 的 raw kv cache {_raw.numel()} 字节不是 "
+                                    f"page_size_bytes={page} 的整数倍")
+                            single_num_blocks = _raw.numel() // page
+                            assert single_num_blocks >= kv_cache_config.num_blocks, (
+                                f"{layer_name} 只有 {single_num_blocks} 块，"
+                                f"少于 kv_cache_config.num_blocks={kv_cache_config.num_blocks}")
+                            # 🔴 形状里的块内 token 数必须【从页大小推出来】，
+                            #    不能直接用 spec.block_size。
+                            #    V4.1 的 kv-source 层有 tokens_per_state（ratio 2 或 1）:
+                            #    一页装的是 block_size // tokens_per_state 个 state，
+                            #    也就是 AscendMLAAttentionSpec 的 storage_block_size。
+                            #    用逻辑 block_size 会让形状的元素数正好是字节数 ⇒
+                            #    view 之后差一个 itemsize 倍
+                            #    （实测 "shape [32922,128,1,512] is invalid for input of
+                            #     size 1078788096"，正好 2 倍，因为 bf16）。
+                            #    ⇒ 形状必须描述【真正分配下去的那些字节】。
+                            per_state = (current_kv_cache_spec.num_kv_heads
+                                         * current_kv_cache_spec.head_size
+                                         * get_dtype_size(current_kv_cache_spec.dtype))
+                            if per_state <= 0 or page % per_state != 0:
+                                raise NotImplementedError(
+                                    f"{layer_name} 的 page_size_bytes={page} 不是每个 state "
+                                    f"{per_state} 字节的整数倍（heads="
+                                    f"{current_kv_cache_spec.num_kv_heads} head_size="
+                                    f"{current_kv_cache_spec.head_size} dtype="
+                                    f"{current_kv_cache_spec.dtype}）")
+                            storage_block = page // per_state
+                            # spec 自己说得出来的话，两者必须一致 —— 不一致是真不一致，
+                            # 不能让推导出来的那个悄悄盖过去。
+                            # ⚠️ 已知会不一致的一类：页里每个 state 还带一段 scale
+                            #    （indexer 的 k_cache：page 16896 = 128 × (128×1 + 1×4)，
+                            #     上面那个只按 head_size×itemsize 的推导会给出 132 而不是 128）。
+                            #    那类 spec 走的是 page-strided / indexer 的专用分支，不该到这里；
+                            #    真到了这里就说明路由错了 ⇒ 当场报，不要用推导值凑一个能跑的形状。
+                            declared = getattr(current_kv_cache_spec, "storage_block_size", None)
+                            if declared is not None and declared != storage_block:
+                                raise NotImplementedError(
+                                    f"{layer_name} 的 storage_block_size 声明是 {declared}，"
+                                    f"但按 page_size_bytes={page} 推出来是 {storage_block}")
+                            if storage_block != current_kv_cache_spec.block_size:
+                                logger.info_once(
+                                    "%s 的块内 state 数按页大小推为 %d（逻辑 block_size=%d，"
+                                    "spec %s）", layer_name, storage_block,
+                                    current_kv_cache_spec.block_size,
+                                    type(current_kv_cache_spec).__name__, scope="local")
+                            single_shape = attn_backend.get_kv_cache_shape(
+                                single_num_blocks,
+                                storage_block,
+                                current_kv_cache_spec.num_kv_heads,
+                                current_kv_cache_spec.head_size,
+                            )
+                            typed = _raw.view(current_kv_cache_spec.dtype)
+                            want = 1
+                            for _d in single_shape:
+                                want *= _d
+                            if want != typed.numel():
+                                raise NotImplementedError(
+                                    f"{layer_name} 形状 {tuple(single_shape)} 要 {want} 个元素，"
+                                    f"而这段 cache 按 {current_kv_cache_spec.dtype} 只有 "
+                                    f"{typed.numel()} 个（{_raw.numel()} 字节 / page {page}）")
+                            kv_caches[layer_name] = typed.view(single_shape)
+                            continue
+                        if len(_raw) != 2:
+                            raise NotImplementedError(
+                                f"{layer_name}（spec {type(current_kv_cache_spec).__name__}）的 "
+                                f"raw kv cache 是长度 {len(_raw)} 的 {type(_raw).__name__}，"
+                                "这条通路只处理 (K, V) 二元组。")
+                        raw_k_tensor, raw_v_tensor = _raw  # type: ignore
                         sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     assert raw_k_tensor is not None
                     assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
