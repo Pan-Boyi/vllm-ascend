@@ -375,6 +375,14 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
     tags = sorted(f[:-len(".safetensors")] for f in os.listdir(golden)
                   if f.endswith(".safetensors"))
     results, failures, missing, notes = {}, [], [], []
+    # Which tensors got an explicitly named tolerance, and which fell through to
+    # _default?  The named list has six entries; a dump has around fifty tensors, so
+    # what actually carries the weight is the dtype-derived floor, not the list.
+    # That is by design -- but it has to be visible, because a future tensor whose
+    # natural floor is tighter than _default would land here silently.
+    tol_named = [k for k in tol if k != "_default"]
+    tol_hit: set = set()
+    tol_fell: set = set()
     forced = force_route.startswith("moe")
     mask_leak, mask_checked, mask_skipped = [], [], {}
 
@@ -464,6 +472,8 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
             else:
                 lim_rel, lim_cos = tol_for(name, tol, gt.dtype)
                 m["limit_rel_l2"], m["limit_cos"] = lim_rel, lim_cos
+                (tol_hit if any(name.startswith(e) for e in tol_named)
+                 else tol_fell).add(name)
                 if m["nonfinite"] and not m["nonfinite_mask_match"]:
                     failures.append((tag, name,
                                      f"non-finite values disagree: {m['nonfinite_only_candidate']} "
@@ -583,6 +593,21 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                           f"axis this check can address: {skipped}"
                           f"{' ...' if len(mask_skipped) > 4 else ''}. A leak confined to "
                           "those would not be caught here."))
+    # Coverage of the tolerance table itself.  Printed unconditionally for the same
+    # reason every other coverage number here is: a named list can be incomplete, and
+    # an incomplete list has no visible gap.  What keeps the fall-throughs safe is the
+    # dtype-derived floor (tol_for), not the list -- so if that ever stops applying to
+    # some dtype, this line is where it shows.
+    if verbose and (tol_hit or tol_fell):
+        n_all = len(tol_hit) + len(tol_fell)
+        print(f"\ntolerance coverage: {len(tol_hit)}/{n_all} tensors matched one of the "
+              f"{len(tol_named)} named rules; {len(tol_fell)} used _default")
+        print(f"  the fall-throughs are held by the dtype floor (3 ULP), not by the "
+              f"list -- see section 6.0 (a)")
+        if tol_fell:
+            ex = sorted(tol_fell)[:6]
+            print(f"  e.g. {' '.join(ex)}{' ...' if len(tol_fell) > 6 else ''}")
+
     return results, failures, missing, notes
 
 
