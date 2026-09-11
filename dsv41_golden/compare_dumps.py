@@ -517,6 +517,12 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                     # is decidable -- so the check runs itself rather than waiting for
                     # someone to think of it.
                     perm = permutation_signature(g[name], c[name])
+                    if perm and not perm.get("is_permutation") and perm.get("note"):
+                        # Say so when the check ran and did NOT fire.  Silence here is
+                        # ambiguous -- it reads the same whether the check was skipped
+                        # or came back negative -- and the negative verdict is itself
+                        # useful: it tells the reader not to go looking at dispatch.
+                        why += f" -- {perm['note']}, so this is not a reordering"
                     if perm and perm.get("is_permutation"):
                         why += (f" -- BUT every row is present: {perm['moved']}/"
                                 f"{perm['rows']} rows are permuted (row "
