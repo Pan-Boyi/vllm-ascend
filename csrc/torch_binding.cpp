@@ -1572,10 +1572,18 @@ void inplace_partial_rotary_mul_npu(at::Tensor & x, const at::Tensor &r1, const 
     };
     std::string rotary_mode_str = std::string(rotary_mode);
     auto it = mode_map.find(rotary_mode_str);
-    if (it == mode_map.end())
-    {
-        return;
-    }
+    // An unrecognised mode used to return quietly, leaving x unrotated. The caller gets a tensor of
+    // the right shape holding values that were never rotated, and a misspelt mode is therefore
+    // indistinguishable from a correct call until the numbers are compared against something. Fail
+    // instead, and name the modes: this is in-place, so there is not even a new tensor whose
+    // absence might hint that nothing happened.
+    TORCH_CHECK(it != mode_map.end(), "rotary_mode must be one of half, interleave, quarter, "
+        "interleave-half, but got '", rotary_mode_str, "'");
+    // ⚠️ `partial_slice` is DECLARED and NEVER READ: it appears twice in this operator, in
+    // inplace_partial_rotary_mul_proto.cpp:59 and _def.cpp:46, and nowhere else. The tiling reads
+    // only the mode attribute, and its tiling struct has no field for a slice. So this argument
+    // cannot restrict the rotation to part of the head dimension on any path, and passing one is
+    // not an error either -- it is simply ignored. To rotate a tail, slice `x` itself.
     auto origin_dim_num = x.dim();
     TORCH_CHECK(origin_dim_num == BSND_DIM_NUM, "Input tensor x's dim num should be 4, actual ", origin_dim_num, ".");
     EXEC_NPU_CMD(aclnnInplacePartialRotaryMul, x, r1, r2, it->second, partial_slice);
