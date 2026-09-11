@@ -170,3 +170,105 @@ def test_the_rebind_reaches_the_call_site_module():
     assert (attention.fused_indexer_q_rope_quant
             is fused_indexer_q_rope_quant_ascend)
     assert apply_indexer_q_patch() is False, "must be idempotent"
+
+
+# -- what this reference is for once the operator path lands ------------------
+#
+# The plan is to route the indexer at Ascend's own stack, which does its own
+# rotation via inplace_partial_rotary_mul with two parameters:
+#
+#     partial_slice = [nope_dim, head_dim)      rotate only the tail
+#     rotary_mode   = "interleave"              pair x[2k] with x[2k+1]
+#
+# Get either wrong and the output has exactly the right shape and dtype and
+# the wrong numbers -- partial_slice covering the whole head silently rotates
+# the NoPE part, and "half" pairs x[k] with x[k + d/2]. Neither raises.
+#
+# So this reference stops being an implementation and becomes the thing those
+# two parameters are checked against. The checks below need no card: they pin
+# what the parameters *mean*, against an implementation already verified
+# against the kernel they replace.
+
+
+def _rotate_like_operator(x, cos, sin, start, end, mode):
+    """What inplace_partial_rotary_mul does, for a given slice and mode."""
+    out = x.clone().float()
+    seg = out[..., start:end]
+    half = (end - start) // 2
+    if mode == "interleave":
+        pairs = seg.reshape(*seg.shape[:-1], half, 2)
+        a, b = pairs[..., 0], pairs[..., 1]
+        rotated = torch.stack((a * cos - b * sin, b * cos + a * sin), dim=-1)
+        out[..., start:end] = rotated.reshape(*seg.shape)
+    elif mode == "half":
+        a, b = seg[..., :half], seg[..., half:]
+        out[..., start:end] = torch.cat((a * cos - b * sin, b * cos + a * sin), -1)
+    else:
+        raise AssertionError(mode)
+    return out
+
+
+def _reference_rotation(args):
+    """The rotation half of the verified implementation, pulled out."""
+    cs = args["index_q_cos_sin_cache"].index_select(0, args["positions"]).float()
+    cos, sin = cs[:, :HALF].unsqueeze(1), cs[:, HALF:].unsqueeze(1)
+    q = args["index_q"].float()
+    tail = q[..., NOPE:].reshape(T, H, HALF, 2)
+    even, odd = tail[..., 0], tail[..., 1]
+    out = q.clone()
+    out[..., NOPE:] = torch.stack(
+        (even * cos - odd * sin, odd * cos + even * sin), dim=-1).reshape(T, H, ROT)
+    return out
+
+
+def test_partial_slice_and_interleave_reproduce_the_reference():
+    """The parameter pair the operator path will pass, checked as semantics."""
+    args = _inputs(20)
+    cs = args["index_q_cos_sin_cache"].index_select(0, args["positions"]).float()
+    cos, sin = cs[:, :HALF].unsqueeze(1), cs[:, HALF:].unsqueeze(1)
+
+    got = _rotate_like_operator(args["index_q"], cos, sin,
+                                start=NOPE, end=HEAD_DIM, mode="interleave")
+    torch.testing.assert_close(got, _reference_rotation(args), rtol=1e-5, atol=1e-5)
+
+
+def test_a_slice_covering_the_whole_head_rotates_the_nope_part():
+    """partial_slice = [0, head_dim) is the natural wrong value, and it is
+    silent: same shape, same dtype, the NoPE dimensions quietly rotated."""
+    args = _inputs(21)
+    cs = args["index_q_cos_sin_cache"].index_select(0, args["positions"]).float()
+    # a full-width slice needs full-width cos/sin; the operator enforces
+    # cos.size(-1) == end - start, so this is the shape such a mistake takes
+    wide_cos = cs[:, :HALF].repeat(1, 2).unsqueeze(1)
+    wide_sin = cs[:, HALF:].repeat(1, 2).unsqueeze(1)
+
+    wrong = _rotate_like_operator(args["index_q"], wide_cos, wide_sin,
+                                  start=0, end=HEAD_DIM, mode="interleave")
+    reference = _reference_rotation(args)
+    assert not torch.allclose(wrong[..., :NOPE], reference[..., :NOPE], atol=1e-3), (
+        "the NoPE part must move, or this test is not demonstrating the hazard")
+
+
+def test_half_pairing_differs_from_interleave():
+    """"half" is the other mode name and pairs x[k] with x[k + d/2]. It
+    produces a complete, wrongly-rotated tail."""
+    args = _inputs(22)
+    cs = args["index_q_cos_sin_cache"].index_select(0, args["positions"]).float()
+    cos, sin = cs[:, :HALF].unsqueeze(1), cs[:, HALF:].unsqueeze(1)
+
+    interleaved = _rotate_like_operator(args["index_q"], cos, sin,
+                                        NOPE, HEAD_DIM, "interleave")
+    half = _rotate_like_operator(args["index_q"], cos, sin,
+                                 NOPE, HEAD_DIM, "half")
+    assert interleaved.shape == half.shape
+    assert not torch.allclose(interleaved, half, atol=1e-3)
+    torch.testing.assert_close(interleaved, _reference_rotation(args),
+                               rtol=1e-5, atol=1e-5)
+
+
+def test_the_cos_sin_width_matches_the_slice_not_the_head():
+    """The operator requires cos.size(-1) == end - start. V4.0 passes 64-wide
+    cos/sin for a 128-wide q with partial_slice=[64,128]; widening them to 128
+    would be the natural over-correction."""
+    assert ROT == HEAD_DIM - NOPE
+    assert 2 * HALF == ROT, "cos/sin carry half the slice width in each of cos and sin"

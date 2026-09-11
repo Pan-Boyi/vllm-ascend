@@ -26,9 +26,7 @@ from vllm.config import VllmConfig
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.v1.attention.backend import AttentionBackend
 
-from vllm_ascend.attention.dsa_v1 import (AscendDSAC4Backend,
-                                          AscendDSAC128Backend,
-                                          AscendDSASWABackend)
+from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
 from vllm_ascend.models.deepseek_v4_1.o_proj import check_grouped_wo_a_layout
 from vllm_ascend.models.deepseek_v4_1.platform_patches import \
     assert_ready_for_ratio_two
@@ -75,13 +73,11 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
     # budget drops from 1930 to 1790 B/token.
     use_fp8_ds_mla_layout: ClassVar[bool] = False
 
-    # Backends that accept these ratios today. Ratio 2 -- which V4.1 needs on
-    # layers 2..19 -- is missing because of the bound operator, not the
-    # hardware; see validate_compress_ratio in vllm_ascend.attention.dsa_v1.
-    _RATIO_BACKENDS: ClassVar[dict[int, type[AttentionBackend]]] = {
-        4: AscendDSAC4Backend,
-        128: AscendDSAC128Backend,
-    }
+    # A _RATIO_BACKENDS map used to sit here, recording that ratio 2 had no
+    # backend. Nothing ever read it, and by the time anyone looked it was false
+    # too -- AscendDSAC2Backend exists. Ratio-to-backend now resolves in
+    # AscendDeepseekV41IndexerCache.get_attn_backend, from the spec that
+    # actually constrains it.
 
     def __init__(
         self,

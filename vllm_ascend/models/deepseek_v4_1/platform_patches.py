@@ -89,6 +89,8 @@ CLASS_REBINDS = (
      "AscendDeepseekV41CompressorStateCache"),
     ("vllm.models.deepseek_v4_1.common.engram", "ParallelEngramEmbedding",
      "AscendEngramEmbedding"),
+    ("vllm.models.deepseek_v4_1.attention", "DeepseekV4IndexerCache",
+     "AscendDeepseekV41IndexerCache"),
 )
 
 

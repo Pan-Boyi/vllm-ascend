@@ -4298,9 +4298,19 @@ class NPUModelRunner(GPUModelRunner):
                     key=lambda name: (extract_dsv4_layer_index(
                         self.model_config.hf_text_config, name), name)):
                 self.kv_caches.append(kv_caches[layer_name])
+            # V4.1's consumers are upstream's methods, which read the cache as
+            # a tensor -- .numel() on it, and an assert on shape[1:]. The list
+            # the V4.0 path needs is wrong for them, and so is upstream's own
+            # squeeze(1): the head axis is at index 2 here, and squeeze on a
+            # non-unit dimension is a silent no-op. See deepseek_v4_1.kv_binding.
+            from vllm_ascend.models.deepseek_v4_1.kv_binding import (
+                bind_value, is_v41)
+
+            v41 = is_v41(self.model_config.hf_text_config)
             for layer_name, kv_cache in kv_caches.items():
                 self.compilation_config.static_forward_context[
-                    layer_name].kv_cache = [kv_cache]
+                    layer_name].kv_cache = (
+                        bind_value(kv_cache) if v41 else [kv_cache])
         else:
             from vllm.v1.worker.utils import bind_kv_cache
 

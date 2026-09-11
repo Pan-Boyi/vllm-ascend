@@ -173,3 +173,125 @@ def test_apply_all_reports_both_rebinds():
                for name in deepseek_v4_1.APPLIED_PATCHES)
     assert any("CompressorStateCache" in name
                for name in deepseek_v4_1.APPLIED_PATCHES)
+
+
+# -- the indexer's K cache ---------------------------------------------------
+
+
+def _indexer_cache(compress_ratio, head_dim=128, cache_dtype="auto"):
+    cache = object.__new__(caches.AscendDeepseekV41IndexerCache)
+    torch.nn.Module.__init__(cache)
+    cache.head_dim = head_dim
+    cache.compress_ratio = compress_ratio
+    cache.dtype = torch.bfloat16
+    cache.cache_config = SimpleNamespace(cache_dtype=cache_dtype)
+    return cache
+
+
+class _VllmConfigStub:
+    def __init__(self, block_size=128, cache_dtype="auto"):
+        self.cache_config = SimpleNamespace(block_size=block_size,
+                                            cache_dtype=cache_dtype)
+
+
+def test_the_indexer_spec_block_size_is_the_page_times_the_ratio():
+    """And it must appear verbatim in the backend's supported list.
+
+    Not "divide into": select_common_block_size silently falls back to a
+    smaller supported size that divides the request, which leaves the planner
+    and the operator using different page sizes with nothing raised.
+    """
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+    page = DSV4_BLOCK_SIZES[128][0][0]
+    for ratio in (1, 2):
+        spec = _indexer_cache(ratio).get_kv_cache_spec(_VllmConfigStub(128))
+        assert isinstance(spec, AscendMLAAttentionSpec)
+        assert spec.block_size == page * ratio
+        assert spec.num_kv_heads == 1
+        assert spec.tokens_per_state == ratio
+
+
+def test_ratio_one_uses_a_backend_that_lists_its_block_size():
+    from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
+    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+    backend = _indexer_cache(1).get_attn_backend()
+    assert backend is AscendDSASWABackend
+    wanted = DSV4_BLOCK_SIZES[128][0][0] * 1
+    assert wanted in backend.get_supported_kernel_block_sizes(), (
+        f"{wanted} must appear verbatim, not merely divide something listed")
+
+
+def test_ratio_two_refuses_rather_than_borrowing_c4():
+    """The measured hazard: ratio 2 on the C4 backend passes at cache block
+    sizes 64 and 128 and only fails at 32 -- and 128 is the default, so the
+    configuration everyone runs is the one that would not catch it."""
+    from vllm_ascend.attention.dsa_v1 import AscendDSAC4Backend
+
+    supported = AscendDSAC4Backend.get_supported_kernel_block_sizes()
+    # The trap is that it looks usable: at the default cache block size of 128
+    # the spec is 256, which C4 does list. What it does not cover is the whole
+    # set ratio 2 can ask for -- cache block size 32 gives a spec of 64.
+    assert 128 * 2 in supported, "this is why borrowing C4 looks fine"
+    assert 32 * 2 not in supported, "and this is the case that breaks it"
+
+    with pytest.raises(NotImplementedError) as exc:
+        _indexer_cache(2).get_attn_backend()
+    msg = str(exc.value)
+    assert "[64, 128, 256]" in msg
+    assert "AscendDSAC4Backend" in msg
+    assert "only refuses at 32" in msg
+
+
+def test_ratio_two_uses_the_c2_backend_once_it_exists(monkeypatch):
+    """Staged deliberately: the refusal above is until the backend lands, not
+    instead of it."""
+    from vllm_ascend.models.deepseek_v4_1 import caches as mod
+
+    sentinel = type("AscendDSAC2Backend", (), {
+        "get_supported_kernel_block_sizes": staticmethod(lambda: [64, 128, 256])})
+    monkeypatch.setattr(mod, "_optional_c2_backend", lambda: sentinel)
+    assert _indexer_cache(2).get_attn_backend() is sentinel
+
+
+def test_an_unexpected_ratio_is_named():
+    with pytest.raises(NotImplementedError, match="carry 1 and 2"):
+        _indexer_cache(4).get_attn_backend()
+
+
+def test_the_indexer_cache_construction_site_is_rebound():
+    import vllm.models.deepseek_v4_1.attention as attention_mod
+
+    platform_patches.rebind_upstream_classes()
+    assert (attention_mod.DeepseekV4IndexerCache
+            is caches.AscendDeepseekV41IndexerCache)
+
+
+def test_ratio_zero_is_one_state_per_token_not_zero_states_per_page():
+    """max(ratio, 1). Multiplying by 0 gives a block size of 0, which no
+    backend can list and which the spec would then divide by."""
+    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+    page = DSV4_BLOCK_SIZES[128][0][0]
+    spec = _indexer_cache(0).get_kv_cache_spec(_VllmConfigStub(128))
+    assert spec.block_size == page
+    assert spec.tokens_per_state == 1
+    assert spec.storage_block_size == page, (
+        "the spec divides block_size by tokens_per_state to recover the "
+        "physical page; both must come back to the page for ratio 0")
+
+
+def test_the_spec_recovers_the_physical_page_for_every_ratio():
+    """Why block_size is multiplied at all: AscendMLAAttentionSpec derives
+    storage_block_size = block_size // tokens_per_state. Upstream's
+    unmultiplied convention would make the physical page B // ratio."""
+    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+    page = DSV4_BLOCK_SIZES[128][0][0]
+    for ratio in (0, 1, 2):
+        spec = _indexer_cache(ratio).get_kv_cache_spec(_VllmConfigStub(128))
+        assert spec.storage_block_size == page, (
+            f"ratio {ratio}: physical page came back as "
+            f"{spec.storage_block_size}, not {page}")
