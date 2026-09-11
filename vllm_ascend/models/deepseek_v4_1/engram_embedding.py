@@ -253,10 +253,64 @@ class AscendStagedEngramEmbedding:
         scales are ``n_scales`` contiguous bytes per row, read with
         ``tl.arange`` and broadcast.
         """
-        raise NotImplementedError(
-            "the staged-dequantise kernel is not bound yet. Everything ahead "
-            "of it is wired: the rows for this step are already in HBM at "
-            "self._dev_weight[:rows] / self._dev_scale[:rows], laid out as "
-            "EngramLayout describes. What is missing is only the kernel that "
-            "reads them. Reaching this during a dummy run is the expected "
-            "outcome, not a regression.")
+        launch = _staged_dequant_launcher()
+        launch(self._dev_weight[:rows], self._dev_scale[:rows], out,
+               dim=self._layout.dim, quant_block=self._layout.quant_block)
+
+
+#: Where the kernel lives. The package path is where it belongs; the
+#: build_artifacts path is where it is today, under a directory named for the
+#: UVA design that this replaced.
+_KERNEL_LOCATIONS = (
+    ("vllm_ascend.ops.triton.engram_dequant_staging", None),
+    ("engram_dequant_staging",
+     "/workspace/code/dsv4_single_card/vllm_project/build_artifacts/npu_view/"
+     "engram_dequant_staging.py"),
+)
+
+
+def _staged_dequant_launcher():
+    """Resolve the kernel, preferring a real package location.
+
+    Verification status, stated here because binding is not endorsing:
+
+    - The arithmetic is settled. ``test_engram_dequant_reference`` checks it on
+      the CPU against golden's authoritative rows, byte for byte, including the
+      negative zero a value comparison would report as equal.
+    - The kernel has run on hardware. Triton compiles at first launch, and
+      ``/root/.triton/cache`` holds two compilations of ``engram_dequant_staging``
+      (2026-09-11 10:48:43 and 11:35:35).
+    - Its file header still says "nothing here has run". That is stale -- it
+      was written before the run -- and it is worth knowing that reading it is
+      what produced the opposite conclusion here first. The compile cache is
+      the artefact that settles it; a comment is not.
+
+    Still open: performance at production scale, and getting that run's output
+    written down somewhere other than a chat log.
+    """
+    import importlib
+
+    errors = []
+    for module_name, path in _KERNEL_LOCATIONS:
+        try:
+            if path is None:
+                module = importlib.import_module(module_name)
+            else:
+                import importlib.util
+                import os
+                if not os.path.isfile(path):
+                    errors.append(f"{path}: not present")
+                    continue
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            return module.launch
+        except Exception as exc:                      # noqa: BLE001
+            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "the staged-dequantise kernel could not be loaded from any known "
+        "location:\n  " + "\n  ".join(errors)
+        + "\n\nEverything ahead of it is wired: this step's rows are already "
+        "in HBM, laid out as EngramLayout describes. Only the kernel is "
+        "missing.")

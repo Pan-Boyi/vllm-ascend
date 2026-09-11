@@ -219,12 +219,55 @@ def test_lookup_refuses_a_sharded_configuration():
         layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
 
 
-def test_the_kernel_seam_reports_that_everything_before_it_is_ready():
-    """Reaching this in a dummy run is the expected outcome, so the message
-    has to say so -- otherwise it reads as a regression."""
-    layer = AscendStagedEngramEmbedding.__new__(AscendStagedEngramEmbedding)
-    with pytest.raises(NotImplementedError) as exc:
-        AscendStagedEngramEmbedding._dequantize_staged(layer, 24, None)
+def test_the_kernel_resolves_and_takes_the_agreed_interface():
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _staged_dequant_launcher
+
+    launch = _staged_dequant_launcher()
+    params = inspect.signature(launch).parameters
+    assert list(params)[:3] == ["staging_weight", "staging_scale", "out"]
+    assert "dim" in params and "quant_block" in params
+
+
+def test_the_binding_records_the_kernels_verification_status():
+    """Binding is not endorsing, so the status is written down next to it.
+
+    The arithmetic is settled on the CPU against golden's rows. The kernel has
+    run -- the Triton compile cache holds two compilations of it, and Triton
+    only compiles at first launch. Its file header still claims otherwise,
+    which is exactly what produced the wrong conclusion here on first reading:
+    an artefact settles this, a comment does not.
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _staged_dequant_launcher
+
+    doc = _staged_dequant_launcher.__doc__
+    assert "arithmetic is settled" in doc
+    assert "has run on hardware" in doc
+    assert "stale" in doc
+    assert "compile cache is" in doc
+
+
+def test_the_resolver_prefers_a_real_package_location():
+    """It lives under a directory named for the design it replaced. When it
+    moves somewhere sane this keeps working without an edit."""
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _KERNEL_LOCATIONS
+
+    assert _KERNEL_LOCATIONS[0][1] is None, "the package path must be tried first"
+    assert _KERNEL_LOCATIONS[0][0].startswith("vllm_ascend.")
+
+
+def test_an_unresolvable_kernel_says_what_is_already_done(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
+
+    monkeypatch.setattr(mod, "_KERNEL_LOCATIONS",
+                        (("nowhere.at.all", None),
+                         ("also_nowhere", "/nonexistent/path.py")))
+    with pytest.raises(RuntimeError) as exc:
+        mod._staged_dequant_launcher()
     msg = str(exc.value)
-    assert "already in HBM" in msg
-    assert "expected outcome" in msg
+    assert "already\nin HBM" in msg or "already in HBM" in msg
+    assert "nowhere.at.all" in msg and "/nonexistent/path.py" in msg
