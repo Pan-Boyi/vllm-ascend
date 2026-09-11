@@ -170,3 +170,100 @@ def test_the_real_staged_tables_match_the_checkpoint():
     verified = staging.verify_staged_tables(REAL_TENSORS, REAL_CHECKPOINT)
     assert set(verified) == set(REAL_TENSORS)
     assert sum(verified.values()) > 0
+
+
+# -- content, which the size check structurally cannot see --------------------
+
+
+def _write(path, payload: bytes):
+    with open(path, "wb") as handle:
+        handle.write(payload)
+
+
+def test_a_write_that_preserves_length_is_invisible_to_the_size_check(checkpoint, stage):
+    """The premise for fingerprinting at all.
+
+    Registration needs PROT_WRITE -- the driver pins with write intent and
+    refuses a read-only mapping -- so every rank holds a writable mapping of
+    the same physical pages. A stray write through any of them changes content
+    and not length, and verify_staged_tables would still pass.
+    """
+    path = os.path.join(stage, staging.staged_file_name(TENSOR))
+    _stage_file(stage, TENSOR, NBYTES)
+    _stage_file(stage, OTHER, OTHER_NBYTES)
+    assert staging.verify_staged_tables([TENSOR, OTHER], checkpoint, stage)
+
+    before = staging.content_fingerprint(path)
+    with open(path, "r+b") as handle:       # one byte, same length
+        handle.seek(NBYTES // 2)
+        handle.write(b"\x01")
+
+    # the size check is still perfectly happy
+    assert staging.verify_staged_tables([TENSOR, OTHER], checkpoint, stage)
+    # and the fingerprint is not
+    assert staging.content_fingerprint(path) != before
+
+
+def test_both_folds_are_reported_and_a_single_bit_moves_them(stage):
+    path = os.path.join(stage, "x.bin")
+    _write(path, bytes(64))
+    zero_sum, zero_xor = staging.content_fingerprint(path)
+    assert (zero_sum, zero_xor) == (0, 0)
+
+    _write(path, bytes(63) + b"\x80")
+    one_sum, one_xor = staging.content_fingerprint(path)
+    assert one_sum != zero_sum and one_xor != zero_xor
+
+
+def test_the_xor_fold_catches_what_the_sum_fold_misses(stage):
+    """Why two folds rather than one.
+
+    Swapping two words leaves the sum identical. It is the case a single
+    additive checksum is blind to, and it is exactly what a misdirected
+    block copy would produce.
+    """
+    import struct
+    path = os.path.join(stage, "y.bin")
+    _write(path, struct.pack("<QQ", 3, 5))
+    a = staging.content_fingerprint(path)
+    _write(path, struct.pack("<QQ", 5, 3))
+    b = staging.content_fingerprint(path)
+    assert a[0] == b[0], "the sums should coincide; that is the point"
+    # ... and xor coincides too for a pure swap, so check a value-preserving
+    # redistribution instead, which is the realistic corruption.
+    _write(path, struct.pack("<QQ", 4, 4))
+    c = staging.content_fingerprint(path)
+    assert c[0] == a[0] and c[1] != a[1], (
+        "sum preserved, xor must differ -- this is the case the second fold "
+        "exists for")
+
+
+def test_verify_staged_content_accepts_unchanged_tables(checkpoint, stage):
+    _stage_file(stage, TENSOR, NBYTES)
+    _stage_file(stage, OTHER, OTHER_NBYTES)
+    expected = staging.fingerprint_staged_tables([TENSOR, OTHER], stage)
+    staging.verify_staged_content(expected, stage)
+
+
+def test_verify_staged_content_refuses_a_changed_table(checkpoint, stage):
+    _stage_file(stage, TENSOR, NBYTES)
+    _stage_file(stage, OTHER, OTHER_NBYTES)
+    expected = staging.fingerprint_staged_tables([TENSOR, OTHER], stage)
+
+    path = os.path.join(stage, staging.staged_file_name(TENSOR))
+    with open(path, "r+b") as handle:
+        handle.seek(8)
+        handle.write(b"\xff")
+
+    with pytest.raises(RuntimeError) as exc:
+        staging.verify_staged_content(expected, stage)
+    msg = str(exc.value)
+    assert TENSOR in msg
+    assert "fingerprint changed" in msg
+    # and it has to name the mechanism, or the reader looks for a disk fault
+    assert "PROT_WRITE" in msg
+
+
+def test_verify_staged_content_refuses_an_empty_expectation(stage):
+    with pytest.raises(ValueError, match="no fingerprints"):
+        staging.verify_staged_content({}, stage)
