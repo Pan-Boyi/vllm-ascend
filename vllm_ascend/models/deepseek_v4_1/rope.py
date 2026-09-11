@@ -108,3 +108,57 @@ def inverse_rope_attention_output(
     out = o.clone()
     inverse_rope_(out[..., -ROPE_HEAD_DIM:], freqs.to(o.device))
     return out
+
+
+def inverse_rope_from_cos_sin_cache(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_head_dim: int = ROPE_HEAD_DIM,
+) -> torch.Tensor:
+    """Undo RoPE using the rotary module's own table, addressed by position.
+
+    This is the form the output projection needs. ``inverse_rope_`` above takes
+    the complex factors and assumes positions ``0..seq_len-1``, which is true of
+    a golden dump and false of anything batched or decoding: there, each row
+    carries its own absolute position and rows from different sequences sit next
+    to each other.
+
+    ``o`` is ``[num_tokens, heads, head_dim]``, ``positions`` is ``[num_tokens]``
+    and ``cos_sin_cache`` is ``[max_pos, rope_head_dim]`` holding cos in the
+    first half of its last dimension and sin in the second -- the layout
+    upstream's fused kernel reads, so the table the attention layer already
+    built can be used as-is rather than rebuilt here with a second set of
+    parameters that could drift from it.
+
+    Returns a fresh tensor; the leading ``head_dim - rope_head_dim`` dimensions
+    are passed through unchanged.
+    """
+    if cos_sin_cache.shape[-1] != rope_head_dim:
+        raise ValueError(
+            f"cos_sin_cache last dim is {cos_sin_cache.shape[-1]}, expected "
+            f"rope_head_dim={rope_head_dim}. It holds cos||sin, each of length "
+            "rope_head_dim // 2, so a mismatch here means the halves would be "
+            "sliced in the wrong place and sin read as cos.")
+    if o.shape[0] != positions.shape[0]:
+        raise ValueError(
+            f"{o.shape[0]} tokens but {positions.shape[0]} positions; each row "
+            "is rotated by its own absolute position, so these cannot differ")
+
+    half = rope_head_dim // 2
+    cs = cos_sin_cache.to(torch.float32).index_select(0, positions.to(torch.long))
+    cos = cs[:, :half].unsqueeze(1)
+    sin = cs[:, half:].unsqueeze(1)
+
+    # Interleaved pairing: dim 2k and 2k+1 rotate together against frequency k.
+    pairs = o[..., -rope_head_dim:].to(torch.float32).unflatten(-1, (half, 2))
+    even, odd = pairs[..., 0], pairs[..., 1]
+
+    # The conjugate rotation. Forward RoPE is (e*cos - o*sin, o*cos + e*sin);
+    # this is that with sin negated, which is what undoes it.
+    rotated = torch.stack((even * cos + odd * sin, odd * cos - even * sin),
+                          dim=-1).flatten(-2)
+
+    out = o.clone()
+    out[..., -rope_head_dim:] = rotated.to(o.dtype)
+    return out

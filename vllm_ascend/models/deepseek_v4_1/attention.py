@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
+import torch_npu
 from vllm.config import VllmConfig
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.v1.attention.backend import AttentionBackend
@@ -28,8 +29,25 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm_ascend.attention.dsa_v1 import (AscendDSAC4Backend,
                                           AscendDSAC128Backend,
                                           AscendDSASWABackend)
+from vllm_ascend.models.deepseek_v4_1.o_proj import check_grouped_wo_a_layout
 from vllm_ascend.models.deepseek_v4_1.platform_patches import \
     assert_ready_for_ratio_two
+from vllm_ascend.models.deepseek_v4_1.rope import \
+    inverse_rope_from_cos_sin_cache
+from vllm_ascend.utils import oproj_tp_enable
+
+#: MX grouping the A5 quantised batch matmul expects: no grouping on the two
+#: batch axes, 32 elements per scale along the contraction axis. Mirrors
+#: DSAImpl._forward_o_proj in vllm_ascend/attention/dsa_v1.py, which is the
+#: established convention for this weight on this hardware.
+MX_GROUP_SIZES = (0, 0, 32)
+
+#: npu_transpose_batchmatmul takes [tokens, groups, in] against
+#: [groups, in, rank]; these permutations put the group axis first for the
+#: matmul and move it back afterwards.
+PERM_X1 = (1, 0, 2)
+PERM_X2 = (0, 1, 2)
+PERM_Y = (1, 0, 2)
 
 
 class AscendDeepseekV41Attention(DeepseekV4Attention):
@@ -132,11 +150,82 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             "running.")
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "Ascend output projection is not wired up yet. It is inverse-RoPE "
-            "on the trailing 64 dims, then wo_a as a block-diagonal grouped "
-            "GEMM (o_groups=8, each group 4096 -> 1024, giving 8192) and wo_b "
-            "as a plain 8192 -> 5120 linear. The quantisation side already "
-            "reshapes wo_a into [o_groups, ...] at load time, so this must not "
-            "treat it as a dense [8192, 4096] matmul -- that would let every "
-            "group see all 32768 input dims.")
+        """Inverse RoPE, then the block-diagonal wo_a, then wo_b.
+
+        The two halves have very different provenance. The wo_a/wo_b half
+        mirrors ``DSAImpl._forward_o_proj`` in ``vllm_ascend/attention/dsa_v1``
+        -- same operators, same layout, same permutations -- because V4.0 has
+        been running it on this hardware.
+
+        The inverse rotation has no such precedent, and the reason is worth
+        recording: V4.0 is MLA, whose attention output lives in the NoPE latent
+        space and carries no rotation to undo. V4.1 has ``num_key_value_heads=1``
+        with K and V the *same* 512-wide tensor, so the value side carries the
+        64 RoPE dimensions and the output inherits them. Skipping this step is
+        not a smaller error than getting it wrong.
+
+        Known gap, deliberately: upstream fuses the rotation into the
+        quantisation kernel (one Triton launch); this is several plain torch
+        ops. Correct first, and it is a self-contained replacement later.
+        """
+        if oproj_tp_enable():
+            raise NotImplementedError(
+                "oproj tensor parallelism is not wired into the V4.1 output "
+                "projection. dsa_v1's version exchanges activations with "
+                "all_to_all and reduce_scatter through address-stable static "
+                "buffers; none of that is reproduced here. Refusing rather "
+                "than computing each rank's partial result and returning it as "
+                "if it were the whole -- DSV4 runs TP=1 on A5, so this should "
+                "not be reachable.")
+
+        cos_sin_cache = getattr(self.rotary_emb, "cos_sin_cache", None)
+        if cos_sin_cache is None:
+            raise AttributeError(
+                f"{self.rotary_emb.__class__.__name__} exposes no "
+                "cos_sin_cache. The output projection undoes the rotation the "
+                "layer's own rotary module applied, so it has to read that "
+                "module's table -- rebuilding one here would be a second copy "
+                "of the per-layer theta and YaRN parameters, free to drift.")
+
+        o = inverse_rope_from_cos_sin_cache(o, positions, cos_sin_cache,
+                                            self.rope_head_dim)
+
+        num_tokens = o.shape[0]
+        group_in = o.shape[1] * o.shape[2] // self.n_local_groups
+        check_grouped_wo_a_layout(self.wo_a.weight, self.n_local_groups,
+                                  group_in, self.o_lora_rank,
+                                  getattr(self, "prefix", None) or "wo_a")
+        o = o.view(num_tokens, self.n_local_groups, group_in)
+
+        if getattr(self.wo_a, "weight_scale", None) is not None:
+            o, act_scale = torch_npu.npu_dynamic_mx_quant(
+                o, dst_type=torch.float8_e4m3fn)
+            z = torch_npu.npu_transpose_quant_batchmatmul(
+                o,
+                self.wo_a.weight,
+                dtype=torch.bfloat16,
+                bias=None,
+                group_sizes=MX_GROUP_SIZES,
+                x1_scale=act_scale.view(torch.float8_e8m0fnu),
+                x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
+                perm_x1=PERM_X1,
+                perm_x2=PERM_X2,
+                perm_y=PERM_Y,
+            )
+        else:
+            z = torch_npu.npu_transpose_batchmatmul(
+                o,
+                self.wo_a.weight,
+                bias=None,
+                scale=None,
+                perm_x1=PERM_X1,
+                perm_x2=PERM_X2,
+                perm_y=PERM_Y,
+                batch_split_factor=1,
+            )
+
+        # wo_b goes through its own linear method: its fp8 activation
+        # quantisation is not optional here. Dequantising both matrices to bf16
+        # and multiplying leaves 1.8e-2 relative error on a single layer,
+        # against 3.5e-5 for a real block-scaled fp8 GEMM.
+        return self.wo_b(z.reshape(num_tokens, -1))

@@ -72,21 +72,46 @@ def test_selector_returns_the_ascend_attention_class():
 
 
 def test_unimplemented_paths_raise_rather_than_doing_the_cuda_thing():
-    """The stubs must not be quietly inherited from the CUDA base.
+    """The remaining stub must not be quietly inherited from the CUDA base.
 
-    forward_mqa and _o_proj are abstract upstream, so inheriting them would be
-    a TypeError at construction; the point here is that the Ascend class
-    supplies its own and that they refuse rather than approximate.
+    forward_mqa is abstract upstream, so inheriting it would be a TypeError at
+    construction; the point here is that the Ascend class supplies its own and
+    that it refuses rather than approximates.
+
+    _o_proj used to be listed here too. It is implemented now, which is why it
+    is not -- see test_o_proj_is_no_longer_a_stub below, which holds that
+    boundary from the other side so this file still records where it sits.
     """
     from vllm_ascend.models.deepseek_v4_1.attention import \
         AscendDeepseekV41Attention as cls
 
     assert cls.forward_mqa is not None
-    for name, expected in [("forward_mqa", "sparse MLA forward"),
-                           ("_o_proj", "output projection")]:
-        with pytest.raises(NotImplementedError, match=expected):
-            getattr(cls, name)(object.__new__(cls), *([None] * 4)[:(
-                4 if name == "forward_mqa" else 2)])
+    with pytest.raises(NotImplementedError, match="sparse MLA forward"):
+        cls.forward_mqa(object.__new__(cls), None, None, None, None)
+
+
+def test_o_proj_is_no_longer_a_stub():
+    """Records that the output projection crossed over, and how far.
+
+    It is implemented, but only for the single-rank case: the oproj tensor
+    parallel path is still refused, and refused explicitly rather than by
+    computing one rank's partial result and returning it as the whole. Asserting
+    that here means removing the guard without wiring the collectives goes red,
+    instead of producing a plausible tensor.
+    """
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention as cls
+
+    source = inspect.getsource(cls._o_proj)
+    assert "raise NotImplementedError" in source, (
+        "the oproj tensor parallel path must still refuse")
+    assert "oproj_tp_enable" in source
+    # The parts that make it a real implementation rather than a stub.
+    assert "inverse_rope_from_cos_sin_cache" in source
+    assert "check_grouped_wo_a_layout" in source
+    assert "self.wo_b(" in source
 
 
 def test_padded_q_heads_does_not_pad():
