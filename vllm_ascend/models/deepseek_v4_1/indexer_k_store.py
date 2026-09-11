@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Indexer K production for V4.1 kv-source layers, without Triton.
+
+Upstream's ``indexer_k_norm_rope_store`` is one Triton program per token doing
+k_norm, RoPE, quantisation and a paged store. It is not dispatched on a
+platform blacklist -- there is only the Triton version -- so on Ascend it would
+be compiled by triton-ascend, and a per-token paged store is exactly the
+pointer-arithmetic shape that has aborted the process three times in this
+project. Those aborts are ``abort()``, not exceptions; the rule after the
+second was to take an equivalent route rather than try to catch them.
+
+The quantisation and the paged store are not rebuilt here: A5 has a fused
+operator for both, ``indexer_compress_epilog_v2``, already used by the V4.0
+path in ``vllm_ascend/device/device_op.py``. What this file adds is the part
+upstream fuses in and the operator has no notion of -- the group gate, the
+norm, and the rotation.
+
+Transcribed, not rederived. Five details are silent if wrong:
+
+* only group-boundary tokens publish a key: ``(position + 1) % ratio == 0``.
+  V4.0 has no such gate -- it pools from a compressor state cache -- so this is
+  not "the V4.0 K write with a different ratio";
+* the latent stands for the *first* token of its group, so the rotation uses
+  ``compressed_pos = (position // ratio) * ratio``, not ``position``;
+* the rotation covers the **trailing** 64 of 128, interleaved -- the head is
+  128 wide and the rope width is 64, and they are different numbers;
+* k_norm makes a round trip through bf16 before the rotation, and the rotated
+  halves make another one before the store. Neither changes a shape or a dtype;
+  both change the bytes that reach the quantiser;
+* the operator's skip sentinel is ``slot == -1`` **exactly**, where upstream's
+  is ``slot < 0``. Any other negative is read as a real slot and writes outside
+  the cache, silently.
+"""
+
+from __future__ import annotations
+
+import torch
+
+#: The rope width of the V4.1 indexer key, against a head width of 128.
+#: Upstream passes these to the kernel as separate constants
+#: (``HEAD_SIZE=128, ROPE_HEAD_DIM=64``); reading the head width as the rope
+#: width rotates the NoPE half as well and raises nothing.
+INDEX_HEAD_DIM = 128
+INDEX_ROPE_HEAD_DIM = 64
+
+#: What the fused A5 store operator treats as "skip this token".
+SKIP_SLOT = -1
+
+_MXFP4_UNREACHABLE = (
+    "MXFP4 indexer keys are not implemented on Ascend, and upstream cannot "
+    "reach them either: resolve_indexer_kv_dtype defaults to 'fp8' and the "
+    "mxfp4 value is gated to Blackwell datacenter parts "
+    "(is_device_capability_family(100)) with a ValueError for everything else. "
+    "If this raises, something selected mxfp4 on hardware upstream would have "
+    "refused, and the question is why -- not how to add the branch.")
+
+
+def group_boundary_slots(kv_slot_mapping: torch.Tensor,
+                         positions: torch.Tensor,
+                         compress_ratio: int) -> torch.Tensor:
+    """Slots for the tokens that publish a key; ``-1`` for the rest.
+
+    Upstream gates inside the kernel, on two conditions in this order: the slot
+    is negative, or the token is not its group's last. Ascend's store operator
+    has no position input, so the gate has to be folded into the slot mapping
+    before the call -- which is also where it belongs, since it is the only
+    thing that knows the ratio.
+
+    The normalisation to exactly ``-1`` is not tidiness. The operator's kernels
+    test ``slot == -1`` and fall through for every other value, so a ``-2`` --
+    or anything a future slot builder picks as its own sentinel -- is divided
+    by the block size into a negative block index and written. That is memory
+    corruption with no error, in a tensor nobody reads until much later.
+    """
+    if compress_ratio < 1:
+        raise ValueError(
+            f"compress_ratio {compress_ratio} has no group boundary. Layers "
+            "with ratio 0 carry no compressed stream and never reach here; "
+            "reaching it means a layer was routed to the wrong K producer.")
+    publishes = ((positions + 1) % compress_ratio) == 0
+    valid = kv_slot_mapping >= 0
+    skip = torch.full_like(kv_slot_mapping, SKIP_SLOT)
+    return torch.where(publishes & valid, kv_slot_mapping, skip)
+
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor,
+              eps: float) -> torch.Tensor:
+    """k_norm in fp32, with upstream's bf16 round trip.
+
+    The round trip is in the reference and in upstream's kernel, and it is not
+    decoration: the values that leave here are the ones the absmax downstream
+    sees, so keeping fp32 precision produces a different scale from the same
+    inputs.
+    """
+    acc = x.to(torch.float32)
+    variance = acc.pow(2).mean(dim=-1, keepdim=True)
+    normed = acc * torch.rsqrt(variance + eps) * weight.to(torch.float32)
+    return normed.to(torch.bfloat16).to(torch.float32)
+
+
+def _rope_interleaved_tail(k: torch.Tensor, cos_sin_cache: torch.Tensor,
+                           positions: torch.Tensor,
+                           rope_head_dim: int) -> torch.Tensor:
+    """GPT-J rotation over the trailing ``rope_head_dim``, position-addressed.
+
+    ``cos_sin_cache[p]`` is ``rope_head_dim`` wide and holds the half-width
+    cosines followed by the half-width sines, one of each per interleaved pair.
+    """
+    half = rope_head_dim // 2
+    row = cos_sin_cache[positions].to(torch.float32)  # [T, rope_head_dim]
+    cos = row[..., :half]
+    sin = row[..., half:]
+
+    head_dim = k.shape[-1]
+    out = k.clone()
+    tail = out[..., head_dim - rope_head_dim:].reshape(*k.shape[:-1], half, 2)
+    even = tail[..., 0]
+    odd = tail[..., 1]
+    new_even = even * cos - odd * sin
+    new_odd = odd * cos + even * sin
+    # Upstream's second round trip: "bf16 roundtrip for parity with the
+    # reference / Q-side kernel numerics."
+    #
+    # Here it is a no-op, and deliberately kept anyway. Upstream quantises from
+    # the fp32 value this produces, so the rounding decides its scale; this
+    # route hands bf16 to the store operator and lets it quantise, so the same
+    # rounding happens one line later either way. Removing it would be correct
+    # today and silently wrong the moment anything downstream takes fp32 -- and
+    # it is upstream's line, so it returns on the next re-transcription. Kept
+    # with the reason rather than deleted and rediscovered.
+    new_even = new_even.to(torch.bfloat16).to(torch.float32)
+    new_odd = new_odd.to(torch.bfloat16).to(torch.float32)
+    rotated = torch.stack((new_even, new_odd), dim=-1).reshape(
+        *k.shape[:-1], rope_head_dim)
+    out[..., head_dim - rope_head_dim:] = rotated
+    return out
+
+
+def indexer_k_norm_rope_store_ascend(
+    k_pre: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    compress_ratio: int,
+    use_fp4_cache: bool,
+) -> None:
+    """k_norm -> RoPE -> quant -> paged store, the Ascend route.
+
+    Same signature and same ``None`` return as upstream's, so it can be bound
+    over the name the V4.1 layer already calls.
+    """
+    if use_fp4_cache:
+        raise NotImplementedError(_MXFP4_UNREACHABLE)
+
+    num_tokens = kv_slot_mapping.shape[0]
+    if k_pre.ndim != 2 or k_pre.shape[1] != INDEX_HEAD_DIM:
+        raise ValueError(
+            f"indexer k_pre must be [num_tokens, {INDEX_HEAD_DIM}], got "
+            f"{tuple(k_pre.shape)}")
+    if kv_slot_mapping.ndim != 1:
+        # The DSA builder can format slots as [T, 2] (block, offset) for plans
+        # that want block-relative addressing. The fused epilog operator wants
+        # flat slots and divides by the block size itself, so a [T, 2] mapping
+        # here would be read as twice as many tokens.
+        raise ValueError(
+            "indexer kv_slot_mapping must be flat [num_tokens]; got "
+            f"{tuple(kv_slot_mapping.shape)}. A [num_tokens, 2] mapping means "
+            "the plan formatted slots as (block, offset), which "
+            "indexer_compress_epilog_v2 does not take.")
+    if num_tokens == 0:
+        return
+
+    slots = group_boundary_slots(kv_slot_mapping, positions[:num_tokens],
+                                 compress_ratio)
+    k = _rms_norm(k_pre[:num_tokens], rms_norm_weight, rms_norm_eps)
+    # A latent stands for the first token of its group.
+    compressed_pos = torch.div(positions[:num_tokens], compress_ratio,
+                               rounding_mode="floor") * compress_ratio
+    k = _rope_interleaved_tail(k, cos_sin_cache, compressed_pos,
+                               INDEX_ROPE_HEAD_DIM)
+
+    # Quantisation, value store and scale store, in one operator. The layout
+    # matches upstream's fp8 branch byte for byte: whole-block values first,
+    # then the per-token fp32 scales.
+    torch.ops._C_ascend.indexer_compress_epilog_v2(
+        indexer_compress_cache=k_cache.view(torch.uint8),
+        x=k.to(torch.bfloat16),
+        slot_mapping=slots,
+        layout=2,
+    )
+
+
+#: Where the V4.1 layer looks the name up. It is imported into the attention
+#: module at import time, and the call site reads that module's globals, so
+#: rebinding the attribute reaches it whenever this is applied -- the same
+#: shape as the MoE router and indexer-q hooks, and unlike FusedMoEFactory.
+_TARGET_MODULE = "vllm.models.deepseek_v4_1.attention"
+_TARGET_NAME = "indexer_k_norm_rope_store"
+
+
+def apply_indexer_k_store_patch() -> bool:
+    """Point the V4.1 K producer at the Ascend route. Returns True if changed."""
+    import importlib
+
+    module = importlib.import_module(_TARGET_MODULE)
+    if not hasattr(module, _TARGET_NAME):
+        raise AttributeError(
+            f"{_TARGET_MODULE} no longer imports {_TARGET_NAME!r}. Until this "
+            "is repointed the kv-source layers call upstream's Triton kernel, "
+            "which on Ascend is compiled by triton-ascend -- and a per-token "
+            "paged store is the shape that aborts the process rather than "
+            "raising.")
+    if getattr(module, _TARGET_NAME) is indexer_k_norm_rope_store_ascend:
+        return False
+    setattr(module, _TARGET_NAME, indexer_k_norm_rope_store_ascend)
+    return True
