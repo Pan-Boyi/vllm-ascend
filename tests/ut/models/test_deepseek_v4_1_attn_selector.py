@@ -71,22 +71,84 @@ def test_selector_returns_the_ascend_attention_class():
     assert issubclass(got, DeepseekV4Attention)
 
 
-def test_unimplemented_paths_raise_rather_than_doing_the_cuda_thing():
-    """The stubs must not be quietly inherited from the CUDA base.
+def test_forward_mqa_no_longer_raises_but_still_refuses_what_is_unwired():
+    """Both abstract methods are implemented now; this holds the boundary.
 
-    forward_mqa and _o_proj are abstract upstream, so inheriting them would be
-    a TypeError at construction; the point here is that the Ascend class
-    supplies its own and that they refuse rather than approximate.
+    The file used to assert that forward_mqa and _o_proj raise
+    NotImplementedError, which was the right check while they were stubs and
+    became the wrong one as each was wired. What still matters is that the
+    Ascend class supplies its own rather than inheriting the CUDA base's, and
+    that the paths which genuinely are not wired refuse rather than approximate.
     """
+    import inspect
+
     from vllm_ascend.models.deepseek_v4_1.attention import \
         AscendDeepseekV41Attention as cls
 
-    assert cls.forward_mqa is not None
-    for name, expected in [("forward_mqa", "sparse MLA forward"),
-                           ("_o_proj", "output projection")]:
-        with pytest.raises(NotImplementedError, match=expected):
-            getattr(cls, name)(object.__new__(cls), *([None] * 4)[:(
-                4 if name == "forward_mqa" else 2)])
+    source = inspect.getsource(cls.forward_mqa)
+    assert "NotImplementedError" not in source
+    # The operator's rules are checked before the call, not discovered from it.
+    assert "build_sparse_flash_mla_kwargs" in source
+    # attn_sink cannot be skipped: the operator rejects a null sinks tensor.
+    assert "self.attn_sink" in source
+    # Its own, not the CUDA base's.
+    assert "forward_mqa" in vars(cls)
+
+
+def test_a_warmup_step_with_no_metadata_zeroes_rather_than_leaving_garbage():
+    """The profiling run reaches forward before any metadata exists.
+
+    Zeroing matters more than it looks: an uninitialised output buffer carries
+    whatever the allocator last left there, which for a freshly grown pool is
+    frequently NaN. A NaN arriving from warmup looks exactly like a numerical
+    problem in the model, and that is hours of looking in the wrong place.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_ascend.models.deepseek_v4_1 import attention as attn_mod
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention as cls
+
+    layer = object.__new__(cls)
+    output = torch.full((4, 8, 512), float("nan"))
+
+    import vllm.forward_context as fc_mod
+    original = fc_mod.get_forward_context
+    fc_mod.get_forward_context = lambda: SimpleNamespace(attn_metadata=None)
+    try:
+        layer.forward_mqa(torch.zeros(4, 8, 512), torch.zeros(4, 512),
+                          torch.arange(4), output)
+    finally:
+        fc_mod.get_forward_context = original
+
+    assert torch.all(output == 0), "warmup left the output buffer untouched"
+    assert not torch.isnan(output).any()
+
+
+def test_o_proj_is_no_longer_a_stub():
+    """Records that the output projection crossed over, and how far.
+
+    It is implemented, but only for the single-rank case: the oproj tensor
+    parallel path is still refused, and refused explicitly rather than by
+    computing one rank's partial result and returning it as the whole. Asserting
+    that here means removing the guard without wiring the collectives goes red,
+    instead of producing a plausible tensor.
+    """
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention as cls
+
+    source = inspect.getsource(cls._o_proj)
+    assert "raise NotImplementedError" in source, (
+        "the oproj tensor parallel path must still refuse")
+    assert "oproj_tp_enable" in source
+    # The parts that make it a real implementation rather than a stub.
+    assert "inverse_rope_from_cos_sin_cache" in source
+    assert "check_grouped_wo_a_layout" in source
+    assert "self.wo_b(" in source
 
 
 def test_padded_q_heads_does_not_pad():

@@ -98,3 +98,68 @@ def o_projection(o: torch.Tensor,
     """
     z = block_diagonal_wo_a(o, wo_a_grouped)
     return z.flatten(-2) @ wo_b.float().t()
+
+
+#: Layout the Ascend load-time reshapes leave ``wo_a.weight`` in. Note this is
+#: the transpose of ``group_wo_a`` above and of upstream's DeepGEMM layout
+#: ``[o_groups, o_lora_rank, group_in]``: ``npu_transpose_batchmatmul`` wants
+#: the contraction dimension in the middle. Both sites that build it agree --
+#: ``vllm_ascend/ops/linear.py`` (bf16, at weight_loader time) and
+#: ``vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py`` (mxfp8, at
+#: process_weights_after_loading time).
+ASCEND_GROUPED_WO_A_LAYOUT = "[o_groups, group_in, o_lora_rank]"
+
+
+def check_grouped_wo_a_layout(weight: torch.Tensor, o_groups: int,
+                              group_in: int, o_lora_rank: int,
+                              where: str) -> None:
+    """Refuse a ``wo_a`` that was never reshaped into groups.
+
+    Not because the wrong layout would go unnoticed -- for these particular
+    sizes (group_in 4096, o_lora_rank 1024) none of the wrong shapes multiply
+    cleanly, so something would fail either way. The point is *what* fails:
+    without this, the report is a shape mismatch from inside
+    ``npu_transpose_batchmatmul``, naming two tensors and no reason, at the
+    first forward pass. Nothing in it suggests that a step at weight-load time
+    was skipped, which is where the fix actually is.
+
+    That step is easy to skip, and the reason is worth stating plainly for
+    whoever hits this next. Upstream marks this weight with ``is_bmm`` /
+    ``bmm_batch_size``; **nothing on Ascend reads either**. The grouping is
+    instead rediscovered by matching the layer's prefix, in two independent
+    places that do not even agree on how to match -- ``vllm_ascend/ops/linear``
+    tests ``"wo_a" in prefix`` and
+    ``vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8`` tests
+    ``prefix.endswith("wo_a")`` -- and only for some quantisation schemes; a
+    plain block-fp8 linear method leaves the weight 2-D.
+
+    So two ordinary-looking changes silently drop the grouping: renaming the
+    submodule, and serving this layer with a scheme that has no wo_a branch.
+    "The reshape happened" is a property of which method served the layer, not
+    of the model, which is why it is checked here rather than assumed.
+
+    The transposed case has its own branch because it is the easy mistake
+    rather than a rare one: ``group_wo_a`` above, upstream's DeepGEMM path and
+    the ROCm einsum all use ``[o_groups, o_lora_rank, group_in]``, and only the
+    Ascend operators want the contraction dimension in the middle.
+    """
+    expected = (o_groups, group_in, o_lora_rank)
+    if tuple(weight.shape) == expected:
+        return
+
+    detail = (f"{where}: wo_a has shape {tuple(weight.shape)}, expected "
+              f"{expected} -- {ASCEND_GROUPED_WO_A_LAYOUT}.")
+    if weight.ndim == 2 and weight.shape[0] == o_groups * o_lora_rank:
+        raise ValueError(
+            detail + " The weight is still in its flat checkpoint form, so "
+            "the load-time grouping did not run for this layer. Look at which "
+            "quantisation method served this linear rather than at the "
+            "projection: only some of them reshape wo_a, and they select it by "
+            "the prefix ending in 'wo_a' -- nothing on Ascend reads the "
+            "is_bmm flag upstream sets for exactly this purpose.")
+    if tuple(weight.shape) == (o_groups, o_lora_rank, group_in):
+        raise ValueError(
+            detail + " This is the transposed layout -- upstream's DeepGEMM "
+            "and group_wo_a() order, not the one npu_transpose_batchmatmul "
+            "takes. Transpose the last two dimensions.")
+    raise ValueError(detail)
