@@ -225,6 +225,14 @@ def apply_all() -> list[str]:
     if apply_moe_router_patch():
         applied.append("create_fused_moe_router")
 
+    # Same shape as the MoE router hook: the call site reads its own module's
+    # globals, so this lands whenever it is applied.
+    from vllm_ascend.models.deepseek_v4_1.indexer_q import \
+        apply_indexer_q_patch
+
+    if apply_indexer_q_patch():
+        applied.append("fused_indexer_q_rope_quant")
+
     if not applied:
         raise RuntimeError(
             "apply_all() applied nothing. Either upstream changed shape and "
