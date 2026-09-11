@@ -94,6 +94,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Which decisions to take from golden instead of computing them:
     # "off" (default) | "moe" | "moe+layer_in" | "moe+indexer"; flags join with "+".
     "VLLM_ASCEND_DSV41_FORCE_ROUTE": lambda: os.getenv("VLLM_ASCEND_DSV41_FORCE_ROUTE", "off"),
+    # DeepSeek-V4.1 mHC post: "1" uses upstream's torch reference instead of
+    # aclnnHcPost. Default "0" (the operator, which is also V4.0's production
+    # path). Exists to A/B the two on a card -- they compute the same
+    # expression, and "the same expression" has been wrong here before.
+    "VLLM_ASCEND_DSV41_MHC_POST_TORCH": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_POST_TORCH", "0"),
 }
 
 # end-env-vars-definition

@@ -36,12 +36,72 @@ def _inputs(seed=0):
     )
 
 
-def test_post_is_a_genuine_drop_in():
-    """Same four arguments, same return -- so it is rebound as-is rather than
-    wrapped, and nothing can drift between them."""
+def test_post_uses_the_ascend_operator_and_adapts_the_shapes():
+    """aclnnHcPost exists here -- it is V4.0's production path, and the
+    hc_pre/hc_post pair was extended to hidden 5120 for V4.1.
+
+    Its shape contract differs from upstream's in two ways, and both are
+    silent if missed: it carries a batch axis V4.1 does not, and its `post`
+    has no trailing 1.
+    """
+    seen = {}
+
+    class _Ops:
+        @staticmethod
+        def npu_hc_post(x, residual, post, comb):
+            seen.update(x=x.shape, residual=residual.shape,
+                        post=post.shape, comb=comb.shape)
+            return torch.zeros_like(residual)
+
+    T, HC, D = 5, 4, 8
+    real = torch.ops._C_ascend if hasattr(torch.ops, "_C_ascend") else None
+    torch.ops._C_ascend = _Ops
+    try:
+        out = mhc.mhc_post_ascend(
+            torch.randn(T, D), torch.randn(T, HC, D),
+            torch.randn(T, HC, 1), torch.randn(T, HC, HC))
+    finally:
+        if real is not None:
+            torch.ops._C_ascend = real
+
+    assert seen["x"] == (1, T, D)
+    assert seen["residual"] == (1, T, HC, D)
+    assert seen["post"] == (1, T, HC), "the trailing 1 must be dropped"
+    assert seen["comb"] == (1, T, HC, HC)
+    assert out.shape == (T, HC, D), "the batch axis must come back off"
+
+
+def test_post_falls_back_to_torch_when_asked(monkeypatch):
+    """The A/B switch. They compute the same expression, and "the same
+    expression" has been wrong here before, so the comparison stays available."""
     from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
 
-    assert mhc.mhc_post_ascend is mhc_post_torch
+    # Patch the accessor rather than the envs module: envs resolves names
+    # through __getattr__, so setattr on it installs a real attribute that
+    # shadows the lookup and outlives the test.
+    monkeypatch.setattr(mhc, "envs_dsv41_mhc_post_torch", lambda: True)
+
+    T, HC, D = 5, 4, 8
+    args = (torch.randn(T, D), torch.randn(T, HC, D),
+            torch.randn(T, HC, 1), torch.randn(T, HC, HC))
+    torch.testing.assert_close(mhc.mhc_post_ascend(*args), mhc_post_torch(*args))
+
+
+@pytest.mark.parametrize("x_shape,res_shape", [
+    ((1, 5, 8), (5, 4, 8)),      # x already batched
+    ((5, 8), (1, 5, 4, 8)),      # residual already batched
+])
+def test_post_refuses_an_already_batched_tensor(x_shape, res_shape):
+    with pytest.raises(ValueError, match="batch axis is added here"):
+        mhc.mhc_post_ascend(torch.randn(*x_shape), torch.randn(*res_shape),
+                            torch.randn(5, 4, 1), torch.randn(5, 4, 4))
+
+
+def test_post_refuses_a_post_without_the_trailing_one():
+    """Without the check this squeezes hc instead, whenever hc is 1."""
+    with pytest.raises(ValueError, match="length-1"):
+        mhc.mhc_post_ascend(torch.randn(5, 8), torch.randn(5, 4, 8),
+                            torch.randn(5, 4), torch.randn(5, 4, 4))
 
 
 def test_pre_accepts_exactly_what_the_decoder_layer_passes():

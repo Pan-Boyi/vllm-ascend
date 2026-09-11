@@ -29,8 +29,59 @@ import torch
 from vllm.model_executor.kernels.mhc.torch import (mhc_post_torch,
                                                    mhc_pre_delayed_torch)
 
-#: Rebound as-is: identical signature and return to the tilelang version.
-mhc_post_ascend = mhc_post_torch
+def mhc_post_ascend(x: torch.Tensor, residual: torch.Tensor,
+                    post_layer_mix: torch.Tensor,
+                    comb_res_mix: torch.Tensor) -> torch.Tensor:
+    """mHC post through ``aclnnHcPost``, which this platform does have.
+
+    Same four arguments and return as the tilelang version, so it is rebound
+    directly. What differs is the operator's shape contract -- it takes a batch
+    axis that V4.1 does not carry, and a ``post`` without the trailing 1 ::
+
+        upstream            operator
+        x    (T, D)         (b, s, d)
+        res  (T, hc, D)     (b, s, hc, d)
+        post (T, hc, 1)     (b, s, hc)      <- trailing 1 dropped
+        comb (T, hc, hc)    (b, s, hc, hc)
+
+    The V4.0 Ascend layer does the same unsqueeze; the ``post`` squeeze is
+    extra here because V4.1's pre returns that axis and V4.0's does not.
+
+    ``VLLM_ASCEND_DSV41_MHC_POST_TORCH=1`` forces upstream's torch reference
+    instead. That exists to A/B the two on a card: the operator is the V4.0
+    production path and its arithmetic is the same expression, but "same
+    expression" has been wrong before today, and the two have never been
+    compared on this model's shapes.
+    """
+    if envs_dsv41_mhc_post_torch():
+        return mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+
+    if x.dim() != 2 or residual.dim() != 3:
+        raise ValueError(
+            f"expected x (tokens, hidden) and residual (tokens, hc, hidden), "
+            f"got {tuple(x.shape)} and {tuple(residual.shape)}. The batch axis "
+            "is added here, so a tensor that already has one would be given a "
+            "second and the operator would read the wrong lengths.")
+    if post_layer_mix.shape[-1] != 1:
+        raise ValueError(
+            f"post has shape {tuple(post_layer_mix.shape)}; the last axis must "
+            "be the length-1 one upstream's pre returns, because it is dropped "
+            "for the operator. Without the trailing 1 this would squeeze hc "
+            "instead when hc happens to be 1.")
+
+    out = torch.ops._C_ascend.npu_hc_post(
+        x.unsqueeze(0),
+        residual.unsqueeze(0),
+        post_layer_mix.squeeze(-1).unsqueeze(0),
+        comb_res_mix.unsqueeze(0),
+    )
+    return out.squeeze(0)
+
+
+def envs_dsv41_mhc_post_torch() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_MHC_POST_TORCH == "1"
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
