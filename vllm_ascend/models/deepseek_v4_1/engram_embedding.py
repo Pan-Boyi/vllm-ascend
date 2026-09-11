@@ -38,6 +38,40 @@ from vllm_ascend.models.deepseek_v4_1.engram_staging import (DEFAULT_STAGE_DIR,
                                                              staged_file_name)
 
 
+#: Upstream logs this from inside ``if cpu_offload:`` regardless of what the
+#: allocation actually did, so with the allocation diverted it describes an
+#: intention rather than an event.
+_STALE_OFFLOAD_LOG = "offloaded to pinned host memory"
+
+
+class _DropStaleOffloadLine:
+    """Filter out upstream's now-untrue INFO line.
+
+    It reports "94.42 GiB per rank", which over four ranks and two layers is
+    755.4 GiB against a 755 GiB host -- a reader would conclude host memory had
+    just been exhausted, when the measured figure is VmPin = 0. Left in place it
+    is worse than no log line, because the number is specific enough to be
+    believed.
+    """
+
+    def filter(self, record) -> bool:
+        return _STALE_OFFLOAD_LOG not in record.getMessage()
+
+
+@contextlib.contextmanager
+def _upstream_offload_line_suppressed():
+    import logging
+
+    logger = logging.getLogger(
+        "vllm.models.deepseek_v4_1.common.engram")
+    drop = _DropStaleOffloadLine()
+    logger.addFilter(drop)
+    try:
+        yield
+    finally:
+        logger.removeFilter(drop)
+
+
 @contextlib.contextmanager
 def tables_not_allocated():
     """Force ``torch.empty`` onto ``meta`` for the duration.
@@ -99,11 +133,20 @@ class AscendStagedEngramEmbedding:
     _staged_tables: tuple | None = None
 
     def __init__(self, *args, **kwargs) -> None:
-        with tables_not_allocated():
+        with tables_not_allocated(), _upstream_offload_line_suppressed():
             super().__init__(*args, **kwargs)
 
         self._assert_nothing_was_allocated()
         self._layer_id = None          # bound by the owner; see bind_layer()
+
+        import logging
+        logging.getLogger(__name__).info(
+            "Engram table not allocated: %d rows x %d stays in the staged "
+            "read-only mapping, 0 bytes resident and 0 bytes pinned per rank. "
+            "Upstream's \"%s\" line is suppressed here because the allocation "
+            "it describes does not happen.",
+            getattr(self, "part_num_embeddings", -1),
+            getattr(self, "dim", -1), _STALE_OFFLOAD_LOG)
 
     # -- guards --------------------------------------------------------------
 

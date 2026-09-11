@@ -271,3 +271,62 @@ def test_an_unresolvable_kernel_says_what_is_already_done(monkeypatch):
     msg = str(exc.value)
     assert "already\nin HBM" in msg or "already in HBM" in msg
     assert "nowhere.at.all" in msg and "/nonexistent/path.py" in msg
+
+
+# -- the log line that became untrue -----------------------------------------
+
+
+def test_the_stale_offload_line_is_dropped():
+    """Upstream logs it from inside `if cpu_offload:` regardless of what the
+    allocation did, so with the allocation diverted it reports an intention."""
+    import logging
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import (
+        _STALE_OFFLOAD_LOG, _upstream_offload_line_suppressed)
+
+    logger = logging.getLogger("vllm.models.deepseek_v4_1.common.engram")
+    seen = []
+    sink = logging.Handler()
+    sink.emit = lambda record: seen.append(record.getMessage())
+    logger.addHandler(sink)
+    logger.setLevel(logging.INFO)
+    try:
+        with _upstream_offload_line_suppressed():
+            logger.info("Engram table %s: 384006168 rows x 256, 94.42 GiB per rank",
+                        _STALE_OFFLOAD_LOG)
+            logger.info("Built engram token map (129280 -> 99092 ids)")
+        logger.info("after the context, %s", _STALE_OFFLOAD_LOG)
+    finally:
+        logger.removeHandler(sink)
+
+    # the untrue line, identified by its number rather than by position
+    assert not any("94.42 GiB per rank" in m for m in seen), (
+        f"the untrue line reached the log: {seen}")
+    # the filter is surgical: other lines from the same logger survive
+    assert any("Built engram token map" in m for m in seen)
+    # and it is removed with the context, not left on the logger forever
+    assert any(m.startswith("after the context") for m in seen), (
+        "the filter must come off again, or it would hide a line that becomes "
+        "true again if the design changes back")
+
+
+def test_the_number_it_printed_was_specific_enough_to_believe():
+    """Why suppressing it beats leaving it.
+
+    94.42 GiB per rank over four ranks and two layers is 755.4 GiB, against a
+    755 GiB host. A reader would conclude host memory had just been exhausted.
+    The measured figure is VmPin = 0.
+    """
+    per_rank_per_layer = 94.42
+    assert round(per_rank_per_layer * 4 * 2, 1) == 755.4
+
+
+def test_the_replacement_line_says_what_actually_happened():
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        AscendStagedEngramEmbedding
+
+    source = inspect.getsource(AscendStagedEngramEmbedding.__init__)
+    assert "0 bytes pinned per rank" in source
+    assert "does not happen" in source
