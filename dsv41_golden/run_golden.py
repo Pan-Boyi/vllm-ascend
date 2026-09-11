@@ -57,6 +57,10 @@ def main():
                          "AFTER RoPE instead of before (ref/model.py:749 requires "
                          "before). Produces no error, only different top-k -- which is "
                          "the point: it is the negative arm for that ordering")
+    ap.add_argument("--pv-bf16", action="store_true",
+                    help="round the softmax probabilities to bf16 before P.V, as the "
+                         "original tilelang sparse_attn does (acc_s_cast is BF16). "
+                         "Diagnostic: measures whether that mechanism compounds")
     ap.add_argument("--probs-bf16", action="store_true",
                     help="round the fp32 routing weights to bf16 before weighting the "
                          "experts, modelling the AllGather combine path's "
@@ -166,6 +170,26 @@ def main():
               "isolate the attention merge semantics from per-stream quantization.",
               flush=True)
 
+    if args_cli.pv_bf16:
+        # tilelang materialises P in bf16 before the P.V gemm; the CPU reference
+        # keeps it fp32 (ALIGNMENT_PROTOCOL section 10.6 P1).  Patched rather than
+        # branched inside kernel_cpu so the golden's own path is untouched.
+        # Patch the name in the MODEL module -- model.py does `from kernel import
+        # sparse_attn`, so the call site resolves against its own namespace.  This is
+        # the second time this bit was got wrong: --no-quant hit it, was fixed, and
+        # the lesson was written into that patch's comment rather than applied when
+        # the next patch was written.
+        import model as _mm
+        import measure_p1_pv_bf16 as _m
+
+        def _sa(q, kv, attn_sink, topk_idxs, softmax_scale):
+            return _m.sparse_attn_pv(q, kv, attn_sink, topk_idxs, softmax_scale,
+                                     torch.bfloat16)
+
+        _mm.sparse_attn = _sa
+        print("!!! --pv-bf16: softmax probabilities rounded to bf16 before P.V. "
+              "Models the tilelang kernel, NOT the reference.", flush=True)
+
     if args_cli.indexer_post_rope:
         model.indexer_post_rope = True
         print("!!! --indexer-post-rope: the indexer will see the latent AFTER RoPE. "
@@ -252,6 +276,7 @@ def main():
         # comparison cannot mistake one for a normal reference.
         "no_quant": args_cli.no_quant,
         "probs_bf16": args_cli.probs_bf16,
+        "pv_bf16": args_cli.pv_bf16,
         "indexer_post_rope": args_cli.indexer_post_rope,
         "routing_plan": args_cli.routing_plan,
         "routing_plan_accum_dtype": None if plan is None else plan.meta.get("accum_dtype"),
