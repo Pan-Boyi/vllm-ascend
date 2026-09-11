@@ -563,6 +563,44 @@ def _ascend_max_memory_usage_bytes_from_groups(
     )
 
 
+
+def _assert_covers(
+    groups: list[KVCacheGroupSpec],
+    kv_cache_spec: dict[str, KVCacheSpec],
+    branch: str,
+) -> list[KVCacheGroupSpec]:
+    """每一层都必须落进某个组，落不进就【当场点名】。
+
+    🔴 上游在 kv_cache_utils.py:2649 有这条断言，但它只说
+        "Some layers are not assigned to any group."
+    —— 不说是哪些层、也不说它们是什么 spec。而那两样正是唯一能定位问题的信息，
+    且分组是在【我们这个补丁里】做的 ⇒ 该由这里说出来，不该让上游去说它不知道的事。
+    2026-09-11 第十一次起飞就撞在那条裸断言上，日志里一个层名都没有。
+
+    ⚠️ 这条只改【报错内容】，不改分组行为：覆盖全时原样返回。
+    """
+    assigned = {name for g in groups for name in g.layer_names}
+    missing = [n for n in kv_cache_spec if n not in assigned]
+    if not missing:
+        return groups
+    def _desc(n: str) -> str:
+        sp = kv_cache_spec[n]
+        bits = [type(sp).__name__]
+        for attr in ("block_size", "page_size_bytes", "model_version", "compress_ratio"):
+            v = getattr(sp, attr, None)
+            if v is not None:
+                bits.append(f"{attr}={v}")
+        return f"{n}  [{', '.join(bits)}]"
+    raise NotImplementedError(
+        f"Ascend {branch} KV-cache grouping left {len(missing)} of {len(kv_cache_spec)} "
+        f"layers unassigned; upstream's assert would only say 'Some layers are not "
+        f"assigned to any group.' The unassigned layers and their specs are:\n  "
+        + "\n  ".join(_desc(n) for n in missing)
+        + f"\nGrouped {len(assigned)} layers into {len(groups)} group(s): "
+        + ", ".join(f"{len(g.layer_names)}x{type(g.kv_cache_spec).__name__}" for g in groups)
+    )
+
+
 def _ascend_get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -612,10 +650,10 @@ def _ascend_get_kv_cache_groups(
     been page_size-padded upstream (see _get_kv_cache_groups_uniform_groups)".
     """
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
-        return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
+        return _assert_covers(get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec), kv_cache_spec, "GLM5-Next")
     if not vllm_version_is("0.28.0") and has_deepseek_v4_specs(kv_cache_spec):
         if grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
-            return _get_kv_cache_groups_uniform_groups(grouped_specs)
+            return _assert_covers(_get_kv_cache_groups_uniform_groups(grouped_specs), kv_cache_spec, "DSV4")
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
