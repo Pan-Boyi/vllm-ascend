@@ -811,6 +811,18 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 
         REGISTERED_ASCEND_OPS["GateLinear"] = AscendGateLinear
 
+    # DeepSeek-V4.1's sparse indexer. Scoped to the model because upstream's
+    # SparseAttnIndexer also serves V3.2 and V4.0, whose Ascend paths reach
+    # their operators through the attention backend and never dispatch this op.
+    if vllm_config is not None:
+        from vllm_ascend.models.deepseek_v4_1.kv_binding import is_v41
+
+        if is_v41(vllm_config.model_config.hf_text_config):
+            from vllm_ascend.models.deepseek_v4_1.sparse_indexer import \
+                register as register_v41_indexer
+
+            register_v41_indexer(REGISTERED_ASCEND_OPS)
+
     # Override selected ops when the compatibility implementations are required.
     if get_current_hardware_profile().supports(HardwareCapability.COMPATIBILITY_OP_IMPLEMENTATIONS):
         from vllm_ascend._310p.fused_moe.fused_moe import AscendMoERunner310, AscendRoutedExperts310

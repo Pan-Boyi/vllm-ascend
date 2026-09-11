@@ -235,6 +235,16 @@ def apply_all() -> list[str]:
     if apply_indexer_q_patch():
         applied.append("fused_indexer_q_rope_quant")
 
+    # Same shape again. This one guards the other half of the indexer: the K
+    # producer upstream ships only as a Triton kernel, so there is no platform
+    # branch to select away from, and a per-token paged store is the pointer
+    # shape that aborts triton-ascend rather than raising.
+    from vllm_ascend.models.deepseek_v4_1.indexer_k_store import \
+        apply_indexer_k_store_patch
+
+    if apply_indexer_k_store_patch():
+        applied.append("indexer_k_norm_rope_store")
+
     if not applied:
         raise RuntimeError(
             "apply_all() applied nothing. Either upstream changed shape and "

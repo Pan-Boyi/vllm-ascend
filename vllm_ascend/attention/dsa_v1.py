@@ -504,6 +504,26 @@ class AscendDSAMetadata:
 
     hadamard: torch.Tensor | None = None
 
+    # Longest sequence in the batch, from common_attn_metadata. Already a
+    # Python int there -- computed by the runner from the CPU copy of seq_lens
+    # -- so carrying it costs nothing and saves a device read.
+    max_seq_len: int = 0
+
+    # Names upstream's DeepSeek-V4.1 indexer reads straight off this object
+    # (vllm/models/deepseek_v4_1/attention.py:1153, :1181). Ascend keeps the
+    # per-request payload one level down, in req_metadata, so without these the
+    # V4.1 layer fails with an AttributeError before reaching any operator.
+    # Added rather than rearranged: nothing in this tree branches on their
+    # presence, and both derive from values already built.
+
+    @property
+    def slot_mapping(self) -> torch.Tensor | None:
+        return None if self.req_metadata is None else self.req_metadata.slot_mapping
+
+    @property
+    def num_prefill_tokens(self) -> int:
+        return self.num_actual_tokens - self.num_decode_tokens
+
 
 DSAMetadataDict: TypeAlias = dict[str, AscendDSAMetadata]
 
@@ -1005,6 +1025,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             attn_state=common_attn_metadata.attn_state,
             req_metadata=req_metadata,
             hadamard=self.hadamard,
+            max_seq_len=common_attn_metadata.max_seq_len,
         )
 
     def _build_sas_metadata(
@@ -1418,6 +1439,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             attn_state=common_attn_metadata.attn_state,
             req_metadata=req_metadata,
             hadamard=None,
+            max_seq_len=common_attn_metadata.max_seq_len,
         )
 
     def build_req_metadata_for_drafting(
