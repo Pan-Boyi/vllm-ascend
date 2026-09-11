@@ -111,6 +111,20 @@ _SCRIPT = textwrap.dedent('''
 ''')
 
 
+#: These tests call aclrtHostRegisterV2. Three of this machine's eight cards
+#: died on 2026-09-10/11 with the same signature, and the third went during a
+#: 2 GiB registration that was never interrupted -- so "an operation that
+#: completes is safe" does not hold. The correlation is not a proven cause and
+#: n is small, but the remaining budget is two working cards, so these do not
+#: run without someone deciding to.
+REGISTRATION_OPT_IN = "VLLM_ASCEND_DSV41_ALLOW_HOST_REGISTER"
+
+
+def _registration_allowed() -> bool:
+    import os
+    return os.environ.get(REGISTRATION_OPT_IN) == "1"
+
+
 def _npu_available() -> bool:
     r = subprocess.run(
         [sys.executable, "-c",
@@ -119,7 +133,9 @@ def _npu_available() -> bool:
     return r.returncode == 0 and r.stdout.strip().isdigit() and int(r.stdout) > 0
 
 
-@pytest.mark.skipif(not _npu_available(), reason="no NPU available")
+@pytest.mark.skipif(not (_npu_available() and _registration_allowed()),
+                    reason=f"host registration is gated behind {REGISTRATION_OPT_IN}=1 "
+                           "while the card failures are unexplained")
 def test_gather_matches_the_cpu_reference_byte_for_byte():
     script = _SCRIPT.format(dim=DIM, block=BLOCK, rows=NUM_ROWS)
     result = subprocess.run([sys.executable, "-c", script],
@@ -219,7 +235,9 @@ _MIXIN_SCRIPT = textwrap.dedent('''
 ''')
 
 
-@pytest.mark.skipif(not _npu_available(), reason="no NPU available")
+@pytest.mark.skipif(not (_npu_available() and _registration_allowed()),
+                    reason=f"host registration is gated behind {REGISTRATION_OPT_IN}=1 "
+                           "while the card failures are unexplained")
 def test_mixin_drives_upstreams_embedding_class():
     """The override surface is exactly _storage and lookup, nothing else."""
     script = _MIXIN_SCRIPT.format(dim=DIM, block=BLOCK, rows=NUM_ROWS)
