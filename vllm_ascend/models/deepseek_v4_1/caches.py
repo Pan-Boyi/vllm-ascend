@@ -136,8 +136,15 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
     the V4.0 Ascend cache, which is the same cache under a model that already
     runs on this hardware.
 
-    The block size is the physical page multiplied by the compression ratio,
-    and that product has to appear verbatim in the backend's supported list.
+    The block size is the physical page multiplied by the compression ratio.
+    That is not a preference: ``AscendMLAAttentionSpec.__post_init__`` derives
+    ``storage_block_size = block_size // tokens_per_state``, so it recovers the
+    physical page by dividing the ratio back out. Passing upstream's
+    convention -- ``block_size = cache_config.block_size``, unmultiplied --
+    would make the derived physical page ``B // ratio``, smaller than the real
+    one, and ``real_page_size_bytes`` would then under-allocate.
+
+    The product has to appear verbatim in the backend's supported list.
     Not "be divisible by": ``select_common_block_size`` silently falls back to
     a smaller supported size that divides it, which leaves the planner and the
     operator working from different page sizes with nothing raised. The
@@ -161,8 +168,13 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
 
         storage_block_size = DSV4_BLOCK_SIZES[
             vllm_config.cache_config.block_size][0][0]
+        # max(ratio, 1): ratio 0 means "no compression", i.e. one state per
+        # token, not zero states per page. Multiplying by it directly gives a
+        # block size of 0, which no backend can list and which
+        # AscendMLAAttentionSpec would then divide by tokens_per_state.
+        states_ratio = max(self.compress_ratio, 1)
         return AscendMLAAttentionSpec(
-            block_size=storage_block_size * self.compress_ratio,
+            block_size=storage_block_size * states_ratio,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -170,7 +182,7 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
             cache_dtype_str=self.cache_config.cache_dtype,
             scale_dim=1 if self.head_dim == 128 else 0,
             scale_dtype=torch.float if compressed else torch.float16,
-            tokens_per_state=self.compress_ratio,
+            tokens_per_state=states_ratio,
         )
 
     def get_attn_backend(self):

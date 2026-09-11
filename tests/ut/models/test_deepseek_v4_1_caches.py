@@ -267,3 +267,31 @@ def test_the_indexer_cache_construction_site_is_rebound():
     platform_patches.rebind_upstream_classes()
     assert (attention_mod.DeepseekV4IndexerCache
             is caches.AscendDeepseekV41IndexerCache)
+
+
+def test_ratio_zero_is_one_state_per_token_not_zero_states_per_page():
+    """max(ratio, 1). Multiplying by 0 gives a block size of 0, which no
+    backend can list and which the spec would then divide by."""
+    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+    page = DSV4_BLOCK_SIZES[128][0][0]
+    spec = _indexer_cache(0).get_kv_cache_spec(_VllmConfigStub(128))
+    assert spec.block_size == page
+    assert spec.tokens_per_state == 1
+    assert spec.storage_block_size == page, (
+        "the spec divides block_size by tokens_per_state to recover the "
+        "physical page; both must come back to the page for ratio 0")
+
+
+def test_the_spec_recovers_the_physical_page_for_every_ratio():
+    """Why block_size is multiplied at all: AscendMLAAttentionSpec derives
+    storage_block_size = block_size // tokens_per_state. Upstream's
+    unmultiplied convention would make the physical page B // ratio."""
+    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+    page = DSV4_BLOCK_SIZES[128][0][0]
+    for ratio in (0, 1, 2):
+        spec = _indexer_cache(ratio).get_kv_cache_spec(_VllmConfigStub(128))
+        assert spec.storage_block_size == page, (
+            f"ratio {ratio}: physical page came back as "
+            f"{spec.storage_block_size}, not {page}")
