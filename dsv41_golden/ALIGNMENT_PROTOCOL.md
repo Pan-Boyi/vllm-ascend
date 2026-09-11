@@ -1173,6 +1173,29 @@ fp32 舍入量级；batch=2 时 expert GEMM 看到 54 行而不是 27 行，舍�
 `compare_batch_rows.py` 的 `FIRST_DIVERGENCE_BUG_THRESHOLD = 1e-6` 远高于 fp32
 首次接触的舍入（~1e-12）、远低于接线错误会产生的量级。超过它才 exit 1。
 
+### 9.7b 长序列的逐 token 稀释与误报检查（第 6.7 节那两张表的来源）
+
+```bash
+# 三个长度的基线。--seq-len 只截断,加长必须用 --random-tokens
+for T in 64 128 256; do
+  run python run_golden.py --layers 3 --threads 16 --random-tokens $T --dump $DU/len$T
+done
+
+# T=256 的「已知无 bug」隔离参考对:fp64 累加 + 强制路由 + 强制 layer.in
+run python routing_plan.py $DU/len256
+run python run_golden.py --layers 3 --threads 16 --random-tokens 256 --fp64     --routing-plan $DU/len256 --force-layer-in $DU/len256 --dump $DU/len256_iso
+
+# 稀释随 T 的变化(第 6.7.1 节的两张表)
+python measure_token_dilution.py --dumps $DU/smoke3:27 $DU/len64:64     $DU/len128:128 $DU/len256:256
+
+# 长序列误报检查(第 6.7.2 节):必须全过
+python compare_dumps.py $DU/len256 $DU/len256_iso --tolerance isolated
+```
+
+耗时:三个基线共约 2 分钟(16 线程,T=256 时约 20s/层 —— **成本主要在读专家,
+不在注意力**,滑窗是 O(T·window) 不是 O(T²)),隔离那趟再约 1 分钟。
+四份 dump 共 1.16 GB。**不需要卡。**
+
 ### 9.8 engram 参考（都不需要跑模型、不需要卡）
 ```bash
 python engram_hash_ref.py --verify $DU/full40_v2 --decode-from 20   # 整数哈希，9 秒
