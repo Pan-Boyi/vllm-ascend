@@ -164,6 +164,13 @@ def rebind_mhc_functions() -> list[str]:
     return rebound
 
 
+def _apply_platform_patches_first() -> None:
+    """Ensure vllm_ascend's global platform patches are in place."""
+    from vllm_ascend.utils import adapt_patch
+
+    adapt_patch(is_global_patch=True)
+
+
 def _upstream_model_module():
     import vllm.models.deepseek_v4_1.nvidia.model as upstream
 
@@ -180,6 +187,25 @@ def apply_all() -> list[str]:
     """
     from vllm_ascend.models.deepseek_v4_1.attn_selector import \
         apply_attn_selector_patch
+
+    # Before anything here imports an upstream model module. Every rebind below
+    # reaches into vllm.models.deepseek_v4_1.nvidia.model, which transitively
+    # imports V4.0's model module, which does
+    #
+    #     from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
+    #
+    # -- a from-import, so the name is frozen into that module's namespace at
+    # import time. vllm_ascend's platform patch replaces the *module attribute*,
+    # which does nothing for a name already bound elsewhere. Importing these
+    # modules first therefore pins the upstream factory permanently, and the
+    # Ascend MoE router is never installed: the first launch to reach the MoE
+    # died at topk_softplus_sqrt, a CUDA entry point, with the Ascend
+    # equivalents present and unused.
+    #
+    # Idempotent -- it is an import of an already-imported module in the normal
+    # case. It is here rather than left to the caller because the ordering is a
+    # property of what this function does, not of who calls it.
+    _apply_platform_patches_first()
 
     applied = []
     disable_join_row_ptrs()
