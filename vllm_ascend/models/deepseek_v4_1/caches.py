@@ -24,8 +24,8 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
-from vllm_ascend.models.deepseek_v4_1.engram_gather import \
-    AscendParallelEngramEmbedding
+from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+    AscendStagedEngramEmbedding
 
 
 class AscendCompressorStateBackend(AscendDSABackend):
@@ -105,22 +105,21 @@ class AscendDeepseekV41SWACache(DeepseekV4SWACache):
         )
 
 
-class AscendEngramEmbedding(AscendParallelEngramEmbedding,
+class AscendEngramEmbedding(AscendStagedEngramEmbedding,
                             ParallelEngramEmbedding):
-    """Upstream's engram table, looked up from host memory.
+    """Upstream's engram table, never allocated and never registered.
 
-    The mixin comes first so its ``_storage`` and ``lookup`` win the MRO; it
-    overrides exactly those two and inherits construction and weight loading.
+    The mixin comes first so its ``__init__`` and ``_storage`` win the MRO.
 
-    This is the class that decides whether the model fits. The engram tables
-    are 188.83 GiB -- 39.8% of the checkpoint -- and upstream reads them
-    through a UVA view of device memory, which is not available here and would
-    not have room for them if it were. The Ascend lookup reads a shared
-    host mapping instead, with the device address travelling as an int64
-    inside an ordinary tensor because Triton's launcher admits only DEVICE and
-    HOST_NUMA pointer arguments.
+    This is the class that decides whether the model loads at all. Upstream's
+    constructor allocates the whole shard before anything else gets a say, and
+    at TP=1 the hash-column sharding degenerates so each rank wants a full
+    copy: 188.83 GiB per rank, 755.3 GiB across four. The first real launch
+    died exactly there.
 
-    If the host tables have not been bound, ``_storage`` raises rather than
-    falling back. There is no fallback worth having: the alternative is
-    allocating 188.83 GiB on a device that does not have it.
+    How it died is the part worth keeping: ``rtsMallocHost ... out of memory``.
+    The banned pinned-host path was stopped by the host being too small, not
+    by any rule of ours. A larger machine would have let it through and then
+    run the registration that took an NPU down. So the interception here is at
+    construction, and it raises.
     """

@@ -107,13 +107,19 @@ def test_the_guard_reads_the_bindings_not_the_record_of_applying_them():
 
 
 def test_the_engram_table_is_the_ascend_one():
-    """The rebind that decides whether the model fits at all: 188.83 GiB of
-    engram tables, 39.8% of the checkpoint, read from a host mapping."""
+    """The rebind that decides whether the model loads at all.
+
+    188.83 GiB of engram tables, 39.8% of the checkpoint. Upstream's
+    constructor allocates the shard up front and the first real launch died
+    there; the Ascend subclass builds the Parameters on meta and reads the
+    staged tables instead.
+    """
     import vllm.models.deepseek_v4_1.common.engram as engram_mod
 
     assert engram_mod.ParallelEngramEmbedding is caches.AscendEngramEmbedding
     mro = [c.__name__ for c in caches.AscendEngramEmbedding.__mro__[:3]]
-    assert mro == ["AscendEngramEmbedding", "AscendParallelEngramEmbedding",
+    assert mro == ["AscendEngramEmbedding", "AscendStagedEngramEmbedding",
                    "ParallelEngramEmbedding"], (
-        "the mixin must precede upstream's class or its _storage and lookup "
-        f"lose the MRO; got {mro}")
+        "the mixin must precede upstream's class or upstream's __init__ wins "
+        "and allocates the whole shard before anything else gets a say; "
+        f"got {mro}")
