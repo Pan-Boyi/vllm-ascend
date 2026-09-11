@@ -212,3 +212,82 @@ def check_in_range(hash_ids: torch.Tensor, num_rows: int) -> None:
             f"engram hash id out of range: [{lo}, {hi}] outside [0, {num_rows}). "
             "A stale compressed-token map or a vocab-size mismatch rehashes the "
             "whole table, and every id it produces looks reasonable.")
+
+
+class AscendParallelEngramEmbedding:
+    """Ascend override surface for upstream's ``ParallelEngramEmbedding``.
+
+    Upstream's ``lookup`` reaches for two things this platform supplies
+    differently, and nothing else, so the mixin replaces exactly those:
+
+    ``_storage`` -- upstream hands the kernel tensors that alias host memory
+        through UVA. There is no equivalent here: a tensor built over a
+        registered host mapping reports its location as HOST, and Triton's
+        launcher admits only DEVICE and HOST_NUMA. The addresses travel as
+        data in one-element int64 tensors instead.
+
+    ``lookup`` -- the kernel differs (see this module's docstring) and so does
+        the grid. Upstream halves it when gathering in the background to leave
+        SMs for the main stream; on A5 that costs about 2x, because the cores
+        being handed back are vector cores and the main stream's work is on the
+        cube cores. Whether the overlap it buys is worth that has to be
+        measured end to end; until then the grid is not halved.
+
+    Mixed in ahead of upstream's class so these win the MRO:
+
+        class AscendEngramEmbedding(AscendParallelEngramEmbedding,
+                                    ParallelEngramEmbedding):
+            pass
+    """
+
+    _host_table: HostTable | None = None
+    _host_scale_table: HostTable | None = None
+
+    def bind_host_tables(self, table: HostTable, scale_table: HostTable) -> None:
+        """Adopt registered mappings for the weight and scale tables.
+
+        Re-binding unregisters first: registration is not idempotent here and a
+        repeat returns 507910. Upstream's equivalent guard exists for the
+        opposite hazard -- on CUDA a stale view is reused silently.
+        """
+        self.release_host_tables()
+        self._host_table = table
+        self._host_scale_table = scale_table
+
+    def release_host_tables(self) -> None:
+        for attr in ("_host_table", "_host_scale_table"):
+            existing = getattr(self, attr, None)
+            if existing is not None:
+                unregister_host_table(existing)
+                setattr(self, attr, None)
+
+    def _storage(self):
+        if self._host_table is None or self._host_scale_table is None:
+            raise RuntimeError(
+                "engram host tables are not bound; call bind_host_tables() "
+                "after registering the mappings. Upstream reaches for a UVA "
+                "view here, which this platform has no equivalent for.")
+        dev = torch.npu.current_device()
+        return (torch.tensor([self._host_table.device_addr], dtype=torch.int64,
+                             device=f"npu:{dev}"),
+                torch.tensor([self._host_scale_table.device_addr],
+                             dtype=torch.int64, device=f"npu:{dev}"))
+
+    def lookup(self, indices: torch.Tensor, out: torch.Tensor,
+               background: bool = False) -> None:
+        rows = indices.shape[0] * self.part_n_hash_cols
+        if not rows:
+            return
+        check_in_range(indices, self.num_embeddings)
+        weight_addr, scale_addr = self._storage()
+        grid = min(rows, self._num_sms)
+        engram_lookup_hostptr[(grid, )](
+            weight_addr, scale_addr, indices, out,
+            self.vocab_start_idx, self.vocab_end_idx, rows,
+            indices.stride(0), indices.stride(1),
+            HEAD_START=self.head_start,
+            LOCAL_HEADS=self.part_n_hash_cols,
+            TOTAL_HEADS=self.n_hash_cols,
+            DIM=self.dim,
+            QUANT_BLOCK=self.block_size,
+            GRID=grid)
