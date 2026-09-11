@@ -46,6 +46,10 @@ from vllm_ascend.attention.dsa_v1 import (
     build_compressor_metadata_out,
     build_vision_bidirectional_swa_indices,
 )
+from vllm_ascend.attention.dsa_attn_kv_plan import (
+    dsv4_indexer_qk_dtype,
+    dsv4_indexer_scale_dtype,
+)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
@@ -762,7 +766,21 @@ def test_dsa_cp_indexer_waits_before_qli_consumer(monkeypatch):
         assert waited
         return torch.zeros((1, 1, 1), dtype=torch.int32), None
 
-    monkeypatch.setattr(DeviceOperator, "unpack_dsa_indexer_kv_cache", lambda *_: (torch.empty(0),) * 4)
+    # The stand-in caches have to carry the dtypes production uses: qli_v2_quant_mode reads
+    # indexer_k_cache.dtype and the key-scale dtype to pick the operator's quant_mode, so a
+    # float32 placeholder is not a neutral stub -- it is an unsupported combination. Derive both
+    # from the same helpers the production path uses rather than pinning a snapshot here, so the
+    # fixture follows the platform instead of going stale behind it.
+    monkeypatch.setattr(
+        DeviceOperator,
+        "unpack_dsa_indexer_kv_cache",
+        lambda *_: (
+            torch.empty(0),
+            torch.empty(0, dtype=dsv4_indexer_qk_dtype()),
+            torch.empty(0, dtype=dsv4_indexer_scale_dtype()),
+            torch.empty(0),
+        ),
+    )
     monkeypatch.setattr(
         DeviceOperator,
         "indexer_quantize_query",
