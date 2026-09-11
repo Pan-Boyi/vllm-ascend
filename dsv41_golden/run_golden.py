@@ -33,7 +33,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--layers", type=int, default=3, help="how many backbone layers to run")
     ap.add_argument("--dump", type=str, default=None, help="directory for per-layer safetensors")
-    ap.add_argument("--seq-len", type=int, default=0, help="truncate/pad the prompt to this many tokens")
+    ap.add_argument("--seq-len", type=int, default=0,
+                    help="truncate the prompt to this many tokens (truncate only -- "
+                         "it does not pad; use --random-tokens N for a longer input)")
     ap.add_argument("--random-tokens", type=int, default=0, help="use N seeded random token ids instead")
     ap.add_argument("--prompt", type=str, default=None, help="override the fixed golden prompt")
     ap.add_argument("--seed", type=int, default=1234)

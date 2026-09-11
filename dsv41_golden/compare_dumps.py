@@ -234,9 +234,36 @@ def metrics(a: torch.Tensor, b: torch.Tensor, name: str = "") -> dict:
     # at cos = 0.999993, which would look like a real (small) divergence at strict
     # tolerance. The metric must be sharper than the thing it measures.
     af, bf = a.double().flatten(), b.double().flatten()
-    finite = torch.isfinite(af) & torch.isfinite(bf)
+    fa, fb = torch.isfinite(af), torch.isfinite(bf)
+    finite = fa & fb
+    # A non-finite value is not automatically a fault: this model's indexer masks
+    # unreachable positions with -inf, so the reference itself produces them (16384
+    # of them in layer 2 at 256 tokens, and none at all in a 27-token prompt -- which
+    # is why a plain "any non-finite value fails" check passed for weeks and then
+    # false-alarmed on the first long sequence).  What matters is whether the two
+    # sides agree about WHERE they are and WHAT they are.
     out = {"kind": "float", "n": af.numel(),
-           "nonfinite": int((~finite).sum())}
+           "nonfinite": int((~finite).sum()),
+           "nonfinite_mask_match": bool(torch.equal(fa, fb)),
+           # NOTE the argument order: compare_dir calls metrics(candidate, golden),
+           # so `a`/`fa` is the CANDIDATE here and `b`/`fb` is the golden.  Getting
+           # this backwards produced a message that named the wrong side, which a
+           # directional control caught -- it would have sent a reader to inspect the
+           # half that was fine.
+           "nonfinite_only_candidate": int((~fa & fb).sum()),
+           "nonfinite_only_golden": int((fa & ~fb).sum()),
+           "nan_count": int(torch.isnan(af).sum() + torch.isnan(bf).sum())}
+    if out["nonfinite_mask_match"] and out["nonfinite"]:
+        # Same positions -- are they the same kind?  ``==`` says no for NaN vs NaN,
+        # so compare the bit patterns of the original dtype instead.
+        ra = a.contiguous().view(torch.uint8).flatten()
+        rb = b.contiguous().view(torch.uint8).flatten()
+        w = a.element_size()
+        nf = ~fa | ~fb                       # union, so it does not depend on order
+        bad = nf.repeat_interleave(w) if w > 1 else nf
+        out["nonfinite_kind_match"] = bool(torch.equal(ra[bad], rb[bad]))
+    else:
+        out["nonfinite_kind_match"] = True
     af, bf = af[finite], bf[finite]
     if af.numel() == 0:
         out.update(rel_l2=float("nan"), max_rel=float("nan"), cos=float("nan"))
@@ -437,8 +464,23 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
             else:
                 lim_rel, lim_cos = tol_for(name, tol, gt.dtype)
                 m["limit_rel_l2"], m["limit_cos"] = lim_rel, lim_cos
-                if m["nonfinite"]:
-                    failures.append((tag, name, f"{m['nonfinite']} non-finite values"))
+                if m["nonfinite"] and not m["nonfinite_mask_match"]:
+                    failures.append((tag, name,
+                                     f"non-finite values disagree: {m['nonfinite_only_candidate']} "
+                                     f"positions are non-finite in the candidate but finite in "
+                                     f"the golden, {m['nonfinite_only_golden']} the other way. "
+                                     f"The golden masks unreachable indexer positions with -inf, "
+                                     f"so a MISMATCH here is a masking bug -- check the window "
+                                     f"and the -1 slot semantics, not the arithmetic."))
+                elif m["nonfinite"] and not m["nonfinite_kind_match"]:
+                    failures.append((tag, name,
+                                     f"{m['nonfinite']} non-finite positions match the golden's "
+                                     f"but differ in kind (e.g. -inf vs NaN). ALIGNMENT_PROTOCOL "
+                                     f"section 8 requires the finite -1e30 fallback, not NaN."))
+                elif m["nonfinite"]:
+                    notes.append((tag, name,
+                                  f"{m['nonfinite']} non-finite positions agree with the golden "
+                                  f"(legitimate masking); the finite part is what was compared"))
                 elif name.startswith(NEVER_GATE):
                     if m["rel_l2"] > lim_rel:
                         notes.append((tag, name,
