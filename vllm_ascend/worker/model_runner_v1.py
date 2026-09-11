@@ -4040,7 +4040,16 @@ class NPUModelRunner(GPUModelRunner):
                     return
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
-            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            # Model construction itself needs the CUDA->NPU substitutions, not
+            # just the runner around it. DeepSeek-V4.1 builds three
+            # torch.cuda.Stream objects in its decoder stack
+            # (vllm/models/deepseek_v4_1/nvidia/model.py), unconditionally and
+            # before any platform check, and torch.cuda.Stream raises outright
+            # here rather than degrading. The wrapper already covers
+            # super().__init__ and the graph wrapper below; this is the third
+            # place that needs it, and the only one reached at load time.
+            with _torch_cuda_wrapper():
+                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
