@@ -201,9 +201,22 @@ def _dsa_layout_kv(vllm_config: VllmConfig) -> str:
 
 
 def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int:
-    """BF16 SWA-only attention takes no compressed stream; otherwise keep main's value."""
+    """Map a layer's configured ratio onto the operator's ``cmp_ratio``.
+
+    These are two different quantities and conflating them has already cost
+    once. The configured ratio comes from ``compress_ratios`` and is 0 on
+    layers with no compressed stream; the operator's parameter describes the
+    stream it is being handed and **must be greater than zero** -- sparse_flash_mla
+    rejects 0 outright with "Cmp_ratio must be greater than 0", measured on A5.
+
+    So a layer without a compressed stream reports 1 here and simply does not
+    supply one; the operator ignores the value in that case. Returning 0 to
+    mean "none" was rejected for all of layers 20..39, which carry ratio 1.
+
+    Everything outside the A5 BF16 plan keeps V4.0's mapping untouched.
+    """
     if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
-        return 0
+        return 1
     return max(compress_ratio, 1)
 
 

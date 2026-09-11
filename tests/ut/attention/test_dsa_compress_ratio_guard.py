@@ -100,3 +100,50 @@ def test_the_union_covers_every_plan():
         assert set(ratios) <= set(ANY_PLAN_COMPRESS_RATIOS)
     assert hasattr(plans.DsaAttnKvPlan, "__annotations__")
     assert "supported_compress_ratios" in plans.DsaAttnKvPlan.__annotations__
+
+
+class _CacheConfig:
+    def __init__(self, dtype):
+        self.cache_dtype = dtype
+
+
+class _VllmConfig:
+    def __init__(self, dtype):
+        self.cache_config = _CacheConfig(dtype)
+
+
+@pytest.mark.parametrize("configured", [0, 1])
+def test_bf16_plan_never_asks_the_operator_for_ratio_zero(configured,
+                                                          monkeypatch):
+    """sparse_flash_mla rejects cmp_ratio=0 outright.
+
+    A layer with no compressed stream simply does not supply one; the value
+    still has to be positive. Reporting 0 was refused for every one of layers
+    20..39, which carry ratio 1.
+    """
+    from vllm_ascend.attention import dsa_v1
+
+    monkeypatch.setattr(dsa_v1, "is_a5_bf16_kv_enabled", lambda cfg: True)
+    got = dsa_v1._dsa_swa_only_cmp_ratio(configured, _VllmConfig("bfloat16"))
+    assert got >= 1, f"configured ratio {configured} mapped to {got}"
+
+
+@pytest.mark.parametrize("configured,expected", [(0, 1), (1, 1), (2, 2),
+                                                 (4, 4), (128, 128)])
+def test_other_plans_keep_v40_mapping(configured, expected, monkeypatch):
+    from vllm_ascend.attention import dsa_v1
+
+    monkeypatch.setattr(dsa_v1, "is_a5_bf16_kv_enabled", lambda cfg: False)
+    assert dsa_v1._dsa_swa_only_cmp_ratio(
+        configured, _VllmConfig("auto")) == expected
+
+
+def test_configured_ratio_and_operator_parameter_are_not_the_same_thing():
+    """Zero is a legal configured ratio and an illegal operator parameter.
+
+    Layers 0 and 1 carry ratio 0 in compress_ratios. Reading the operator's
+    refusal of cmp_ratio=0 as a statement about the configured value sends the
+    next reader to the wrong place -- the validator rather than the mapping.
+    """
+    assert 0 in ANY_PLAN_COMPRESS_RATIOS
+    assert validate_compress_ratio(0, "layer", BF16_PLAN) == 0
