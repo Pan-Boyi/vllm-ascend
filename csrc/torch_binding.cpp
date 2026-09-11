@@ -1168,8 +1168,32 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_npu(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
-std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, std::string layout,
-    bool return_softmax_lse)
+// The softmax-lse buffer is shaped by the KV head count, not by the query's last dimension. The
+// kv-head axis sits at dim 2 for BSND and PA_BBND and at dim 1 for the other TND layouts -- see
+// CANN's own output constructors (cann_ops_transformer/ops/csrc/mixed_quant_sparse_flash_mla.cpp
+// :115-140, sparse_flash_mla.cpp, quant_sparse_flash_mla.cpp), which all three agree on.
+static int64_t sparse_mla_kv_head_num(const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv, const std::string &layout_kv)
+{
+    TORCH_CHECK(ori_kv.has_value() || cmp_kv.has_value(),
+        "softmax_lse is requested but neither ori_kv nor cmp_kv was given; its shape is derived "
+        "from the KV head count and cannot be determined from the query alone");
+    const at::Tensor &kv = ori_kv.has_value() ? ori_kv.value() : cmp_kv.value();
+    const int64_t axis = (layout_kv == "BSND" || layout_kv == "PA_BBND") ? 2 : 1;
+    TORCH_CHECK(kv.dim() > axis, "KV tensor has ", kv.dim(), " dimensions, too few for layout_kv ",
+        layout_kv, " whose kv-head axis is ", axis);
+    TORCH_CHECK(kv.size(axis) > 0, "KV head count must be positive, got ", kv.size(axis));
+    return kv.size(axis);
+}
+
+// `layout_kv`, `ori_kv` and `cmp_kv` are load-bearing here: the earlier version of this helper took
+// only the query, copied its shape and set the last dimension to 1. That is not the shape the
+// kernel writes whenever the query head count differs from the KV head count, and nothing caught it
+// because `return_softmax_lse` defaults to false and had no caller at all -- the mismatch would
+// have surfaced on the first person to ask for the lse, in both eager and compiled paths.
+std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q,
+    const std::string &layout_q, const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv, const std::string &layout_kv, bool return_softmax_lse)
 {
     for (size_t i = 0; i < q.sizes().size(); i++) {
         TORCH_CHECK(q.size(i) > 0,
@@ -1182,10 +1206,23 @@ std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, 
     at::Tensor output = at::empty(q.sizes(), q.options().dtype(q.dtype()));
     at::Tensor softmax_lse;
     if (return_softmax_lse) {
-        std::vector<int64_t> lse_sizes(q.sizes().begin(), q.sizes().end());
-        lse_sizes.back() = 1;
+        const int64_t n = sparse_mla_kv_head_num(ori_kv, cmp_kv, layout_kv);
+        std::vector<int64_t> lse_sizes;
+        if (layout_q == "BSND") {
+            TORCH_CHECK(q.dim() == 4, "layout_q BSND needs a 4-D query, got ", q.dim());
+            TORCH_CHECK(q.size(2) % n == 0, "query head count ", q.size(2),
+                " is not a multiple of the KV head count ", n);
+            lse_sizes = {q.size(0), n, q.size(1), q.size(2) / n};
+        } else {
+            TORCH_CHECK(q.dim() == 3, "layout_q TND needs a 3-D query, got ", q.dim());
+            TORCH_CHECK(q.size(1) % n == 0, "query head count ", q.size(1),
+                " is not a multiple of the KV head count ", n);
+            lse_sizes = {n, q.size(0), q.size(1) / n};
+        }
         softmax_lse = at::empty(lse_sizes, q.options().dtype(c10::ScalarType::Float));
     } else {
+        // CANN allocates a 0-dim scalar here; a 0-element tensor is kept instead because the kernel
+        // writes nothing in this branch and callers already distinguish "absent" by numel() == 0.
         softmax_lse = at::empty({0}, q.options().dtype(c10::ScalarType::Float));
     }
     return std::tuple<at::Tensor, at::Tensor>(output, softmax_lse);
@@ -1203,7 +1240,7 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_npu(const at::Tensor
 {
     std::string layout_q_str = std::string(layout_q);
     std::string layout_kv_str = std::string(layout_kv);
-    std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, ori_kv, cmp_kv, layout_kv_str, return_softmax_lse);
     at::Tensor attn_out = std::get<0>(output);
     at::Tensor softmax_lse = std::get<1>(output);
     int64_t ori_kv_stride = 0;
@@ -1656,7 +1693,7 @@ std::tuple<at::Tensor, at::Tensor> npu_kv_quant_sparse_attn_sharedkv_npu(
 {
     std::string layout_q_str = std::string(layout_q);
     std::string layout_kv_str = std::string(layout_kv);
-    auto output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    auto output = construct_output_tensor(q, layout_q_str, ori_kv, cmp_kv, layout_kv_str, return_softmax_lse);
     at::Tensor attn_out = std::get<0>(output);
     at::Tensor softmax_lse = std::get<1>(output);
 
@@ -1742,11 +1779,21 @@ at::Tensor npu_kv_quant_sparse_attn_sharedkv_metadata_npu(
     return output;
 }
 
-// MixedQuantSparseFlashMla is the Ascend950-only sparse MLA kernel shipped with CANN. It covers the
-// same ground as the vendored KvQuantSparseAttnSharedkv above, but it accepts any cmp_ratio rather
-// than the {1, 4, 128} that one is limited to -- DeepSeek-V4.1 asks for ratio 2 on layers 2..19.
+// MixedQuantSparseFlashMla is the Ascend950-only sparse MLA kernel shipped with CANN. Its
+// distinguishing feature is the quantised KV container: quant_mode 1 and 2 describe 608- and
+// 584-byte rows of fp8 nope, bf16 rope and a scale field, which no sibling here accepts.
+//
+// It is NOT the only way to get cmp_ratio 2, and choosing it for that reason would be a wasted
+// migration. The vendored KvQuantSparseAttnSharedkv above does restrict cmp_ratio to {1, 4, 128}
+// (kv_quant_sparse_attn_sharedkv_check_existance.cpp:152-166, unconditionally -- that source has no
+// SoC gate), but CANN's own sparse_flash_mla accepts ratio 2 on Ascend 950 with a BF16 KV cache;
+// measured at max rel err 4.044e-03 against a two-stream CPU reference, with a window-only control
+// differing by 6.6e-01 to show the compressed stream was really used
+// (build_artifacts/sparse_flash_mla/test_two_stream_vs_operator.py).
+//
 // It also splits seqused_kv into separate ori/cmp tensors and adds cmp_residual_kv, so that the
-// pre-compression KV length can be recovered, plus per-batch topk lengths.
+// pre-compression KV length can be recovered, plus per-batch topk lengths. cmp_residual_kv is 1-D,
+// one value per request -- despite the name it carries no KV data.
 std::tuple<at::Tensor, at::Tensor> npu_mixed_quant_sparse_flash_mla_npu(
     const at::Tensor& q,
     int64_t quant_mode,
@@ -1781,7 +1828,7 @@ std::tuple<at::Tensor, at::Tensor> npu_mixed_quant_sparse_flash_mla_npu(
 {
     std::string layout_q_str = std::string(layout_q);
     std::string layout_kv_str = std::string(layout_kv);
-    auto output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    auto output = construct_output_tensor(q, layout_q_str, ori_kv, cmp_kv, layout_kv_str, return_softmax_lse);
     at::Tensor attn_out = std::get<0>(output);
     at::Tensor softmax_lse = std::get<1>(output);
 
