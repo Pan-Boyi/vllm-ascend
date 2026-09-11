@@ -145,3 +145,82 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                    f"got {residual.numel()} values for {num_requests} requests")
 
     return kwargs
+
+
+def build_sparse_flash_mla_kwargs(
+    *,
+    q: torch.Tensor,
+    num_requests: int,
+    swa_kv_cache: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_kv: torch.Tensor,
+    sinks: torch.Tensor,
+    metadata: Any,
+    softmax_scale: float,
+    cmp_ratio: int,
+    layout_kv: str,
+    attends_compressed: bool,
+    ori_win_left: int,
+    ori_win_right: int,
+    cmp_kv: torch.Tensor | None = None,
+    cmp_block_table: torch.Tensor | None = None,
+    seqused_cmp_kv: torch.Tensor | None = None,
+    cmp_residual_kv: torch.Tensor | None = None,
+    ori_sparse_indices: torch.Tensor | None = None,
+    cmp_sparse_indices: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Assemble one call, mirroring ``DSAImpl._forward_attention``.
+
+    ``attends_compressed`` is passed in rather than inferred from
+    ``cmp_ratio``, because the two mean different things for V4.1 and inferring
+    one from the other is the mistake this port has already made once: V4.0
+    reads ratio <= 1 as "no compressed stream", while V4.1 gives layers 20..39
+    ratio 1 to mean "compressed, pooling disabled". A layer that attends a
+    compressed stream and reports ratio 1 is a legitimate V4.1 configuration
+    and an impossible V4.0 one.
+
+    The window bounds are forced to -1 whenever a compressed stream is present.
+    That is not a preference: the operator rejects window bounds alongside a
+    compressed stream, and the two configurations are mutually exclusive at
+    this boundary.
+    """
+    kwargs: dict[str, Any] = dict(
+        ori_kv=swa_kv_cache,
+        ori_block_table=swa_block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_kv=seqused_kv,
+        sinks=sinks,
+        metadata=metadata,
+        softmax_scale=softmax_scale,
+        cmp_ratio=cmp_ratio,
+        ori_mask_mode=COMPRESSED_MASK_MODE if attends_compressed else ORI_ONLY_MASK_MODE,
+        ori_win_left=-1 if attends_compressed else ori_win_left,
+        ori_win_right=-1 if attends_compressed else ori_win_right,
+        layout_q="TND",
+        layout_kv=layout_kv,
+    )
+
+    if ori_sparse_indices is not None:
+        kwargs["ori_sparse_indices"] = ori_sparse_indices
+
+    if attends_compressed:
+        if cmp_kv is None:
+            raise ValueError(
+                "attends_compressed is set but no cmp_kv was supplied. The "
+                "layer would then be configured for a compressed stream -- "
+                "mask mode 0, window bounds disabled -- while attending only "
+                "its window, which the operator has no reason to reject.")
+        kwargs.update(
+            cmp_kv=cmp_kv,
+            cmp_block_table=cmp_block_table,
+            cmp_mask_mode=CMP_MASK_MODE,
+        )
+        if seqused_cmp_kv is not None:
+            kwargs["seqused_cmp_kv"] = seqused_cmp_kv
+        if cmp_residual_kv is not None:
+            kwargs["cmp_residual_kv"] = cmp_residual_kv
+        if cmp_sparse_indices is not None:
+            kwargs["cmp_sparse_indices"] = cmp_sparse_indices
+
+    return validate_sparse_flash_mla_args(kwargs, q, num_requests)

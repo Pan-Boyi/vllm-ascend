@@ -189,3 +189,99 @@ def test_the_error_quotes_the_operator_rather_than_paraphrasing(q):
         _validate(_ori_only(cmp_ratio=0), q)
     assert "sparse_flash_mla would reject this call" in str(exc.value)
     assert "cmp_ratio must be greater than 0" in str(exc.value)
+
+
+# -- assembling a call from metadata -----------------------------------------
+
+
+def _common(**overrides):
+    kwargs = dict(
+        q=torch.zeros(NUM_TOKENS, NUM_HEADS, HEAD_DIM),
+        num_requests=NUM_REQUESTS,
+        swa_kv_cache=torch.zeros(4, 32, 1, HEAD_DIM),
+        swa_block_table=torch.zeros(NUM_REQUESTS, 4, dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
+        seqused_kv=torch.tensor([4, 5, 3], dtype=torch.int32),
+        sinks=torch.zeros(NUM_HEADS, dtype=torch.float32),
+        metadata=object(),
+        softmax_scale=0.04419,
+        layout_kv="PA_BBND",
+        ori_win_left=127,
+        ori_win_right=0,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_a_window_only_layer_keeps_its_bounds_and_mask_mode_4():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    built = build_sparse_flash_mla_kwargs(
+        **_common(cmp_ratio=1, attends_compressed=False))
+    assert built["ori_mask_mode"] == 4
+    assert (built["ori_win_left"], built["ori_win_right"]) == (127, 0)
+    assert "cmp_kv" not in built and "cmp_mask_mode" not in built
+
+
+def test_a_compressed_layer_disables_its_bounds():
+    """Not a preference -- the operator rejects bounds alongside a compressed
+    stream."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    built = build_sparse_flash_mla_kwargs(**_common(
+        cmp_ratio=2, attends_compressed=True,
+        cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+        cmp_block_table=torch.zeros(NUM_REQUESTS, 2, dtype=torch.int32),
+        seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32)))
+    assert built["ori_mask_mode"] == 0
+    assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1)
+    assert built["cmp_mask_mode"] == 3
+
+
+def test_ratio_one_may_still_attend_a_compressed_stream():
+    """V4.1 layers 20..39.
+
+    V4.0 reads ratio <= 1 as "no compressed stream"; V4.1 gives those layers
+    ratio 1 to mean "compressed, pooling disabled". Inferring one from the
+    other is the mistake this port already made once, so attends_compressed is
+    passed in rather than derived.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    built = build_sparse_flash_mla_kwargs(**_common(
+        cmp_ratio=1, attends_compressed=True,
+        cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+        cmp_block_table=torch.zeros(NUM_REQUESTS, 2, dtype=torch.int32),
+        seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32),
+        cmp_residual_kv=torch.zeros(NUM_REQUESTS, dtype=torch.int32)))
+    assert built["cmp_ratio"] == 1
+    assert built["cmp_kv"] is not None
+    assert built["cmp_residual_kv"].ndim == 1
+
+
+def test_claiming_a_compressed_stream_without_one_is_refused():
+    """The configuration the operator would happily accept and get wrong.
+
+    mask mode 0 with the bounds disabled, but nothing compressed to attend --
+    the layer then sees only its window, unwindowed. Nothing downstream would
+    report that.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    with pytest.raises(ValueError, match="no reason to reject"):
+        build_sparse_flash_mla_kwargs(
+            **_common(cmp_ratio=2, attends_compressed=True))
+
+
+def test_every_assembled_call_is_validated():
+    """The builder runs the checks itself, so a caller cannot skip them."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    with pytest.raises(ValueError, match="sparse_flash_mla would reject"):
+        build_sparse_flash_mla_kwargs(
+            **_common(cmp_ratio=0, attends_compressed=False))
