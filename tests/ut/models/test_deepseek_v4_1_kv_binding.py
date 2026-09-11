@@ -87,3 +87,37 @@ def test_the_head_axis_is_the_one_the_backend_allocates():
     shape = AscendDSABackend.get_kv_cache_shape(BLOCKS, BLOCK, HEADS, HEAD_DIM)
     assert shape[HEAD_AXIS] == HEADS
     assert len(shape) == 4 and shape == (BLOCKS, BLOCK, HEADS, HEAD_DIM)
+
+
+def test_the_compressor_ring_binds_to_three_dims_not_a_list():
+    """The ring is a V4.1 cache like the others, and its consumer is upstream's.
+
+    ``DeepseekCompressor`` reads ``self.state_cache.kv_cache`` and hands it to
+    the compressor kernel expecting [num_blocks, ring_capacity, state_dim]. A
+    list there is not a shape error, it is a type error, one frame further in.
+
+    This is the axis-order question in its sharpest form: with num_kv_heads=1,
+    (B, N, H, C) and (B, H, N, C) occupy identical bytes with identical
+    strides, so no assertion on shape can tell them apart. Only how many
+    dimensions survive the squeeze can. Ascend allocates head-at-2, and this
+    pins that the ring is not made an exception to it.
+    """
+    ring = torch.zeros((BLOCKS, 8, 1, 512))
+    bound = bind_value(ring)
+    assert isinstance(bound, torch.Tensor), (
+        "a list reaches the compressor kernel as a list")
+    assert bound.shape == (BLOCKS, 8, 512)
+
+
+def test_a_head_first_ring_is_not_silently_flattened():
+    """If the declared shape ever moves the head axis to 1, say so here.
+
+    bind_value refuses to guess: an unrecognised layout keeps the old wrapping
+    rather than squeezing whichever axis happens to be 1. That makes the
+    mismatch visible at the consumer instead of producing a plausible tensor
+    with the ring capacity silently removed.
+    """
+    head_first = torch.zeros((BLOCKS, 1, 8, 512))
+    bound = bind_value(head_first)
+    assert not isinstance(bound, torch.Tensor)
+    assert bound[0].shape == (BLOCKS, 1, 8, 512)

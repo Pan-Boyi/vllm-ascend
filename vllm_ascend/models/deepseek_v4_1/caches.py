@@ -34,7 +34,16 @@ from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
 class AscendCompressorStateBackend(AscendDSABackend):
     """Backend for the compressor's ring buffer.
 
-    It exists for one inherited method. Upstream's ``CompressorBackend``
+    ⚠️ The sentence that used to open this docstring -- "it exists for one
+    inherited method" -- was wrong, and wrong in a way no grep shows: it also
+    inherited ``get_builder_cls`` from ``AscendDSABackend``, so the ring group
+    was handed an ``AscendDSAMetadataBuilder``, whose first act is to read
+    ``kv_cache_spec.storage_block_size``. A ``CircularBufferSpec`` has no such
+    attribute, and a ring does no attention at all -- upstream gives it
+    ``CompressorMetadataBuilder``. Inheriting from the DSA backend to borrow one
+    method brought the rest of the class with it.
+
+    Upstream's ``CompressorBackend``
     defines ``get_name`` / ``get_supported_kernel_block_sizes`` /
     ``get_supported_head_sizes`` / ``get_builder_cls`` and no
     ``get_kv_cache_shape`` -- and neither does ``AttentionBackend``, which only
