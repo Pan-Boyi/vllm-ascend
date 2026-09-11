@@ -1321,19 +1321,43 @@ M=256 K=4096 N=256,65536 个输出元素逐位比)`[未经我复核]`:
 **不同机制 ⇒ 随分块单调变化**,且 blk→K 时收敛到前者(那时它**就是**前者)。
 ⇒ **`torch.matmul` 的 bf16 MMA 路径是 fp32 累加或更宽。**
 
-🔴 **⚠️ 但那条测的是 `torch.matmul`,而模型的量化 GEMM 不走它。** 实际路径(自核):
+**✅ 专家 GEMM 路径也已测**(同一套指纹,`PROBE_OP=grouped_matmul`)`[integration 实测]`:
+五种求和顺序簇宽 **0.0031%**,而「每块舍回 bf16」随分块 27.6 → 59.3% 单调上升
+⇒ **同一个指纹形状,`npu_grouped_matmul` 的累加器也是 fp32 或更宽。**
 
-| 路径 | 算子 | 位置 |
+#### V4.1 的量化 GEMM 到底走哪个算子 —— 整条链自核
+
+⚠️ **我先前在这里只写了基名(`w4a8_mxfp4.py:210`),而同名的有三个文件分处三个目录**
+(`methods/w4a4/w4a4_mxfp4.py`、`methods/w4a8/w4a8_mxfp4.py`、`methods/w8a8/w8a8_mxfp8.py`),
+导致对方重建成了一个不存在的路径。**以后引用一律写全路径** —— 这条项目里叫「同名不同物」,
+这次是它用在我自己的引用习惯上。
+
+```
+/workspace/models/DeepSeek-V4.1-Flash/config.json
+    quant_method=fp8   expert_dtype=fp4   scale_fmt=ue8m0   weight_block_size=[32,32]
+ → AscendDeepseekV4FP8Config(按 V4 家族前缀匹配 model_type)
+ → get_quant_method → get_scheme_class(FP8_METHOD, "ds_w4a8_moe")
+       vllm-ascend/vllm_ascend/quantization/configs/fp8_config.py:209
+ → @register_scheme(FP8_METHOD, "ds_w4a8_moe")
+       vllm-ascend/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py:316
+ → 该文件用的算子:
+       torch_npu.npu_quant_matmul      :90                稠密量化线性层
+       torch_npu.npu_grouped_matmul    :210/236/267/298   专家 GEMM
+```
+
+⇒ **V4.1 的专家 GEMM 走的就是 plain `npu_grouped_matmul`** —— 正是已测的那个,**在路径上**。
+⚪ `npu_grouped_matmul_swiglu_quant_v2` 出现在 `methods/w4a4/` 与 `methods/w8a8/`,
+那是**别的 scheme**,**不在 V4.1 的专家路径上**。
+
+| 算子 | 在 V4.1 路径上? | 累加器 |
 |---|---|---|
-| 稠密量化线性层 | **`torch_npu.npu_quant_matmul`** | `w4a8_mxfp4.py:90`、`w8a8_mxfp8.py:108` |
-| **专家 GEMM** | **`torch_npu.npu_grouped_matmul`** | `w4a8_mxfp4.py:210/236/267/298` |
+| `torch.matmul` 的 MMA | 否(基线) | ✅ fp32 或更宽 |
+| **`npu_grouped_matmul`**(专家) | **是** | ✅ **fp32 或更宽** |
+| **`npu_quant_matmul`**(稠密线性层) | **是** | ❓ **未测** |
+| `npu_grouped_matmul_swiglu_quant_v2` | 否 | — 不必测 |
 
-⇒ **前提在通用 MMA 上成立,在这两个融合算子上仍是开口。**
-⚪ 供应商在通用路径上用 fp32 累加,**提高了**融合算子也如此的可能性,**但那不是证明**
-—— 「同名不同物」在本项目一天踩过五次。
-
-⇒ **优先级**:`npu_grouped_matmul` 排前面 —— 它是专家路径,`moe.out` 就从那里出来,
-而 `moe.out` 是判据交织最紧的那个张量(第 6.8/6.9 节)。
+⇒ **第 6.10 那条结论的前提,在专家这条最重的路径上已经是已测事实。**
+剩下 `npu_quant_matmul` 一个开口。
 
 ⚠️ **另有一处别混**(integration 标的):输出仍是 bf16,所以结果自带**一次输出舍入**,
 实测 **1.49 个输出 ULP**(相对 2.904e-03,bf16 输出 ULP 2.0e-03)。

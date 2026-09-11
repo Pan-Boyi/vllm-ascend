@@ -110,7 +110,9 @@
 | ✅ | 累加精度这一项**已量化**:`GOLDEN_DOT_DTYPE` fp32↔fp64 的差就是第 0.1 节那个实验(layer 2 翻 22.2% 路由),整套阈值结构就建在这个实测地板上 `[golden 实测]` |
 | ✅ | **「先反量化再稠密 GEMM」vs「块内累加后施 scale」已给出上界,而且这个带不是新地板**:全模型 **47589 个 scale 张量全部是 `float8_e8m0fnu`(纯指数 ⇒ 恒为 2 的幂)**,而乘 2 的幂与加法精确交换 ⇒ **形式差异精确退化成求和顺序差异**。实测两种形式差 **1.82e-07 相对 ≈ 1 个 fp32 ULP**,落在已测噪声地板之内(协议 §6.10)`[golden 实测]` |
 | ✅ | **前提在通用 MMA 上已测成立**:`torch.matmul` 的 bf16 MMA 是 **fp32 累加或更宽**(五种求和顺序聚成 0.0061% 宽的一簇;「每块舍回 bf16」随分块单调 27.74→59.08%,形状完全不同)`[integration 实测,未经我复核]` |
-| ❌ | 🔴 **但模型的量化 GEMM 不走 `torch.matmul`**(自核):稠密线性层走 **`npu_quant_matmul`**(`w4a8_mxfp4.py:90`),**专家 GEMM 走 `npu_grouped_matmul`**(`w4a8_mxfp4.py:210/236/267/298`)⇒ **这两个融合算子的累加器仍是开口。** 优先测 `npu_grouped_matmul` —— `moe.out` 从那里出来 |
+| ✅ | **专家 GEMM 那条也已测**:`npu_grouped_matmul` 同一指纹形状(五序簇宽 0.0031%;每块舍 bf16 随分块 27.6→59.3% 单调)⇒ **fp32 或更宽** `[integration 实测,未经我复核]` |
+| ✅ | **V4.1 实际走哪个算子已自核到底**:`config.json(expert_dtype=fp4)` → `AscendDeepseekV4FP8Config` → `get_scheme_class(FP8_METHOD,"ds_w4a8_moe")`(`quantization/configs/fp8_config.py:209`)→ `@register_scheme`(`quantization/methods/w4a8/w4a8_mxfp4.py:316`)→ 该文件用 **plain `npu_grouped_matmul`**(:210/236/267/298)⇒ **已测的那个算子在路径上。** `swiglu_quant_v2` 属于别的 scheme,**不在 V4.1 专家路径上** |
+| ❌ | **`npu_quant_matmul`(稠密量化线性层,同文件 :90)仍未测** —— §6.10 前提剩这一个开口 |
 | ⚠️ | 已确认的**真实不等价**至少一处(第 10.6 节 P1):原 tilelang `sparse_attn` 把 softmax 概率**舍到 bf16** 再做 P·V,CPU golden 全程 fp32 ⇒ **golden 更准**,一个忠实的实现会有约 1.8e-3 的**系统性偏差,而那不是 bug** |
 | ⚠️ | ⇒ **这套 golden 的定位是「定义参考」不是「逐位裁判」** —— 它逐字实现 `ref/model.py` 的语义(vendor 文件原样,只换 `kernel.py`),但**不保证与 GPU kernel 逐位一致**。整套协议因此建在「实测地板 + 集合判据」上,而不是逐位相等;逐位相等只保留给**整数哈希和 engram 查表**那两条没有浮点借口的路 |
 
