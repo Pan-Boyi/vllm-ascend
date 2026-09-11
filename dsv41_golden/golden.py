@@ -535,7 +535,97 @@ class Recorder:
             json.dump({"tensors": self.manifest, **extra}, f, indent=2)
 
 
+# The recorder the quantization taps below should write into.  A list because the
+# wrappers are installed once on the model module while the blocks run one at a
+# time, so the destination has to be swappable without rewrapping.
+_CURRENT_REC: list = [None]
+
+
+def _install_quant_taps():
+    """Record the input and output of the two in-place KV quantizers.
+
+    Both streams are quantized in place -- ``dequant(quant(x))`` is written back over
+    ``x`` -- so by the time anything downstream sees the tensor, the pre-quantization
+    value is gone.  Without these taps the only way to check a quantizer is to find
+    two dumps that happen not to have diverged upstream yet, which is a coincidence
+    that the next change of input destroys.  With them, a reference gets the exact
+    pair (in, out) and depends on nothing else.
+
+    The non-inplace calls are for Linear weights and are not recorded.
+    """
+    if getattr(M.act_quant, "_golden_tapped", False):
+        return
+    _real_aq, _real_fq = M.act_quant, M.fp4_act_quant
+
+    def _aq(x, *a, **k):
+        r = _CURRENT_REC[0]
+        inplace = bool(k.get("inplace") or (len(a) >= 4 and a[3]))
+        if r is not None and inplace:
+            r.add("quant.window.in", x.clone())
+        out = _real_aq(x, *a, **k)
+        if r is not None and inplace:
+            r.add("quant.window.out", x.clone())
+        return out
+
+    def _fq(x, *a, **k):
+        r = _CURRENT_REC[0]
+        inplace = bool(k.get("inplace") or (len(a) >= 2 and a[1]))
+        if r is not None and inplace:
+            r.add("quant.compress.in", x.clone())
+            r.add("quant.compress.group", torch.tensor(
+                [int(a[0]) if a else int(k.get("block_size", 32))], dtype=torch.int32))
+        out = _real_fq(x, *a, **k)
+        if r is not None and inplace:
+            r.add("quant.compress.out", x.clone())
+        return out
+
+    _aq._golden_tapped = _fq._golden_tapped = True
+    M.act_quant, M.fp4_act_quant = _aq, _fq
+
+    # The candidate mask (level one of the two-level top-k) had no dump point at all,
+    # so nothing could be compared about it -- found by asking, for every discrete
+    # decision in the model, "is there a criterion on the decision itself, or only on
+    # the numbers downstream of it?".  It is the one place the answer was "neither".
+    #
+    # It only exists on candidate_source_layer (20), and only bites above
+    # candidate_topk_blocks * candidate_block_size = 16384 positions; below that the
+    # mask is all-True and comparing it proves nothing (see section 0.4 row 15a).
+    _real_cand = M.select_candidate_blocks
+
+    def _cand(*a, **k):
+        out = _real_cand(*a, **k)
+        r = _CURRENT_REC[0]
+        if r is not None:
+            r.add("candidates", out.clone())
+            # What makes the no-op visible is the BLOCK count, not the True count.
+            # Measured at 27 tokens: 465/729 positions are True, not all of them --
+            # because the mask also carries reachability at block granularity (query
+            # j keeps whole blocks up to floor(j/8); summing that over 27 queries is
+            # exactly 465).  So "all True" is the wrong test: the filter is already a
+            # no-op there, it just does not look like it.  The right test is whether
+            # `topk_blocks` binds at all.
+            n_pos = out.shape[-1]
+            # block_size and topk_blocks come from the call, not from a constant here:
+            # select_candidate_blocks(logits, compress_lens, topk_blocks, block_size)
+            topk_blocks = int(a[2]) if len(a) > 2 else int(k.get("topk_blocks", 0))
+            blk = int(a[3]) if len(a) > 3 else int(k.get("block_size", 8))
+            num_blocks = (n_pos + blk - 1) // blk
+            kept_blocks = (int(out.reshape(-1, n_pos)[:, ::blk].sum(-1).max())
+                           if n_pos and blk else 0)
+            r.add("candidates.kept", torch.tensor(
+                [int(out.sum()), int(out.numel())], dtype=torch.int64))
+            # [最大保留块数, 总块数, topk_blocks] -- 筛子咬没咬到 = topk_blocks < 总块数
+            r.add("candidates.blocks", torch.tensor(
+                [kept_blocks, num_blocks, topk_blocks], dtype=torch.int64))
+        return out
+
+    _cand._golden_tapped = True
+    M.select_candidate_blocks = _cand
+
+
 def _attach_taps(block, rec: Recorder):
+    _install_quant_taps()
+    _CURRENT_REC[0] = rec
     """Hook every sublayer boundary worth comparing, plus the three hc helpers.
 
     Module hooks give the sublayer inputs/outputs without touching the reference
