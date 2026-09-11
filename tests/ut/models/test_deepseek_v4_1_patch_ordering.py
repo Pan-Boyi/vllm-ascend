@@ -85,3 +85,77 @@ def test_apply_all_does_it_rather_than_relying_on_the_caller():
     # ... and before the rebinds, which are what do the importing
     assert (source.index("_apply_platform_patches_first()")
             < source.index("apply_attn_selector_patch()"))
+
+
+# -- the hook that does not depend on ordering -------------------------------
+#
+# The factory binding above cannot be repaired: V4.0 froze the name into its
+# own globals before anything of ours ran, and vLLM imports that module while
+# resolving the architecture. So the fix is not to win the race but to leave
+# it: `create_fused_moe_router` has exactly one call site and it is inside the
+# module that imports it, so that lookup happens in `layer`'s globals at call
+# time and a rebind lands whenever it is made.
+
+
+def test_the_router_hook_survives_the_worst_ordering():
+    """Upstream imported first, our package second -- the real order."""
+    got = _run("""
+        import vllm.models.deepseek_v4.nvidia.model          # noqa: F401
+        import vllm_ascend.models.deepseek_v4_1              # noqa: F401
+        import vllm.model_executor.layers.fused_moe.layer as layer
+        print(layer.create_fused_moe_router.__name__)
+    """)
+    assert got == "create_ascend_router_for_upstream", (
+        f"the router hook is {got!r}; upstream's factory will build its own "
+        "router and the MoE will reach topk_softplus_sqrt, a CUDA entry point")
+
+
+def test_the_factory_binding_is_still_lost_and_that_is_fine():
+    """Pins the thing the fix deliberately does NOT do.
+
+    A test that expected the factory binding to be repaired would be measuring
+    the wrong criterion and would fail forever. What matters is which router
+    comes out, not which factory ran.
+    """
+    got = _run("""
+        import vllm.models.deepseek_v4.nvidia.model as v40
+        import vllm_ascend.models.deepseek_v4_1              # noqa: F401
+        print(v40.FusedMoEFactory.__name__)
+    """)
+    assert got == "FusedMoEFactory", (
+        "if this is repaired the hijack above may be redundant -- check "
+        "before removing either")
+
+
+def test_the_hook_actually_builds_an_ascend_router():
+    """Being rebound is not the same as producing the right object."""
+    got = _run("""
+        import vllm_ascend.models.deepseek_v4_1              # noqa: F401
+        import vllm.model_executor.layers.fused_moe.layer as layer
+        router = layer.create_fused_moe_router(
+            top_k=6, global_num_experts=384, renormalize=True,
+            use_grouped_topk=False, num_expert_group=None, topk_group=None,
+            custom_routing_function=None, scoring_func="sqrtsoftplus",
+            routed_scaling_factor=1.5, e_score_correction_bias=None,
+            num_fused_shared_experts=0, eplb_state=None,
+            num_logical_experts=384, hash_indices_table=None,
+            bias_vl=None, image_sentinel_lo=129257,
+            shared_expert_weight=1.0, zero_expert_type=None,
+        )
+        print(type(router).__module__)
+    """)
+    assert got.startswith("vllm_ascend."), (
+        f"the router came from {got!r}, not from vllm_ascend")
+
+
+def test_an_option_ascend_cannot_honour_is_refused_not_dropped():
+    """zero_expert_type is upstream-only. At its default it is dropped; set,
+    it must raise -- routing by a different rule than the caller asked for
+    would produce no error at all."""
+    from vllm_ascend.models.deepseek_v4_1.moe_router import \
+        create_ascend_router_for_upstream
+
+    with pytest.raises(ValueError, match="zero_expert_type"):
+        create_ascend_router_for_upstream(
+            top_k=6, global_num_experts=384, renormalize=True,
+            scoring_func="sqrtsoftplus", zero_expert_type="identity")
