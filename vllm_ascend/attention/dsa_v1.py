@@ -48,8 +48,7 @@ from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
-    oproj_tp_enable,
-)
+    oproj_tp_enable, is_deepseek_v4_family)
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     DeviceMetadataTask,
@@ -780,7 +779,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
     def _init_hadamard(self, layer_names: list[str]) -> None:
         hf_config = self.model_config.hf_config
-        if hf_config.model_type != "deepseek_v4":
+        if not is_deepseek_v4_family(hf_config):
             return
 
         indexer_head_dim = hf_config.index_head_dim

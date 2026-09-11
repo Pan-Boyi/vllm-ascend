@@ -187,8 +187,8 @@ def _get_layer_compress_ratio(
 ) -> int | None:
     if compress_ratios is None:
         return None
-    if getattr(hf_config, "model_type", None) == "deepseek_v4":
-        from vllm_ascend.utils import extract_dsv4_layer_index, get_dsv4_compress_ratio
+    if is_deepseek_v4_family(hf_config):
+        from vllm_ascend.utils import extract_dsv4_layer_index, get_dsv4_compress_ratio, is_deepseek_v4_family
 
         return get_dsv4_compress_ratio(hf_config, extract_dsv4_layer_index(hf_config, layer_name))
     from vllm.model_executor.models.utils import extract_layer_index

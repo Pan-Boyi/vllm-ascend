@@ -209,8 +209,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
     weak_ref_tensor,
-    weak_ref_tensors,
-)
+    weak_ref_tensors, is_deepseek_v4_family)
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataExecutor,
@@ -4268,7 +4267,7 @@ class NPUModelRunner(GPUModelRunner):
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        if self.model_config.hf_text_config.model_type == "deepseek_v4":
+        if is_deepseek_v4_family(self.model_config.hf_text_config):
             from vllm_ascend.utils import extract_dsv4_layer_index
 
             assert len(self.kv_caches) == 0
