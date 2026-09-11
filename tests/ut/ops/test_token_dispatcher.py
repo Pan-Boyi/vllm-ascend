@@ -822,6 +822,38 @@ class TestTokenDispatcherWithAllGather(TestBase):
         self.mock_npu_moe_token_unpermute.assert_called_once()
         self.assertEqual(final_hidden_states.shape, (6, 128))
 
+    def test_token_combine_keeps_router_weights_in_fp32(self):
+        """The router weights must reach the operator in fp32, not in the activation dtype.
+
+        This is a fingerprint assertion, not a tolerance: there is no knob to loosen. Rounding
+        fp32 router weights to bf16 costs about 1.6 bf16 ULP per layer, and over 40 layers that
+        flipped 13 of 27 logits top-1 in the model line's dump. The other combine path (MC2)
+        already passes `expert_scales=topk_weights.to(torch.float32)`, so a downcast here also
+        means the same model weights its experts in fp32 during decode and bf16 during prefill.
+
+        The negative arm is the behaviour this replaced: `probs=topk_weights.to(hidden.dtype)`.
+        Restoring it makes both assertions below fail -- the dtype check directly, and the
+        "did not follow the activation dtype" check as the sentinel that keeps the first one
+        from passing vacuously when hidden_states happens to already be fp32.
+        """
+        hidden_states = torch.randn(6, 128, dtype=torch.bfloat16)
+        topk_weights = torch.rand(6, dtype=torch.float32)
+        assert topk_weights.dtype != hidden_states.dtype, (
+            "fixture is vacuous: the two dtypes must differ for this test to distinguish "
+            "'kept fp32' from 'followed the activation dtype'"
+        )
+        combine_metadata = MoEAllGatherCombineMetadata(
+            expanded_row_idx=torch.tensor([0, 1, 1, 1, 1, 1]),
+            topk_weights=topk_weights,
+            restore_shape=torch.Size([6, 128]),
+        )
+        self.dispatcher.token_combine(hidden_states, combine_metadata)
+
+        self.mock_npu_moe_token_unpermute.assert_called_once()
+        probs = self.mock_npu_moe_token_unpermute.call_args.kwargs["probs"]
+        self.assertEqual(probs.dtype, torch.float32)
+        self.assertNotEqual(probs.dtype, hidden_states.dtype)
+
     @pytest.mark.skip("Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")
     def test_token_dispatch_with_router_weight(self):
         hidden_states = torch.randn(3, 128)
@@ -1000,6 +1032,34 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         output = self.dispatcher.token_combine(hidden_states, combine_metadata)
         self.assertIsNotNone(output)
         self.assertEqual(output.shape, (8, 16))
+
+    def test_token_combine_keeps_router_weights_in_fp32(self):
+        """Mirror of the AllGather assertion; see that docstring for why this is a fingerprint.
+
+        ⚠️ This arm has no on-hardware measurement behind it: ALLTOALL is unreachable in the
+        DSV4.1/A5 config (needs world_size > num_experts_per_tok = 6, ours is 4). The unit test
+        is the only thing holding it, which is exactly why it should not be a tolerance check.
+        """
+        hidden_states = torch.randn(16, 16, dtype=torch.bfloat16)
+        topk_weights = torch.rand(8, 4, dtype=torch.float32)
+        assert topk_weights.dtype != hidden_states.dtype, "fixture is vacuous"
+        combine_metadata = MoEAllToAllCombineMetadata(
+            input_splits=np.array([4, 4]),
+            output_splits=np.array([4, 4]),
+            topk_weights=topk_weights,
+            reversed_local_input_permutation_mapping=torch.arange(8),
+            reversed_global_input_permutation_mapping=torch.arange(16),
+            hidden_shape=torch.Size([8, 16]),
+            hidden_shape_before_permute=torch.Size([8, 16]),
+        )
+        self.dispatcher.expert_ids_per_ep_rank = torch.tensor([0, 1], dtype=torch.int32)
+        self.dispatcher.local_expert_indices = [0, 1]
+
+        self.dispatcher.token_combine(hidden_states, combine_metadata)
+
+        probs = self.mock_npu_moe_token_unpermute.call_args.kwargs["probs"]
+        self.assertEqual(probs.dtype, torch.float32)
+        self.assertNotEqual(probs.dtype, hidden_states.dtype)
 
     @pytest.mark.skip("Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")
     def test_token_dispatch_with_quant(self):

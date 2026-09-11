@@ -430,7 +430,15 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=combine_metadata.expanded_row_idx,
-            probs=combine_metadata.topk_weights.to(hidden_states.dtype),
+            # Router weights stay fp32. Rounding them to the activation dtype is a real
+            # precision loss and it is not what the other combine path does: the MC2 path
+            # passes `expert_scales=topk_weights.to(torch.float32)`, so the same model would
+            # otherwise weight its experts in fp32 during decode and bf16 during prefill.
+            # Measured on A5 (4096x6x5120, bit-exact fingerprint against the reference):
+            # the operator itself accumulates in fp32 and rounds once either way, so the
+            # only thing the cast changed was the weights -- worth ~1.6 bf16 ULP per layer,
+            # which over 40 layers flipped 13/27 logits top-1 in the model line's dump.
+            probs=combine_metadata.topk_weights.float(),
         )
         if len(combine_metadata.restore_shape) == 3:
             final_hidden_states = final_hidden_states.view(combine_metadata.restore_shape)
@@ -715,7 +723,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         output = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=permutated_local_input_tokens,
             sorted_indices=combine_metadata.reversed_local_input_permutation_mapping.to(torch.int32),
-            probs=combine_metadata.topk_weights.to(permutated_local_input_tokens.dtype),
+            # Same as the AllGather path: router weights stay fp32. See the note there.
+            # ⚠️ Unlike that one this arm is covered by the unit test only -- ALLTOALL is
+            # unreachable in the DSV4.1/A5 config we can run (it needs world_size >
+            # num_experts_per_tok = 6, and ours is 4), so there is no on-hardware fingerprint
+            # measurement behind it. Same one-line shape, same reasoning, less evidence.
+            probs=combine_metadata.topk_weights.float(),
             restore_shape=combine_metadata.hidden_shape_before_permute,
         )
         output = output.view(combine_metadata.hidden_shape)
