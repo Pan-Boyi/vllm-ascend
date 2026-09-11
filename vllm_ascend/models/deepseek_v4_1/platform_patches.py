@@ -216,6 +216,15 @@ def apply_all() -> list[str]:
     applied.extend(rebind_upstream_classes())
     applied.extend(rebind_mhc_functions())
 
+    # Ordering-immune, unlike the platform patch above: its one call site is
+    # inside the module that owns the name, so the rebind takes effect whenever
+    # it happens. See moe_router for why FusedMoEFactory is not like that.
+    from vllm_ascend.models.deepseek_v4_1.moe_router import \
+        apply_moe_router_patch
+
+    if apply_moe_router_patch():
+        applied.append("create_fused_moe_router")
+
     if not applied:
         raise RuntimeError(
             "apply_all() applied nothing. Either upstream changed shape and "
