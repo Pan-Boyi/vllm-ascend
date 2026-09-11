@@ -104,6 +104,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # compared numerically at hidden 5120 -- it has been checked at 4096, and
     # at 5120 only for producing finite values.
     "VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR", "0"),
+    # DeepSeek-V4.1 engram dequantise: "1" takes a torch route instead of the
+    # Triton kernel. A bisection instrument, not a production fallback -- a
+    # triton-ascend compiler assertion aborts the process rather than raising,
+    # so the only cheap way to attribute one is to remove a kernel and look.
+    "VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH", "0"),
 }
 
 # end-env-vars-definition
