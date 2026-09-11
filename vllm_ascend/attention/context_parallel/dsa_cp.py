@@ -48,7 +48,7 @@ from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.ops.triton.dsa_cp import build_local_metadata_triton
 from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import enable_dsa_cp_full_o_proj
+from vllm_ascend.utils import enable_dsa_cp_full_o_proj, is_deepseek_v4_family
 from vllm_ascend.weight_switch import WeightSwitchConfig, WeightSwitchMixin, WeightSwitchState
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
@@ -240,7 +240,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         hf_config = self.model_config.hf_config
 
         self.hadamard = None
-        if hf_config.model_type == "deepseek_v4":
+        if is_deepseek_v4_family(hf_config):
             indexer_head_dim = hf_config.index_head_dim
             try:
                 from scipy.linalg import hadamard  # type: ignore[import-untyped]

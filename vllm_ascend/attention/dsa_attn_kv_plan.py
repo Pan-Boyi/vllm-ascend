@@ -158,6 +158,12 @@ class DsaAttnKvPlan:
     sparse_attn_metadata_kwargs: dict[str, Any]
     include_metadata_device: bool
     applies_sparse_attn_runtime_kwargs: bool
+    #: Compression ratios this plan's operator accepts. A property of the
+    #: operator each plan dispatches to, not of the hardware -- the three plans
+    #: call three different operators and their sets differ. See each plan
+    #: below for what the entry rests on; they are not equally well
+    #: established.
+    supported_compress_ratios: tuple[int, ...]
 
     def get_dsa_sparse_attn_metadata_op(self):
         return self.sparse_attn_metadata_op
@@ -232,6 +238,10 @@ def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
             sparse_attn_metadata_kwargs={},
             include_metadata_device=True,
             applies_sparse_attn_runtime_kwargs=True,
+            # Not established. This plan predates DeepSeek-V4.1 and nobody has
+            # checked npu_sparse_attn_sharedkv's range; the V4.0 values are
+            # assumed rather than read out of its parameter check.
+            supported_compress_ratios=(0, 1, 4, 128),
         )
 
     use_bf16 = is_a5_bf16_kv_enabled(vllm_config)
@@ -248,6 +258,12 @@ def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
             sparse_attn_metadata_kwargs={},
             include_metadata_device=True,
             applies_sparse_attn_runtime_kwargs=True,
+            # Ratio 2 is why this plan matters: DeepSeek-V4.1 needs it on
+            # layers 2..19, and 1 on 20..39. Being measured -- this plan exists
+            # in the tree but has never been run end to end -- so this entry is
+            # what the model requires, not what anyone has observed. If the
+            # measurement comes back short, it is this tuple that changes.
+            supported_compress_ratios=(0, 1, 2),
         )
     return DsaAttnKvPlan(
         uses_sparse_flash_mla=False,
@@ -261,4 +277,10 @@ def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
         sparse_attn_metadata_kwargs={"kv_quant_mode": 1},
         include_metadata_device=False,
         applies_sparse_attn_runtime_kwargs=False,
+        # Read out of the operator's own parameter check:
+        # csrc/attention/kv_quant_sparse_attn_sharedkv/op_host/
+        # kv_quant_sparse_attn_sharedkv_check_existance.cpp:154-166 accepts
+        # {1, 4, 128} in SWA and {4, 128} in CFA/SCFA. 0 never reaches it --
+        # _dsa_swa_only_cmp_ratio converts it first.
+        supported_compress_ratios=(0, 1, 4, 128),
     )

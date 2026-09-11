@@ -1233,6 +1233,23 @@ def has_layer_idx(model_instance: torch.nn.Module) -> bool:
     return _HAS_LAYER_IDX
 
 
+def is_deepseek_v4_family(hf_config) -> bool:
+    """Whether this is DeepSeek V4 or one of its descendants.
+
+    V4.1 reports ``deepseek_v41`` (and ``deepseek_v41_text`` for the text
+    config), so an equality test against ``deepseek_v4`` silently excludes it:
+    the branch guarded by such a test does not run, and nothing says so. The
+    speculative-decode path already matched by prefix
+    (``llm_base_proposer.py``); this is the same test, named once.
+
+    Deliberately not applied to ``model_version`` comparisons. Upstream's V4.1
+    attention spec sets ``model_version="deepseek_v4"`` itself, so those
+    equalities are already correct and widening them would break the match.
+    """
+    model_type = getattr(hf_config, "model_type", None)
+    return isinstance(model_type, str) and model_type.startswith("deepseek_v4")
+
+
 def refresh_block_size(vllm_config):
     """
     Refresh the block size in cache config.
@@ -1261,7 +1278,7 @@ def refresh_block_size(vllm_config):
     if not scheduler_config or not model_config:
         return
 
-    if model_config.hf_config.model_type == "deepseek_v4":
+    if is_deepseek_v4_family(model_config.hf_config):
         if cache_config.block_size is None:
             cache_config.block_size = 32
         elif cache_config.block_size not in [32, 64, 128]:

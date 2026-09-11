@@ -2,6 +2,7 @@ from dataclasses import replace
 
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm_ascend.utils import is_deepseek_v4_family
 
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
@@ -53,7 +54,7 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
     hf_config = getattr(draft_model_config, "hf_config", None)
     if (
         hf_config is None
-        or getattr(hf_config, "model_type", None) != "deepseek_v4"
+        or not is_deepseek_v4_family(hf_config)
         or getattr(hf_config, "dspark_target_layer_ids", None) is None
     ):
         return

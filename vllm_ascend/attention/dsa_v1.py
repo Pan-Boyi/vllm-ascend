@@ -51,8 +51,7 @@ from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
-    oproj_tp_enable,
-)
+    oproj_tp_enable, is_deepseek_v4_family)
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     DeviceMetadataTask,
@@ -204,49 +203,87 @@ def _dsa_layout_kv(vllm_config: VllmConfig) -> str:
 
 
 def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int:
-    """BF16 SWA-only attention takes no compressed stream; otherwise keep main's value."""
+    """Map a layer's configured ratio onto the operator's ``cmp_ratio``.
+
+    These are two different quantities and conflating them has already cost
+    once. The configured ratio comes from ``compress_ratios`` and is 0 on
+    layers with no compressed stream; the operator's parameter describes the
+    stream it is being handed and **must be greater than zero** -- sparse_flash_mla
+    rejects 0 outright with "Cmp_ratio must be greater than 0", measured on A5.
+
+    So a layer without a compressed stream reports 1 here and simply does not
+    supply one; the operator ignores the value in that case. Returning 0 to
+    mean "none" was rejected for all of layers 20..39, which carry ratio 1.
+
+    Everything outside the A5 BF16 plan keeps V4.0's mapping untouched.
+    """
     if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
-        return 0
+        return 1
     return max(compress_ratio, 1)
 
 
-# Compression ratios the *currently bound* attention operator can honour.
-#
-# This is a property of KvQuantSparseAttnSharedkv, not of the hardware: its
-# host-side check rejects everything else outright -- see
-# csrc/attention/kv_quant_sparse_attn_sharedkv/op_host/
-# kv_quant_sparse_attn_sharedkv_check_existance.cpp:154-166, where SWA accepts
-# {1, 4, 128} and CFA/SCFA accept {4, 128}. That whitelist predates A5; the
-# operator is vendored here rather than shipped by CANN.
-#
-# A5 itself does support ratio 2: CANN 9.2.0's MixedQuantSparseFlashMla accepts
-# 1/2/4/128 and has been measured doing so. It is not bound in this repo yet,
-# so ratio 2 still cannot run -- but the limit moves when that binding lands,
-# and the error below must not leave anyone concluding the hardware cannot do it.
-#
-# 0 is deliberately in this set even though the operator's whitelist has no
-# such value: it means "no compressed stream at all", and _dsa_swa_only_cmp_ratio
-# converts it before anything is dispatched, so 0 never reaches the operator.
-SUPPORTED_COMPRESS_RATIOS = (0, 1, 4, 128)
+def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
+    """Does this layer's attention read a compressed stream?
 
+    Asked at three places that must agree -- whether to pass the compressed
+    cumulative lengths, whether to supply the stream itself, and whether the
+    mask may be sliding-window-only. Splitting one question across three
+    comparisons is how two of them stayed on V4.0's answer while the third was
+    fixed.
 
-def validate_compress_ratio(compress_ratio: int, where: str) -> int:
-    """Reject compression ratios that no dispatch path implements.
+    It is deliberately *not* the same question as "does this layer own a
+    compressed cache". V4.1 has four source layers and thirty-eight that attend
+    to one, so a single predicate would be wrong for every consumer.
 
-    DeepSeek-V4.1 asks for ratio 2 on layers 2..19. Every dispatch site here
-    used to fall through to a default instead of rejecting it -- the cmp_ratio
-    mapping to 128, the backend selection to SWA -- so an unsupported ratio
-    produced quietly wrong numbers rather than an error, and would surface far
-    downstream as "accuracy is a bit off".
+    V4.0 and V4.1 disagree on the threshold. V4.0 pools by 4 or 128 and treats
+    ratio 1 as "sliding window only"; V4.1 gives layers 20..39 ratio 1 meaning
+    "compressed, pooling disabled" -- a stream that is read. The two are told
+    apart by whether the checkpoint declares ``kv_source_layer_ids``, which is
+    the field that actually answers the question rather than a version label:
+    a config that names its source layers has the V4.1 topology whatever it
+    calls itself.
     """
-    if compress_ratio not in SUPPORTED_COMPRESS_RATIOS:
+    hf_config = getattr(getattr(vllm_config, "model_config", None),
+                        "hf_config", None)
+    declares_sources = getattr(hf_config, "kv_source_layer_ids", None) is not None
+    if declares_sources:
+        return compress_ratio >= 1
+    # V4.0: unchanged from the `compress_ratio <= 1` this replaced.
+    return compress_ratio > 1
+
+
+#: Union over every plan's set, for the few call sites that run before a plan
+#: is resolved. Deliberately permissive: refusing there would reject ratios a
+#: plan accepts, and the per-plan check still runs later.
+ANY_PLAN_COMPRESS_RATIOS = (0, 1, 2, 4, 128)
+
+
+def validate_compress_ratio(compress_ratio: int, where: str, plan=None) -> int:
+    """Reject ratios the dispatched operator cannot honour.
+
+    The supported set belongs to the plan, not to this module: the three plans
+    in dsa_attn_kv_plan call three different operators, and DeepSeek-V4.1's
+    ratio 2 is accepted by one of them and not the others. Hard-coding one set
+    here made this guard plan-blind -- it refused ratio 2 even after switching
+    to a plan built for it.
+
+    ``plan`` may be omitted only where no plan is reachable yet; the union of
+    every plan's set is used then, which rejects nothing a plan would accept.
+    """
+    if plan is not None:
+        supported = tuple(plan.supported_compress_ratios)
+        scope = f"the {type(plan).__name__} in use"
+    else:
+        supported = ANY_PLAN_COMPRESS_RATIOS
+        scope = "any plan (no plan resolved at this point)"
+
+    if compress_ratio not in supported:
         raise ValueError(
-            f"{where}: compress_ratio={compress_ratio} is not supported by the "
-            f"bound attention operator; it accepts "
-            f"{list(SUPPORTED_COMPRESS_RATIOS)}. DeepSeek-V4.1 needs ratio 2 on "
-            "layers 2..19. This is a binding gap, not a hardware limit -- CANN's "
-            "MixedQuantSparseFlashMla accepts ratio 2 on A5 but is not bound in "
-            "this repo yet.")
+            f"{where}: compress_ratio={compress_ratio} is not supported by "
+            f"{scope}, which accepts {list(supported)}. DeepSeek-V4.1 needs "
+            "ratio 2 on layers 2..19 and 1 on 20..39, and the plans differ in "
+            "which they accept -- this is about which operator is dispatched, "
+            "not about what the hardware can do.")
     return compress_ratio
 
 
@@ -745,7 +782,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
     def _init_hadamard(self, layer_names: list[str]) -> None:
         hf_config = self.model_config.hf_config
-        if hf_config.model_type != "deepseek_v4":
+        if not is_deepseek_v4_family(hf_config):
             return
 
         indexer_head_dim = hf_config.index_head_dim
@@ -946,7 +983,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
             index_topk = self.model_config.hf_config.index_topk
-            validate_compress_ratio(self.compressor_ratio, layer_name)
+            validate_compress_ratio(self.compressor_ratio, layer_name,
+                                    get_dsa_attn_kv_plan(self.vllm_config))
             cmp_ratio = (
                 _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
                 if self.compressor_ratio <= 1
@@ -2234,7 +2272,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
-        if self.compress_ratio > 1:
+        attends_compressed = attends_compressed_stream(self.compress_ratio, self.vllm_config)
+        if attends_compressed:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_cmp_kv=common_metadata.cu_cmp_seqlen_list)
 
         attn_kwargs.update(
@@ -2246,9 +2285,12 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             metadata=common_metadata.sas_metadata,
             softmax_scale=self.softmax_scale,
             cmp_ratio=_dsa_swa_only_cmp_ratio(self.compress_ratio, self.vllm_config),
-            ori_mask_mode=4,
-            ori_win_left=ori_win_left,
-            ori_win_right=ori_win_right,
+            # The operator refuses sliding-window mode alongside a compressed
+            # stream ("SWA mode requires cmp_ratio=1"), and a non-windowed mode
+            # requires both bounds at -1.
+            ori_mask_mode=0 if attends_compressed else 4,
+            ori_win_left=-1 if attends_compressed else ori_win_left,
+            ori_win_right=-1 if attends_compressed else ori_win_right,
             layout_q="TND",
             layout_kv=_dsa_layout_kv(self.vllm_config),
         )
@@ -2265,7 +2307,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         # operator mode those layers are meant to use is still open, so the
         # V4.0 reading is kept rather than guessed at; validate_compress_ratio
         # does not catch this because ratio 1 is a legitimate V4.0 value.
-        if self.compress_ratio <= 1:
+        if not attends_compressed:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
         else:
