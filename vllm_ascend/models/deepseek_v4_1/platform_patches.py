@@ -125,6 +125,51 @@ def rebind_upstream_classes() -> list[str]:
     return rebound
 
 
+#: Hyper-connection entry points the V4.1 decoder layer calls directly in its
+#: forward. They are plain module-level names in upstream's model module, bound
+#: there by a ``from ... import`` at import time, so rebinding the attribute on
+#: the already-imported module reaches every call site without forking the
+#: layer. tilelang is not installed here and these are the only two names that
+#: need it.
+MHC_REBINDS = (
+    ("mhc_pre_delayed_tilelang", "mhc_pre_delayed_ascend"),
+    ("mhc_post_tilelang", "mhc_post_ascend"),
+)
+
+
+def rebind_mhc_functions() -> list[str]:
+    """Point the decoder layer's mHC calls at the tilelang-free versions.
+
+    Returns the names rebound. Refuses rather than skipping when one is gone:
+    the failure it prevents is an ImportError inside the first decoder layer's
+    forward, which is late enough that the model has already loaded and every
+    earlier stage has reported success.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import mhc
+
+    upstream = _upstream_model_module()
+    rebound = []
+    for upstream_name, ascend_name in MHC_REBINDS:
+        if not hasattr(upstream, upstream_name):
+            raise AttributeError(
+                f"upstream's V4.1 model module no longer defines "
+                f"{upstream_name!r}. Until this is repointed the decoder layer "
+                "calls tilelang, which is not installed here, and it fails in "
+                "the first forward rather than at load.")
+        replacement = getattr(mhc, ascend_name)
+        if getattr(upstream, upstream_name) is replacement:
+            continue
+        setattr(upstream, upstream_name, replacement)
+        rebound.append(upstream_name)
+    return rebound
+
+
+def _upstream_model_module():
+    import vllm.models.deepseek_v4_1.nvidia.model as upstream
+
+    return upstream
+
+
 def apply_all() -> list[str]:
     """Apply every adaptation and report which. Safe to call more than once.
 
@@ -143,6 +188,7 @@ def apply_all() -> list[str]:
     apply_attn_selector_patch()
     applied.append("_select_dsv4_attn_cls")
     applied.extend(rebind_upstream_classes())
+    applied.extend(rebind_mhc_functions())
 
     if not applied:
         raise RuntimeError(
