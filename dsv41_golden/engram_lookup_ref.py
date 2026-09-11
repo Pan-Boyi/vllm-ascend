@@ -230,19 +230,48 @@ def byte_scan(ck, rows_per_stripe: int = 200000) -> dict:
 
 
 def dup_test(ck, layer_ids, block: int) -> bool:
-    """Repeated hash ids -- the input shape upstream is known to get wrong quietly.
+    """LOAD-BEARING.  Repeated hash ids -- the one input shape that is got wrong quietly.
 
-    A row of 24 hash columns has no reason to hold distinct ids, and in practice it
-    does not: the standard prompt already repeats.  Upstream's scale gather returns
-    wrong values for repeated indices **without erroring** (maxdiff 32 as measured by
-    the kernel line), and 32 is roughly seven times the entire legitimate value range
-    of this table, so the fault is enormous and silent at the same time.
+    This is the only check standing between the project and a known silent defect,
+    and there is no fallback: moving the table to HBM was assumed to be an escape
+    route and is not.  The kernel line ran all four combinations in one session:
+
+        weight  scale   scale indexing     result
+          HBM    HBM      cols//QB         WRONG, maxdiff 2.800e+01
+          HBM    HBM      contiguous       bit-identical
+         host    HBM      cols//QB         WRONG, maxdiff 2.800e+01
+         host    HBM      contiguous       bit-identical
+
+    ⇒ the defect does not depend on the address space.  It is the index-based gather
+    itself.  Upstream fetches weight and scale from host through the same kwargs, so
+    "keep both on host, as upstream does" is the decision -- and this test is what
+    guards it.  Anyone swapping the gather kernel has to pass here first.
+
+    Why it is so easy to miss: the right and wrong versions differ by one line, the
+    wrong one does not raise, and hash ids repeat naturally (the standard 24-column
+    prompt already does).
+
+    🔴 And there is no cheap second signal.  It was briefly claimed here that a plain
+    range assertion would also catch it, because the observed output maxima are 4.5
+    and 4.0 while the defect produces maxdiff 28.  That is wrong, and the full scale
+    tables say why: layer 14's exponents run to 2**-4 across all 384M rows, so the
+    defensible bound is 448 * 2**-4 = **28.0** -- exactly the size of the defect.  A
+    difference of 28 forces the wrong value to only |28| - 28 = 0 beyond the bound,
+    i.e. nothing.  (Layer 1 bounds at 14.0, no better: 28 - 14 = 14 = 1.0x.)
+
+    A tight empirical bound would catch it, but sampling does not give one: a scan of
+    1.8M of the 384M scale rows reported layer 14's exponent range as 2**-10..2**-5,
+    and the full scan found 2**-11..2**-4 -- the sampled extremes understated the
+    bound by 2x.  **A sample maximum is not a bound.**
+
+    ⇒ this test is not one of two independent signals.  It is the only one.
 
     Checked as a property against an independent naive per-row gather, not against
     this module's own dedup path -- ``lookup_raw`` deduplicates with
     ``unique(return_inverse=True)``, so comparing it to itself would prove nothing.
     """
-    print("duplicate hash ids -- the shape upstream mishandles silently")
+    print("LOAD-BEARING: duplicate hash ids (see the four-cell table in the docstring)")
+    print("  the defect is address-space independent; there is no fallback to HBM")
     ids = torch.tensor([[[101, 202, 303, 101, 404, 202, 505, 101,
                           606, 707, 101, 808, 303, 909, 101, 111,
                           222, 202, 333, 444, 555, 666, 777, 888]]], dtype=torch.int64)
@@ -279,9 +308,10 @@ def dup_test(ck, layer_ids, block: int) -> bool:
         ok &= f_ok and s_ok and consistent
         print(f"  layer {lid:2d}: fp8 == naive per-row gather {f_ok}   "
               f"scale == naive {s_ok}   repeats byte-consistent {consistent}")
-        print(f"            max|value| {rng:.4f} -- upstream's 32 would be "
-              f"{32 / max(rng, 1e-9):.0f}x the legitimate range, so a plain range "
-              f"check also catches it")
+        print(f"            max|value| on THIS input {rng:.4f} -- a sample maximum, "
+              f"NOT a bound. The defensible bound from the full scale table is "
+              f"{'14.0' if lid == 1 else '28.0'} (448 * 2**{-5 if lid == 1 else -4}), "
+              f"so a range assertion does NOT catch the maxdiff-28 defect.")
     print()
     print("PASS" if ok else "FAIL")
     if ok:
@@ -433,11 +463,16 @@ def main():
             if not r["pass"]:
                 failed = True
         # Tell the failure modes apart, which is why .fp8/.scale are dumped.  THREE
-        # buckets, not two, because the two quantised inputs do not travel the same
-        # road: the tech report keeps the full scale table resident in device local
-        # memory and ships only the fp8 rows from host.  So an fp8 mismatch implicates
-        # the host fetch, while a scale mismatch cannot -- it never crossed that bus.
-        # Merging them would send someone to audit a transfer that did not happen.
+        # buckets, not two, because the fp8 rows and the scale rows are fetched by two
+        # independent gathers and either can be wrong on its own.
+        #
+        # An earlier version of this comment said the scale table stays resident on
+        # device and therefore could not implicate the host path.  That was wrong --
+        # upstream fetches weight and scale through the same kwargs, both from host --
+        # and the kernel line then showed the defect does not depend on the address
+        # space at all (see dup_test).  The correction matters in a specific way: a
+        # bucket carrying a false premise does not merely misname the cause, it tells
+        # the reader to RULE OUT something that did happen.
         for lid in layout.layer_ids:
             rk = f"layer_{lid:02d}.rows"
             fk = f"layer_{lid:02d}.fp8"
@@ -454,12 +489,13 @@ def main():
                       f"GATHER is wrong (hash / index / the host->device fetch). "
                       f"Do not look at the dequantize or the scale.")
             elif sc_ok is False:
-                print(f"  layer {lid}: fp8 rows agree, SCALE does not => the "
-                      f"device-side scale indexing is wrong. The scale table is "
-                      f"resident on device, so this is NOT the host path. "
-                      f"⚠️ Duplicate hash ids are the known trap here -- upstream's "
-                      f"scale gather returns wrong values for repeated indices "
-                      f"without erroring (see --dup-test).")
+                print(f"  layer {lid}: fp8 rows agree, SCALE does not => the scale "
+                      f"gather/indexing is wrong (the fp8 rows came back fine, so "
+                      f"the hash ids and the fetch path are not the problem). "
+                      f"⚠️ Duplicate hash ids are the known trap here: an index-based "
+                      f"scale gather (cols//QB) returns wrong values for repeated "
+                      f"indices without erroring, in host AND in HBM alike. "
+                      f"Run --dup-test.")
             elif fp8_ok and sc_ok:
                 print(f"  layer {lid}: both quantised inputs agree byte for byte but "
                       f"the output does not => the DEQUANTIZE arithmetic is wrong "
