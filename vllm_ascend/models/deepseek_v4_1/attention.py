@@ -25,6 +25,7 @@ import torch_npu
 from vllm.config import VllmConfig
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
 from vllm_ascend.models.deepseek_v4_1.o_proj import check_grouped_wo_a_layout
@@ -87,6 +88,77 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
     # too -- AscendDSAC2Backend exists. Ratio-to-backend now resolves in
     # AscendDeepseekV41IndexerCache.get_attn_backend, from the spec that
     # actually constrains it.
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """The compressed-KV cache, described the way Ascend's kernels read it.
+
+        Without this the layer inherits upstream's, which returns a plain
+        ``MLAAttentionSpec``. That is not merely a different class: three places
+        in the runner test ``isinstance(spec, AscendMLAAttentionSpec)`` and take
+        a non-Ascend branch when it fails -- ``_uses_page_strided_kv_layout``,
+        ``_get_attention_kv_cache_dims``, and the page-size formula itself.
+
+        The two conventions also disagree about where the compression ratio
+        goes, and it is not a wash. Upstream fixes ``block_size`` at the cache
+        config's value and lets ``storage_block_size`` shrink by the ratio;
+        Ascend keeps the storage page at what the block-size table says and
+        multiplies ``block_size`` up instead. For a ratio-2 layer at cache
+        block 128 that is 64 states of storage against 128 -- the same cache
+        described with pages half the size. The table is the kernel's contract,
+        so the table wins; see the page-size test for the four combinations it
+        has to reproduce.
+
+        The ratio-2 spec's ``block_size`` of 256 is also why AscendDSAC2Backend
+        lists [64, 128, 256]. Table, spec convention and backend support set are
+        three exits from one decision, not three decisions.
+        """
+        # Only kv-source layers own a compressed-KV cache. Consumers read the
+        # source's through the forward context, and ratio-0 layers are pure SWA.
+        if not self.is_kv_source:
+            return None
+
+        from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+        from vllm_ascend.device.hardware_profile import (
+            HardwareCapability, get_current_hardware_profile)
+        from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
+
+        use_bf16_kv = is_a5_bf16_kv_enabled(vllm_config)
+        compressed = get_current_hardware_profile().supports(
+            HardwareCapability.DSV4_COMPRESSED_CACHE)
+
+        dtype = self.kv_cache_torch_dtype
+        if use_bf16_kv:
+            dtype = torch.bfloat16
+        elif compressed:
+            dtype = torch.float8_e4m3fn
+            vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
+
+        # The compressed layout carries the RoPE half and the scale inside the
+        # state rather than beside it: 448 NoPE fp8 + 128 RoPE + scale + pad,
+        # 640 bytes. Expressed as 128 extra head elements at one byte each, the
+        # way V4.0 expresses it, so both models produce the same page from the
+        # same table entry.
+        cached_head_size = (self.head_dim + 128
+                            if compressed and not use_bf16_kv else self.head_dim)
+
+        storage_block_size = dsv4_block_sizes(vllm_config)[
+            vllm_config.cache_config.block_size][0][0]
+        # max(ratio, 1): a kv source always has at least one token per state.
+        # Zero would make block_size 0, which select_common_block_size does not
+        # reject -- 0 % n == 0 for every n, so it silently takes the largest.
+        ratio = max(self.compress_ratio, 1)
+        return AscendMLAAttentionSpec(
+            # The scheduler counts raw tokens; the kernels use the compressed
+            # page that storage_block_size names. block_size is the product.
+            block_size=storage_block_size * ratio,
+            num_kv_heads=1,
+            head_size=cached_head_size,
+            dtype=dtype,
+            model_version="deepseek_v4",
+            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            tokens_per_state=ratio,
+        )
 
     def __init__(
         self,
