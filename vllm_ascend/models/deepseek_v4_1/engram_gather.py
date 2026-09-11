@@ -15,6 +15,15 @@ a tensor argument fails in Triton's launcher, which queries pointer attributes
 and gets ``ACL_ERROR_RT_DRV_INTERNAL_ERROR`` -- before the kernel runs, and with
 an error that reads like the hardware refusing the access.
 
+**The scales must be read contiguously and broadcast, never gathered by
+``cols // QUANT_BLOCK``.** That indexing puts 256 lanes on 8 addresses and
+returns the wrong values -- measured at maxdiff 28, with no error raised, on
+*both* HBM and a host mapping. It is not an address-space quirk with a fallback;
+there is only the correct read. Engram's hash ids repeat by construction (24
+rows per token, collisions within a batch are the norm), so this mode is reached
+rather than merely reachable, and the wrong version differs from the right one
+by a single line.
+
 **The scale is one exponent per 32 values along the row, not a 2-D block grid.**
 Non-expert weights use 32x32 tiles and engram does not; feeding a row of engram
 scales to a 2-D dequantiser produces a correctly shaped, entirely wrong answer.
@@ -226,12 +235,12 @@ class AscendParallelEngramEmbedding:
         launcher admits only DEVICE and HOST_NUMA. The addresses travel as
         data in one-element int64 tensors instead.
 
-    ``lookup`` -- the kernel differs (see this module's docstring) and so does
-        the grid. Upstream halves it when gathering in the background to leave
-        SMs for the main stream; on A5 that costs about 2x, because the cores
-        being handed back are vector cores and the main stream's work is on the
-        cube cores. Whether the overlap it buys is worth that has to be
-        measured end to end; until then the grid is not halved.
+    ``lookup`` -- the kernel differs (see this module's docstring). The grid is
+        never halved: upstream's ``background`` parameter has no call site in
+        DeepSeek-V4.1 at all, so it is unexercised code rather than a weighed
+        option. Were anyone to reach for it, halving costs about 2x here, since
+        the cores handed back are vector cores while the main stream's work is
+        on the cube cores.
 
     Mixed in ahead of upstream's class so these win the MRO:
 
