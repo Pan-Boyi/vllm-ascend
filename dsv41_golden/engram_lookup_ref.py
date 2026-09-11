@@ -229,7 +229,7 @@ def byte_scan(ck, rows_per_stripe: int = 200000) -> dict:
     return out
 
 
-def dup_test(ck, layer_ids, block: int) -> bool:
+def dup_test(ck, layer_ids, block: int, ids: torch.Tensor | None = None) -> bool:
     """LOAD-BEARING.  Repeated hash ids -- the one input shape that is got wrong quietly.
 
     This is the only check standing between the project and a known silent defect,
@@ -272,13 +272,31 @@ def dup_test(ck, layer_ids, block: int) -> bool:
     """
     print("LOAD-BEARING: duplicate hash ids (see the four-cell table in the docstring)")
     print("  the defect is address-space independent; there is no fallback to HBM")
-    ids = torch.tensor([[[101, 202, 303, 101, 404, 202, 505, 101,
-                          606, 707, 101, 808, 303, 909, 101, 111,
-                          222, 202, 333, 444, 555, 666, 777, 888]]], dtype=torch.int64)
+    if ids is None:
+        ids = torch.tensor([[[101, 202, 303, 101, 404, 202, 505, 101,
+                              606, 707, 101, 808, 303, 909, 101, 111,
+                              222, 202, 333, 444, 555, 666, 777, 888]]], dtype=torch.int64)
     n_uniq = int(torch.unique(ids).numel())
-    print(f"  {ids.numel()} columns, {n_uniq} distinct ids, "
-          f"{ids.numel() - n_uniq} repeats (one id appears 5 times)")
+    n_rep = ids.numel() - n_uniq
+    counts = torch.unique(ids, return_counts=True)[1]
+    max_rep = int(counts.max())
+    print(f"  {ids.numel()} columns, {n_uniq} distinct ids, {n_rep} repeats "
+          f"(most-repeated id appears {max_rep} times)")
+
+    # Zero-coverage guard.  The duplicate-consistency loop below skips ids that occur
+    # once, so an input without repeats would leave it running zero times and the test
+    # would PASS having checked nothing about duplicates -- while being the only thing
+    # guarding that defect.  A load-bearing case must not be able to pass vacuously.
+    if n_rep < 2 or max_rep < 3:
+        print()
+        print(f"NOTHING CHECKED -- the input has {n_rep} repeated column(s) and its "
+              f"most-repeated id appears {max_rep} time(s).")
+        print("This is a FAILURE, not a pass: the property under test only exists when")
+        print("ids repeat, so an input without repeats exercises none of it.  Need at")
+        print("least 2 repeated columns and one id appearing at least 3 times.")
+        return False
     ok = True
+    n_checked = 0
     for lid in layer_ids:
         fp8, sc = lookup_raw(ck, lid, ids)
         rows = dequantize(fp8, sc, block)
@@ -297,22 +315,35 @@ def dup_test(ck, layer_ids, block: int) -> bool:
         fb = fp8.reshape(-1, fp8.shape[-1]).view(torch.uint8)
         sb = sc.reshape(-1, sc.shape[-1]).view(torch.uint8)
         consistent = True
+        checked_here = 0
         for uid in torch.unique(flat):
             pos = (flat == uid).nonzero().flatten()
             if len(pos) < 2:
                 continue
+            checked_here += 1
             for tb in (rb, fb, sb):
                 if not all(torch.equal(tb[p], tb[pos[0]]) for p in pos):
                     consistent = False
+        n_checked += checked_here
         rng = float(rows.float().abs().max())
         ok &= f_ok and s_ok and consistent
         print(f"  layer {lid:2d}: fp8 == naive per-row gather {f_ok}   "
-              f"scale == naive {s_ok}   repeats byte-consistent {consistent}")
+              f"scale == naive {s_ok}   repeats byte-consistent {consistent} "
+              f"({checked_here} repeated ids actually compared)")
         print(f"            max|value| on THIS input {rng:.4f} -- a sample maximum, "
               f"NOT a bound. The defensible bound from the full scale table is "
               f"{'14.0' if lid == 1 else '28.0'} (448 * 2**{-5 if lid == 1 else -4}), "
               f"so a range assertion does NOT catch the maxdiff-28 defect.")
+    # Second half of the guard: the comparison must have actually run.  Counting the
+    # input's repeats is not enough -- a bug in the loop itself could skip them all.
+    if n_checked == 0:
+        print()
+        print("NOTHING CHECKED -- the input had repeats but no repeated id was actually "
+              "compared. The loop did not run; treat this as a failure of the test, "
+              "not a pass of the code.")
+        return False
     print()
+    print(f"  {n_checked} repeated-id comparisons ran across {len(layer_ids)} layers")
     print("PASS" if ok else "FAIL")
     if ok:
         print("  The reference deduplicates with unique(return_inverse=True) and the")
@@ -334,6 +365,9 @@ def main():
     ap.add_argument("--dup-test", action="store_true",
                     help="check repeated hash ids, the one input shape known to be "
                          "mishandled silently upstream")
+    ap.add_argument("--dup-ids", default=None,
+                    help="comma-separated hash ids to use instead of the built-in set; "
+                         "exists so the zero-coverage guard can be exercised")
     ap.add_argument("--max-seq-len", type=int, default=512)
     a = ap.parse_args()
 
@@ -357,7 +391,11 @@ def main():
     print()
 
     if a.dup_test:
-        ok = dup_test(ckpt, layout.layer_ids, bs)
+        custom = None
+        if a.dup_ids:
+            vals = [int(x) for x in a.dup_ids.split(",") if x.strip()]
+            custom = torch.tensor([[vals]], dtype=torch.int64)
+        ok = dup_test(ckpt, layout.layer_ids, bs, custom)
         ckpt.close()
         sys.exit(0 if ok else 1)
 
