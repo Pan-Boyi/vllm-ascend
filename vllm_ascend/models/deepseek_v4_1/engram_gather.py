@@ -1,6 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gather engram rows out of a host-resident table, on the AIV cores.
 
+.. deprecated:: 2026-09-11
+
+    **This path is retired: the device may not address the host tables.**
+    ``aclrtHostRegisterV2`` is banned at every size, and everything below that
+    depends on it is kept for provenance rather than for use. Deleting it would
+    only mean the next person reinvents it, and reinvention cost a card.
+
+    What happened: the first registration attempted against the *real* table
+    took an NPU down. Baseline dmesg was clean at 09:46:59; the registration
+    started 10:03:55 and the card began reporting errors at 10:06:06, two
+    minutes in. (A SIGTERM arrived at 10:18:55, thirteen minutes after the
+    first error -- it was not the cause; the twelve-minute hang was the card
+    already not answering.) Three 1 GiB registrations against scratch files
+    immediately before had all succeeded with the card unharmed.
+
+    That correlation is not proof -- another card here failed with nobody
+    touching it. But a second, independent objection does not depend on it:
+    pinning 1 GiB of the real table did not return within twelve minutes,
+    against 6.4 seconds for a scratch file. At that rate the 189 registrations
+    a full table needs are not a usable startup path however safe they are.
+
+    A third fact, worth keeping because it outlives the mechanism:
+    registration **requires a writable mapping**. A read-only one is refused
+    outright (rc=507899; the kernel reports ``get_user_pages_fast`` -EFAULT,
+    the driver pinning with write intent). So this design necessarily mapped
+    read-only data writable, in every rank, over shared physical pages.
+
+    The replacement gathers on the CPU out of a **read-only** mapping into a
+    small staging buffer and does one H2D copy; the kernel then reads HBM. See
+    ``engram_layout`` for the convention that replaces this. That removes the
+    writable-mapping hazard entirely rather than guarding it.
+
 The two engram tables are ~94 GiB each and never enter HBM. They live in one
 shared mapping on the host that every rank maps, registered with CANN so the
 device can address it, and a Triton (AIV) kernel reads the rows it needs
