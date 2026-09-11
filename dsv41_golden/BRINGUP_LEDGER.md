@@ -112,7 +112,8 @@
 | ✅ | **前提在通用 MMA 上已测成立**:`torch.matmul` 的 bf16 MMA 是 **fp32 累加或更宽**(五种求和顺序聚成 0.0061% 宽的一簇;「每块舍回 bf16」随分块单调 27.74→59.08%,形状完全不同)`[integration 实测,未经我复核]` |
 | ✅ | **专家 GEMM 那条也已测**:`npu_grouped_matmul` 同一指纹形状(五序簇宽 0.0031%;每块舍 bf16 随分块 27.6→59.3% 单调)⇒ **fp32 或更宽** `[integration 实测,未经我复核]` |
 | ✅ | **V4.1 实际走哪个算子已自核到底**:`config.json(expert_dtype=fp4)` → `AscendDeepseekV4FP8Config` → `get_scheme_class(FP8_METHOD,"ds_w4a8_moe")`(`quantization/configs/fp8_config.py:209`)→ `@register_scheme`(`quantization/methods/w4a8/w4a8_mxfp4.py:316`)→ 该文件用 **plain `npu_grouped_matmul`**(:210/236/267/298)⇒ **已测的那个算子在路径上。** `swiglu_quant_v2` 属于别的 scheme,**不在 V4.1 专家路径上** |
-| ❌ | **`npu_quant_matmul`(稠密量化线性层,同文件 :90)仍未测** —— §6.10 前提剩这一个开口 |
+| ✅ | **`npu_quant_matmul`(稠密线性层)也已测**:五序簇宽 0.0015% ⇒ **fp32 或更宽** `[integration 实测]` ⇒ 🟢 **§6.10 那条前提在 V4.1 整条路径上闭合** |
+| ⚠️ | 但这组测量的**承重参数不是算子,是 MX scale 的解码方式**:错误解码下候选 A 的**所有分块给出完全相同的低值**(0.3754%),读起来像「机制确定」,实为「参考坏了」。⚪ 本 golden 的解码已自核与 `[32,32]` 一致(三个权重的 scale 形状 = `(⌈N/32⌉, K/32)`)`[golden 自核]` |
 | ⚠️ | 已确认的**真实不等价**至少一处(第 10.6 节 P1):原 tilelang `sparse_attn` 把 softmax 概率**舍到 bf16** 再做 P·V,CPU golden 全程 fp32 ⇒ **golden 更准**,一个忠实的实现会有约 1.8e-3 的**系统性偏差,而那不是 bug** |
 | ⚠️ | ⇒ **这套 golden 的定位是「定义参考」不是「逐位裁判」** —— 它逐字实现 `ref/model.py` 的语义(vendor 文件原样,只换 `kernel.py`),但**不保证与 GPU kernel 逐位一致**。整套协议因此建在「实测地板 + 集合判据」上,而不是逐位相等;逐位相等只保留给**整数哈希和 engram 查表**那两条没有浮点借口的路 |
 
