@@ -905,6 +905,9 @@ def test_build_classifies_short_speculative_extends_as_decodes(
         num_actual_tokens=14,
         num_input_tokens=14,
         max_query_len=7,
+        # Mandatory on the real AscendCommonAttentionMetadata (no default);
+        # matches max(seq_lens) below.
+        max_seq_len=20,
         context_parallel_metadata=None,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc,
