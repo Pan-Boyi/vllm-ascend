@@ -123,12 +123,20 @@ def check_grouped_wo_a_layout(weight: torch.Tensor, o_groups: int,
     first forward pass. Nothing in it suggests that a step at weight-load time
     was skipped, which is where the fix actually is.
 
-    That step is easy to skip. Nothing on Ascend honours
-    ``is_bmm``/``bmm_batch_size``, which is how upstream marks this weight; the
-    grouping is instead reconstructed from ``prefix.endswith("wo_a")`` in two
-    independent places, and only for some quantisation schemes -- a plain
-    block-fp8 linear method leaves the weight 2-D. So "the reshape happened" is
-    a property of which method served the layer, not of the model.
+    That step is easy to skip, and the reason is worth stating plainly for
+    whoever hits this next. Upstream marks this weight with ``is_bmm`` /
+    ``bmm_batch_size``; **nothing on Ascend reads either**. The grouping is
+    instead rediscovered by matching the layer's prefix, in two independent
+    places that do not even agree on how to match -- ``vllm_ascend/ops/linear``
+    tests ``"wo_a" in prefix`` and
+    ``vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8`` tests
+    ``prefix.endswith("wo_a")`` -- and only for some quantisation schemes; a
+    plain block-fp8 linear method leaves the weight 2-D.
+
+    So two ordinary-looking changes silently drop the grouping: renaming the
+    submodule, and serving this layer with a scheme that has no wo_a branch.
+    "The reshape happened" is a property of which method served the layer, not
+    of the model, which is why it is checked here rather than assumed.
 
     The transposed case has its own branch because it is the easy mistake
     rather than a rare one: ``group_wo_a`` above, upstream's DeepGEMM path and

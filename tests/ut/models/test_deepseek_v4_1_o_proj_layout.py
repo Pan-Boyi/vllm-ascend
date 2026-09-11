@@ -95,3 +95,83 @@ def test_a_wrong_group_count_is_not_waved_through():
     with pytest.raises(ValueError):
         check_grouped_wo_a_layout(torch.empty(4, GROUP_IN, O_LORA_RANK),
                                   O_GROUPS, GROUP_IN, O_LORA_RANK, "w")
+
+
+# -- what the grouping actually depends on ----------------------------------
+
+
+def test_nothing_on_ascend_reads_the_flag_upstream_uses_to_mark_this_weight():
+    """Pins the premise the layout check exists for.
+
+    Upstream marks wo_a with ``is_bmm`` / ``bmm_batch_size`` and several CUDA
+    and XPU linear methods branch on it. If an Ascend linear method ever starts
+    honouring it, the grouping stops depending on prefix spelling and the
+    hazard described in check_grouped_wo_a_layout changes shape -- so this
+    going red is informative rather than a nuisance.
+
+    Judged by parsing, not by grepping: the first version of this test matched
+    the words inside check_grouped_wo_a_layout's own docstring, which is how a
+    test that describes a property can end up measuring its own prose. An
+    attribute access is a syntax node; a mention in a comment is not.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "vllm_ascend"
+    names = {"is_bmm", "bmm_batch_size"}
+    readers, parsed = [], 0
+
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:  # pragma: no cover - would be a broken checkout
+            continue
+        parsed += 1
+        for node in ast.walk(tree):
+            # layer.is_bmm / self.bmm_batch_size
+            if isinstance(node, ast.Attribute) and node.attr in names:
+                readers.append(f"{path.relative_to(root)}:{node.lineno} .{node.attr}")
+            # getattr(layer, "is_bmm", False)
+            elif (isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name)
+                  and node.func.id in ("getattr", "hasattr")
+                  and len(node.args) >= 2
+                  and isinstance(node.args[1], ast.Constant)
+                  and node.args[1].value in names):
+                readers.append(
+                    f"{path.relative_to(root)}:{node.lineno} "
+                    f"{node.func.id}(..., {node.args[1].value!r})")
+
+    # A check that silently measured nothing would look exactly like a pass.
+    assert parsed > 100, f"only parsed {parsed} files under {root}; expected the whole plugin"
+
+    assert not readers, (
+        "an Ascend linear method now reads is_bmm/bmm_batch_size:\n"
+        + "\n".join(readers)
+        + "\nIf it groups wo_a from that flag, the prefix-matching hazard in "
+        "check_grouped_wo_a_layout no longer applies and its docstring needs "
+        "rewriting.")
+
+
+def test_the_two_reshape_sites_still_match_on_the_wo_a_prefix():
+    """The grouping hangs on a string literal in two places.
+
+    Renaming the submodule, or matching it differently, drops the grouping
+    with no error at the point of the change. A comment saying so would drift;
+    this goes red instead. Note the two sites do not even agree on how to
+    match -- one substring, one suffix -- which is recorded here rather than
+    quietly normalised, because changing either is a behaviour change for
+    layers whose prefix merely contains "wo_a".
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "vllm_ascend"
+    linear = (root / "ops" / "linear.py").read_text()
+    mxfp8 = (root / "quantization" / "methods" / "w8a8" / "w8a8_mxfp8.py").read_text()
+
+    assert '"wo_a" in prefix' in linear or '"wo_a" in self.prefix' in linear, (
+        "vllm_ascend/ops/linear.py no longer selects wo_a by prefix substring; "
+        "check whether the bf16 grouping still happens at all")
+    assert 'endswith("wo_a")' in mxfp8, (
+        "the mxfp8 linear method no longer selects wo_a by prefix suffix; "
+        "check whether the quantised grouping still happens at all")
