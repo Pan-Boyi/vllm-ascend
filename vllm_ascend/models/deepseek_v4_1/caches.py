@@ -34,16 +34,23 @@ from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
 class AscendCompressorStateBackend(CompressorBackend):
     """Upstream's compressor backend, plus the one method Ascend needs.
 
-    🔴 这个类【曾经】继承 ``AscendDSABackend``，理由写的是"只为一个继承来的方法
-    而存在"（``get_kv_cache_shape``）。那句话是错的：继承带过来的不止一个方法。
-    2026-09-11 第十六次起飞死在
-    ``AttributeError: 'CircularBufferSpec' object has no attribute 'storage_block_size'``
-    —— 继承来的 ``get_builder_cls`` 返回了 ``AscendDSAMetadataBuilder``，
-    而那个 builder 第一行就读 ``kv_cache_spec.storage_block_size``，
-    它假设自己拿到的是 ``AscendMLAAttentionSpec``。
-    环形 buffer 根本不做 attention：它的读写是 compressor 自己的 Triton kernel，
-    上游为它配了 ``CompressorMetadataBuilder``（算环槽位映射）。
-    ⇒ 正确的基类是上游的 ``CompressorBackend``，这里只补 Ascend 多要的那一个方法。
+    🔴 这个类【曾经】继承 ``AscendDSABackend``，docstring 开头写的是"它只为一个
+    继承来的方法而存在"（``get_kv_cache_shape``）。那句话是错的，而且错在一个
+    **grep 看不见**的地方：它还继承了 ``get_builder_cls``，于是环组被塞了一个
+    ``AscendDSAMetadataBuilder``，而那个 builder 第一件事就是读
+    ``kv_cache_spec.storage_block_size`` —— ``CircularBufferSpec`` 没有这个属性。
+    2026-09-11 第十六次起飞就死在
+    ``AttributeError: 'CircularBufferSpec' object has no attribute 'storage_block_size'``。
+    环根本不做 attention：它的读写是 compressor 自己的 Triton kernel，
+    上游为它配的是 ``CompressorMetadataBuilder``（算环槽位映射）。
+    **为了借一个方法去继承 DSA backend，把那个类的其余部分一起带了过来。**
+
+    ⇒ 正确的基类是上游的 ``CompressorBackend``：它定义了 ``get_name`` /
+    ``get_supported_kernel_block_sizes`` / ``get_supported_head_sizes`` /
+    ``get_builder_cls``，唯独没有 ``get_kv_cache_shape`` —— ``AttentionBackend``
+    也没有，那是只有具体 backend 才实现的方法。而昇腾 runner 的通用 attention
+    分支在 reshape 时会调它，所以在本平台上，状态 cache 会在 KV cache 建立阶段、
+    任何一次前向之前就以 AttributeError 失败。⇒ 这里只补那一个方法。
 
     ⚠️ ``get_kv_cache_shape`` 的维序必须是 ``(B, N, H, C)``，头维在 **-2**，
     和主 MLA / indexer K 同一个约定。
