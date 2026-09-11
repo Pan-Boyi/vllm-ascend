@@ -485,6 +485,25 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                     if m["rel_l2"] > lim_rel:
                         notes.append((tag, name,
                                       f"rel_l2={m['rel_l2']:.3e} (diagnostic only, not gated)"))
+                elif forced and name.startswith("moe_gate.out."):
+                    # ROUTING_INJECTION.md section 3: under forced routing BOTH
+                    # moe_gate.out.* record what the implementation's own gate computed
+                    # and deliberately did not use, so they are stage-B data, not a
+                    # stage-A criterion.  The exemption used to key on kind=="routing",
+                    # which only covers ``.1`` (the int index tensor); ``.0`` (the fp32
+                    # weights) fell through to the numeric path and was gated.  It then
+                    # false-alarmed on a known-good isolated pair at T=1100 -- the
+                    # weights are renormalised over the selected set, so a near-tie in
+                    # the *unpinned* gate moves the denominator (measured 7.9e-3 vs a
+                    # 5e-3 limit) with nothing wrong.
+                    #
+                    # moe_gate.forced.* stays gated: that is the "did the injection
+                    # land" check and it is the whole point of stage A.
+                    if m["rel_l2"] > lim_rel or m["cos"] < lim_cos:
+                        notes.append((tag, name,
+                                      f"rel_l2={m['rel_l2']:.3e} (the implementation's own "
+                                      f"gate, overridden by the injection -- stage-B data, "
+                                      f"not gated under force_route={force_route})"))
                 elif (m["rel_l2"] > lim_rel or m["cos"] < lim_cos
                       or m.get("max_token_rel_l2", 0) > TOKEN_LIMIT_FACTOR * lim_rel):
                     why = (f"rel_l2={m['rel_l2']:.3e} (limit {lim_rel:.1e}) "
