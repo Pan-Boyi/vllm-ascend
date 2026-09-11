@@ -422,13 +422,30 @@ def _wrap_indexer_post_rope(block, args):
 
 
 def _record_ep_sim(layer_id, y_seq, parts, shared, out_dtype):
-    """Compare the golden's id-order sum against every plausible all_reduce order.
+    """Compare the golden's id-order sum against every plausible grouping of it.
 
-    ``dist.all_reduce`` does not promise an association -- ring and tree reductions
-    combine the ranks differently, and the difference is real because fp32 addition
-    is not associative.  So the number worth reporting is the spread over the orders
-    an implementation might pick, not one arbitrary order: with it, a comparison can
-    say "at or below this, expert parallelism alone explains it".
+    ⚠️ **This models arithmetic, not a specific operator.**  An earlier version of this
+    docstring framed it as ``dist.all_reduce``, which is wrong for this deployment:
+    the TP group has world_size 1 (A5 forces TP=1), and
+    ``vllm/distributed/parallel_state.py:737-739`` returns the input unchanged in that
+    case -- so the three ``tensor_model_parallel_all_reduce`` calls in
+    ``vllm_ascend/ops/fused_moe/fused_moe.py`` (200/241/259) are no-ops.  Ascend does
+    the reduction inside its own dispatch/combine path instead (the comment at
+    fused_moe.py:245 says so), i.e. in ``npu_moe_distribute_combine_v2``.
+    (All four of those readings verified directly, not relayed.)
+    
+    What the two numbers below do and do not establish:
+    
+    * **fp32 variant -- dataflow independent.**  Summing the *same* contributions in
+      fp32 in any order or grouping lands bit-identically after the cast to the
+      residual dtype, because fp32 re-association is orders of magnitude below one
+      bf16 ULP.  This holds whoever does the summing, so "we shard experts and the
+      golden does not" cannot explain a ``moe.out`` mismatch.
+    * **low-precision variant -- models ONE implementation choice.**  It rounds each
+      group's partial sum to the residual dtype before combining.  Whether any
+      operator on the real path does that is **unmeasured**; do not read it as a
+      property of the NPU.  It is the price of rounding intermediate partial sums,
+      whoever rounds them.
     """
     import itertools
     worst_pre, worst_out, worst_bf16, worst_order = 0.0, 0.0, 0.0, None
