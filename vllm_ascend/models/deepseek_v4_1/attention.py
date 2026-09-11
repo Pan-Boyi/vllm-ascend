@@ -135,6 +135,30 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         """
         return num_heads
 
+    @staticmethod
+    def _unwrap_cache(cache):
+        """Strip the single-element list levels the Ascend runner adds.
+
+        This is where the V4.1 kv-cache convention question resolves, and it
+        resolves by following what Ascend already does rather than by changing
+        either side. Two levels of wrapping exist: the runner's
+        `_adjust_kv_layout` returns a list per layer, and the V4-family branch
+        of the binding loop wraps that again. `unfold_kvcache` in
+        vllm_ascend/ops/dsa strips exactly the length-1 levels and stops at the
+        indexer's length-2/3 list, whose slots are addressed by fixed index.
+
+        The alternatives were worse. Routing V4.1 to the runner's other branch
+        changes nothing -- vllm_ascend replaces `bind_kv_cache` wholesale at
+        import, so neither branch calls a layer's own method. Overriding
+        `bind_kv_cache` on the V4.1 layers would mean forking upstream at four
+        sites, and upstream's version squeezes dim 1 while the Ascend cache
+        shape carries the head dim at index 2 -- on a non-unit dimension
+        `squeeze` is a silent no-op, so that fork would quietly do nothing.
+        """
+        while isinstance(cache, (list, tuple)) and len(cache) == 1:
+            cache = cache[0]
+        return cache
+
     def forward_mqa(
         self,
         q: torch.Tensor,
@@ -142,12 +166,91 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        raise NotImplementedError(
-            "Ascend sparse MLA forward is not wired up yet. It should call "
-            "npu_kv_quant_sparse_attn_sharedkv (or MixedQuantSparseFlashMla "
-            "once bound), passing attn_sink -- the operator rejects a null "
-            "sinks tensor, so it cannot be skipped even to get something "
-            "running.")
+        """Sparse MLA through cann_ops_transformer.sparse_flash_mla.
+
+        The argument rules the operator states about itself are enforced by
+        build_sparse_flash_mla_kwargs, on CPU, so they do not have to be
+        rediscovered one rejection at a time here.
+
+        What is exercised only on a card is the metadata mapping just below:
+        which AscendDSAReqMetadata field supplies each operator argument. Every
+        lookup is therefore explicit and named -- a missing field raises here
+        with the field named, rather than passing None into the operator.
+        """
+        from vllm.forward_context import get_forward_context
+
+        from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
+        from vllm_ascend.attention.dsa_v1 import (_dsa_swa_only_cmp_ratio,
+                                                  attends_compressed_stream)
+        from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+            build_sparse_flash_mla_kwargs
+
+        attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+        if attn_metadata is None:
+            # Warmup / profiling run: no real metadata yet. Upstream's ROCm
+            # path does the same. Zeroing rather than leaving the buffer
+            # uninitialised keeps a warmup step from producing NaNs that look
+            # like a numerical problem.
+            output.zero_()
+            return
+
+        swa_prefix = self.swa_cache_layer.prefix
+        swa_metadata = attn_metadata.get(swa_prefix)
+        if swa_metadata is None:
+            raise KeyError(
+                f"no attention metadata for {swa_prefix!r}. The SWA cache "
+                "registers itself in the compilation context at construction, "
+                "so an absent entry means its kv-cache spec was not collected "
+                "-- check get_kv_cache_spec on the Ascend SWA cache.")
+        req = swa_metadata.req_metadata
+        if req is None:
+            raise ValueError(
+                f"{swa_prefix}: metadata carries no req_metadata; the builder "
+                "produced an attention metadata object without per-request "
+                "fields, so there is nothing to address the KV with.")
+
+        attends_compressed = attends_compressed_stream(self.compress_ratio,
+                                                       self.vllm_config)
+        plan = get_dsa_attn_kv_plan(self.vllm_config)
+
+        cmp_kv = cmp_block_table = None
+        if attends_compressed:
+            cmp_kv = self._unwrap_cache(self._compressed_kv_cache())
+            cmp_block_table = req.block_table
+
+        # Explicit original-KV indices, following dsa_v1's precedence: a vision
+        # prefill supplies them so tokens inside an image span see the whole
+        # span bidirectionally, and a layer with no compressed stream may carry
+        # DSpark's instead. A layer that attends a compressed stream keeps the
+        # vision ones and does not take DSpark's.
+        ori_sparse_indices = req.vision_swa_indices
+        if not attends_compressed and req.dspark_swa_indices is not None:
+            ori_sparse_indices = req.dspark_swa_indices
+
+        kwargs = build_sparse_flash_mla_kwargs(
+            q=q,
+            num_requests=req.query_start_loc.numel() - 1,
+            swa_kv_cache=self._unwrap_cache(self.swa_cache_layer.kv_cache),
+            swa_block_table=req.block_table,
+            cu_seqlens_q=req.query_start_loc,
+            seqused_kv=req.seq_lens,
+            sinks=self.attn_sink,
+            metadata=req.sas_metadata,
+            softmax_scale=self.softmax_scale,
+            cmp_ratio=_dsa_swa_only_cmp_ratio(self.compress_ratio,
+                                              self.vllm_config),
+            layout_kv=plan.layout_kv,
+            attends_compressed=attends_compressed,
+            ori_win_left=req.ori_win_left,
+            ori_win_right=req.ori_win_right,
+            cmp_kv=cmp_kv,
+            cmp_block_table=cmp_block_table,
+            seqused_cmp_kv=req.cu_cmp_seqlen_list if attends_compressed else None,
+            cmp_residual_kv=req.qli_cmp_residual_k if attends_compressed else None,
+            ori_sparse_indices=ori_sparse_indices,
+        )
+
+        output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Inverse RoPE, then the block-diagonal wo_a, then wo_b.

@@ -71,23 +71,60 @@ def test_selector_returns_the_ascend_attention_class():
     assert issubclass(got, DeepseekV4Attention)
 
 
-def test_unimplemented_paths_raise_rather_than_doing_the_cuda_thing():
-    """The remaining stub must not be quietly inherited from the CUDA base.
+def test_forward_mqa_no_longer_raises_but_still_refuses_what_is_unwired():
+    """Both abstract methods are implemented now; this holds the boundary.
 
-    forward_mqa is abstract upstream, so inheriting it would be a TypeError at
-    construction; the point here is that the Ascend class supplies its own and
-    that it refuses rather than approximates.
-
-    _o_proj used to be listed here too. It is implemented now, which is why it
-    is not -- see test_o_proj_is_no_longer_a_stub below, which holds that
-    boundary from the other side so this file still records where it sits.
+    The file used to assert that forward_mqa and _o_proj raise
+    NotImplementedError, which was the right check while they were stubs and
+    became the wrong one as each was wired. What still matters is that the
+    Ascend class supplies its own rather than inheriting the CUDA base's, and
+    that the paths which genuinely are not wired refuse rather than approximate.
     """
+    import inspect
+
     from vllm_ascend.models.deepseek_v4_1.attention import \
         AscendDeepseekV41Attention as cls
 
-    assert cls.forward_mqa is not None
-    with pytest.raises(NotImplementedError, match="sparse MLA forward"):
-        cls.forward_mqa(object.__new__(cls), None, None, None, None)
+    source = inspect.getsource(cls.forward_mqa)
+    assert "NotImplementedError" not in source
+    # The operator's rules are checked before the call, not discovered from it.
+    assert "build_sparse_flash_mla_kwargs" in source
+    # attn_sink cannot be skipped: the operator rejects a null sinks tensor.
+    assert "self.attn_sink" in source
+    # Its own, not the CUDA base's.
+    assert "forward_mqa" in vars(cls)
+
+
+def test_a_warmup_step_with_no_metadata_zeroes_rather_than_leaving_garbage():
+    """The profiling run reaches forward before any metadata exists.
+
+    Zeroing matters more than it looks: an uninitialised output buffer carries
+    whatever the allocator last left there, which for a freshly grown pool is
+    frequently NaN. A NaN arriving from warmup looks exactly like a numerical
+    problem in the model, and that is hours of looking in the wrong place.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_ascend.models.deepseek_v4_1 import attention as attn_mod
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention as cls
+
+    layer = object.__new__(cls)
+    output = torch.full((4, 8, 512), float("nan"))
+
+    import vllm.forward_context as fc_mod
+    original = fc_mod.get_forward_context
+    fc_mod.get_forward_context = lambda: SimpleNamespace(attn_metadata=None)
+    try:
+        layer.forward_mqa(torch.zeros(4, 8, 512), torch.zeros(4, 512),
+                          torch.arange(4), output)
+    finally:
+        fc_mod.get_forward_context = original
+
+    assert torch.all(output == 0), "warmup left the output buffer untouched"
+    assert not torch.isnan(output).any()
 
 
 def test_o_proj_is_no_longer_a_stub():
