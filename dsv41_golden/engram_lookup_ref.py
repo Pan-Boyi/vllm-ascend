@@ -229,6 +229,70 @@ def byte_scan(ck, rows_per_stripe: int = 200000) -> dict:
     return out
 
 
+def dup_test(ck, layer_ids, block: int) -> bool:
+    """Repeated hash ids -- the input shape upstream is known to get wrong quietly.
+
+    A row of 24 hash columns has no reason to hold distinct ids, and in practice it
+    does not: the standard prompt already repeats.  Upstream's scale gather returns
+    wrong values for repeated indices **without erroring** (maxdiff 32 as measured by
+    the kernel line), and 32 is roughly seven times the entire legitimate value range
+    of this table, so the fault is enormous and silent at the same time.
+
+    Checked as a property against an independent naive per-row gather, not against
+    this module's own dedup path -- ``lookup_raw`` deduplicates with
+    ``unique(return_inverse=True)``, so comparing it to itself would prove nothing.
+    """
+    print("duplicate hash ids -- the shape upstream mishandles silently")
+    ids = torch.tensor([[[101, 202, 303, 101, 404, 202, 505, 101,
+                          606, 707, 101, 808, 303, 909, 101, 111,
+                          222, 202, 333, 444, 555, 666, 777, 888]]], dtype=torch.int64)
+    n_uniq = int(torch.unique(ids).numel())
+    print(f"  {ids.numel()} columns, {n_uniq} distinct ids, "
+          f"{ids.numel() - n_uniq} repeats (one id appears 5 times)")
+    ok = True
+    for lid in layer_ids:
+        fp8, sc = lookup_raw(ck, lid, ids)
+        rows = dequantize(fp8, sc, block)
+        # independent reference: one gather_rows call per column, no dedup anywhere
+        flat = ids.flatten()
+        nf = torch.stack([ck.gather_rows(f"layers.{lid}.engram.embed.weight",
+                                         torch.tensor([int(i)]))[0] for i in flat])
+        ns = torch.stack([ck.gather_rows(f"layers.{lid}.engram.embed.scale",
+                                         torch.tensor([int(i)]))[0] for i in flat])
+        f_ok = torch.equal(fp8.reshape(-1, fp8.shape[-1]).view(torch.uint8),
+                           nf.view(torch.uint8))
+        s_ok = torch.equal(sc.reshape(-1, sc.shape[-1]).view(torch.uint8),
+                           ns.view(torch.uint8))
+        # every occurrence of one id must give byte-identical results
+        rb = rows.reshape(-1, rows.shape[-1]).view(torch.uint8)
+        fb = fp8.reshape(-1, fp8.shape[-1]).view(torch.uint8)
+        sb = sc.reshape(-1, sc.shape[-1]).view(torch.uint8)
+        consistent = True
+        for uid in torch.unique(flat):
+            pos = (flat == uid).nonzero().flatten()
+            if len(pos) < 2:
+                continue
+            for tb in (rb, fb, sb):
+                if not all(torch.equal(tb[p], tb[pos[0]]) for p in pos):
+                    consistent = False
+        rng = float(rows.float().abs().max())
+        ok &= f_ok and s_ok and consistent
+        print(f"  layer {lid:2d}: fp8 == naive per-row gather {f_ok}   "
+              f"scale == naive {s_ok}   repeats byte-consistent {consistent}")
+        print(f"            max|value| {rng:.4f} -- upstream's 32 would be "
+              f"{32 / max(rng, 1e-9):.0f}x the legitimate range, so a plain range "
+              f"check also catches it")
+    print()
+    print("PASS" if ok else "FAIL")
+    if ok:
+        print("  The reference deduplicates with unique(return_inverse=True) and the")
+        print("  result matches a naive per-row gather byte for byte, so it can serve")
+        print("  as the golden for this case.  An NPU implementation that fails it will")
+        print("  show up as a SCALE mismatch, not a gather or dequantize one -- see the")
+        print("  three-bucket attribution in --verify.")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default=None)
@@ -237,6 +301,9 @@ def main():
                     help="a safetensors written by --out, or an NPU-produced one with "
                          "the same keys; compared byte-wise modulo signed zero")
     ap.add_argument("--scan", action="store_true", help="redo the byte-pattern survey")
+    ap.add_argument("--dup-test", action="store_true",
+                    help="check repeated hash ids, the one input shape known to be "
+                         "mishandled silently upstream")
     ap.add_argument("--max-seq-len", type=int, default=512)
     a = ap.parse_args()
 
@@ -258,6 +325,11 @@ def main():
     print(f"engram_layer_ids        {layout.layer_ids}")
     print(f"hash ids                {tuple(hashes.shape)}   [B, L, n_engram_layers, n_hash_cols]")
     print()
+
+    if a.dup_test:
+        ok = dup_test(ckpt, layout.layer_ids, bs)
+        ckpt.close()
+        sys.exit(0 if ok else 1)
 
     if a.scan:
         scan = byte_scan(ckpt)
@@ -360,19 +432,41 @@ def main():
             print(f"  {tag:4s} {key:<22} {note}")
             if not r["pass"]:
                 failed = True
-        # tell the two failure modes apart, which is why .fp8/.scale are dumped
+        # Tell the failure modes apart, which is why .fp8/.scale are dumped.  THREE
+        # buckets, not two, because the two quantised inputs do not travel the same
+        # road: the tech report keeps the full scale table resident in device local
+        # memory and ships only the fp8 rows from host.  So an fp8 mismatch implicates
+        # the host fetch, while a scale mismatch cannot -- it never crossed that bus.
+        # Merging them would send someone to audit a transfer that did not happen.
         for lid in layout.layer_ids:
-            rk, fk = f"layer_{lid:02d}.rows", f"layer_{lid:02d}.fp8"
-            if rk in got and fk in got:
-                rows_ok = compare(out_tensors[rk], got[rk])["pass"]
-                fp8_ok = compare(out_tensors[fk], got[fk])["pass"]
-                if not rows_ok and fp8_ok:
-                    print(f"  layer {lid}: raw fp8 rows agree but the output does not "
-                          f"=> the DEQUANTIZE is wrong, not the gather")
-                elif not fp8_ok:
-                    print(f"  layer {lid}: the raw fp8 rows already differ "
-                          f"=> the GATHER is wrong (hash / index / shard); "
-                          f"do not look at the dequantize")
+            rk = f"layer_{lid:02d}.rows"
+            fk = f"layer_{lid:02d}.fp8"
+            sk = f"layer_{lid:02d}.scale"
+            if rk not in got:
+                continue
+            rows_ok = compare(out_tensors[rk], got[rk])["pass"]
+            fp8_ok = compare(out_tensors[fk], got[fk])["pass"] if fk in got else None
+            sc_ok = compare(out_tensors[sk], got[sk])["pass"] if sk in got else None
+            if rows_ok:
+                continue
+            if fp8_ok is False:
+                print(f"  layer {lid}: the raw fp8 rows already differ => the HOST "
+                      f"GATHER is wrong (hash / index / the host->device fetch). "
+                      f"Do not look at the dequantize or the scale.")
+            elif sc_ok is False:
+                print(f"  layer {lid}: fp8 rows agree, SCALE does not => the "
+                      f"device-side scale indexing is wrong. The scale table is "
+                      f"resident on device, so this is NOT the host path. "
+                      f"⚠️ Duplicate hash ids are the known trap here -- upstream's "
+                      f"scale gather returns wrong values for repeated indices "
+                      f"without erroring (see --dup-test).")
+            elif fp8_ok and sc_ok:
+                print(f"  layer {lid}: both quantised inputs agree byte for byte but "
+                      f"the output does not => the DEQUANTIZE arithmetic is wrong "
+                      f"(block size, scale layout, or the cast).")
+            else:
+                print(f"  layer {lid}: output differs and .fp8/.scale were not both "
+                      f"supplied, so the cause cannot be localised. Dump them.")
 
     if a.out:
         from safetensors.torch import save_file

@@ -119,6 +119,52 @@ python engram_lookup_ref.py --scan                                    # 重做�
 | scale block 用 16 而不是 32(形状对、答案错) | 失败,定位到**反量化** | ✅ `57951 elements differ` + `the DEQUANTIZE is wrong, not the gather`,exit 1 |
 | 取行索引偏一行 | 失败,定位到**取行** | ✅ `1 rows touched` + `the GATHER is wrong; do not look at the dequantize`,exit 1 |
 
+### 1b2. 🔴 归因分三桶,不是两桶 —— scale 不走 host
+
+技报 `:212`:**全量 scale 常驻 device local memory,host 只放 fp8 行。**
+所以那两个量化输入**不走同一条路**:
+
+| 症状 | 归因 | 为什么 |
+|---|---|---|
+| **fp8 行就已经不同** | **host gather**(哈希 / 索引 / host→device 取数) | 它是唯一跨总线的那个 |
+| fp8 行相同、**scale 不同** | **device 侧的 scale 索引** | **scale 从没跨过那条总线,查 host 传输是白费** |
+| 两个量化输入逐字节相同、**输出不同** | **反量化算术**(block 大小 / scale 布局 / cast) | 输入都对,只剩算术 |
+
+把前两个合成一桶会**把人送去审计一次根本没发生的传输**。
+
+### 1b3. 重复 hash id —— 一个已知会被静默放过的失败模式
+
+一行 24 个哈希列**没有理由互不相同**,实际也不是:标准 prompt 本来就有重复。
+而**上游 kernel 在 host 映射上对重复索引的 scale gather 会给出错值且不报错**
+(kernel 线实测 maxdiff=32)。
+
+`python engram_lookup_ref.py --dup-test`(24 列 / 17 个不同 id / 一个 id 出现 5 次):
+
+| 检查 | layer 1 | layer 14 |
+|---|---|---|
+| fp8 与**朴素逐行 gather** 逐位相同 | ✅ | ✅ |
+| scale 与朴素逐行 gather 逐位相同 | ✅ | ✅ |
+| 同一 id 的所有出现位置逐字节一致 | ✅ | ✅ |
+| 合法值域 `max\|value\|` | 4.5000 | 4.0000 |
+
+⚠️ **对照的是「朴素逐行 gather」,不是本模块自己的去重路径** ——
+`lookup_raw` 用 `unique(return_inverse=True)` 去重,拿它跟自己比什么都证明不了。
+
+⚪ 顺带一个独立旁证:**上游那个 32 是合法值域的 7~8 倍**,所以**一个纯值域检查也能抓到它** ——
+两个独立信号,不必只依赖逐字节比对。
+
+⚪ 还有一个实现细节:**`torch.equal` 对 `float8_e8m0fnu` 直接抛
+`NotImplementedError: equal_notnan_cpu`** —— fp8 按值比连跑都跑不起来,
+这是判据必须走字节的又一个理由(不只是负零那一条)。
+
+**三个阴性用例落在三个不同的桶里**(不是三个都「确实失败了」):
+
+| 人造故障 | 期望归因 | 实测 |
+|---|---|---|
+| fp8 行取成邻居的 | host gather | ✅ `HOST GATHER is wrong` |
+| **只有 scale 取错**(模拟重复 id) | device 侧 scale 索引 | ✅ `device-side scale indexing is wrong` |
+| 两个输入都对、block 用 16 | 反量化算术 | ✅ `DEQUANTIZE arithmetic is wrong` |
+
 ### 1c. ⛔ 不要用 `ckpt.dequant_fp8_2d` 反量化 engram
 
 那个 helper 是给**权重**用的,权重的 scale 是**二维 block 网格**,它对两个轴都做
