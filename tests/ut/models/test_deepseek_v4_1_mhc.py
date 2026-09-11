@@ -218,3 +218,137 @@ def test_apply_all_reports_them():
 
     assert "mhc_pre_delayed_tilelang" in deepseek_v4_1.APPLIED_PATCHES
     assert "mhc_post_tilelang" in deepseek_v4_1.APPLIED_PATCHES
+
+
+# -- the operator path for delayed pre ---------------------------------------
+
+
+class _FakeNpuOps:
+    """Stands in for torch.ops.npu, returning the six/three-tensor contracts."""
+
+    def __init__(self, tokens, hc, hidden, out_flag_seen=None):
+        self.t, self.hc, self.d = tokens, hc, hidden
+        self.calls = out_flag_seen if out_flag_seen is not None else []
+
+    def npu_mhc_pre(self, x, phi, alpha, bias, *, gamma=None, norm_eps,
+                    hc_eps, out_flag=0):
+        self.calls.append(("pre", out_flag))
+        empty = torch.empty(0)
+        h_in = torch.full((self.t, self.d), 7.0)          # the NON-delayed one
+        h_post = torch.full((self.t, self.hc), 2.0)
+        h_res = torch.full((self.t, self.hc, self.hc), 3.0)
+        h_pre = torch.full((self.t, self.hc), 5.0)
+        if not out_flag:
+            return h_in, h_post, h_res, empty, empty, empty
+        return (h_in, h_post, h_res, torch.ones(self.t),
+                torch.ones(self.t, 24), h_pre)
+
+    def npu_mhc_sinkhorn(self, h_res, *, eps, num_iters, out_flag=0):
+        self.calls.append(("sinkhorn", num_iters, float(h_res.flatten()[0])))
+        return (h_res * 10, torch.empty(0), torch.empty(0))
+
+
+def _with_fake_ops(fake):
+    class _Ops:
+        npu = fake
+    return _Ops
+
+
+def test_delayed_uses_the_incoming_pre_mix_not_the_operators_collapsed_output(monkeypatch):
+    """The whole of "delayed", and the one substitution that would be silent.
+
+    npu_mhc_pre[0] is collapsed with the pre-mix this call just computed --
+    the non-delayed variant. It has the right shape and the wrong values.
+    """
+    monkeypatch.setattr(mhc, 'envs_dsv41_mhc_pre_operator', lambda: True)
+    T, HC, D = 3, 4, 8
+    fake = _FakeNpuOps(T, HC, D)
+    residual = torch.randn(T, HC, D)
+    incoming = torch.rand(T, HC)
+
+    real_ops = torch.ops
+    torch.ops = _with_fake_ops(fake)
+    try:
+        post, comb, layer_input, next_pre = mhc.mhc_pre_delayed_ascend(
+            residual, torch.randn(HC * (HC + 2), HC * D), torch.rand(3),
+            torch.randn(HC * (HC + 2)), 1e-20, 1e-6, 1e-6, 2.0, 20,
+            pre_mix=incoming)
+    finally:
+        torch.ops = real_ops
+
+    expected = (incoming.unsqueeze(-1) * residual.float()).sum(1).to(residual.dtype)
+    torch.testing.assert_close(layer_input, expected)
+    assert not torch.allclose(layer_input, torch.full((T, D), 7.0)), (
+        "hIn is the non-delayed collapse and must not be used")
+    torch.testing.assert_close(next_pre, torch.full((T, HC), 5.0))
+
+
+def test_out_flag_is_always_one(monkeypatch):
+    """At the default 0 the last three outputs come back empty, and `pre` is
+    one of them. An empty tensor there reads as a shape problem downstream."""
+    monkeypatch.setattr(mhc, 'envs_dsv41_mhc_pre_operator', lambda: True)
+    T, HC, D = 3, 4, 8
+    fake = _FakeNpuOps(T, HC, D)
+    real_ops = torch.ops
+    torch.ops = _with_fake_ops(fake)
+    try:
+        mhc.mhc_pre_delayed_ascend(
+            torch.randn(T, HC, D), torch.randn(HC * (HC + 2), HC * D),
+            torch.rand(3), torch.randn(HC * (HC + 2)), 1e-20, 1e-6, 1e-6,
+            2.0, 20, pre_mix=torch.rand(T, HC))
+    finally:
+        torch.ops = real_ops
+
+    assert ("pre", 1) in fake.calls
+
+
+def test_the_sinkhorn_fragment_is_passed_straight_through(monkeypatch):
+    """It already carries scale and bias. Adding them again measured 0.419
+    against 1.18e-06 for feeding it unchanged."""
+    monkeypatch.setattr(mhc, 'envs_dsv41_mhc_pre_operator', lambda: True)
+    T, HC, D = 3, 4, 8
+    fake = _FakeNpuOps(T, HC, D)
+    real_ops = torch.ops
+    torch.ops = _with_fake_ops(fake)
+    try:
+        _, comb, _, _ = mhc.mhc_pre_delayed_ascend(
+            torch.randn(T, HC, D), torch.randn(HC * (HC + 2), HC * D),
+            torch.rand(3), torch.randn(HC * (HC + 2)), 1e-20, 1e-6, 1e-6,
+            2.0, 20, pre_mix=torch.rand(T, HC))
+    finally:
+        torch.ops = real_ops
+
+    sinkhorn_call = next(c for c in fake.calls if c[0] == "sinkhorn")
+    assert sinkhorn_call[2] == 3.0, "the fragment must reach sinkhorn unmodified"
+    assert sinkhorn_call[1] == 20, "sinkhorn_repeat must be forwarded"
+    torch.testing.assert_close(comb, torch.full((T, HC, HC), 30.0))
+
+
+def test_an_empty_pre_is_diagnosed_as_the_flag(monkeypatch):
+    monkeypatch.setattr(mhc, 'envs_dsv41_mhc_pre_operator', lambda: True)
+    T, HC, D = 3, 4, 8
+
+    class _Flag0(_FakeNpuOps):
+        def npu_mhc_pre(self, *a, **kw):
+            kw["out_flag"] = 0
+            return _FakeNpuOps.npu_mhc_pre(self, *a, **kw)
+
+    real_ops = torch.ops
+    torch.ops = _with_fake_ops(_Flag0(T, HC, D))
+    try:
+        with pytest.raises(RuntimeError, match="out_flag=0"):
+            mhc.mhc_pre_delayed_ascend(
+                torch.randn(T, HC, D), torch.randn(HC * (HC + 2), HC * D),
+                torch.rand(3), torch.randn(HC * (HC + 2)), 1e-20, 1e-6, 1e-6,
+                2.0, 20, pre_mix=torch.rand(T, HC))
+    finally:
+        torch.ops = real_ops
+
+
+def test_the_operator_path_is_off_until_5120_is_compared():
+    """Checked at hidden 4096; at 5120 only for producing finite values.
+    Defaulting it on would make an unverified numeric path the one that runs."""
+    import vllm_ascend.envs as envs
+
+    assert envs.VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR == "0"
+    assert not mhc.envs_dsv41_mhc_pre_operator()

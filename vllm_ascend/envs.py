@@ -99,6 +99,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # path). Exists to A/B the two on a card -- they compute the same
     # expression, and "the same expression" has been wrong here before.
     "VLLM_ASCEND_DSV41_MHC_POST_TORCH": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_POST_TORCH", "0"),
+    # DeepSeek-V4.1 mHC pre: "1" uses npu_mhc_pre + npu_mhc_sinkhorn instead of
+    # upstream's torch reference. Default "0" until the operator chain is
+    # compared numerically at hidden 5120 -- it has been checked at 4096, and
+    # at 5120 only for producing finite values.
+    "VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR", "0"),
 }
 
 # end-env-vars-definition
