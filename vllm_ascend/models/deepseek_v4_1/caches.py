@@ -208,8 +208,10 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
             if backend is not None:
                 return backend
             raise NotImplementedError(
-                "no Ascend backend covers indexer compress_ratio 2, which "
-                "needs supported kernel block sizes [64, 128, 256]. Do not "
+                f"AscendDSAC2Backend is not importable from "
+                f"vllm_ascend.attention.dsa_v1 in this tree ({_c2_absence()}). "
+                "compress_ratio 2 needs supported kernel block sizes "
+                "[64, 128, 256] and no other class covers all three. Do not "
                 "reuse AscendDSAC4Backend: it accepts this layer at cache "
                 "block sizes 64 and 128 and only refuses at 32, so the "
                 "default configuration would run with the planner and the "
@@ -226,3 +228,27 @@ def _optional_c2_backend():
     except ImportError:
         return None
     return AscendDSAC2Backend
+
+
+def _c2_absence() -> str:
+    """Why it is missing, in the two words that decide who fixes it.
+
+    "Unsupported" and "not merged into the tree you are running" are the same
+    ImportError and want opposite responses. Saying only the first cost a
+    launch: the class existed, on a branch, and the message sent everyone
+    looking for work that was already done.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "log", "--all", "--oneline", "-1", "-S",
+             "class AscendDSAC2Backend", "--", "vllm_ascend/attention/dsa_v1.py"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:  # git absent, not a checkout, anything
+        return "could not check whether it exists elsewhere"
+    found = out.stdout.strip()
+    if not found:
+        return "no commit in this repository ever added it"
+    return (f"it exists on another branch -- {found} -- and is not merged "
+            "into the tree you are running")

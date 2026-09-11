@@ -245,6 +245,48 @@ def test_ratio_two_refuses_rather_than_borrowing_c4():
     assert "only refuses at 32" in msg
 
 
+def test_the_refusal_says_whether_the_backend_merely_is_unmerged(monkeypatch):
+    """Two ImportErrors, opposite responses, one message -- that cost a launch.
+
+    AscendDSAC2Backend had been written and committed on another branch. The
+    tree that was launched did not have it, the import failed, and the refusal
+    said "no Ascend backend covers ratio 2" -- which reads as "nobody has built
+    this" and sent three people looking for work that was already done. The
+    message now has to name which of the two it is.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import caches as mod
+
+    monkeypatch.setattr(mod, "_optional_c2_backend", lambda: None)
+    monkeypatch.setattr(mod, "_c2_absence",
+                        lambda: "it exists on another branch -- abc123 -- and "
+                        "is not merged into the tree you are running")
+    with pytest.raises(NotImplementedError) as exc:
+        _indexer_cache(2).get_attn_backend()
+    msg = str(exc.value)
+    assert "not merged into the tree you are running" in msg
+    assert "abc123" in msg
+    # And the hazard is still spelled out: the reason not to borrow C4 does not
+    # depend on why C2 is missing.
+    assert "only refuses at 32" in msg
+
+
+def test_the_absence_check_distinguishes_never_written_from_unmerged():
+    """Both arms, against the real repository.
+
+    A probe that cannot tell the two apart would still return a string, and the
+    message would still look specific.
+    """
+    from vllm_ascend.models.deepseek_v4_1.caches import _c2_absence
+
+    said = _c2_absence()
+    assert said, "the probe must say something; a blank reads as 'no reason'"
+    # Whichever arm this tree is in, it must commit to one of them rather than
+    # hedging -- the point of the string is to route the fix.
+    assert ("not merged into the tree you are running" in said
+            or "no commit in this repository ever added it" in said
+            or "could not check" in said)
+
+
 def test_ratio_two_uses_the_c2_backend_once_it_exists(monkeypatch):
     """Staged deliberately: the refusal above is until the backend lands, not
     instead of it."""
