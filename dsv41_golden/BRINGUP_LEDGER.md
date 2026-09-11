@@ -117,6 +117,19 @@
 | ⚠️ | 已确认的**真实不等价**至少一处(第 10.6 节 P1):原 tilelang `sparse_attn` 把 softmax 概率**舍到 bf16** 再做 P·V,CPU golden 全程 fp32 ⇒ **golden 更准**,一个忠实的实现会有约 1.8e-3 的**系统性偏差,而那不是 bug** |
 | ⚠️ | ⇒ **这套 golden 的定位是「定义参考」不是「逐位裁判」** —— 它逐字实现 `ref/model.py` 的语义(vendor 文件原样,只换 `kernel.py`),但**不保证与 GPU kernel 逐位一致**。整套协议因此建在「实测地板 + 集合判据」上,而不是逐位相等;逐位相等只保留给**整数哈希和 engram 查表**那两条没有浮点借口的路 |
 
+### 10c. ⚠️ `round_mode` —— 现在不在路径上,但它是一个**潜伏的单向偏差**
+
+| | |
+|---|---|
+| ✅ | **A5 的 fp4 舍入是 `npu_dynamic_mx_quant` 的一个显式参数,不是硬件行为**:`round` = 向上舍(half-away-from-zero),**`rint` = RNE,与本 golden 的参考侧一致** `[integration 实测]` |
+| ✅ | **不在 V4.1 的运行时路径上**(双方各自读代码确认):V4.1 走 `QuantType.W4A8MXFP` ⇒ `npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)`,**激活是 fp8 不是 fp4,且不传 `round_mode`**;`round_mode="round"` 只出现在 `W4A4MXFP` 分支(`ops/fused_moe/prepare_finalize.py:412-417`、`quantization/methods/w4a4/w4a4_mxfp4.py:117`)。而 `quantization/quant_parser.py:58-61` 更直白:**除 W4A4 外一律强制 `"rint"`** |
+| ⚠️ | 🔴 **但它是潜伏的**:谁哪天开 W4A4,或谁把 `round_mode` 传进 W4A8 那条,**它立刻变成一个真正单向的偏差**(四个中点上 A5 一律比参考大一档)—— 而那种偏差**不能靠余量吸收,要显式占位** |
+| ❌ | **运行时未确认**:服务还起不来(停在 `SparseAttnIndexer.forward_oot`)⇒ 「实际走 W4A8 分支」目前是**代码推断**,不是运行时观测。第一次跑通时在 `prepare_finalize` 那个分支上打一行即可确认 |
+
+⚪ **这条的形态**:测量是真的,**相关性是顺下来的** —— 与 `all_reduce` 那次同型,
+只是方向相反(那次是我把别人的测量顺成了相关,这次是对方)。
+**两轮四次,都是「数字为真、适用范围没核」。**
+
 ### 11. fp4 的两个问题 —— 必须有 GPU 才能定
 
 | | |
