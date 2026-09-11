@@ -11,6 +11,7 @@ def bind_kv_cache(
     forward_context: dict[str, Attention],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
+    kv_cache_groups=None,
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -45,6 +46,16 @@ def bind_kv_cache(
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
+
+    # kv_cache_groups is accepted and not used. Upstream added it to pass to
+    # share_replayssm_ring_trackers, which is Mamba/SSM state sharing and has
+    # no counterpart on this path. Accepting it is not cosmetic: upstream's
+    # vllm/v1/worker/gpu/attn_utils.py passes it by keyword, so a signature
+    # without it is a TypeError at that call site rather than an ignored
+    # argument. The DeepSeek-V4 family branch in the Ascend model runner binds
+    # its caches directly and never reaches that call, which is why this went
+    # unnoticed -- the failure is real and simply not on our path yet.
+    del kv_cache_groups
 
 
 utils.bind_kv_cache = bind_kv_cache

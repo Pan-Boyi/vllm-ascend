@@ -169,9 +169,15 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
         storage_block_size = DSV4_BLOCK_SIZES[
             vllm_config.cache_config.block_size][0][0]
         # max(ratio, 1): ratio 0 means "no compression", i.e. one state per
-        # token, not zero states per page. Multiplying by it directly gives a
-        # block size of 0, which no backend can list and which
-        # AscendMLAAttentionSpec would then divide by tokens_per_state.
+        # token, not zero states per page.
+        #
+        # This is the only interception point, not a tidiness fix. A block size
+        # of 0 does not fail: select_common_block_size looks for a supported
+        # size that divides the request, and `0 % n == 0` holds for every n, so
+        # the first candidate -- the largest -- matches. Measured: 0 resolves
+        # to 256 on C2, 512 on C4, 128 on the base backend. The planner then
+        # allocates that page. Nothing raises; the only symptom is a page size
+        # nobody asked for.
         states_ratio = max(self.compress_ratio, 1)
         return AscendMLAAttentionSpec(
             block_size=storage_block_size * states_ratio,

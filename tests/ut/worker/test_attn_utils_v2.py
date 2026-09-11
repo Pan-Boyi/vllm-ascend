@@ -456,8 +456,9 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
             forward_context: dict[str, Any],
             runner_kv_caches_: list[Any],
             num_attn_module: int = 1,
+            kv_cache_groups=None,
         ) -> None:
-            del num_attn_module
+            del num_attn_module, kv_cache_groups
             assert len(runner_kv_caches_) == 0
             for kv_cache in kv_caches.values():
                 runner_kv_caches_.append(kv_cache)
@@ -465,6 +466,32 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
                 forward_context[layer_name_].kv_cache = kv_cache
 
         monkeypatch.setattr(upstream_attn_utils, "allocate_kv_cache", _ascend_allocate_kv_cache)
+        # This stub stands in for vllm_ascend's patched bind_kv_cache, and it
+        # duplicates that signature rather than deriving it. When upstream's
+        # call site grew kv_cache_groups both were wrong, but only the stub was
+        # exercised -- the production path for this model family binds its
+        # caches directly and never reaches that call. Assert the two agree, so
+        # the next divergence fails here instead of waiting for a model that
+        # does reach it.
+        import inspect
+
+        from vllm_ascend.patch.worker.patch_bind_kv_cache import \
+            bind_kv_cache as _patched_bind_kv_cache
+
+        stub_params = inspect.signature(_ascend_bind_kv_cache).parameters
+        real_params = inspect.signature(_patched_bind_kv_cache).parameters
+        # Arity, plus every name upstream passes by keyword. Not the full name
+        # list: the first four are positional at the call site and the stub
+        # spells one of them differently, which is harmless.
+        assert len(stub_params) == len(real_params), (
+            f"the stub takes {len(stub_params)} parameters and the patched "
+            f"bind_kv_cache takes {len(real_params)}; they have drifted")
+        for keyword in ("num_attn_module", "kv_cache_groups"):
+            assert keyword in stub_params and keyword in real_params, (
+                f"{keyword} is passed by keyword from upstream's call site, so "
+                "a signature missing it is a TypeError there rather than an "
+                "ignored argument")
+
         monkeypatch.setattr(upstream_attn_utils, "bind_kv_cache", _ascend_bind_kv_cache)
         kv_caches = upstream_attn_utils.init_kv_cache(
             runner_kv_caches=runner_kv_caches,
