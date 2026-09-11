@@ -224,19 +224,55 @@ def test_ratio_one_uses_a_backend_that_lists_its_block_size():
         f"{wanted} must appear verbatim, not merely divide something listed")
 
 
-def test_ratio_two_refuses_rather_than_borrowing_c4():
-    """The measured hazard: ratio 2 on the C4 backend passes at cache block
-    sizes 64 and 128 and only fails at 32 -- and 128 is the default, so the
-    configuration everyone runs is the one that would not catch it."""
+def test_what_borrowing_c4_for_ratio_two_would_look_like():
+    """The shape of the wrong shortcut, pinned independently of the right one.
+
+    Ratio 2 on the C4 backend passes at cache block sizes 64 and 128 and only
+    fails at 32 -- and 128 is the default, so the configuration everyone runs
+    is the one that would not catch it.
+
+    This used to be checked by asserting that ratio 2 was refused, which stopped
+    being true the moment AscendDSAC2Backend was merged: the test was written
+    while the backend was missing and pinned that moment rather than the hazard.
+    The hazard did not go away with it. Someone deciding that C2 is more trouble
+    than it is worth would reintroduce exactly this, and at the default block
+    size it would look like it worked.
+    """
     from vllm_ascend.attention.dsa_v1 import AscendDSAC4Backend
 
     supported = AscendDSAC4Backend.get_supported_kernel_block_sizes()
-    # The trap is that it looks usable: at the default cache block size of 128
-    # the spec is 256, which C4 does list. What it does not cover is the whole
-    # set ratio 2 can ask for -- cache block size 32 gives a spec of 64.
     assert 128 * 2 in supported, "this is why borrowing C4 looks fine"
     assert 32 * 2 not in supported, "and this is the case that breaks it"
 
+
+def test_ratio_two_routes_to_the_c2_backend():
+    """The positive half: ratio 2 goes to the class built for it.
+
+    If C2 stops being importable -- unmerged again, renamed, moved -- this goes
+    red here rather than at KV cache setup on a card.
+    """
+    from vllm_ascend.attention.dsa_v1 import AscendDSAC2Backend
+
+    assert _indexer_cache(2).get_attn_backend() is AscendDSAC2Backend
+    # And it covers the whole set the spec can ask for, which is the thing C4
+    # did not.
+    supported = AscendDSAC2Backend.get_supported_kernel_block_sizes()
+    for cache_block_size in (32, 64, 128):
+        assert cache_block_size * 2 in supported, (
+            f"cache block size {cache_block_size} gives a spec block size of "
+            f"{cache_block_size * 2}, which C2 must accept")
+
+
+def test_the_refusal_still_names_the_shortcut_when_c2_is_gone(monkeypatch):
+    """The message is the only thing that survives C2 going missing.
+
+    Kept as a separate test because it is about the text, not the routing: the
+    reason not to borrow C4 has to be readable by whoever hits the refusal, and
+    that person by definition does not have C2 to look at.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import caches as mod
+
+    monkeypatch.setattr(mod, "_optional_c2_backend", lambda: None)
     with pytest.raises(NotImplementedError) as exc:
         _indexer_cache(2).get_attn_backend()
     msg = str(exc.value)
@@ -285,17 +321,6 @@ def test_the_absence_check_distinguishes_never_written_from_unmerged():
     assert ("not merged into the tree you are running" in said
             or "no commit in this repository ever added it" in said
             or "could not check" in said)
-
-
-def test_ratio_two_uses_the_c2_backend_once_it_exists(monkeypatch):
-    """Staged deliberately: the refusal above is until the backend lands, not
-    instead of it."""
-    from vllm_ascend.models.deepseek_v4_1 import caches as mod
-
-    sentinel = type("AscendDSAC2Backend", (), {
-        "get_supported_kernel_block_sizes": staticmethod(lambda: [64, 128, 256])})
-    monkeypatch.setattr(mod, "_optional_c2_backend", lambda: sentinel)
-    assert _indexer_cache(2).get_attn_backend() is sentinel
 
 
 def test_an_unexpected_ratio_is_named():
