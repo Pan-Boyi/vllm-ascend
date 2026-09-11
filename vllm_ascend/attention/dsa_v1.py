@@ -220,6 +220,36 @@ def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int
     return max(compress_ratio, 1)
 
 
+def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
+    """Does this layer's attention read a compressed stream?
+
+    Asked at three places that must agree -- whether to pass the compressed
+    cumulative lengths, whether to supply the stream itself, and whether the
+    mask may be sliding-window-only. Splitting one question across three
+    comparisons is how two of them stayed on V4.0's answer while the third was
+    fixed.
+
+    It is deliberately *not* the same question as "does this layer own a
+    compressed cache". V4.1 has four source layers and thirty-eight that attend
+    to one, so a single predicate would be wrong for every consumer.
+
+    V4.0 and V4.1 disagree on the threshold. V4.0 pools by 4 or 128 and treats
+    ratio 1 as "sliding window only"; V4.1 gives layers 20..39 ratio 1 meaning
+    "compressed, pooling disabled" -- a stream that is read. The two are told
+    apart by whether the checkpoint declares ``kv_source_layer_ids``, which is
+    the field that actually answers the question rather than a version label:
+    a config that names its source layers has the V4.1 topology whatever it
+    calls itself.
+    """
+    hf_config = getattr(getattr(vllm_config, "model_config", None),
+                        "hf_config", None)
+    declares_sources = getattr(hf_config, "kv_source_layer_ids", None) is not None
+    if declares_sources:
+        return compress_ratio >= 1
+    # V4.0: unchanged from the `compress_ratio <= 1` this replaced.
+    return compress_ratio > 1
+
+
 #: Union over every plan's set, for the few call sites that run before a plan
 #: is resolved. Deliberately permissive: refusing there would reject ratios a
 #: plan accepts, and the per-plan check still runs later.
@@ -2233,7 +2263,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
-        if self.compress_ratio > 1:
+        attends_compressed = attends_compressed_stream(self.compress_ratio, self.vllm_config)
+        if attends_compressed:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_cmp_kv=common_metadata.cu_cmp_seqlen_list)
 
         attn_kwargs.update(
@@ -2245,9 +2276,12 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             metadata=common_metadata.sas_metadata,
             softmax_scale=self.softmax_scale,
             cmp_ratio=_dsa_swa_only_cmp_ratio(self.compress_ratio, self.vllm_config),
-            ori_mask_mode=4,
-            ori_win_left=ori_win_left,
-            ori_win_right=ori_win_right,
+            # The operator refuses sliding-window mode alongside a compressed
+            # stream ("SWA mode requires cmp_ratio=1"), and a non-windowed mode
+            # requires both bounds at -1.
+            ori_mask_mode=0 if attends_compressed else 4,
+            ori_win_left=-1 if attends_compressed else ori_win_left,
+            ori_win_right=-1 if attends_compressed else ori_win_right,
             layout_q="TND",
             layout_kv=_dsa_layout_kv(self.vllm_config),
         )
@@ -2264,7 +2298,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         # operator mode those layers are meant to use is still open, so the
         # V4.0 reading is kept rather than guessed at; validate_compress_ratio
         # does not catch this because ratio 1 is a legitimate V4.0 value.
-        if self.compress_ratio <= 1:
+        if not attends_compressed:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
         else:
