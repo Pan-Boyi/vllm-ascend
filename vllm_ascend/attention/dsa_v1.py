@@ -207,43 +207,38 @@ def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int
     return max(compress_ratio, 1)
 
 
-# Compression ratios the *currently bound* attention operator can honour.
-#
-# This is a property of KvQuantSparseAttnSharedkv, not of the hardware: its
-# host-side check rejects everything else outright -- see
-# csrc/attention/kv_quant_sparse_attn_sharedkv/op_host/
-# kv_quant_sparse_attn_sharedkv_check_existance.cpp:154-166, where SWA accepts
-# {1, 4, 128} and CFA/SCFA accept {4, 128}. That whitelist predates A5; the
-# operator is vendored here rather than shipped by CANN.
-#
-# A5 itself does support ratio 2: CANN 9.2.0's MixedQuantSparseFlashMla accepts
-# 1/2/4/128 and has been measured doing so. It is not bound in this repo yet,
-# so ratio 2 still cannot run -- but the limit moves when that binding lands,
-# and the error below must not leave anyone concluding the hardware cannot do it.
-#
-# 0 is deliberately in this set even though the operator's whitelist has no
-# such value: it means "no compressed stream at all", and _dsa_swa_only_cmp_ratio
-# converts it before anything is dispatched, so 0 never reaches the operator.
-SUPPORTED_COMPRESS_RATIOS = (0, 1, 4, 128)
+#: Union over every plan's set, for the few call sites that run before a plan
+#: is resolved. Deliberately permissive: refusing there would reject ratios a
+#: plan accepts, and the per-plan check still runs later.
+ANY_PLAN_COMPRESS_RATIOS = (0, 1, 2, 4, 128)
 
 
-def validate_compress_ratio(compress_ratio: int, where: str) -> int:
-    """Reject compression ratios that no dispatch path implements.
+def validate_compress_ratio(compress_ratio: int, where: str, plan=None) -> int:
+    """Reject ratios the dispatched operator cannot honour.
 
-    DeepSeek-V4.1 asks for ratio 2 on layers 2..19. Every dispatch site here
-    used to fall through to a default instead of rejecting it -- the cmp_ratio
-    mapping to 128, the backend selection to SWA -- so an unsupported ratio
-    produced quietly wrong numbers rather than an error, and would surface far
-    downstream as "accuracy is a bit off".
+    The supported set belongs to the plan, not to this module: the three plans
+    in dsa_attn_kv_plan call three different operators, and DeepSeek-V4.1's
+    ratio 2 is accepted by one of them and not the others. Hard-coding one set
+    here made this guard plan-blind -- it refused ratio 2 even after switching
+    to a plan built for it.
+
+    ``plan`` may be omitted only where no plan is reachable yet; the union of
+    every plan's set is used then, which rejects nothing a plan would accept.
     """
-    if compress_ratio not in SUPPORTED_COMPRESS_RATIOS:
+    if plan is not None:
+        supported = tuple(plan.supported_compress_ratios)
+        scope = f"the {type(plan).__name__} in use"
+    else:
+        supported = ANY_PLAN_COMPRESS_RATIOS
+        scope = "any plan (no plan resolved at this point)"
+
+    if compress_ratio not in supported:
         raise ValueError(
-            f"{where}: compress_ratio={compress_ratio} is not supported by the "
-            f"bound attention operator; it accepts "
-            f"{list(SUPPORTED_COMPRESS_RATIOS)}. DeepSeek-V4.1 needs ratio 2 on "
-            "layers 2..19. This is a binding gap, not a hardware limit -- CANN's "
-            "MixedQuantSparseFlashMla accepts ratio 2 on A5 but is not bound in "
-            "this repo yet.")
+            f"{where}: compress_ratio={compress_ratio} is not supported by "
+            f"{scope}, which accepts {list(supported)}. DeepSeek-V4.1 needs "
+            "ratio 2 on layers 2..19 and 1 on 20..39, and the plans differ in "
+            "which they accept -- this is about which operator is dispatched, "
+            "not about what the hardware can do.")
     return compress_ratio
 
 
@@ -943,7 +938,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
             index_topk = self.model_config.hf_config.index_topk
-            validate_compress_ratio(self.compressor_ratio, layer_name)
+            validate_compress_ratio(self.compressor_ratio, layer_name,
+                                    get_dsa_attn_kv_plan(self.vllm_config))
             cmp_ratio = (
                 _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
                 if self.compressor_ratio <= 1
