@@ -15,8 +15,11 @@ one replacement for both.
 
 from __future__ import annotations
 
+import torch
+
 from vllm.config import VllmConfig
 from vllm.models.deepseek_v4_1.common.engram import ParallelEngramEmbedding
+from vllm.models.deepseek_v4_1.attention import DeepseekV4IndexerCache
 from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
@@ -123,3 +126,85 @@ class AscendEngramEmbedding(AscendStagedEngramEmbedding,
     run the registration that took an NPU down. So the interception here is at
     construction, and it raises.
     """
+
+
+class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
+    """The indexer's K cache, reported the way the Ascend runner needs it.
+
+    Upstream returns a plain ``MLAAttentionSpec`` and upstream's indexer
+    backend; neither reaches the Ascend path. Both are replaced here, following
+    the V4.0 Ascend cache, which is the same cache under a model that already
+    runs on this hardware.
+
+    The block size is the physical page multiplied by the compression ratio,
+    and that product has to appear verbatim in the backend's supported list.
+    Not "be divisible by": ``select_common_block_size`` silently falls back to
+    a smaller supported size that divides it, which leaves the planner and the
+    operator working from different page sizes with nothing raised. The
+    measured case is ratio 2 on the C4 backend -- it passes at cache block
+    sizes 64 and 128 and only fails at 32, and 128 is the default.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+        from vllm_ascend.device.hardware_profile import (
+            HardwareCapability, get_current_hardware_profile)
+        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+        compressed = get_current_hardware_profile().supports(
+            HardwareCapability.DSV4_COMPRESSED_CACHE)
+        if compressed:
+            self.dtype = torch.float8_e4m3fn
+            if not is_a5_bf16_kv_enabled(vllm_config):
+                vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
+
+        storage_block_size = DSV4_BLOCK_SIZES[
+            vllm_config.cache_config.block_size][0][0]
+        return AscendMLAAttentionSpec(
+            block_size=storage_block_size * self.compress_ratio,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+            model_version="deepseek_v4",
+            cache_dtype_str=self.cache_config.cache_dtype,
+            scale_dim=1 if self.head_dim == 128 else 0,
+            scale_dtype=torch.float if compressed else torch.float16,
+            tokens_per_state=self.compress_ratio,
+        )
+
+    def get_attn_backend(self):
+        """Pick the backend whose supported block sizes contain this layer's.
+
+        V4.1's index-source layers carry ratios 1 and 2 only. Ratio 1 needs
+        [.., 128] and the SWA backend already lists it; ratio 2 needs 256 and
+        no existing class covers [64, 128, 256], so it refuses rather than
+        borrowing the nearest one.
+        """
+        from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
+
+        if self.compress_ratio <= 1:
+            return AscendDSASWABackend
+        if self.compress_ratio == 2:
+            backend = _optional_c2_backend()
+            if backend is not None:
+                return backend
+            raise NotImplementedError(
+                "no Ascend backend covers indexer compress_ratio 2, which "
+                "needs supported kernel block sizes [64, 128, 256]. Do not "
+                "reuse AscendDSAC4Backend: it accepts this layer at cache "
+                "block sizes 64 and 128 and only refuses at 32, so the "
+                "default configuration would run with the planner and the "
+                "operator disagreeing about the page size, silently.")
+        raise NotImplementedError(
+            f"indexer compress_ratio {self.compress_ratio} has no Ascend "
+            "backend; V4.1's index-source layers carry 1 and 2.")
+
+
+def _optional_c2_backend():
+    """The ratio-2 backend, if it has landed yet."""
+    try:
+        from vllm_ascend.attention.dsa_v1 import AscendDSAC2Backend
+    except ImportError:
+        return None
+    return AscendDSAC2Backend
