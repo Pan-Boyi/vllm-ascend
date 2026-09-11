@@ -55,10 +55,48 @@ def disable_join_row_ptrs() -> bool:
     return True
 
 
-def apply_all() -> None:
-    """Apply every adaptation. Safe to call more than once."""
+def join_row_ptrs_disabled() -> bool:
+    """Whether the compressor will take the separate-loads path."""
+    return getattr(_compress_module(), JOIN_FLAG) is False
+
+
+def assert_ready_for_ratio_two(where: str) -> None:
+    """Refuse to reach a ratio-2 compressor compile with the joined path live.
+
+    Without this the failure surfaces inside the compiler: it aborts the
+    process in OffsetAnalysis.cpp and leaves a core file, at whatever moment
+    the first ratio-2 kernel happens to be compiled -- which is well after
+    everything looks configured. Checking here moves it somewhere readable.
+    """
+    if not join_row_ptrs_disabled():
+        raise RuntimeError(
+            f"{where}: compressor ratio 2 is about to be compiled while "
+            f"{JOIN_FLAG} is still true. Ascend's compiler does not raise on "
+            "that path -- it aborts the process. apply_all() has not run, or "
+            "something re-imported the module afterwards.")
+
+
+def apply_all() -> list[str]:
+    """Apply every adaptation and report which. Safe to call more than once.
+
+    Returns the names applied, and refuses to return quietly having done
+    nothing: a patch set that silently becomes a no-op looks exactly like one
+    that worked, and these two guard a compiler abort and a CUDA-only class
+    selection respectively.
+    """
     from vllm_ascend.models.deepseek_v4_1.attn_selector import \
         apply_attn_selector_patch
 
+    applied = []
     disable_join_row_ptrs()
+    if join_row_ptrs_disabled():
+        applied.append(JOIN_FLAG)
     apply_attn_selector_patch()
+    applied.append("_select_dsv4_attn_cls")
+
+    if not applied:
+        raise RuntimeError(
+            "apply_all() applied nothing. Either upstream changed shape and "
+            "every patch became a no-op, or this is being called against a "
+            "module set it does not recognise.")
+    return applied

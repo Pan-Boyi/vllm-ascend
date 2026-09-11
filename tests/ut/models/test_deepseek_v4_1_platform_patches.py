@@ -67,3 +67,37 @@ def test_apply_all_covers_both_adaptations(compress_module):
                 is attn_selector.select_ascend_attn_cls)
     finally:
         setattr(model_mod, attn_selector.SELECTOR_NAME, original_selector)
+
+
+def test_apply_all_reports_what_it_applied(compress_module):
+    applied = platform_patches.apply_all()
+    assert platform_patches.JOIN_FLAG in applied
+    assert "_select_dsv4_attn_cls" in applied
+
+
+def test_importing_the_package_applies_them():
+    """The patches are scoped to "V4.1 was actually loaded".
+
+    Registered globally they would also reach V4.0, whose compressor has no
+    need of them; here, importing any submodule runs the package __init__
+    first, so there is no path that reaches the model without them.
+    """
+    from vllm_ascend.models import deepseek_v4_1
+
+    assert deepseek_v4_1.APPLIED_PATCHES
+    assert platform_patches.join_row_ptrs_disabled()
+
+
+def test_ratio_two_readiness_refuses_the_joined_path(compress_module):
+    """The check exists to move the failure somewhere readable.
+
+    Left to the compiler, this aborts the process in OffsetAnalysis.cpp and
+    leaves a core file, at whatever moment the first ratio-2 kernel is
+    compiled -- long after everything looks configured.
+    """
+    setattr(compress_module, platform_patches.JOIN_FLAG, True)
+    with pytest.raises(RuntimeError, match="aborts the process"):
+        platform_patches.assert_ready_for_ratio_two("model.layers.2.self_attn")
+
+    platform_patches.disable_join_row_ptrs()
+    platform_patches.assert_ready_for_ratio_two("model.layers.2.self_attn")

@@ -28,6 +28,8 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm_ascend.attention.dsa_v1 import (AscendDSAC4Backend,
                                           AscendDSAC128Backend,
                                           AscendDSASWABackend)
+from vllm_ascend.models.deepseek_v4_1.platform_patches import \
+    assert_ready_for_ratio_two
 
 
 class AscendDeepseekV41Attention(DeepseekV4Attention):
@@ -71,6 +73,14 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         aux_stream_list: list | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
     ) -> None:
+        # A ratio-2 layer will have the compressor kernel compiled for it, and
+        # that compile aborts the process unless the platform patch has
+        # selected away from the joined-pointer path. Checked here, where the
+        # ratio is known and a traceback still exists.
+        if getattr(self, "compress_ratio", None) == 2 or self._configured_ratio(
+                vllm_config, prefix) == 2:
+            assert_ready_for_ratio_two(prefix)
+
         # aux_stream_list is dropped: it carries torch.cuda.Stream objects for
         # the base class's multi-stream overlap. Passing None makes the base
         # class's four ln_events unused, which is what keeps its
@@ -84,6 +94,17 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         )
 
     # -- upstream's abstract surface ---------------------------------------
+
+    @staticmethod
+    def _configured_ratio(vllm_config, prefix: str) -> int | None:
+        """This layer's compress_ratios entry, read before super() sets it."""
+        try:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            ratios = vllm_config.model_config.hf_config.compress_ratios
+            return ratios[extract_layer_index(prefix)]
+        except Exception:
+            return None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
