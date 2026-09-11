@@ -118,3 +118,215 @@ def test_the_mixin_precedes_upstream_so_its_init_wins():
         "upstream's __init__ must not win -- it allocates the shard before "
         f"anything else gets a say; got {mro}")
     assert "__init__" in vars(AscendStagedEngramEmbedding)
+
+
+# -- the lookup path, up to the kernel seam ----------------------------------
+
+from vllm_ascend.models.deepseek_v4_1.engram_layout import EngramLayout
+
+LAYOUT = EngramLayout(n_hash_cols=24, dim=256, quant_block=32,
+                      layer_ids=(1,), num_embeddings=(512,))
+
+
+class _Lookup(AscendStagedEngramEmbedding):
+    """Enough of upstream's surface to exercise lookup(); no NPU involved."""
+
+    def __init__(self, tables, part=24, total=24, start=0):
+        import numpy as np
+        self.weight = torch.empty(1, 1, device="meta")
+        self.weight_scale_inv = torch.empty(1, 1, device="meta")
+        self.part_n_hash_cols, self.n_hash_cols = part, total
+        self.head_start = start
+        self._tables = tables
+        self.dequantised_rows = None
+        self._np = np
+
+    def staged_tables(self):
+        return self._tables
+
+    def _dequantize_staged(self, rows, out):     # the seam, stubbed
+        self.dequantised_rows = rows
+
+
+def _tables(rows=512):
+    import numpy as np
+    w = np.zeros((rows, 256), dtype=np.uint8)
+    s = np.zeros((rows, 8), dtype=np.uint8)
+    w[:, 0] = np.arange(rows) % 256
+    s[:, 0] = np.arange(rows) % 251
+    return w, s
+
+
+def test_lookup_stages_the_rows_each_token_asked_for():
+    import numpy as np
+
+    tables = _tables()
+    layer = _Lookup(tables)
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+
+    rng = np.random.default_rng(11)
+    ids = rng.integers(0, 512, size=(5, 24)).astype(np.int32)
+    layer.lookup(torch.from_numpy(ids), out=None)
+
+    assert layer.dequantised_rows == 5 * 24
+    for t in range(5):
+        for c in range(24):
+            r = LAYOUT.row_index(t, c)
+            assert layer._dev_weight[r, 0].item() == tables[0][ids[t, c], 0]
+            assert layer._dev_scale[r, 0].item() == tables[1][ids[t, c], 0]
+
+
+def test_flattening_indices_matches_upstreams_row_numbering():
+    """Upstream numbers rows token * LOCAL_HEADS + head and reads
+    ``indices + token * TOTAL_HEADS + head``. With the columns undivided that
+    is row-major order, which is what lookup() relies on -- so this pins the
+    two numbering schemes against each other rather than trusting they agree.
+    """
+    import numpy as np
+
+    ids = np.arange(5 * 24, dtype=np.int32).reshape(5, 24)
+    flat = ids.reshape(-1)
+    for t in range(5):
+        for c in range(24):
+            assert flat[LAYOUT.row_index(t, c)] == ids[t, c]
+
+
+def test_an_empty_batch_does_nothing():
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    layer.lookup(torch.zeros(0, 24, dtype=torch.int32), out=None)
+    assert layer.dequantised_rows is None
+
+
+def test_more_tokens_than_the_buffers_were_sized_for_is_refused():
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=4, device="cpu")
+    with pytest.raises(ValueError, match="staging buffers were sized for"):
+        layer.lookup(torch.zeros(5, 24, dtype=torch.int32), out=None)
+
+
+def test_lookup_without_staging_says_what_to_call():
+    layer = _Lookup(_tables())
+    with pytest.raises(RuntimeError, match="allocate_staging"):
+        layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
+
+
+def test_lookup_refuses_a_sharded_configuration():
+    """The row numbering is only right while the hash columns are undivided."""
+    layer = _Lookup(_tables(), part=12, total=24, start=0)
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    with pytest.raises(ValueError, match="undivided hash columns"):
+        layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
+
+
+def test_the_kernel_resolves_and_takes_the_agreed_interface():
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _staged_dequant_launcher
+
+    launch = _staged_dequant_launcher()
+    params = inspect.signature(launch).parameters
+    assert list(params)[:3] == ["staging_weight", "staging_scale", "out"]
+    assert "dim" in params and "quant_block" in params
+
+
+def test_the_binding_records_the_kernels_verification_status():
+    """Binding is not endorsing, so the status is written down next to it.
+
+    The arithmetic is settled on the CPU against golden's rows. The kernel has
+    run -- the Triton compile cache holds two compilations of it, and Triton
+    only compiles at first launch. Its file header still claims otherwise,
+    which is exactly what produced the wrong conclusion here on first reading:
+    an artefact settles this, a comment does not.
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _staged_dequant_launcher
+
+    doc = _staged_dequant_launcher.__doc__
+    assert "arithmetic is settled" in doc
+    assert "has run on hardware" in doc
+    assert "stale" in doc
+    assert "compile cache is" in doc
+
+
+def test_the_resolver_prefers_a_real_package_location():
+    """It lives under a directory named for the design it replaced. When it
+    moves somewhere sane this keeps working without an edit."""
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _KERNEL_LOCATIONS
+
+    assert _KERNEL_LOCATIONS[0][1] is None, "the package path must be tried first"
+    assert _KERNEL_LOCATIONS[0][0].startswith("vllm_ascend.")
+
+
+def test_an_unresolvable_kernel_says_what_is_already_done(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
+
+    monkeypatch.setattr(mod, "_KERNEL_LOCATIONS",
+                        (("nowhere.at.all", None),
+                         ("also_nowhere", "/nonexistent/path.py")))
+    with pytest.raises(RuntimeError) as exc:
+        mod._staged_dequant_launcher()
+    msg = str(exc.value)
+    assert "already\nin HBM" in msg or "already in HBM" in msg
+    assert "nowhere.at.all" in msg and "/nonexistent/path.py" in msg
+
+
+# -- the log line that became untrue -----------------------------------------
+
+
+def test_the_stale_offload_line_is_dropped():
+    """Upstream logs it from inside `if cpu_offload:` regardless of what the
+    allocation did, so with the allocation diverted it reports an intention."""
+    import logging
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import (
+        _STALE_OFFLOAD_LOG, _upstream_offload_line_suppressed)
+
+    logger = logging.getLogger("vllm.models.deepseek_v4_1.common.engram")
+    seen = []
+    sink = logging.Handler()
+    sink.emit = lambda record: seen.append(record.getMessage())
+    logger.addHandler(sink)
+    logger.setLevel(logging.INFO)
+    try:
+        with _upstream_offload_line_suppressed():
+            logger.info("Engram table %s: 384006168 rows x 256, 94.42 GiB per rank",
+                        _STALE_OFFLOAD_LOG)
+            logger.info("Built engram token map (129280 -> 99092 ids)")
+        logger.info("after the context, %s", _STALE_OFFLOAD_LOG)
+    finally:
+        logger.removeHandler(sink)
+
+    # the untrue line, identified by its number rather than by position
+    assert not any("94.42 GiB per rank" in m for m in seen), (
+        f"the untrue line reached the log: {seen}")
+    # the filter is surgical: other lines from the same logger survive
+    assert any("Built engram token map" in m for m in seen)
+    # and it is removed with the context, not left on the logger forever
+    assert any(m.startswith("after the context") for m in seen), (
+        "the filter must come off again, or it would hide a line that becomes "
+        "true again if the design changes back")
+
+
+def test_the_number_it_printed_was_specific_enough_to_believe():
+    """Why suppressing it beats leaving it.
+
+    94.42 GiB per rank over four ranks and two layers is 755.4 GiB, against a
+    755 GiB host. A reader would conclude host memory had just been exhausted.
+    The measured figure is VmPin = 0.
+    """
+    per_rank_per_layer = 94.42
+    assert round(per_rank_per_layer * 4 * 2, 1) == 755.4
+
+
+def test_the_replacement_line_says_what_actually_happened():
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        AscendStagedEngramEmbedding
+
+    source = inspect.getsource(AscendStagedEngramEmbedding.__init__)
+    assert "0 bytes pinned per rank" in source
+    assert "does not happen" in source

@@ -38,6 +38,40 @@ from vllm_ascend.models.deepseek_v4_1.engram_staging import (DEFAULT_STAGE_DIR,
                                                              staged_file_name)
 
 
+#: Upstream logs this from inside ``if cpu_offload:`` regardless of what the
+#: allocation actually did, so with the allocation diverted it describes an
+#: intention rather than an event.
+_STALE_OFFLOAD_LOG = "offloaded to pinned host memory"
+
+
+class _DropStaleOffloadLine:
+    """Filter out upstream's now-untrue INFO line.
+
+    It reports "94.42 GiB per rank", which over four ranks and two layers is
+    755.4 GiB against a 755 GiB host -- a reader would conclude host memory had
+    just been exhausted, when the measured figure is VmPin = 0. Left in place it
+    is worse than no log line, because the number is specific enough to be
+    believed.
+    """
+
+    def filter(self, record) -> bool:
+        return _STALE_OFFLOAD_LOG not in record.getMessage()
+
+
+@contextlib.contextmanager
+def _upstream_offload_line_suppressed():
+    import logging
+
+    logger = logging.getLogger(
+        "vllm.models.deepseek_v4_1.common.engram")
+    drop = _DropStaleOffloadLine()
+    logger.addFilter(drop)
+    try:
+        yield
+    finally:
+        logger.removeFilter(drop)
+
+
 @contextlib.contextmanager
 def tables_not_allocated():
     """Force ``torch.empty`` onto ``meta`` for the duration.
@@ -99,11 +133,20 @@ class AscendStagedEngramEmbedding:
     _staged_tables: tuple | None = None
 
     def __init__(self, *args, **kwargs) -> None:
-        with tables_not_allocated():
+        with tables_not_allocated(), _upstream_offload_line_suppressed():
             super().__init__(*args, **kwargs)
 
         self._assert_nothing_was_allocated()
         self._layer_id = None          # bound by the owner; see bind_layer()
+
+        import logging
+        logging.getLogger(__name__).info(
+            "Engram table not allocated: %d rows x %d stays in the staged "
+            "read-only mapping, 0 bytes resident and 0 bytes pinned per rank. "
+            "Upstream's \"%s\" line is suppressed here because the allocation "
+            "it describes does not happen.",
+            getattr(self, "part_num_embeddings", -1),
+            getattr(self, "dim", -1), _STALE_OFFLOAD_LOG)
 
     # -- guards --------------------------------------------------------------
 
@@ -161,3 +204,156 @@ class AscendStagedEngramEmbedding:
                 "allocated by the constructor on purpose -- see this module's "
                 "docstring.")
         return self._staged_tables[0], self._staged_tables[1]
+
+    # -- the lookup path -----------------------------------------------------
+
+    def allocate_staging(self, layout: EngramLayout, max_tokens: int,
+                         device) -> None:
+        """Pre-allocate the per-step buffers, once, at the maximum batch.
+
+        Allocated once and reused so the device addresses stay put: ACL graph
+        replay requires the addresses recorded at capture, and a fresh buffer
+        per step desynchronises it.
+
+        The host side is **not** pinned. Pinning would make the H2D faster and
+        ``aclrtMallocHost`` at this size (about 104 MB at 8192 tokens) is not
+        the call that took a card down -- that was ``aclrtHostRegisterV2``. But
+        the two are close enough in this area that turning it on should be a
+        decision someone makes deliberately rather than something that arrives
+        inside an optimisation, so it is left off and noted here.
+        """
+        import numpy as np
+
+        (wshape, sshape) = layout.staging_shapes(max_tokens)
+        self._layout = layout
+        self._max_tokens = max_tokens
+        self._host_weight = np.empty(wshape, dtype=np.uint8)
+        self._host_scale = np.empty(sshape, dtype=np.uint8)
+        self._dev_weight = torch.empty(wshape, dtype=torch.uint8, device=device)
+        self._dev_scale = torch.empty(sshape, dtype=torch.uint8, device=device)
+
+    def lookup(self, indices: torch.Tensor, out: torch.Tensor,
+               background: bool = False) -> None:
+        """Gather on the host, copy once, let the kernel read HBM.
+
+        ``indices`` is ``[num_tokens, n_hash_cols]`` of table rows. Flattened
+        row-major it is already in staging order: upstream numbers its rows
+        ``token * LOCAL_HEADS + head`` and, with the hash columns undivided,
+        that is exactly ``EngramLayout.row_index``. The two agreeing is checked
+        rather than assumed -- see ``assert_head_sharding_is_degenerate``.
+        """
+        import numpy as np
+
+        from vllm_ascend.models.deepseek_v4_1.engram_layout import \
+            gather_into_staging
+
+        num_tokens = indices.shape[0]
+        rows = num_tokens * self.part_n_hash_cols
+        if not rows:
+            return
+
+        layout = getattr(self, "_layout", None)
+        if layout is None:
+            raise RuntimeError(
+                "engram staging buffers are not allocated; call "
+                "allocate_staging() after construction. The tables are not "
+                "device-addressable on this platform, so there is no path that "
+                "reads them without this.")
+        layout.assert_head_sharding_is_degenerate(
+            self.part_n_hash_cols, self.n_hash_cols, self.head_start)
+        if num_tokens > self._max_tokens:
+            raise ValueError(
+                f"{num_tokens} tokens exceeds the {self._max_tokens} the "
+                "staging buffers were sized for. They are allocated once so "
+                "their device addresses stay stable for graph replay, so this "
+                "cannot grow on demand.")
+
+        weight_table, scale_table = self.staged_tables()
+
+        # The one synchronising transfer on this path: the hash ids have to
+        # reach the host to be gathered. Small (24 int32 per token) but it is a
+        # sync point, and the way to remove it is to hash on the host from the
+        # token ids the runner already holds, rather than to make it faster.
+        row_ids = indices.reshape(-1).to("cpu", torch.int64).numpy()
+
+        gather_into_staging(weight_table, scale_table, row_ids,
+                            self._host_weight[:rows], self._host_scale[:rows])
+
+        self._dev_weight[:rows].copy_(
+            torch.from_numpy(self._host_weight[:rows]), non_blocking=True)
+        self._dev_scale[:rows].copy_(
+            torch.from_numpy(self._host_scale[:rows]), non_blocking=True)
+
+        self._dequantize_staged(rows, out)
+
+    def _dequantize_staged(self, rows: int, out: torch.Tensor) -> None:
+        """Read the staged rows out of HBM and write the embedding.
+
+        The seam the device-side kernel binds to. It reads
+        ``self._dev_weight[:rows]`` and ``self._dev_scale[:rows]``, which are
+        contiguous, so it needs no hash ids, no vocabulary offset and -- this
+        is the load-bearing one -- no ``cols // QUANT_BLOCK`` scale gather: the
+        scales are ``n_scales`` contiguous bytes per row, read with
+        ``tl.arange`` and broadcast.
+        """
+        launch = _staged_dequant_launcher()
+        launch(self._dev_weight[:rows], self._dev_scale[:rows], out,
+               dim=self._layout.dim, quant_block=self._layout.quant_block)
+
+
+#: Where the kernel lives. The package path is where it belongs; the
+#: build_artifacts path is where it is today, under a directory named for the
+#: UVA design that this replaced.
+_KERNEL_LOCATIONS = (
+    ("vllm_ascend.ops.triton.engram_dequant_staging", None),
+    ("engram_dequant_staging",
+     "/workspace/code/dsv4_single_card/vllm_project/build_artifacts/npu_view/"
+     "engram_dequant_staging.py"),
+)
+
+
+def _staged_dequant_launcher():
+    """Resolve the kernel, preferring a real package location.
+
+    Verification status, stated here because binding is not endorsing:
+
+    - The arithmetic is settled. ``test_engram_dequant_reference`` checks it on
+      the CPU against golden's authoritative rows, byte for byte, including the
+      negative zero a value comparison would report as equal.
+    - The kernel has run on hardware. Triton compiles at first launch, and
+      ``/root/.triton/cache`` holds two compilations of ``engram_dequant_staging``
+      (2026-09-11 10:48:43 and 11:35:35).
+    - Its file header still says "nothing here has run". That is stale -- it
+      was written before the run -- and it is worth knowing that reading it is
+      what produced the opposite conclusion here first. The compile cache is
+      the artefact that settles it; a comment is not.
+
+    Still open: performance at production scale, and getting that run's output
+    written down somewhere other than a chat log.
+    """
+    import importlib
+
+    errors = []
+    for module_name, path in _KERNEL_LOCATIONS:
+        try:
+            if path is None:
+                module = importlib.import_module(module_name)
+            else:
+                import importlib.util
+                import os
+                if not os.path.isfile(path):
+                    errors.append(f"{path}: not present")
+                    continue
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            return module.launch
+        except Exception as exc:                      # noqa: BLE001
+            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "the staged-dequantise kernel could not be loaded from any known "
+        "location:\n  " + "\n  ".join(errors)
+        + "\n\nEverything ahead of it is wired: this step's rows are already "
+        "in HBM, laid out as EngramLayout describes. Only the kernel is "
+        "missing.")
