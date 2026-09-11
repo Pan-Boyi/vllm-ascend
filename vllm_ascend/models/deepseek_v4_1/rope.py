@@ -110,6 +110,29 @@ def inverse_rope_attention_output(
     return out
 
 
+#: Why this is torch and not ``inplace_partial_rotary_mul``, which exists on
+#: this platform and looks like an exact fit.
+#:
+#: Its ``partial_slice`` attribute is declared and never read -- it appears
+#: twice in the whole operator, both times in a declaration, and the tiling
+#: reads only the mode. Passing [448, 512] and [448, 64] do the same thing:
+#: nothing, silently. The rotation covers all of ``D``, so handing it a 512-wide
+#: head would rotate the 448 NoPE dimensions too.
+#:
+#: Rotating only the tail would mean passing a 4-D *view* of ``x[..., 448:512]``
+#: to an in-place operator, on non-contiguous memory, which nobody has tried.
+#: The cos/sin would also need widening from 32 frequencies to 64, because the
+#: operator requires their ``D`` to equal ``x``'s.
+#:
+#: So it is available and it is not a drop-in. This path is bit-exact against
+#: golden today; the operator is a performance question for later, with a
+#: measurable answer and three untested steps in front of it.
+#:
+#: ``interleave`` is confirmed to be the GPT-J pairing (the kernel does
+#: ``i ^ 1``), and the inverse is the forward rotation with ``sin`` negated --
+#: both worth keeping for whoever picks this up.
+
+
 def inverse_rope_from_cos_sin_cache(
     o: torch.Tensor,
     positions: torch.Tensor,

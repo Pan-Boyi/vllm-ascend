@@ -87,6 +87,18 @@ def envs_dsv41_mhc_post_torch() -> bool:
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm in fp32, cast back at the end.
 
+    ``npu_rms_norm_cast(x, gamma, eps) -> (y, y_fp32)`` is an in-repo operator
+    that matches this exactly and also hands back the fp32 copy. It is not used
+    yet, and the reason it looks unavailable is not the reason it is unused:
+    V4.0 calls it behind ``enable_custom_op()``, which returns False on A5, but
+    that switch is a blanket "disable all custom ops on this chip" precaution
+    rather than a judgement about this operator. The mechanism works --
+    ``npu_hc_pre_v2``, also in-repo, runs on A5 after
+    ``bootstrap_custom_op_env()``. What is missing is a check that this
+    particular operator is numerically right there, which is minutes of work on
+    a card and has not been done.
+
+
     Accumulating in the input dtype is the usual way to lose this: hidden_size
     is 5120 and bf16 has an eight-bit significand, so the sum of squares stops
     growing well before the last terms are reached.
