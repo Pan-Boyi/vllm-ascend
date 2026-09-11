@@ -9,6 +9,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -564,6 +565,34 @@ def _ascend_max_memory_usage_bytes_from_groups(
 
 
 
+
+def _ring_groups(ring: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec]:
+    """compressor 的 state_cache 各自成组，按 (block_size, page_size) 归并。
+
+    ⚠️ 断言 block_size 落在该 backend 支持的 kernel block size 集合里 ——
+       这是 select_common_block_size 的必要条件，不该默认它成立。
+       （AscendCompressorStateBackend 故意不覆盖 get_supported_kernel_block_sizes，
+        基类给 [2,4,8,16,32,64,128]；无投机时环容量 8、七个草稿 token 时 16，都在里面。）
+    """
+    buckets: dict[tuple, list[str]] = {}
+    for name, spec in ring.items():
+        buckets.setdefault((spec.block_size, spec.page_size_bytes), []).append(name)
+    out: list[KVCacheGroupSpec] = []
+    for (bs, _ps), names in sorted(buckets.items()):
+        spec = ring[names[0]]
+        backend = getattr(spec, "attn_backend", None) or getattr(spec, "backend", None)
+        if backend is not None and hasattr(backend, "get_supported_kernel_block_sizes"):
+            supported = backend.get_supported_kernel_block_sizes()
+            if supported and bs not in supported:
+                raise NotImplementedError(
+                    f"compressor state_cache block_size={bs} 不在 {backend.__name__} 支持的 "
+                    f"kernel block sizes {supported} 里 —— select_common_block_size 会失败。"
+                    f"涉及层: {names}"
+                )
+        out.append(KVCacheGroupSpec(layer_names=sorted(names), kv_cache_spec=spec))
+    return out
+
+
 def _assert_covers(
     groups: list[KVCacheGroupSpec],
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -652,7 +681,25 @@ def _ascend_get_kv_cache_groups(
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return _assert_covers(get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec), kv_cache_spec, "GLM5-Next")
     if not vllm_version_is("0.28.0") and has_deepseek_v4_specs(kv_cache_spec):
-        if grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+        # 🔴 V4.1 的 compressor state_cache 是【第三种】spec，必须单独成组 ——
+        #    而这不是我们的偏好，是上游用代码要求的：
+        #      CircularBufferSpec.is_uniform_with_collection（kv_cache_interface.py:784-789）
+        #      覆盖了基类的默认实现，改成「这一组里【每一个】都必须是 CircularBufferSpec」，
+        #      而 SameTypeKVCacheSpecs.is_uniform_type 正是调它来决定能不能成组。
+        #    ⇒ 把它和任何别的 spec 放进同一组，uniformity 判定直接为假。
+        #    ⚪ 它没有跨层语义（max_num_blocks_per_req()→1、max_memory_usage_bytes()→page_size、
+        #      prefix_cacheable=False）：那个「环」是单层内部跨 token 的，三个环互不相干。
+        #    ⚪ 为什么恰好 3 个：kv_source_layer_ids=[2,8,14,20] 共 4 个，
+        #      而第 20 层 compress_ratio=1（不压缩）⇒ 没有「还在压缩中的组」⇒ 没有 state。
+        #      4 - 1 = 3，和实际看到的一致，不是漏了一个。
+        ring = {n: sp for n, sp in kv_cache_spec.items() if isinstance(sp, CircularBufferSpec)}
+        rest = {n: sp for n, sp in kv_cache_spec.items() if n not in ring}
+        if ring and rest:
+            if grouped_specs := group_and_unify_kv_cache_specs(rest):
+                groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+                groups = groups + _ring_groups(ring)
+                return _assert_covers(groups, kv_cache_spec, "DSV4+ring")
+        elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
             return _assert_covers(_get_kv_cache_groups_uniform_groups(grouped_specs), kv_cache_spec, "DSV4")
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
