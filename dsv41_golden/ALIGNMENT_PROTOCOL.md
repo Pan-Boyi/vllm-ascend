@@ -559,6 +559,77 @@ return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 ---
 
+### 5.3 一条只有在 T > 1024 才存在的语义:indexer 必须看 **pre-RoPE** 的 latent
+
+`ref/model.py:749` 把顺序写成了要求:
+
+```python
+# the indexer needs the latent before RoPE, so it runs before the cache is written
+⇒ 顺序是硬的:indexer → rope → 写 cache
+```
+
+**弄错不报错,只会选错 token。** 而「把 rope 提前一步,少遍历一次 latent」
+看起来是**纯粹的优化** —— 做这件事的人不会觉得自己改了语义。
+
+#### 5.3.1 实测:阴性臂在 27 token 上区分力是 **0**
+
+`run_golden.py --indexer-post-rope` 故意用错序(只给 indexer 一份 RoPE 过的 clone,
+真 latent 不动 ⇒ **恰好一个变量不同**,`compressor.out` 逐位相同已验)。
+
+| | T=27 | **T=1100** |
+|---|---|---|
+| `K` / 候选数 | 13 / 13 —— **13 选 13,没得选** | **512 / 550 —— 有选择余地** |
+| `indexer_topk.out` 集合不同的行 | **0/27 = 0%** | **75/1100 = 6.8%**(对称差 2226 个位置) |
+| `indexer_score` rel_l2 | 有限部分有差 | **3.697e-01** |
+| `layer.out` rel_l2 | **0.000e+00** | 7.408e-03 |
+| `logits` rel_l2 | 0.000e+00 | 1.162e-02(top-1 有 75/1100 token 变了) |
+
+🔴 **T=27 下下游差 `0.000e+00` —— 不是「差得小」,是「一模一样」。**
+原因是结构性的,不是输入太温和:`K = min(index_topk=512, end_pos//ratio)`,
+27 token 在 ratio=2 的层上 `K=13` 而候选也正好 13 个 ⇒ **分数怎么变都选同一批。**
+
+⇒ **这条语义在 ≤1024 token 上不存在可观测的后果。** 与第 6.6/候选筛那条同族:
+**不是测得不够全,是那个现象在小规模下根本不存在。**
+
+#### 5.3.2 🔴 判据必须落在**选择**上,不能落在数值上
+
+T=1100 的实测把这点钉死了:
+
+| 判据 | 值 | 阈值 | 结果 |
+|---|---|---|---|
+| `layer.out` rel_l2 | 7.408e-03 | `isolated` 1.5e-2 | **通过** ← 数值判据放过了一个真实的语义错误 |
+| `indexer_topk.out`(按集合) | **5.36% 索引不同** | 逐位 | **失败** |
+| `indexer_score` rel_l2 | **3.697e-01** | — | **失败** |
+
+**⇒ 这条不需要新的判据所有者,它属于第 5.2 节(indexer 有自己的判据)。**
+缺的不是判据,是**没有任何东西在长序列上跑过第 5.2 节** ——
+而它在短序列上跑等于没跑。
+
+⚪ 一个反直觉的旁证:`indexer_score` 差 **3.7e-01** 而 `layer.out` 只差 **7.4e-03**。
+分数差很多,输出几乎不动 —— 因为 top-k 在不同分数上仍然选中**大部分相同**的位置,
+而 attention 输出是个加权平均。**「输入差很多、输出差很少」在这里是正常的,
+所以拿输出反推输入的健康度会得到错的结论。**
+
+#### 5.3.3 复现
+
+```bash
+run python run_golden.py --layers 3 --threads 16 --random-tokens 1100 --max-seq-len 2048 \
+    --dump $DU/len1100
+run python run_golden.py --layers 3 --threads 16 --random-tokens 1100 --max-seq-len 2048 \
+    --indexer-post-rope --dump $DU/len1100_postrope
+python compare_dumps.py $DU/len1100 $DU/len1100_postrope --tolerance isolated   # 必须 exit 1
+```
+
+约 28 s/层,两趟共约 3 分钟,**不占卡**。
+⚠️ **`--random-tokens 1100` 需要 `--max-seq-len 2048`**(默认 512 装不下)。
+
+⚪ model 已确认的两条相关事实(`commit 6daee0e8f`,用我的三层 dump 逐位验过):
+- 压缩流的 `freqs` 按 ratio 抽样:`freqs_cis[: seqlen - seqlen % ratio : ratio]`,
+  decode 时取 `freqs_cis[start_pos + 1 - ratio]`。
+  ⚠️ **不是「每个 latent 用它自己位置的 freqs」** —— 那是所有人的默认直觉,而它是错的。
+- 两套 rope 参数:压缩流 `compress_rope_theta=160000` + YaRN;
+  滑窗流 `rope_theta` 不开 YaRN。
+
 ## 6. 阈值与理由
 
 阈值全部来自实测，不是拍脑袋。**下限取自 golden 自身的数值敏感度**（同一份代码，只把
