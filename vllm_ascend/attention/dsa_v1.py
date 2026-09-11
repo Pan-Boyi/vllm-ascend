@@ -349,6 +349,46 @@ class AscendDSABackend(AttentionBackend):
         return [2, 4, 8, 16, 32, 64, 128]
 
 
+class AscendDSAC2Backend(AscendDSABackend):
+    """DeepSeek-V4.1's ratio-2 compressed indexer/KV cache.
+
+    The listed sizes are not a free choice. ``AscendMLAAttentionSpec`` recovers the
+    physical page from the logical one by dividing the ratio back out
+    (``core/kv_cache_interface.py``: ``storage_block_size = block_size //
+    tokens_per_state``, and ``real_page_size_bytes`` is computed from that), so a
+    spec's ``block_size`` is always already multiplied by the ratio. At ratio 2
+    Ascend's physical 32/64/128-token pages therefore present as 64/128/256 raw
+    scheduler tokens, and those three numbers are exactly what
+    ``select_common_block_size`` is handed.
+
+    ⚠️ The derivation only runs when the caller leaves ``storage_block_size``
+    unset. A caller that passes it explicitly escapes the convention, and this
+    list would then be wrong for that caller -- so pass ``block_size`` already
+    multiplied and let the spec derive the rest, as every DSV4 site does.
+
+    Do NOT reuse ``AscendDSAC4Backend`` for ratio 2. Its list is [128, 256, 512],
+    which covers ratio 2 at cache block_size 64 and 128 and fails only at 32 --
+    i.e. it passes on the default block size and breaks on the small one. That is
+    verified as the red case in ``tests/ut/attention/test_dsa_c2_backend.py``.
+
+    V4.1 uses ratios 0, 1 and 2 only (``vllm/models/deepseek_v4_1/attention.py``:
+    ``compress_ratio not in (0, 1, 2)`` raises). Ratio 1 needs [32, 64, 128],
+    which ``AscendDSABackend`` and ``AscendDSASWABackend`` already list, so no
+    ratio-1 class is needed. Ratio 0 means sliding window and must be mapped to 1
+    before it reaches the spec, or the page size divides to zero.
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "ASCEND_DSA_C2"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        # Align with upstream's logical block-size contract: Ascend's physical
+        # 32/64/128-token C2 pages represent 64/128/256 raw scheduler tokens.
+        return [64, 128, 256]
+
+
 class AscendDSAC4Backend(AscendDSABackend):
     @staticmethod
     def get_name() -> str:

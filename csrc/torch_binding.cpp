@@ -1579,11 +1579,21 @@ void inplace_partial_rotary_mul_npu(at::Tensor & x, const at::Tensor &r1, const 
     // absence might hint that nothing happened.
     TORCH_CHECK(it != mode_map.end(), "rotary_mode must be one of half, interleave, quarter, "
         "interleave-half, but got '", rotary_mode_str, "'");
-    // ⚠️ `partial_slice` is DECLARED and NEVER READ: it appears twice in this operator, in
-    // inplace_partial_rotary_mul_proto.cpp:59 and _def.cpp:46, and nowhere else. The tiling reads
-    // only the mode attribute, and its tiling struct has no field for a slice. So this argument
-    // cannot restrict the rotation to part of the head dimension on any path, and passing one is
-    // not an error either -- it is simply ignored. To rotate a tail, slice `x` itself.
+    // `partial_slice` is [start, end) over the head dimension: the kernel rotates only
+    // `x[..., start:end)` and leaves the rest untouched. It is load-bearing, and it is read
+    // POSITIONALLY as attr index 1 (attr 0 is the mode), so grepping the operator for the name
+    // finds only the two declarations in inplace_partial_rotary_mul_proto.cpp:59 and _def.cpp:46
+    // and misses every use. Both tilings read it:
+    //   op_host/rope_regbase_tiling_base.cpp:330-340   (ASCEND950 / A5, selected at
+    //                                                   inplace_partial_rotary_mul_tiling.cpp:79)
+    //   op_host/inplace_partial_rotary_mul_a3_tiling.cpp:306
+    // Hard constraint, checked in JudgeSliceInfo (rope_regbase_tiling_base.cpp:271-279):
+    //   cos.size(-1) == sin.size(-1) == end - start,  0 <= start,  end <= x.size(-1),  end > start.
+    // So cos/sin are the width of the ROTATED SLICE, not of the head -- for DSV4's indexer that is
+    // 64, against a 128-wide q. The old "D of x, cos, sin must all be equal" check that would have
+    // forbidden this is commented out at rope_regbase_tiling_base.cpp:178-183.
+    // An empty list means the whole head dimension; the proto's {0, 0} default does NOT, it makes
+    // sliceLength 0 and JudgeSliceInfo rejects it.
     auto origin_dim_num = x.dim();
     TORCH_CHECK(origin_dim_num == BSND_DIM_NUM, "Input tensor x's dim num should be 4, actual ", origin_dim_num, ".");
     EXEC_NPU_CMD(aclnnInplacePartialRotaryMul, x, r1, r2, it->second, partial_slice);
