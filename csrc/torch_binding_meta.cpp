@@ -987,14 +987,31 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_meta(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
-std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, std::string layout,
-    bool return_softmax_lse)
+// Mirrors the real implementation's shape rule; see the comment on construct_output_tensor in
+// torch_binding.cpp. Meta and real must agree or compiled graphs allocate a differently shaped
+// buffer than eager does, and that disagreement only shows up once someone asks for the lse.
+std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q,
+    const std::string &layout_q, const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv, const std::string &layout_kv, bool return_softmax_lse)
 {
     at::Tensor output = at::empty_symint(q.sym_sizes(), q.options().dtype(q.dtype()));
     at::Tensor softmax_lse;
     if (return_softmax_lse) {
-        c10::SymDimVector lse_sizes(q.sym_sizes().begin(), q.sym_sizes().end());
-        lse_sizes.back() = c10::SymInt(1);
+        TORCH_CHECK(ori_kv.has_value() || cmp_kv.has_value(),
+            "softmax_lse is requested but neither ori_kv nor cmp_kv was given");
+        const at::Tensor &kv = ori_kv.has_value() ? ori_kv.value() : cmp_kv.value();
+        const int64_t axis = (layout_kv == "BSND" || layout_kv == "PA_BBND") ? 2 : 1;
+        TORCH_CHECK(kv.dim() > axis, "KV tensor has ", kv.dim(),
+            " dimensions, too few for layout_kv ", layout_kv);
+        c10::SymInt n = kv.sym_size(axis);
+        c10::SymDimVector lse_sizes;
+        if (layout_q == "BSND") {
+            TORCH_CHECK(q.dim() == 4, "layout_q BSND needs a 4-D query, got ", q.dim());
+            lse_sizes = {q.sym_size(0), n, q.sym_size(1), q.sym_size(2) / n};
+        } else {
+            TORCH_CHECK(q.dim() == 3, "layout_q TND needs a 3-D query, got ", q.dim());
+            lse_sizes = {n, q.sym_size(0), q.sym_size(1) / n};
+        }
         softmax_lse = at::empty_symint(lse_sizes, q.options().dtype(c10::ScalarType::Float));
     } else {
         softmax_lse = at::empty_symint(c10::SymDimVector{c10::SymInt(0)}, q.options().dtype(c10::ScalarType::Float));
@@ -1013,7 +1030,9 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_meta(const at::Tenso
     int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse)
 {
     std::string layout_q_str = std::string(layout_q);
-    std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    std::string layout_kv_str = std::string(layout_kv);
+    std::tuple<at::Tensor, at::Tensor> output =
+        construct_output_tensor(q, layout_q_str, ori_kv, cmp_kv, layout_kv_str, return_softmax_lse);
 
     return output;
 }
@@ -1278,7 +1297,8 @@ std::tuple<at::Tensor, at::Tensor> npu_kv_quant_sparse_attn_sharedkv_meta(
     bool return_softmax_lse)
 {
     std::string layout_q_str = std::string(layout_q);
-    return construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    std::string layout_kv_str = std::string(layout_kv);
+    return construct_output_tensor(q, layout_q_str, ori_kv, cmp_kv, layout_kv_str, return_softmax_lse);
 }
 
 at::Tensor npu_kv_quant_sparse_attn_sharedkv_metadata_meta(
@@ -1380,7 +1400,8 @@ std::tuple<at::Tensor, at::Tensor> npu_mixed_quant_sparse_flash_mla_meta(
     bool return_softmax_lse)
 {
     std::string layout_q_str = std::string(layout_q);
-    return construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    std::string layout_kv_str = std::string(layout_kv);
+    return construct_output_tensor(q, layout_q_str, ori_kv, cmp_kv, layout_kv_str, return_softmax_lse);
 }
 
 at::Tensor npu_mixed_quant_sparse_flash_mla_metadata_meta(
