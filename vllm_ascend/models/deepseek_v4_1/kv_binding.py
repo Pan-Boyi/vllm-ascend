@@ -36,16 +36,27 @@ def is_v41(hf_text_config) -> bool:
 def bind_value(kv_cache):
     """What to store on the layer.
 
-    A single tensor with a unit head axis is handed over with that axis
-    dropped, which is the shape upstream reads. Anything else keeps the list:
-    the indexer's cache is two or three tensors addressed by fixed slot, and
+    A tensor stays a tensor. Every V4.1 consumer of a single-tensor cache reads
+    it as one -- ``kv_cache.numel()`` in ``engram.ensure_cache``, an assert on
+    ``shape[1:]`` in the SWA path -- so wrapping it is not a conservative
+    default, it is a type error deferred to whoever reads it next. The unit
+    head axis is dropped when there is one, because that is the shape upstream
+    expects; a tensor that arrives already without it is handed over unchanged.
+
+    The list is kept for a cache that genuinely is several tensors. The
+    indexer's is a (values, scales) pair addressed by fixed slot, and
     flattening it would turn a slot index into an element index.
+
+    The earlier version wrapped anything it did not recognise, on the reasoning
+    that preserving the old behaviour was the safe default. It was not: the
+    old behaviour belongs to V4.0, whose consumers index the list. Here the
+    reshape path can legitimately hand over a three-dimensional tensor with no
+    head axis at all, and wrapping that produced
+    ``'list' object has no attribute 'numel'`` during decode graph capture --
+    several frames from here, in upstream code that never asked for a list.
     """
     if isinstance(kv_cache, torch.Tensor):
         if kv_cache.ndim >= 3 and kv_cache.shape[HEAD_AXIS] == 1:
             return kv_cache.squeeze(HEAD_AXIS)
-        # A tensor whose head axis is not 1 is not the layout this was written
-        # for. Wrapping it preserves the old behaviour rather than reshaping
-        # something unrecognised.
-        return [kv_cache]
+        return kv_cache
     return [kv_cache]

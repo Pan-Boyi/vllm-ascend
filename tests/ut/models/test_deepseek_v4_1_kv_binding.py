@@ -71,12 +71,17 @@ def test_a_multi_tensor_cache_keeps_its_list():
     assert isinstance(bound, list) and len(bound) == 1 and bound[0] is slots
 
 
-def test_an_unrecognised_head_axis_is_left_alone():
-    """Not the layout this was written for, so it keeps the old behaviour
-    rather than reshaping something it does not recognise."""
+def test_a_multi_head_cache_is_handed_over_unreshaped():
+    """Not the layout this was written for -- so nothing is dropped from it.
+
+    V4.1's caches all carry num_kv_heads=1. A cache with eight would be a
+    different model, and squeezing some other axis to make it fit would give
+    the consumer a tensor of the right rank and the wrong contents. It comes
+    back whole, and the consumer's own assert on shape says so.
+    """
     cache = torch.zeros(BLOCKS, BLOCK, 8, HEAD_DIM)     # 8 kv heads
     bound = bind_value(cache)
-    assert isinstance(bound, list) and bound[0] is cache
+    assert bound is cache
 
 
 def test_the_head_axis_is_the_one_the_backend_allocates():
@@ -109,15 +114,40 @@ def test_the_compressor_ring_binds_to_three_dims_not_a_list():
     assert bound.shape == (BLOCKS, 8, 512)
 
 
-def test_a_head_first_ring_is_not_silently_flattened():
-    """If the declared shape ever moves the head axis to 1, say so here.
+def test_a_head_first_ring_is_not_silently_reshaped():
+    """If the declared shape ever moves the head axis to 1, do not guess.
 
-    bind_value refuses to guess: an unrecognised layout keeps the old wrapping
-    rather than squeezing whichever axis happens to be 1. That makes the
-    mismatch visible at the consumer instead of producing a plausible tensor
-    with the ring capacity silently removed.
+    bind_value drops an axis only where the head axis is; it does not hunt for
+    whichever axis happens to be 1. A head-first ring therefore comes back
+    whole, and the mismatch surfaces at the consumer rather than as a plausible
+    tensor with the ring capacity silently removed.
     """
     head_first = torch.zeros((BLOCKS, 1, 8, 512))
     bound = bind_value(head_first)
+    assert isinstance(bound, torch.Tensor)
+    assert bound.shape == (BLOCKS, 1, 8, 512)
+
+
+def test_a_tensor_never_comes_back_as_a_list():
+    """`'list' object has no attribute 'numel'`, from decode graph capture.
+
+    engram.ensure_cache reads self.swa_cache_module.kv_cache and calls .numel()
+    on it. The reshape path can hand over a three-dimensional tensor that has
+    no head axis left to drop, and the old "wrap anything unrecognised" default
+    turned that into a list -- a type error several frames away, in upstream
+    code that never asked for a list. Wrapping was never the conservative
+    choice; it was V4.0's convention applied where V4.0's consumers are not.
+    """
+    for shape in ((BLOCKS, BLOCK, 512), (BLOCKS, BLOCK, HEADS, HEAD_DIM),
+                  (BLOCKS, 1, 8, 512), (BLOCKS, 8)):
+        bound = bind_value(torch.zeros(shape))
+        assert isinstance(bound, torch.Tensor), f"{shape} came back wrapped"
+        assert bound.numel() > 0
+
+
+def test_a_multi_tensor_cache_still_keeps_its_list():
+    """The indexer's (values, scales) pair is addressed by fixed slot."""
+    pair = (torch.zeros(2, 4), torch.zeros(2, 4))
+    bound = bind_value(pair)
     assert not isinstance(bound, torch.Tensor)
-    assert bound[0].shape == (BLOCKS, 1, 8, 512)
+    assert bound[0] is pair
