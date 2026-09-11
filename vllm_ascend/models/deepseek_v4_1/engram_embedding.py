@@ -296,6 +296,12 @@ class AscendStagedEngramEmbedding:
         scales are ``n_scales`` contiguous bytes per row, read with
         ``tl.arange`` and broadcast.
         """
+        if envs_dsv41_engram_dequant_torch():
+            dequantize_staged_torch(
+                self._dev_weight[:rows], self._dev_scale[:rows], out,
+                quant_block=self._layout.quant_block)
+            return
+
         launch = _staged_dequant_launcher()
         launch(self._dev_weight[:rows], self._dev_scale[:rows], out,
                dim=self._layout.dim, quant_block=self._layout.quant_block)
@@ -357,3 +363,49 @@ def _staged_dequant_launcher():
         + "\n\nEverything ahead of it is wired: this step's rows are already "
         "in HBM, laid out as EngramLayout describes. Only the kernel is "
         "missing.")
+
+
+# -- a torch route through the same arithmetic -------------------------------
+#
+# Exists to answer one question: whether a triton-ascend compiler assertion is
+# coming from this kernel. That assertion is an MLIR abort(), not an exception
+# -- the worker vanishes with exit code None, no traceback, nothing in dmesg --
+# so it cannot be caught, narrowed by a stack, or attributed by reading a log.
+# The only cheap way to attribute it is to take one Triton kernel out of the
+# picture and see whether the process still dies.
+#
+# This is not a fallback anybody should run in production: it materialises the
+# dequantised rows through several ordinary torch ops where the kernel does one
+# pass. It is a bisection instrument.
+
+
+def envs_dsv41_engram_dequant_torch() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH == "1"
+
+
+def dequantize_staged_torch(staging_weight: torch.Tensor,
+                            staging_scale: torch.Tensor,
+                            out: torch.Tensor,
+                            quant_block: int) -> None:
+    """The staging kernel's arithmetic, in torch.
+
+    Same contract: row r of the weight and scale buffers is row r of the
+    output. The scales are read contiguously and broadcast over their block --
+    never indexed by ``cols // quant_block``, which is the form that reads the
+    same values from HBM in a 2-D block and the wrong ones everywhere else.
+    """
+    rows, dim = staging_weight.shape
+    n_scales = dim // quant_block
+    if staging_scale.shape != (rows, n_scales):
+        raise ValueError(
+            f"scale buffer is {tuple(staging_scale.shape)}, expected "
+            f"({rows}, {n_scales}) for dim={dim} and quant_block={quant_block}")
+
+    values = staging_weight.view(torch.float8_e4m3fn).to(torch.float32)
+    # ue8m0 is a power of two, so the byte *is* the fp32 exponent field.
+    scales = (staging_scale.to(torch.int32) << 23).view(torch.float32)
+
+    scaled = values.view(rows, n_scales, quant_block) * scales.unsqueeze(-1)
+    out.copy_(scaled.view(rows, dim).to(out.dtype))

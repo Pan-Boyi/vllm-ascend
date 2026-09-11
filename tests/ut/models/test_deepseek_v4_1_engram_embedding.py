@@ -330,3 +330,85 @@ def test_the_replacement_line_says_what_actually_happened():
     source = inspect.getsource(AscendStagedEngramEmbedding.__init__)
     assert "0 bytes pinned per rank" in source
     assert "does not happen" in source
+
+
+# -- the torch route, used to attribute a compiler abort ----------------------
+
+
+def test_torch_dequant_matches_an_independent_computation():
+    """The kernel's arithmetic, checked against a separate expression.
+
+    Not a refactor of the same lines: the reference below multiplies by
+    2**(byte-127) explicitly, while the implementation bit-casts the byte into
+    the exponent field. Those agreeing is the point -- it is the same trick
+    verified two ways.
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        dequantize_staged_torch
+
+    rows, dim, qb = 4, 64, 32
+    torch.manual_seed(5)
+    values = (torch.randn(rows, dim) * 3).to(torch.float8_e4m3fn)
+    weight_u8 = values.view(torch.uint8)
+    # ue8m0 exponents around 1.0, avoiding the extremes
+    scale_u8 = torch.randint(120, 134, (rows, dim // qb), dtype=torch.uint8)
+
+    out = torch.zeros(rows, dim, dtype=torch.bfloat16)
+    dequantize_staged_torch(weight_u8, scale_u8, out, quant_block=qb)
+
+    factors = torch.pow(2.0, scale_u8.to(torch.float32) - 127.0)
+    expected = (values.to(torch.float32).view(rows, dim // qb, qb)
+                * factors.unsqueeze(-1)).view(rows, dim).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected)
+
+
+def test_each_scale_covers_its_own_block_only():
+    """The broadcast, checked positionally.
+
+    A scale applied to the wrong block is the failure that produced maxdiff 28
+    on this data with no error raised, so it is checked by construction rather
+    than by a tolerance.
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        dequantize_staged_torch
+
+    rows, dim, qb = 2, 64, 32
+    ones = torch.ones(rows, dim, dtype=torch.float8_e4m3fn).view(torch.uint8)
+    scale_u8 = torch.tensor([[127, 128], [129, 127]], dtype=torch.uint8)
+
+    out = torch.zeros(rows, dim, dtype=torch.float32)
+    dequantize_staged_torch(ones, scale_u8, out, quant_block=qb)
+
+    assert torch.all(out[0, :32] == 1.0)    # 2**0
+    assert torch.all(out[0, 32:] == 2.0)    # 2**1
+    assert torch.all(out[1, :32] == 4.0)    # 2**2
+    assert torch.all(out[1, 32:] == 1.0)
+
+
+def test_a_scale_buffer_of_the_wrong_width_is_refused():
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        dequantize_staged_torch
+
+    with pytest.raises(ValueError, match="scale buffer is"):
+        dequantize_staged_torch(
+            torch.zeros(4, 64, dtype=torch.uint8),
+            torch.zeros(4, 4, dtype=torch.uint8),      # should be 2
+            torch.zeros(4, 64), quant_block=32)
+
+
+def test_the_switch_is_off_by_default_and_selects_the_torch_route():
+    """It is a bisection instrument, not a fallback: the kernel does one pass
+    where this materialises several intermediates."""
+    import vllm_ascend.envs as envs
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
+
+    assert envs.VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH == "0"
+    assert not mod.envs_dsv41_engram_dequant_torch()
+
+    import inspect
+    source = inspect.getsource(mod.AscendStagedEngramEmbedding._dequantize_staged)
+    assert "envs_dsv41_engram_dequant_torch()" in source
+    assert source.index("envs_dsv41_engram_dequant_torch()") < source.index(
+        "_staged_dequant_launcher()"), (
+        "the switch must be checked before the kernel is even resolved -- "
+        "resolving it imports the module whose compilation is under suspicion")
