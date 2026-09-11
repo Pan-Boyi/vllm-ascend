@@ -80,6 +80,20 @@ TOLERANCES = {
 # near-tie from a real routing bug, not to be a threshold.
 NEVER_GATE = ("moe_routing_margin",)
 
+# A whole-tensor rel_l2 dilutes a single bad token by roughly sqrt(n_tokens), and
+# this model's errors grow precisely by "more tokens become wrong" -- so the tensor
+# number alone lets a localised fault through.  Measured dilution on a known-good
+# reference pair (full40 vs full40_fp64_iso, per-layer isolated): moe.out's worst
+# token sits at 2.6e-2 while the tensor reads 6.2e-3, a factor of 4.2; layer.out
+# 1.4e-2 vs 2.4e-3, a factor of 5.8.
+#
+# So the per-token limit is the tensor limit scaled up, not down: the factor has to
+# clear the measured per-token floor (2.6e-2 against moe.out's 3e-2 tensor limit
+# needs > 0.87x) while still being tighter than what the tensor number would
+# tolerate once diluted.  2x clears every measured tensor with roughly 2x margin
+# and was verified against that known-good pair, which must pass.
+TOKEN_LIMIT_FACTOR = 2.0
+
 
 def indexer_agreement(a: torch.Tensor, b: torch.Tensor,
                       a_off: torch.Tensor | None, b_off: torch.Tensor | None,
@@ -258,6 +272,64 @@ def metrics(a: torch.Tensor, b: torch.Tensor, name: str = "") -> dict:
 # landed they are bit-identical by construction; if it silently did not, per-layer
 # rel_l2 jumps wholesale to the 1e-1 saturation level and every layer looks broken
 # at once.  Checking the injected tensors directly is cheaper and says which.
+def permutation_signature(a: torch.Tensor, b: torch.Tensor,
+                          max_rows: int = 4096) -> dict | None:
+    """Is ``b`` a row permutation of ``a`` rather than a different computation?
+
+    Written for expert parallelism.  With EP>1 the tokens are physically regrouped
+    by expert, shipped between ranks, and put back; a wrong token-to-slot mapping in
+    that dispatch or combine returns **the right values in the wrong places**.  That
+    is the most likely bug during EP bring-up, and against a plain tolerance it looks
+    the same as arithmetic being wrong -- large, and everywhere.
+
+    A permutation has a fingerprint a threshold does not see: the multiset of rows
+    survives.  So this is decidable rather than a judgement call, which is the whole
+    point -- it turns "moe.out is far off, go and look at the GEMM" into "every row
+    is present, look at the dispatch."
+
+    Returns None when the shapes make the question meaningless, otherwise a verdict
+    with ``is_permutation``, how many rows moved, and where the first one went.
+    """
+    if a.shape != b.shape or a.dim() < 2:
+        return None
+    af = a.reshape(-1, a.shape[-1])
+    bf = b.reshape(-1, b.shape[-1])
+    n = af.shape[0]
+    if n < 2 or n > max_rows:
+        return None
+
+    # Byte-level row keys: a dispatch error moves values without touching them, so
+    # the rows themselves are bit-identical and only their order is wrong.  Using
+    # bytes (not values) keeps this exact and dtype-agnostic.
+    def keys(t):
+        raw = t.contiguous().view(torch.uint8).reshape(n, -1)
+        return [bytes(r.numpy().tobytes()) for r in raw]
+
+    ka, kb = keys(af), keys(bf)
+    if ka == kb:
+        return {"is_permutation": False, "identical": True, "moved": 0}
+    from collections import Counter
+    if Counter(ka) != Counter(kb):
+        return {"is_permutation": False, "identical": False, "moved": None,
+                "note": "row multiset differs -- not a pure reordering"}
+
+    pos = {}
+    for i, k in enumerate(ka):
+        pos.setdefault(k, []).append(i)
+    mapping, moved = [], 0
+    for j, k in enumerate(kb):
+        src = pos[k].pop(0)
+        mapping.append(src)
+        if src != j:
+            moved += 1
+    first = next((j for j, srcj in enumerate(mapping) if srcj != j), None)
+    return {"is_permutation": True, "identical": False, "moved": moved,
+            "rows": n, "first_moved_to": first,
+            "first_came_from": None if first is None else mapping[first],
+            "note": (f"every row is present, {moved}/{n} are in the wrong place "
+                     f"-- this is a dispatch/combine ordering bug, not arithmetic")}
+
+
 INJECTED_KEYS = ("layer.in", "pre_mix.in")
 
 
@@ -371,10 +443,28 @@ def compare_dir(golden: str, cand: str, tol: dict, verbose: bool = True,
                     if m["rel_l2"] > lim_rel:
                         notes.append((tag, name,
                                       f"rel_l2={m['rel_l2']:.3e} (diagnostic only, not gated)"))
-                elif m["rel_l2"] > lim_rel or m["cos"] < lim_cos:
-                    failures.append((tag, name,
-                                     f"rel_l2={m['rel_l2']:.3e} (limit {lim_rel:.1e}) "
-                                     f"cos={m['cos']:.6f} (limit {lim_cos})"))
+                elif (m["rel_l2"] > lim_rel or m["cos"] < lim_cos
+                      or m.get("max_token_rel_l2", 0) > TOKEN_LIMIT_FACTOR * lim_rel):
+                    why = (f"rel_l2={m['rel_l2']:.3e} (limit {lim_rel:.1e}) "
+                           f"cos={m['cos']:.6f} (limit {lim_cos})")
+                    if m.get("max_token_rel_l2", 0) > TOKEN_LIMIT_FACTOR * lim_rel:
+                        m["limit_max_token_rel_l2"] = TOKEN_LIMIT_FACTOR * lim_rel
+                        why += (f" max_token_rel_l2={m['max_token_rel_l2']:.3e} "
+                                f"(limit {TOKEN_LIMIT_FACTOR * lim_rel:.1e})")
+                    # Before blaming arithmetic, ask whether the values are simply in
+                    # the wrong places.  Under EP>1 that is the likelier bug, and it
+                    # is decidable -- so the check runs itself rather than waiting for
+                    # someone to think of it.
+                    perm = permutation_signature(g[name], c[name])
+                    if perm and perm.get("is_permutation"):
+                        why += (f" -- BUT every row is present: {perm['moved']}/"
+                                f"{perm['rows']} rows are permuted (row "
+                                f"{perm['first_moved_to']} holds row "
+                                f"{perm['first_came_from']}'s data). This is a "
+                                f"dispatch/combine ORDERING bug, not arithmetic. "
+                                f"Look at the token permutation, not the GEMM.")
+                        tag_res.setdefault(name, {})["permutation"] = perm
+                    failures.append((tag, name, why))
         # Did the injection actually reach the experts?  Cross-name on purpose: the
         # candidate records what it fed the experts, the golden records what it chose.
         if "moe_gate.forced.1" in c and "moe_gate.out.1" in g:

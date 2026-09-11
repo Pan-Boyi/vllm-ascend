@@ -240,6 +240,12 @@ class StreamingEngramEmbedding(nn.Module):
         return values.masked_fill(mask.unsqueeze(-1), 0)
 
 
+# Filled in by StreamingMoE when --ep-sim is on; read by run_golden.py.  Kept at
+# module scope because the blocks are built and freed one at a time, so there is no
+# surviving object to hang it off.
+EP_SIM_STATS: list[dict] = []
+
+
 class StreamingMoE(nn.Module):
     """``model.MoE`` with the routed experts read on demand.
 
@@ -277,6 +283,12 @@ class StreamingMoE(nn.Module):
         self.routing_override = None   # (layer_id, positions, weights, indices) -> (weights, indices)
         self.routing_positions = None  # [n_rows] absolute sequence position of each gate row
         self.record_forced = None      # set by _attach_taps when dumping
+        # --ep-sim: how many expert-parallel ranks to simulate.  The NPU side runs
+        # EP>1, where each rank sums only the experts it owns and an all_reduce adds
+        # the partial sums; the golden sums all of them in expert-id order.  Same
+        # terms, different association -- so this is a floor, not a bug.  See the
+        # note in forward().
+        self.ep_sim = None
 
     def _bind_expert(self, i: int):
         p = f"{self.prefix}ffn.experts.{i}."
@@ -341,15 +353,75 @@ class StreamingMoE(nn.Module):
             if self.record_forced is not None:
                 self.record_forced(weights, indices)
         y = torch.zeros_like(x, dtype=torch.float32)
+        # --ep-sim only: one extra fp32 accumulator per simulated rank.  The expert
+        # outputs are computed once and added into both, so this costs no expert
+        # arithmetic -- it isolates the *association* of the sum, which is the only
+        # thing expert parallelism changes.
+        ep = self.ep_sim
+        parts = None
+        if ep:
+            assert self.n_routed_experts % ep == 0, (
+                f"{self.n_routed_experts} experts do not divide across {ep} ranks; "
+                f"ref/model.py asserts the same thing")
+            n_local = self.n_routed_experts // ep
+            parts = [torch.zeros_like(y) for _ in range(ep)]
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.n_routed_experts):
             if counts[i] == 0:
                 continue
             expert = self._bind_expert(i)
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
+            out = expert(x[idx], weights[idx, top, None])
+            y[idx] += out
+            if parts is not None:
+                parts[i // n_local][idx] += out
+        if parts is not None:
+            _record_ep_sim(self.layer_id, y, parts, self.shared_experts(x), x.dtype)
         y += self.shared_experts(x)
         return y.type_as(x).view(shape)
+
+
+def _record_ep_sim(layer_id, y_seq, parts, shared, out_dtype):
+    """Compare the golden's id-order sum against every plausible all_reduce order.
+
+    ``dist.all_reduce`` does not promise an association -- ring and tree reductions
+    combine the ranks differently, and the difference is real because fp32 addition
+    is not associative.  So the number worth reporting is the spread over the orders
+    an implementation might pick, not one arbitrary order: with it, a comparison can
+    say "at or below this, expert parallelism alone explains it".
+    """
+    import itertools
+    worst_pre, worst_out, worst_bf16, worst_order = 0.0, 0.0, 0.0, None
+    seq_out = (y_seq + shared).to(out_dtype).float()
+    for order in itertools.permutations(range(len(parts))):
+        acc = parts[order[0]].clone()
+        for k in order[1:]:
+            acc = acc + parts[k]
+        d_pre = float((acc - y_seq).abs().max())
+        d_out = float(((acc + shared).to(out_dtype).float() - seq_out).abs().max())
+        # The fp32 result above assumes the all_reduce carries fp32.  An
+        # implementation that reduces in the residual dtype rounds each rank's
+        # partial sum first, which is a different and much coarser question -- and
+        # it is the one that decides whether EP is invisible at the dumped
+        # precision.  Measured separately rather than assumed away.
+        acc16 = parts[order[0]].to(out_dtype)
+        for k in order[1:]:
+            acc16 = (acc16 + parts[k].to(out_dtype)).to(out_dtype)
+        d16 = float(((acc16.float() + shared).to(out_dtype).float() - seq_out).abs().max())
+        if d_pre > worst_pre:
+            worst_pre, worst_order = d_pre, order
+        worst_out = max(worst_out, d_out)
+        worst_bf16 = max(worst_bf16, d16)
+    denom = max(float(y_seq.abs().max()), 1e-30)
+    EP_SIM_STATS.append({
+        "layer": layer_id, "ranks": len(parts),
+        "max_abs_pre_shared": worst_pre,
+        "rel_pre_shared": worst_pre / denom,
+        "max_abs_moe_out": worst_out,          # after + shared and the cast to out_dtype
+        "max_abs_moe_out_reduce_in_out_dtype": worst_bf16,
+        "out_dtype": str(out_dtype),
+        "worst_order": worst_order,
+    })
 
 
 class _NullMoE(nn.Module):
@@ -715,6 +787,9 @@ class GoldenModel:
         with _lean_block_construction():
             block = M.Block(layer_id, self.args, self.engram_layout)
         block.ffn = StreamingMoE(layer_id, self.args, self.ckpt, f"layers.{layer_id}.")
+        # set by run_golden.py --ep-sim; diagnostic only, the dumped values are
+        # unchanged because the golden's own sum is still the one that is returned
+        block.ffn.ep_sim = getattr(self, "ep_sim", 0) or None
         return block
 
     # -- forward -----------------------------------------------------------

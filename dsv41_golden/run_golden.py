@@ -44,6 +44,11 @@ def main():
                          "(the smallest difference the residual stream can hold, and the "
                          "size two different implementations start with). Measures what "
                          "that becomes after N layers")
+    ap.add_argument("--ep-sim", type=int, default=0,
+                    help="also sum the experts the way EP=N would (per-rank partial "
+                         "sums + all_reduce) and report the spread against the "
+                         "golden's expert-id-order sum. Diagnostic; does not change "
+                         "the dump")
     ap.add_argument("--batch", type=int, default=1, metavar="N",
                     help="replicate the prompt into a batch of N identical sequences. "
                          "Every row must then come out bit-identical to every other; "
@@ -114,6 +119,7 @@ def main():
 
     guard = G.MemoryGuard(args_cli.floor_gb)
     model = G.GoldenModel(args, ckpt, tokenizer, guard)
+    model.ep_sim = args_cli.ep_sim
     print(f"setup {time.time() - t0:.1f}s, rss {G.rss_gb():.1f} GB", flush=True)
 
     plan = None
@@ -198,6 +204,33 @@ def main():
         "peak_rss_gb": round(guard.peak_rss, 2),
         "layer_seconds": [round(x, 2) for x in st["layer_times"]],
     })
+    if args_cli.ep_sim:
+        st_ep = G.EP_SIM_STATS
+        print()
+        print(f"--- EP={args_cli.ep_sim} simulation: same expert outputs, summed the "
+              f"way {args_cli.ep_sim} ranks would")
+        print("    (per-rank partial sums + all_reduce, vs the golden's expert-id-order sum;")
+        print("     worst case over every all_reduce association, since it is not promised)")
+        print(f"    {'layer':>5} {'max|diff| pre-shared':>21} {'relative':>10} "
+              f"{'moe.out, fp32 reduce':>21} {'moe.out, lowp reduce':>21}")
+        worst, worst16 = 0.0, 0.0
+        for r in st_ep:
+            worst = max(worst, r["max_abs_moe_out"])
+            worst16 = max(worst16, r["max_abs_moe_out_reduce_in_out_dtype"])
+            print(f"    {r['layer']:>5} {r['max_abs_pre_shared']:>21.3e} "
+                  f"{r['rel_pre_shared']:>10.3e} {r['max_abs_moe_out']:>21.3e} "
+                  f"{r['max_abs_moe_out_reduce_in_out_dtype']:>21.3e}")
+        print(f"    worst over {len(st_ep)} layers:  fp32 reduce {worst:.3e}   "
+              f"low-precision reduce {worst16:.3e}")
+        if worst == 0.0:
+            print("    => with the all_reduce in fp32, expert parallelism is INVISIBLE at")
+            print("       the dumped precision: the cast to the residual dtype absorbs it")
+            print("       entirely.  So EP sharding is not an excuse for a moe.out mismatch.")
+        if worst16 > 0.0:
+            print("    => but reducing in the residual dtype does show up. If the NPU")
+            print("       all_reduce carries the low precision, that is a real floor and")
+            print("       the criterion has to allow it -- so keep the reduce in fp32.")
+
     if args_cli.dump:
         print(f"  dumped to {args_cli.dump}")
         print("  files:", sorted(os.listdir(args_cli.dump))[:6], "...")
