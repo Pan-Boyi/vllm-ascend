@@ -34,7 +34,10 @@ Transcribed, not rederived. Five details are silent if wrong:
 
 from __future__ import annotations
 
+import os
+
 import torch
+from vllm.logger import logger
 
 #: The rope width of the V4.1 indexer key, against a head width of 128.
 #: Upstream passes these to the kernel as separate constants
@@ -251,8 +254,20 @@ def indexer_k_norm_rope_store_ascend(
     # Quantisation, value store and scale store, in one operator. The layout
     # matches upstream's fp8 branch byte for byte: whole-block values first,
     # then the per-token fp32 scales.
+    # 算子按【维数】校验这个 cache（tiling 里 "the dim of indexer_compress_cache
+    # only support 4"），而它失败时只说"只支持 4"，不说【实际是几】。
+    # ⇒ 把实参的形状打出来，否则"这个张量几维"要再烧一发起飞才能知道。
+    _viewed = k_cache.view(torch.uint8)
+    if os.environ.get("DSV41_SFM_CHECK", "") == "1":
+        logger.error(
+            "【IDX-EPILOG】indexer_compress_cache: ndim=%d shape=%s dtype=%s "
+            "(view 前 ndim=%d shape=%s dtype=%s) | x: shape=%s dtype=%s | "
+            "slot_mapping: shape=%s dtype=%s | layout=2",
+            _viewed.dim(), tuple(_viewed.shape), _viewed.dtype,
+            k_cache.dim(), tuple(k_cache.shape), k_cache.dtype,
+            tuple(k.shape), k.dtype, tuple(slots.shape), slots.dtype)
     torch.ops._C_ascend.indexer_compress_epilog_v2(
-        indexer_compress_cache=k_cache.view(torch.uint8),
+        indexer_compress_cache=_viewed,
         x=k.to(torch.bfloat16),
         slot_mapping=slots,
         layout=2,
