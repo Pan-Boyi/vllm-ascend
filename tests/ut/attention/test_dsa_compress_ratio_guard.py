@@ -149,27 +149,24 @@ def test_configured_ratio_and_operator_parameter_are_not_the_same_thing():
     assert validate_compress_ratio(0, "layer", BF16_PLAN) == 0
 
 
-def test_the_source_layer_ids_are_read_from_the_text_config():
-    """V4.1 is multimodal: its real fields live under text_config.
+def test_the_source_layer_ids_are_found_on_the_loaded_config():
+    """Measured, not assumed: DeepseekV41Config exposes them at the top level.
 
-    Reading hf_config alone finds no kv_source_layer_ids, and the predicate
-    then falls back to V4.0's `ratio > 1` -- which is a legitimate answer for a
-    different model, so nothing looks wrong. Layers 20..39 carry ratio 1
-    meaning "compressed, pooling disabled", and under the fallback they report
-    "no compressed stream": their cmp_kv and the indexer's selection are both
-    dropped at the call while the descriptor still declares one.
+    The checkpoint's JSON nests these under text_config, which makes "the
+    predicate cannot see kv_source_layer_ids" a very plausible story -- it was
+    briefly believed here. The custom config class vLLM loads flattens them,
+    and get_hf_text_config returns that same object, so both spellings work.
     """
     from types import SimpleNamespace
 
     from vllm_ascend.attention.dsa_v1 import attends_compressed_stream
 
-    text = SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20])
-    multimodal = SimpleNamespace(model_config=SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="deepseek_v41"),
-        hf_text_config=text))
-    assert attends_compressed_stream(1, multimodal) is True
-    assert attends_compressed_stream(2, multimodal) is True
-    assert attends_compressed_stream(0, multimodal) is False
+    flat = SimpleNamespace(model_type="deepseek_v41",
+                           kv_source_layer_ids=[2, 8, 14, 20])
+    cfg = SimpleNamespace(model_config=SimpleNamespace(hf_config=flat,
+                                                       hf_text_config=flat))
+    assert attends_compressed_stream(1, cfg) is True
+    assert attends_compressed_stream(0, cfg) is False
 
 
 def test_a_v40_config_still_gets_v40s_threshold():
