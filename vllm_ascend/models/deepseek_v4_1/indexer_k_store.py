@@ -245,6 +245,53 @@ def check_epilog_cache(cache: torch.Tensor, x: torch.Tensor) -> None:
 
 
 
+def _log_epilog_args(k_cache: torch.Tensor, x: torch.Tensor,
+                     slots: torch.Tensor) -> None:
+    """Print what the epilog operator is about to receive.
+
+    The tiling has three failure modes and only the first two announce
+    themselves:
+
+        not 4 dims          -> "the dim of indexer_compress_cache only support 4"
+        4 dims, dim2 != 1   -> "the third dim ... must be 1"
+        4 dims, dim2 == 1,
+        wrong axis order    -> nothing.  ``layout`` has exactly one legal value,
+                               so no parameter can express "the other order";
+                               the tiling computes offsets as though the shape
+                               were [blocks, bs, 1, D] and writes to the wrong
+                               rows.
+
+    So the third one has to be visible in the numbers, before and after any fix.
+    The tiling also takes ``d_`` from ``x`` and ``cacheD_`` from the cache and
+    never compares them, which is the same shape as two other seams found the
+    same day.
+    """
+    import math
+
+    cache = with_head_axis(k_cache.view(torch.uint8))
+    xw = int(x.shape[-1]) if x.dim() else None
+    cw = int(cache.shape[-1]) if cache.dim() else None
+    st0 = int(cache.stride(0)) if cache.dim() else None
+    bs = int(cache.shape[1]) if cache.dim() >= 2 else None
+    prod = (bs * cw) if (bs is not None and cw is not None) else None
+    # kernel derived this from the tiling source; keep it as the relation, not
+    # as 132/128 -- the relation follows d_, a literal does not.
+    want = (xw + 4 * math.ceil(xw / 128)) if xw else None
+    logger.error(
+        "【IDX-EPILOG】将传入的 cache: ndim=%d shape=%s dtype=%s "
+        "(绑定前 k_cache ndim=%d shape=%s dtype=%s) | x: shape=%s dtype=%s | "
+        "slot_mapping: shape=%s dtype=%s | layout=2 | dim2==1? %s | "
+        "x末维=%s cache末维=%s 等式 d+4*ceil(d/128)=%s %s | "
+        "stride(0)=%s cacheBs*cacheD=%s %s",
+        cache.dim(), tuple(cache.shape), cache.dtype,
+        k_cache.dim(), tuple(k_cache.shape), k_cache.dtype,
+        tuple(x.shape), x.dtype, tuple(slots.shape), slots.dtype,
+        (cache.shape[2] == 1) if cache.dim() >= 3 else "算不出来",
+        xw, cw, want, ("✅相等" if cw == want else "🔴不等"),
+        st0, prod,
+        ("stride>=乘积" if (st0 is not None and prod is not None
+                            and st0 >= prod) else "🔴 stride<乘积"))
+
 def _checked_cache(k_cache: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """The cache as the operator will see it, checked against the x beside it."""
     cache = with_head_axis(k_cache.view(torch.uint8))
@@ -411,41 +458,14 @@ def indexer_k_norm_rope_store_ascend(
     # The widths matched, so only the dtype would have differed, and the
     # tiling has no dtype validation to catch what the guard then missed.
     x = k.to(torch.bfloat16)
-    # 同样的理由适用于仪器：它必须打【真正传进去的那个对象】。
-    # _checked_cache 会 view(uint8) 再把 head 轴加回去，所以 k_cache 和它
-    # 【不是同一个形状】—— 打 k_cache.view(uint8) 会记下一个没被传进算子的东西。
-    _cache_arg = _checked_cache(k_cache, x)
+    # 仪器打【将要被传进去的那个张量】，而且【打在守卫之前】：
+    #   · 守卫之前 ⇒ 守卫 raise 时诊断数据仍然存在（守卫失败正是最需要这些数的时候）
+    #   · 用同一条推导（with_head_axis(view(uint8))）⇒ 和 _checked_cache 交出的是同一个形状
+    #   · 不重复调用 _checked_cache ⇒ 不把守卫跑两遍
     if os.environ.get("DSV41_SFM_CHECK", "") == "1":
-        # tiling 的三档，前两档靠它自己的报错文本区分，第三档【没有任何 host 校验】：
-        #   不是 4 维              -> "dim ... only support 4"
-        #   4 维但 dim2 != 1       -> "third dim ... must be 1"
-        #   4 维且 dim2 == 1 但序错 -> 🔴 不报错，静默按 [blocks,bs,1,D] 算 offset
-        # 而 layout 只有一个合法值(2)，没有参数能表达"另一种序"。
-        # ⇒ 所以第三档要在【修之前/修之后】都能被看见，得自己打这四个数。
-        _xw = int(x.shape[-1]) if x.dim() else None
-        _cw = int(_cache_arg.shape[-1]) if _cache_arg.dim() else None
-        _st0 = int(_cache_arg.stride(0)) if _cache_arg.dim() else None
-        _bs = int(_cache_arg.shape[1]) if _cache_arg.dim() >= 2 else None
-        _prod = (_bs * _cw) if (_bs is not None and _cw is not None) else None
-        # kernel 从 tiling 源码读到的关系，按等式判、不按字面量：
-        import math as _math
-        _want = (_xw + 4 * _math.ceil(_xw / 128)) if _xw else None
-        logger.error(
-            "【IDX-EPILOG】传给算子的 cache: ndim=%d shape=%s dtype=%s "
-            "(绑定前 k_cache ndim=%d shape=%s dtype=%s) | x: shape=%s dtype=%s | "
-            "slot_mapping: shape=%s dtype=%s | layout=2 | "
-            "dim2==1? %s | x末维=%s cache末维=%s 等式 d+4*ceil(d/128)=%s %s | "
-            "stride(0)=%s cacheBs*cacheD=%s %s",
-            _cache_arg.dim(), tuple(_cache_arg.shape), _cache_arg.dtype,
-            k_cache.dim(), tuple(k_cache.shape), k_cache.dtype,
-            tuple(x.shape), x.dtype, tuple(slots.shape), slots.dtype,
-            (_cache_arg.shape[2] == 1) if _cache_arg.dim() >= 3 else "算不出来",
-            _xw, _cw, _want, ("✅相等" if _cw == _want else "🔴不等"),
-            _st0, _prod,
-            ("stride>=乘积" if (_st0 is not None and _prod is not None
-                                and _st0 >= _prod) else "🔴 stride<乘积"))
+        _log_epilog_args(k_cache, x, slots)
     torch.ops._C_ascend.indexer_compress_epilog_v2(
-        indexer_compress_cache=_cache_arg,
+        indexer_compress_cache=_checked_cache(k_cache, x),
         x=x,
         slot_mapping=slots,
         layout=2,
