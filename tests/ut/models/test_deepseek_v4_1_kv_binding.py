@@ -61,14 +61,19 @@ def test_the_bound_tensor_answers_numel():
         [torch.zeros(1)].numel()
 
 
-def test_a_multi_tensor_cache_keeps_its_list():
-    """The indexer's cache is two or three tensors read by fixed slot index;
-    flattening it would turn a slot index into an element index."""
+def test_a_multi_tensor_cache_keeps_its_slots_addressable():
+    """The indexer's cache is two or three tensors read by fixed slot index.
+
+    This used to assert the opposite -- that the list came back wrapped in
+    another list -- which is what the implementation did and what made the
+    indexer's slot 0 return the whole pair. The test agreed with the code
+    because it was written from the code.
+    """
     slots = [torch.zeros(BLOCKS, BLOCK, HEADS, 128),
              torch.zeros(BLOCKS, BLOCK, HEADS)]
-    assert bind_value(slots) is not slots or isinstance(bind_value(slots), list)
     bound = bind_value(slots)
-    assert isinstance(bound, list) and len(bound) == 1 and bound[0] is slots
+    assert len(bound) == 2
+    assert bound[0] is slots[0] and bound[1] is slots[1]
 
 
 def test_a_multi_head_cache_is_handed_over_unreshaped():
@@ -145,9 +150,48 @@ def test_a_tensor_never_comes_back_as_a_list():
         assert bound.numel() > 0
 
 
-def test_a_multi_tensor_cache_still_keeps_its_list():
-    """The indexer's (values, scales) pair is addressed by fixed slot."""
-    pair = (torch.zeros(2, 4), torch.zeros(2, 4))
-    bound = bind_value(pair)
-    assert not isinstance(bound, torch.Tensor)
-    assert bound[0] is pair
+def test_a_multi_tensor_cache_is_handed_over_at_the_same_depth():
+    """The indexer's (values, scales) pair is addressed by fixed slot.
+
+    The earlier version returned [kv_cache] here, wrapping an existing pair in
+    another list and moving every slot index down a level -- so cache[0] gave
+    the whole pair instead of the values. That half never raised: the indexer
+    reads slot 0 and got something, and the SWA failure above it fired first.
+    An error that is only reachable after another error is fixed is not a
+    latent risk, it is a scheduled one.
+    """
+    values, scales = torch.zeros(2, 4), torch.ones(2, 4)
+    bound = bind_value((values, scales))
+    assert len(bound) == 2, "a pair must not come back as a one-element list"
+    assert bound[0] is values and bound[1] is scales
+
+
+def test_a_one_element_list_is_not_several_tensors():
+    """_adjust_kv_layout always returns a list, so SWA arrives wrapped.
+
+    The reshape branch builds its shapes as a list because some specs need two
+    -- a scale beside the values, a nope/rope split -- and hands back a list of
+    one when they do not. Unwrapping here is what makes the consumer's
+    kv_cache.numel() work.
+    """
+    cache = torch.zeros(BLOCKS, BLOCK, 1, HEAD_DIM)
+    bound = bind_value([cache])
+    assert isinstance(bound, torch.Tensor)
+    assert bound.shape == (BLOCKS, BLOCK, HEAD_DIM)
+
+
+def test_nothing_is_ever_wrapped_one_level_deeper():
+    """The invariant behind both halves: this function never adds a level.
+
+    It may remove one (a single-element list, a unit head axis); it must never
+    add one, because every consumer addresses what it is given by position or
+    by attribute, and an extra level silently answers both.
+    """
+    for value in (torch.zeros(2, 2), [torch.zeros(2, 2)],
+                  [torch.zeros(2, 2), torch.zeros(2, 2)],
+                  (torch.zeros(2, 2), torch.zeros(2, 2)), []):
+        bound = bind_value(value)
+        if isinstance(bound, torch.Tensor):
+            continue
+        assert len(bound) == len(value), (
+            f"{type(value).__name__} of {len(value)} came back as {len(bound)}")

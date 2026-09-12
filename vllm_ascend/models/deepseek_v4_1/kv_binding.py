@@ -55,8 +55,27 @@ def bind_value(kv_cache):
     ``'list' object has no attribute 'numel'`` during decode graph capture --
     several frames from here, in upstream code that never asked for a list.
     """
+    if isinstance(kv_cache, (list, tuple)) and len(kv_cache) == 1:
+        # A one-element list is not "several tensors". The page-strided reshape
+        # branch builds its shapes as a list because some specs need two -- a
+        # scale alongside the values, or a nope/rope split -- and hands back a
+        # list of one when they do not. _adjust_kv_layout always returns a list,
+        # so SWA arrives wrapped.
+        inner = kv_cache[0]
+        if isinstance(inner, torch.Tensor):
+            return _drop_head_axis(inner)
     if isinstance(kv_cache, torch.Tensor):
-        if kv_cache.ndim >= 3 and kv_cache.shape[HEAD_AXIS] == 1:
-            return kv_cache.squeeze(HEAD_AXIS)
-        return kv_cache
-    return [kv_cache]
+        return _drop_head_axis(kv_cache)
+    # Several tensors, addressed by fixed slot. Handed over exactly as it came:
+    # the earlier version returned [kv_cache] here, which wrapped an existing
+    # list in another one and moved every slot index down a level. That half
+    # does not raise -- the indexer reads slot 0 and got the whole pair -- and
+    # it stayed invisible while the SWA failure above it fired first.
+    return kv_cache
+
+
+def _drop_head_axis(kv_cache: torch.Tensor) -> torch.Tensor:
+    """The unit head axis, where there is one. Never any other axis."""
+    if kv_cache.ndim >= 3 and kv_cache.shape[HEAD_AXIS] == 1:
+        return kv_cache.squeeze(HEAD_AXIS)
+    return kv_cache
