@@ -220,6 +220,92 @@ class AlignRecorder:
                 "\n".join(problems))
 
 
+def build_row_to_pos(positions: torch.Tensor, *, num_actual_tokens: int,
+                     num_reqs: int) -> torch.Tensor:
+    """The ``row_to_pos`` that :meth:`AlignRecorder.record` wants.
+
+    The right quantity is ``positions`` -- not ``cu_seqlens_q`` (boundaries)
+    and not ``seq_lens`` (per-request totals). But it cannot be handed over as
+    it arrives, for a reason that is invisible in the tensor:
+
+        model_runner_v1.py:1523 / 1530  write self.positions[:total_num_scheduled_tokens]
+        model_runner_v1.py:3889         read  self.positions[:num_tokens_padded]
+
+    and no line anywhere clears the gap between them (the whole file writes
+    ``self.positions[...]`` at four places, none of which touch the tail). So
+    the padding rows carry *last step's* positions: in range, not 0, not -1.
+    Passed through, those rows scatter onto real positions and overwrite真值.
+
+    The recorder's flush-time coverage assertion does catch it -- a position
+    written twice -- but only after the run, and these runs cost a launch. A
+    guard being correct is not a reason to let the defect travel that far.
+
+    Two facts are asserted rather than assumed:
+
+    * **Single request.** ``positions`` is per-request-relative, so two
+      requests both starting at 0 scatter onto each other. ``set_seq_len()``
+      would eventually raise on a second sequence length, but only if they
+      differ; the cheap, exact check is here.
+    * **Row count.** ``num_actual_tokens`` must not exceed the rows, or the
+      slice that is supposed to be padding is real data.
+    """
+    if num_reqs != 1:
+        raise ValueError(
+            f"alignment recording needs a single request, got {num_reqs}. "
+            "positions are per-request, so two requests both start at 0 and "
+            "their rows scatter onto each other -- silently, since every "
+            "value stays in range.")
+    total = int(positions.shape[-1]) if positions.ndim else 0
+    if not 0 <= num_actual_tokens <= total:
+        raise ValueError(
+            f"num_actual_tokens {num_actual_tokens} is outside the {total} "
+            "rows of positions; the tail this marks as padding would then "
+            "cover real tokens.")
+    row_to_pos = positions.detach().reshape(-1).clone().to(torch.int64)
+    row_to_pos[num_actual_tokens:] = -1
+    return row_to_pos
+
+
+def current_row_to_pos(positions: torch.Tensor) -> Optional[torch.Tensor]:
+    """``row_to_pos`` for this forward, or ``None`` when it must not record.
+
+    ``None`` is a third state and not a failure: a profile or dummy run has no
+    metadata dict, and during ACL graph capture ``positions`` is a placeholder
+    (measured: every entry 127), which would map every row to one position and
+    trip the coverage assertion with nothing wrong. Recording in either case
+    produces a dump that looks real.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    from vllm.forward_context import get_forward_context
+
+    try:
+        context = get_forward_context()
+    except AssertionError:
+        return None
+    attn_metadata = getattr(context, "attn_metadata", None)
+    if not isinstance(attn_metadata, dict) or not attn_metadata:
+        # Profile / dummy run: no caches bound, nothing worth recording.
+        return None
+
+    for metadata in attn_metadata.values():
+        num_actual_tokens = getattr(metadata, "num_actual_tokens", None)
+        req = getattr(metadata, "req_metadata", None)
+        starts = getattr(req, "query_start_loc", None)
+        if num_actual_tokens is None or starts is None:
+            continue
+        return build_row_to_pos(positions,
+                                num_actual_tokens=int(num_actual_tokens),
+                                num_reqs=int(starts.numel()) - 1)
+
+    raise ValueError(
+        "no attention metadata in this forward carries both "
+        "num_actual_tokens and a query_start_loc, so the padding boundary is "
+        "unknown. Recording anyway would scatter stale positions over real "
+        f"rows. Metadata seen: {sorted(attn_metadata)[:4]}")
+
+
 def _is_flat_key(key: str) -> bool:
     """True for protocol keys stored as ``[S, ...]`` with no batch axis."""
     return key.startswith("moe_gate.") or key == "moe_routing_margin"
