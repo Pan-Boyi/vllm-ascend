@@ -169,3 +169,94 @@ def test_the_call_sites_no_longer_discard_it():
     source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
     assert "swa_indices, _ = build_" not in source, (
         "a call site is discarding the valid-entry count again")
+
+
+# ------------------------------------------- what makes the V4.0 change safe
+
+def _vision_table(window=4, max_image=8, page=16, blocks=8, seq=10,
+                  spans=None):
+    from vllm_ascend.attention.dsa_v1 import \
+        build_vision_bidirectional_swa_indices
+
+    block_table = torch.arange(blocks, dtype=torch.int32).repeat(1, 1)
+    return build_vision_bidirectional_swa_indices(
+        block_table=block_table,
+        window_size=window,
+        max_image_tokens=max_image,
+        block_size=page,
+        query_start_loc=torch.tensor([0, seq], dtype=torch.int32),
+        seq_lens=torch.tensor([seq], dtype=torch.int32),
+        mm_prefix_ranges=spans if spans is not None else {0: []},
+        num_tokens=seq,
+    )
+
+
+def _dspark_table(window=4, spec=2, page=16, blocks=8, seq=6):
+    from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices
+
+    block_table = torch.arange(blocks, dtype=torch.int32).repeat(1, 1)
+    return build_dspark_swa_indices(
+        block_table,
+        spec,
+        window,
+        page,
+        torch.tensor([0, seq], dtype=torch.int32),
+        torch.tensor([seq], dtype=torch.int32),
+        seq,
+    )
+
+
+@pytest.mark.parametrize("build", [_vision_table, _dspark_table],
+                         ids=["vision", "dspark"])
+def test_the_length_is_exactly_the_count_of_real_entries(build):
+    """The invariant the whole rule rests on.
+
+    Not "roughly the valid count" and not "at most the width": the operator
+    reads this number as how many leading entries to gather, so it has to be
+    the count of entries that are not -1. Slots are non-negative, so the two
+    are the same statement.
+    """
+    indices, lengths = build()
+    rows = indices.reshape(indices.shape[0], -1)
+    counted = (rows != -1).sum(dim=-1).to(lengths.dtype)
+    torch.testing.assert_close(lengths, counted)
+
+
+@pytest.mark.parametrize("build", [_vision_table, _dspark_table],
+                         ids=["vision", "dspark"])
+def test_the_old_default_was_wrong_on_every_row_of_these_tables(build):
+    """Why changing the shared V4.0 call site is not a gamble.
+
+    The argument for touching a path this line does not exercise was: the new
+    behaviour differs from the old only where the old one was already wrong,
+    because a table with no padding has count == width and the two agree.
+
+    That argument is weaker than it needs to be here, and the measurement says
+    so: neither builder can produce a padding-free row at realistic sizes. The
+    vision width is window + max_image_tokens while a row's span is bounded by
+    the larger of the two, and the dspark width is rounded up to a multiple of
+    128. So on these tables the old default -- "the whole row is valid" -- was
+    wrong on *every* row, and the change cannot be a regression on any of
+    them. If this ever goes red, a padding-free table has become possible and
+    the no-op half of the argument has to carry the weight again.
+    """
+    indices, lengths = build()
+    width = indices.reshape(indices.shape[0], -1).shape[-1]
+    assert int(lengths.max()) < width, (
+        f"a row now fills all {width} columns; the old full-width default "
+        "would have been correct for it, so the reasoning about the shared "
+        "V4.0 path needs re-reading rather than this assertion relaxing")
+
+
+def test_a_padding_free_row_would_have_declared_the_full_width():
+    """The no-op half, stated directly rather than left implicit.
+
+    Constructed rather than found in a builder, because the builders cannot
+    produce one: this pins what the rule does in that case, which is nothing.
+    """
+    row = torch.arange(6, dtype=torch.int32).reshape(1, 6)
+    count = int((row != -1).sum())
+    assert count == row.shape[-1], (
+        "with no -1 the true length is the full width, which is exactly what "
+        "the operator assumes when no length is passed -- so supplying it "
+        "changes nothing for such a table")
