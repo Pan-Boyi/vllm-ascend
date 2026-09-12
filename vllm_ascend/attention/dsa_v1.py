@@ -524,6 +524,14 @@ class AscendDSAMetadata:
     def num_prefill_tokens(self) -> int:
         return self.num_actual_tokens - self.num_decode_tokens
 
+    @property
+    def query_start_loc(self) -> torch.Tensor | None:
+        return None if self.req_metadata is None else self.req_metadata.query_start_loc
+
+    @property
+    def block_table(self) -> torch.Tensor | None:
+        return None if self.req_metadata is None else self.req_metadata.block_table
+
 
 DSAMetadataDict: TypeAlias = dict[str, AscendDSAMetadata]
 
