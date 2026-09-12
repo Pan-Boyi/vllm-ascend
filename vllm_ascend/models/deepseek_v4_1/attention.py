@@ -239,6 +239,25 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             candidate_block_buffer=candidate_block_buffer,
         )
 
+        # Kept because three call sites in forward_mqa read it and the base
+        # class does not store it. nn.Module.__getattr__ turns a missing
+        # attribute into an AttributeError at the first forward rather than at
+        # construction, so an unstored config is a runtime failure on a card,
+        # several frames inside upstream code.
+        self.vllm_config = vllm_config
+
+        # Read by forward_mqa and defined by neither this class nor the base.
+        # Upstream's only softmax_scale is DeepseekV4Indexer's -- a different
+        # class, for the indexer's own logits -- so the main MLA scale has no
+        # owner upstream and has to be stated here.
+        #
+        # head_dim ** -0.5, matching AscendDSAImpl (dsa_v1.py:1685), which
+        # feeds the same build_sparse_flash_mla_kwargs from the same operator
+        # family. No YaRN mscale correction: build_deepseek_v4_rope sets
+        # mscale and mscale_all_dim to 0 for every V4 layer, so the usual
+        # scaled-rope adjustment does not apply.
+        self.softmax_scale = self.head_dim**-0.5
+
         # The compressor metadata builder looks its frequency table up by group
         # name -- dsa_v1 builds f"c{ratio}" for every layer with ratio > 1 --
         # and that registry is populated only by constructing an Ascend
