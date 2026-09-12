@@ -139,8 +139,11 @@ class AscendStagedEngramEmbedding:
         self._assert_nothing_was_allocated()
         self._layer_id = None          # bound by the owner; see bind_layer()
 
-        import logging
-        logging.getLogger(__name__).info(
+        # vllm.logger: a bare module logger is silent once vLLM has configured
+        # logging, and this line is the only evidence that the table was left
+        # unallocated.
+        from vllm.logger import logger
+        logger.info(
             "Engram table not allocated: %d rows x %d stays in the staged "
             "read-only mapping, 0 bytes resident and 0 bytes pinned per rank. "
             "Upstream's \"%s\" line is suppressed here because the allocation "

@@ -32,6 +32,8 @@ from vllm_ascend.models.deepseek_v4_1.o_proj import check_grouped_wo_a_layout
 from vllm_ascend.models.deepseek_v4_1.platform_patches import \
     assert_ready_for_ratio_two
 from vllm_ascend.models.deepseek_v4_1.rope_groups import register_rope_groups
+from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+    kv_with_layout_rank
 from vllm_ascend.models.deepseek_v4_1.rope import \
     inverse_rope_from_cos_sin_cache
 from vllm_ascend.utils import oproj_tp_enable
@@ -394,7 +396,9 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
             num_requests=req.query_start_loc.numel() - 1,
-            swa_kv_cache=self._unwrap_cache(self.swa_cache_layer.kv_cache),
+            swa_kv_cache=kv_with_layout_rank(
+                self._unwrap_cache(self.swa_cache_layer.kv_cache),
+                plan.layout_kv),
             swa_block_table=req.block_table,
             cu_seqlens_q=req.query_start_loc,
             seqused_kv=req.seq_lens,

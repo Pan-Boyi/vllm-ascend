@@ -147,6 +147,55 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
     return kwargs
 
 
+#: How many axes each KV layout describes. The operator reads ``ori_kv``'s
+#: stride vector against this and rejects a length mismatch by name
+#: ("Ori_kv strideVec size[3] not match layout_kv expect len[4]"), so the rank
+#: is part of the layout, not a property of the cache.
+#:
+#: The names are the ones LAYOUTS_KV accepts, checked below. Writing the
+#: plausible spelling instead is how this table first went in: "PA_BSND" reads
+#: like the paged sibling of PA_BBND and is not a layout this operator has.
+LAYOUT_KV_RANK = {
+    "PA_BBND": 4,   # blocks, block, heads, dim
+    "BSND": 4,      # batch, seq, heads, dim
+    "TND": 3,       # tokens, heads, dim
+}
+
+
+def kv_with_layout_rank(cache, layout_kv: str):
+    """Give the operator ``ori_kv`` at the rank ``layout_kv`` describes.
+
+    The head axis is dropped on the way in and has to come back here. It is
+    dropped for a real reason -- upstream's own V4.1 consumers read the cache
+    as three dimensions, ``engram.ensure_cache`` calls ``.numel()`` on it and
+    the SWA path asserts ``shape[1:] == (block_size, head_dim)`` -- and the
+    operator wants four. Both are right; the disagreement is about what a KV
+    cache is, and it resolves where the layout is known, which is here.
+
+    Dispatched on the layout rather than unconditionally restored. ``TND`` is
+    three axes, so an unconditional ``unsqueeze`` would hand that plan a tensor
+    of the right rank with the axes meaning something else -- and the operator
+    only checks the stride vector's *length*, so it would be accepted.
+    """
+    expected = LAYOUT_KV_RANK.get(layout_kv)
+    if expected is None:
+        raise ValueError(
+            f"no KV rank recorded for layout_kv={layout_kv!r}; known layouts "
+            f"are {sorted(LAYOUT_KV_RANK)}. Passing the cache through "
+            "unchanged would let the operator check the stride length against "
+            "a layout nothing here understands.")
+    if cache is None or cache.ndim == expected:
+        return cache
+    if cache.ndim == expected - 1 and expected == 4:
+        # The axis bind_value dropped: num_kv_heads, at index -2.
+        return cache.unsqueeze(-2)
+    raise ValueError(
+        f"ori_kv is {cache.ndim}-dimensional ({tuple(cache.shape)}) and "
+        f"layout_kv={layout_kv!r} describes {expected} axes. Only the single "
+        "dropped head axis is restored here; any other difference means the "
+        "cache is not the layout this plan selected.")
+
+
 def build_sparse_flash_mla_kwargs(
     *,
     q: torch.Tensor,

@@ -285,3 +285,80 @@ def test_every_assembled_call_is_validated():
     with pytest.raises(ValueError, match="sparse_flash_mla would reject"):
         build_sparse_flash_mla_kwargs(
             **_common(cmp_ratio=0, attends_compressed=False))
+
+
+def test_a_paged_layout_gets_the_head_axis_back():
+    """bind_value drops it; aclnnSparseFlashMla reads the stride vector against
+    layout_kv and rejects a three-axis ori_kv under PA_BBND by name."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        kv_with_layout_rank
+
+    cache = torch.zeros(4, 32, 512)
+    got = kv_with_layout_rank(cache, "PA_BBND")
+    assert got.shape == (4, 32, 1, 512)
+    assert got.shape[-2] == 1, "the restored axis is num_kv_heads"
+
+
+def test_tnd_is_left_at_three_axes():
+    """The case an unconditional unsqueeze gets wrong.
+
+    TND describes three axes. A fourth would be accepted -- the operator checks
+    the stride vector's length, not what the axes mean -- and the plan would
+    run on a tensor whose axes no longer match its layout.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        kv_with_layout_rank
+
+    cache = torch.zeros(4, 32, 512)
+    assert kv_with_layout_rank(cache, "TND") is cache
+
+
+def test_an_already_correct_rank_is_untouched():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        kv_with_layout_rank
+
+    cache = torch.zeros(4, 32, 1, 512)
+    assert kv_with_layout_rank(cache, "BSND") is cache
+
+
+def test_an_unknown_layout_is_refused_rather_than_passed_through():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        kv_with_layout_rank
+
+    with pytest.raises(ValueError, match="no KV rank recorded"):
+        kv_with_layout_rank(torch.zeros(4, 32, 512), "PA_ND")
+
+
+def test_a_rank_that_is_off_by_more_than_the_head_axis_is_refused():
+    """Only the one axis bind_value drops is restored. Anything else means the
+    cache is not the layout this plan selected, and reshaping it would produce
+    the right stride length over the wrong axes."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        kv_with_layout_rank
+
+    with pytest.raises(ValueError, match="not the layout this plan selected"):
+        kv_with_layout_rank(torch.zeros(4, 512), "PA_BBND")
+
+
+def test_every_layout_the_plans_use_has_a_rank():
+    """The table is derived from the plans, not from the layouts seen so far.
+
+    A plan selecting a layout with no entry would otherwise reach the operator
+    with the cache unchanged.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_attn_kv_plan
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        LAYOUT_KV_RANK, LAYOUTS_KV)
+
+    source = inspect.getsource(dsa_attn_kv_plan)
+    used = {m for m in LAYOUTS_KV if f'"{m}"' in source}
+    assert used, "no layout literals found; the plans moved"
+    missing = used - set(LAYOUT_KV_RANK)
+    assert not missing, f"plans select {sorted(missing)} with no rank recorded"
+    # And no invented names: every entry must be a layout the operator accepts.
+    unknown = set(LAYOUT_KV_RANK) - set(LAYOUTS_KV)
+    assert not unknown, (
+        f"{sorted(unknown)} is not in LAYOUTS_KV; a plausible-looking spelling "
+        "in this table silently never matches")
