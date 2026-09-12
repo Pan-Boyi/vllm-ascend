@@ -431,3 +431,73 @@ def test_a_compressed_stream_is_mode_zero_too_but_for_another_reason():
                     cmp_ratio=2)
     assert kwargs["ori_mask_mode"] == NO_MASK_MODE
     assert kwargs["ori_win_left"] == -1
+
+
+def _tables(num_blocks=8, block=128, max_id=3, longest=256):
+    return dict(
+        ori_kv=torch.zeros(num_blocks, block, 1, 512, dtype=torch.bfloat16),
+        ori_block_table=torch.tensor([[0, max_id]], dtype=torch.int32),
+        seqused_kv=torch.tensor([longest], dtype=torch.int32))
+
+
+def test_a_block_id_past_the_cache_is_refused_with_both_numbers():
+    """The table and the cache arrive from unrelated objects and nothing pairs
+    them. The operator does not range-check, and every core reads through the
+    same table, so one wrong table faults all of them in the same place."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        _check_block_table_addresses_this_cache
+
+    with pytest.raises(ValueError) as exc:
+        _check_block_table_addresses_this_cache(_tables(num_blocks=4, max_id=9))
+    msg = str(exc.value)
+    assert "9" in msg and "4 blocks" in msg
+    assert "another cache group" in msg
+
+
+def test_a_length_past_the_capacity_is_refused():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        _check_block_table_addresses_this_cache
+
+    with pytest.raises(ValueError, match="longest sequence"):
+        _check_block_table_addresses_this_cache(
+            _tables(num_blocks=2, block=128, max_id=1, longest=257))
+
+
+def test_a_matching_pair_passes():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        _check_block_table_addresses_this_cache
+
+    assert _check_block_table_addresses_this_cache(_tables()) is None
+
+
+def test_an_empty_table_fails_as_unchecked_not_as_a_pass():
+    """Zero coverage and a clean run look identical from the outside."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        _check_block_table_addresses_this_cache
+
+    kwargs = _tables()
+    kwargs["ori_block_table"] = torch.zeros((0, 2), dtype=torch.int32)
+    with pytest.raises(ValueError, match="did not run"):
+        _check_block_table_addresses_this_cache(kwargs)
+
+
+def test_missing_lengths_fail_as_unchecked_too():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        _check_block_table_addresses_this_cache
+
+    kwargs = _tables()
+    del kwargs["seqused_kv"]
+    with pytest.raises(ValueError, match="capacity check did"):
+        _check_block_table_addresses_this_cache(kwargs)
+
+
+def test_the_bounds_come_from_the_tensor_not_a_configured_value():
+    """A configured num_blocks is true of both groups, which is the confusion
+    this exists to catch."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args
+
+    body = inspect.getsource(
+        sparse_attn_args._check_block_table_addresses_this_cache)
+    assert "int(cache.shape[0])" in body and "int(cache.shape[1])" in body

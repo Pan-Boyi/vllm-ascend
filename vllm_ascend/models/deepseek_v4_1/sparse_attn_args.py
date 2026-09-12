@@ -91,6 +91,84 @@ def _check(condition: bool, operator_message: str, detail: str = "") -> None:
         + (f"\n  {detail}" if detail else ""))
 
 
+def _check_block_table_addresses_this_cache(kwargs: dict[str, Any],
+                                            cache_group_key=None,
+                                            owner_key=None) -> None:
+    """Refuse a block table that does not belong with the cache it is paired with.
+
+    Two separate questions, because the cheap one does not cover the dangerous
+    case.
+
+    *Range*: the table's highest block id must be inside the cache. These
+    arguments arrive from unrelated places -- the table from the attention
+    metadata, the cache from the layer -- and the operator does not range-check
+    them. Every core reads its slice through the same table, so one wrong table
+    is one fault in the same place on all of them.
+
+    *Identity*: a table from another cache group can be entirely in range --
+    when that group has as many blocks or more, every id is valid and simply
+    addresses the wrong memory. Range says the numbers fit; only the two
+    objects' own account of which group they belong to says they are the same
+    allocation.
+
+    Bounds are read from the tensor passed here, never from a configured
+    num_blocks: a configured value is true of both groups, which is the
+    confusion being checked for.
+
+    ⚠️ ``.max()`` synchronises, once per layer per step. Affordable while the
+    priority is finding a fault, not afterwards. TRIGGER: the first performance
+    measurement that includes this path.
+    """
+    if cache_group_key is not None and owner_key is not None \
+            and cache_group_key != owner_key:
+        raise ValueError(
+            f"the attention metadata reports cache group {cache_group_key!r} "
+            f"and the cache tensor belongs to {owner_key!r}. Every id in the "
+            "block table may still be in range -- a group with as many blocks "
+            "or more makes them all valid -- so this is not caught by bounds. "
+            "The two objects disagree about which allocation they describe.")
+
+    # seqused_kv, not seqused_ori_kv: this runs inside the builder, and the
+    # rename happens later, in the sparse_flash_mla adapter. Reading the
+    # renamed key here finds nothing and the capacity check reports itself as
+    # not run -- which the existing tests caught before a launch did.
+    for table_key, cache_key, used_key in (
+            ("ori_block_table", "ori_kv", "seqused_kv"),
+            ("cmp_block_table", "cmp_kv", "seqused_cmp_kv")):
+        table = kwargs.get(table_key)
+        cache = kwargs.get(cache_key)
+        if table is None or cache is None:
+            continue
+        num_blocks, block_size = int(cache.shape[0]), int(cache.shape[1])
+        if table.numel() == 0:
+            raise ValueError(
+                f"{table_key} is empty, so this check did not run. An empty "
+                "table is not a batch needing no blocks; it addresses nothing.")
+        highest = int(table.max())
+        if highest >= num_blocks:
+            raise ValueError(
+                f"{table_key}'s highest block id is {highest} and {cache_key} "
+                f"holds {num_blocks} blocks. These come from different "
+                "objects: the table from the attention metadata, the cache "
+                "from the layer. An id at or past the end most likely means "
+                "the table belongs to another cache group -- V4.1 has several, "
+                "with different block counts.")
+        used = kwargs.get(used_key)
+        if used is None or used.numel() == 0:
+            raise ValueError(
+                f"{used_key} is missing or empty, so the capacity check did "
+                f"not run against {cache_key}. Calling that a pass would claim "
+                "coverage this call does not have.")
+        capacity = num_blocks * block_size
+        longest = int(used.max())
+        if longest > capacity:
+            raise ValueError(
+                f"{used_key}'s longest sequence is {longest} tokens and "
+                f"{cache_key} holds {capacity} ({num_blocks} blocks of "
+                f"{block_size}). Lengths and cache are sized by different code "
+                "paths; a length past the end reads another allocation.")
+
+
 def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                                    num_requests: int) -> dict[str, Any]:
     """Check one assembled call. Returns the kwargs so it can wrap a build."""
@@ -170,6 +248,7 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                    "cmp_residual_kv incorrect shape dim. It should be 1",
                    f"got {residual.numel()} values for {num_requests} requests")
 
+    _check_block_table_addresses_this_cache(kwargs)
     return kwargs
 
 

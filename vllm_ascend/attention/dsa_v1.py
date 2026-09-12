@@ -1134,6 +1134,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         and the window bounds at -1; so does a layer attending a compressed
         stream. Only window-bounds-without-indices is sliding-window mode.
         """
+        # Keyed on the compression ratio alone. That assumes two cache groups
+        # with the same ratio can share one descriptor, and nothing checks the
+        # assumption -- an unchecked implication and a verified equivalence
+        # look the same in the source. The descriptor encodes a per-core split
+        # of the query tokens, so what it really depends on is query_start_loc,
+        # max_seqlen_q and the head count; those happen to be identical across
+        # groups within one build, which is why this is safe today rather than
+        # by construction. The dict is a local rebuilt every
+        # _build_attention_metadata, so nothing survives a forward.
         sas_metadata = metadata_cache.get(layer_name)
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
