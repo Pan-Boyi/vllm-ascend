@@ -222,6 +222,12 @@ def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int
     return max(compress_ratio, 1)
 
 
+def is_deepseek_v41_text(hf_text_config) -> bool:
+    """V4.1 only. V4.0's descriptor values are the defaults and stay put."""
+    return str(getattr(hf_text_config, "model_type", "")).startswith(
+        "deepseek_v41")
+
+
 def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
     """Does this layer's attention read a compressed stream?
 
@@ -1094,7 +1100,28 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_seqlen_kv: int | torch.Tensor,
         cu_seqlens_ori_kv: torch.Tensor | None,
         cu_seqlens_cmp_kv: torch.Tensor | None,
+        ori_mask_mode: int | None = None,
+        ori_win_left: int | None = None,
+        ori_win_right: int | None = None,
+        has_cmp_kv: bool | None = None,
     ) -> torch.Tensor:
+        """Build the descriptor the sparse-attention operator reads its tiling
+        from.
+
+        The four mask/window parameters default to the values V4.0 hard-coded
+        here, so every existing call site produces a byte-identical descriptor.
+        They are parameters because the descriptor and the operator call must
+        agree item by item: the kernel derives its tiling from this blob and
+        then receives the real arguments, and a disagreement is not rejected --
+        it surfaced as an aicore exception with tilingKey 0 and every core
+        failing at once.
+
+        V4.1 needs different values on two of its three configurations. A layer
+        whose original stream is selected by an explicit index list is in the
+        operator's "ori-only sparse mode", which requires both mask modes at 0
+        and the window bounds at -1; so does a layer attending a compressed
+        stream. Only window-bounds-without-indices is sliding-window mode.
+        """
         sas_metadata = metadata_cache.get(layer_name)
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
@@ -1127,14 +1154,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 batch_size=len(seq_lens),
                 cmp_topk=index_topk if self.compressor_ratio == 4 else 0,
                 cmp_ratio=cmp_ratio,
-                ori_mask_mode=4,  # 4:sliding window
+                # 4: sliding window. None means "what V4.0 passes", so the
+                # descriptor is unchanged for every caller that does not care.
+                ori_mask_mode=4 if ori_mask_mode is None else ori_mask_mode,
                 cmp_mask_mode=3,  # 3:causal
-                ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                ori_win_right=0,
+                ori_win_left=(self.model_config.hf_config.sliding_window - 1
+                              if ori_win_left is None else ori_win_left),
+                ori_win_right=0 if ori_win_right is None else ori_win_right,
                 layout_q="TND",
                 layout_kv=_dsa_layout_kv(self.vllm_config),
                 has_ori_kv=True,
-                has_cmp_kv=self.compressor_ratio > 1,
+                has_cmp_kv=(self.compressor_ratio > 1
+                            if has_cmp_kv is None else has_cmp_kv),
             )
             metadata_cache[layer_name] = sas_metadata
 
@@ -1321,6 +1352,31 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         elif has_prefill:
             cu_seqlens_ori_kv = query_start_loc
 
+        # The descriptor and the operator call must agree item by item: the
+        # kernel takes its tiling from the descriptor and then receives the
+        # real arguments, and a disagreement is not rejected -- it appeared as
+        # an aicore exception with tilingKey 0 and every core failing at once.
+        #
+        # An empty dict leaves V4.0's hard-coded values in place. V4.1 computes
+        # them from the same facts its call site uses, so the two cannot drift:
+        # an explicit index list puts the operator in ori-only sparse mode,
+        # which takes mask mode 0 and no window bounds, and so does a
+        # compressed stream. Only window-bounds-without-indices is sliding
+        # window.
+        sas_mask_kwargs: dict = {}
+        if is_deepseek_v41_text(self.model_config.hf_text_config):
+            attends_cmp = attends_compressed_stream(self.compressor_ratio,
+                                                    self.vllm_config)
+            has_indices = vision_swa_indices is not None or (
+                not attends_cmp and dspark_swa_indices is not None)
+            plain_window = not attends_cmp and not has_indices
+            sas_mask_kwargs = {
+                "ori_mask_mode": 4 if plain_window else 0,
+                "ori_win_left": ori_win_left if plain_window else -1,
+                "ori_win_right": ori_win_right if plain_window else -1,
+                "has_cmp_kv": attends_cmp,
+            }
+
         if self._device_metadata_enabled:
 
             def build_sas_metadata() -> None:
@@ -1333,6 +1389,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     max_seqlen_kv=max_seqlen_kv,
                     cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                     cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                    **sas_mask_kwargs,
                 )
 
             def build_qli_metadata() -> None:
@@ -1366,6 +1423,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_kv=max_seqlen_kv,
                 cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                **sas_mask_kwargs,
             )
             qli_metadata = self._build_qli_metadata(
                 metadata_cache=metadata_cache,

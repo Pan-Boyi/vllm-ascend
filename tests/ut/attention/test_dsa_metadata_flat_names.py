@@ -205,3 +205,70 @@ def test_both_builder_sites_publish_the_per_token_mapping():
 
     source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
     assert source.count("token_slot_mapping=") == 2
+
+
+def test_the_descriptor_defaults_are_v40s_hardcoded_values():
+    """The one path by which V4.1's change could reach V4.0.
+
+    Every V4.0 call site omits these parameters, so the defaults are what it
+    gets. This is the exception to "do not write invariants against V4.0": the
+    whole purpose of these defaults is that changing one silently changes V4.0's
+    descriptor, which is the harm the parameterisation was chosen to avoid.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+
+    sig = inspect.signature(dsa_v1.AscendDSAMetadataBuilder._build_sas_metadata)
+    for name in ("ori_mask_mode", "ori_win_left", "ori_win_right",
+                 "has_cmp_kv"):
+        assert sig.parameters[name].default is None, (
+            f"{name} must default to None so the body applies V4.0's value; a "
+            "literal default here would be a second place to keep in step")
+
+    body = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder._build_sas_metadata)
+    assert "4 if ori_mask_mode is None else ori_mask_mode" in body
+    assert "sliding_window - 1\n" in body or "sliding_window - 1" in body
+    assert "0 if ori_win_right is None else ori_win_right" in body
+    assert "self.compressor_ratio > 1\n" in body or "compressor_ratio > 1" in body
+
+
+def test_v40_call_sites_pass_none_of_them():
+    """B' holds only while V4.0's callers stay unchanged."""
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+
+    # Scoped to _build_sas_metadata: build_for_drafting constructs its own
+    # descriptor with its own literals, and that path is V4.0's speculative
+    # decoding, which this change does not touch.
+    body = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder._build_sas_metadata)
+    assert body.count("ori_mask_mode=") == 1, (
+        "only the descriptor operator call may name ori_mask_mode here; a "
+        "caller passing it directly would bypass the parameter")
+    source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
+    assert source.count("**sas_mask_kwargs") == 2, (
+        "both _build_sas_metadata call sites must forward the triple, or one "
+        "path silently keeps V4.0's descriptor while the call uses V4.1's")
+
+
+def test_the_descriptor_and_the_call_agree_on_the_mask_triple():
+    """The invariant, stated without reference to V4.0.
+
+    The kernel takes its tiling from the descriptor and then receives the real
+    arguments; a disagreement is not rejected. Both sides derive the triple
+    from the same two facts, so this pins that they use the same rule rather
+    than two rules that happen to agree.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+    from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args
+
+    builder = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
+    caller = inspect.getsource(sparse_attn_args._is_plain_sliding_window)
+    # Descriptor side: mode 4 only when plain sliding window.
+    assert '"ori_mask_mode": 4 if plain_window else 0' in builder
+    # Call side: the same predicate, spelled from the same two facts.
+    assert "not attends_compressed and ori_sparse_indices is None" in caller
+    assert "plain_window = not attends_cmp and not has_indices" in builder

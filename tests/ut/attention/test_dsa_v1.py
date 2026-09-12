@@ -127,16 +127,21 @@ def _make_forward_context():
 
 
 def _make_vllm_config(num_speculative_tokens: int | None = None) -> SimpleNamespace:
+    # hf_text_config is always present on the real ModelConfig; a stub without
+    # it describes a type that cannot exist, and the code under test reads it
+    # to decide whether the model is V4.1.
+    hf_config = SimpleNamespace(
+        model_type="test",
+        num_attention_heads=64,
+        index_topk=512,
+        index_n_heads=64,
+        index_head_dim=128,
+        qk_rope_head_dim=4,
+        sliding_window=4096,
+    )
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            model_type="test",
-            num_attention_heads=64,
-            index_topk=512,
-            index_n_heads=64,
-            index_head_dim=128,
-            qk_rope_head_dim=4,
-            sliding_window=4096,
-        ),
+        hf_config=hf_config,
+        hf_text_config=hf_config,
         enable_sleep_mode=False,
         get_head_size=lambda: 512,
     )
@@ -1694,7 +1699,9 @@ def test_pcp_metadata_builds_from_manager_global_view():
     builder._pcp_world_size = 2
     builder._pcp_rank = 1
     builder._hidden_restore_idx_buffer = torch.empty(8, dtype=torch.int64)
-    builder.model_config = SimpleNamespace(get_head_size=lambda: 512)
+    builder.model_config = SimpleNamespace(
+        get_head_size=lambda: 512,
+        hf_text_config=SimpleNamespace(model_type="test"))
 
     raw_slot_mapping = torch.arange(6, dtype=torch.int64)
     hidden_restore_idx = torch.arange(5, dtype=torch.int64)
@@ -1821,7 +1828,9 @@ def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool):
     builder._pcp_world_size = 2
     builder._pcp_rank = 1
     builder._hidden_restore_idx_buffer = torch.empty(8, dtype=torch.int64)
-    builder.model_config = SimpleNamespace(get_head_size=lambda: 512)
+    builder.model_config = SimpleNamespace(
+        get_head_size=lambda: 512,
+        hf_text_config=SimpleNamespace(model_type="test"))
 
     global_slot_mappings = (
         torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
