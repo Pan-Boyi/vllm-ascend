@@ -507,3 +507,57 @@ def test_both_construction_time_hooks_are_called():
                              ._allocate_staging_at_construction)
     assert "allocate_staging(" in body
     assert "bind_staged_tables(" in body
+
+
+def test_the_callers_per_token_buffer_becomes_gathered_rows():
+    """Upstream hands [num_tokens, n_hash_cols, dim]; the kernel wants rows.
+
+    Both are right about their own axis. EngramLayout.row_index is
+    token * n_hash_cols + col, which is exactly the row-major order of the
+    first two axes, so one buffer answers both descriptions.
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _flatten_out_rows
+
+    out = torch.zeros(8, 24, 256)
+    flat = _flatten_out_rows(out, 8 * 24)
+    assert flat.shape == (192, 256)
+    # The same storage, so the kernel's writes are the caller's reads.
+    flat[5, 0] = 3.5
+    assert out[0, 5, 0] == 3.5
+
+
+def test_an_already_flat_buffer_is_passed_through():
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _flatten_out_rows
+
+    out = torch.zeros(192, 256)
+    assert _flatten_out_rows(out, 192) is out
+
+
+def test_a_non_contiguous_buffer_is_refused_rather_than_copied():
+    """reshape would return a copy, the kernel would fill the copy, and the
+    caller would read back its previous contents with nothing raised."""
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _flatten_out_rows
+
+    out = torch.zeros(8, 24, 512)[:, :, ::2]        # non-contiguous view
+    assert not out.is_contiguous()
+    with pytest.raises(ValueError, match="not contiguous"):
+        _flatten_out_rows(out, 8 * 24)
+
+
+def test_a_hash_column_count_mismatch_says_which_two_numbers():
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _flatten_out_rows
+
+    with pytest.raises(ValueError, match="disagree about how many hash columns"):
+        _flatten_out_rows(torch.zeros(8, 12, 256), 8 * 24)
+
+
+def test_a_flat_buffer_of_the_wrong_length_is_refused():
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _flatten_out_rows
+
+    with pytest.raises(ValueError, match="already in"):
+        _flatten_out_rows(torch.zeros(8, 256), 192)

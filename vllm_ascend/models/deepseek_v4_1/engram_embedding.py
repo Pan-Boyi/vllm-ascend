@@ -369,15 +369,63 @@ class AscendStagedEngramEmbedding:
         scales are ``n_scales`` contiguous bytes per row, read with
         ``tl.arange`` and broadcast.
         """
+        flat = _flatten_out_rows(out, rows)
         if envs_dsv41_engram_dequant_torch():
             dequantize_staged_torch(
-                self._dev_weight[:rows], self._dev_scale[:rows], out,
+                self._dev_weight[:rows], self._dev_scale[:rows], flat,
                 quant_block=self._layout.quant_block)
             return
 
         launch = _staged_dequant_launcher()
-        launch(self._dev_weight[:rows], self._dev_scale[:rows], out,
+        launch(self._dev_weight[:rows], self._dev_scale[:rows], flat,
                dim=self._layout.dim, quant_block=self._layout.quant_block)
+
+
+def _flatten_out_rows(out: torch.Tensor, rows: int) -> torch.Tensor:
+    """The caller's per-token view, as the per-gathered-row view the kernel takes.
+
+    Upstream allocates ``staged_rows`` as ``[max_tokens, n_hash_cols, dim]`` and
+    hands over ``[num_tokens, n_hash_cols, dim]``; the kernel indexes one
+    gathered row per program and wants ``[num_tokens * n_hash_cols, dim]``.
+    Both are right about their own axis, and the two disagree about what a row
+    is -- which is why the kernel's guard fired with 192 against 8 rather than
+    with anything about shapes.
+
+    The flattening is not a choice. ``EngramLayout.row_index`` is
+    ``token * n_hash_cols + col``, which *is* the row-major order of the first
+    two axes, so the same memory answers both descriptions. That identity is
+    the contract the CPU gather already relies on.
+
+    ``view`` rather than ``reshape``, deliberately: reshape on a
+    non-contiguous tensor returns a **copy**, the kernel writes into the copy,
+    and the caller reads back whatever its buffer held before -- no error
+    anywhere. view raises instead, which is the outcome worth having.
+    """
+    if out.ndim == 2:
+        if out.shape[0] != rows:
+            raise ValueError(
+                f"the output buffer has {out.shape[0]} rows and the gather "
+                f"produced {rows}. A two-dimensional buffer is already in "
+                "gathered-row order, so these have to match.")
+        return out
+    if out.ndim == 3:
+        if out.shape[0] * out.shape[1] != rows:
+            raise ValueError(
+                f"the output buffer is {tuple(out.shape)}, whose first two "
+                f"axes give {out.shape[0] * out.shape[1]} rows, but the gather "
+                f"produced {rows}. The buffer is [num_tokens, n_hash_cols, "
+                "dim]; a mismatch means the caller and the gather disagree "
+                "about how many hash columns a token has.")
+        if not out.is_contiguous():
+            raise ValueError(
+                f"the output buffer {tuple(out.shape)} is not contiguous, so "
+                "it cannot be viewed as gathered rows. Reshaping it would copy, "
+                "the kernel would write into the copy, and the caller would "
+                "read back its previous contents with nothing raised.")
+        return out.view(rows, out.shape[-1])
+    raise ValueError(
+        f"the output buffer has {out.ndim} dimensions; this takes "
+        "[rows, dim] or [num_tokens, n_hash_cols, dim].")
 
 
 #: Where the kernel lives. The package path is where it belongs; the
