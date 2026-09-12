@@ -95,11 +95,16 @@ def _check_block_table_fits(kwargs: dict[str, Any]) -> None:
         logger.error(
             "【SFM-META #%d】metadata: numel=%d 非零=%d data_ptr=0x%x dtype=%s | "
             "调用侧 has_cmp_kv=%s cmp_topk=%s cmp_ratio=%s ori_mask_mode=%s "
-            "cmp_mask_mode=%s cmp_sparse_indices=%s seqused_cmp_kv=%s",
+            "cmp_mask_mode=%s ori_win=(%s,%s) ori_sparse_indices=%s "
+            "cmp_sparse_indices=%s seqused_cmp_kv=%s",
             n, md.numel(), nz, md.data_ptr(), md.dtype,
             kwargs.get("has_cmp_kv"), kwargs.get("cmp_topk"),
             kwargs.get("cmp_ratio"), kwargs.get("ori_mask_mode"),
             kwargs.get("cmp_mask_mode"),
+            kwargs.get("ori_win_left"), kwargs.get("ori_win_right"),
+            # mask mode 0 要的是 ori 这张表，不是 cmp 那张。两张表不同名不同物，
+            # 混了就会得出一个"独立成立"的假违规。
+            "有" if kwargs.get("ori_sparse_indices") is not None else "无",
             "有" if kwargs.get("cmp_sparse_indices") is not None else "无",
             "有" if kwargs.get("seqused_cmp_kv") is not None else "无",
         )
