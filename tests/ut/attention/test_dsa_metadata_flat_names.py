@@ -169,3 +169,39 @@ def test_the_enumeration_was_taken_from_upstream_not_from_failures():
     assert not unknown, (
         f"upstream reads {sorted(unknown)} off the SWA metadata and this list "
         "does not mention them")
+
+
+def test_slot_mapping_falls_back_when_the_field_is_nulled():
+    """dsa_v1 sets the field to None for compressing groups, on purpose.
+
+    Their compressed stream is scattered by its own operator, so a per-token
+    mapping there would be misleading. V4.1's indexer K writer needs one at
+    every ratio -- _produce_k reads it through this property -- so the null is
+    kept as a field and answered here.
+    """
+    class _Req:
+        slot_mapping = None
+        token_slot_mapping = torch.arange(4, dtype=torch.int32)
+
+    assert torch.equal(_metadata(req_metadata=_Req()).slot_mapping,
+                       _Req.token_slot_mapping)
+
+
+def test_an_explicit_slot_mapping_wins():
+    class _Req:
+        slot_mapping = torch.zeros(2, dtype=torch.int32)
+        token_slot_mapping = torch.ones(2, dtype=torch.int32)
+
+    assert torch.equal(_metadata(req_metadata=_Req()).slot_mapping,
+                       _Req.slot_mapping)
+
+
+def test_both_builder_sites_publish_the_per_token_mapping():
+    """A site that forgets it leaves the property returning None again, which
+    is the failure this replaced -- an AttributeError on .shape one frame in."""
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+
+    source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
+    assert source.count("token_slot_mapping=") == 2

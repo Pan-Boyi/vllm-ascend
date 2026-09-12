@@ -21,14 +21,17 @@ mutually exclusive at the operator boundary: a layer that attends a compressed
 stream must disable its window bounds, and a layer that does not must keep
 them.
 
-⚠️ One stated constraint is deliberately **not** modelled here: "ori-only
-sparse mode requires both mask modes to be 0". Checking it needs a way to tell
-"ori-only sparse mode" -- which uses explicit ori_sparse_indices -- from plain
-sliding-window mode, which also has no compressed stream but does pass mask
-mode 4. Nothing measured distinguishes them, and inventing a rule to tell them
-apart would reject valid calls or accept invalid ones with equal confidence.
-It is recorded here rather than silently assumed away; it remains a live
-constraint that this function will not catch for you.
+"Ori-only sparse mode requires both mask modes to be 0" was left unmodelled
+here for a while, because telling that mode from plain sliding-window mode
+needed a signal nothing measured provided -- both have no compressed stream,
+and inventing a rule would have rejected valid calls or accepted invalid ones
+with equal confidence. The operator supplied the signal on the first real
+forward, by refusing (4, 0) for a call that passed ori_sparse_indices.
+
+So the rule is now modelled, from a measurement rather than a reading: an
+explicit index list selects the original stream, which is mode 0, and the
+window bounds have nothing left to say. Three configurations, two of them mode
+0 for different reasons, and only window-bounds-without-indices is mode 4.
 
 That distinction matters because of the asymmetry in how the two fail: window
 bounds alongside a compressed stream are rejected outright, while a wrong mask
@@ -50,11 +53,34 @@ LAYOUTS_KV = ("TND", "BSND", "PA_BBND")
 #: the 64 rope dims are part of this 512 rather than declared separately.
 HEAD_DIM = 512
 
-#: Mask mode for a layer that attends only its own (window) stream, and the
-#: mode required once a compressed stream is present.
-ORI_ONLY_MASK_MODE = 4
-COMPRESSED_MASK_MODE = 0
+#: Sliding-window mask mode, for a layer that attends its own stream by window
+#: bounds rather than by an explicit index list.
+SLIDING_WINDOW_MASK_MODE = 4
+#: The mode required once a compressed stream is present, and also the one
+#: required when the original stream is selected by explicit indices -- the
+#: operator calls that "ori-only sparse mode" and refuses anything else:
+#: "Parameters ori_mask_mode and cmp_mask_mode ... have incorrect values 4, 0.
+#: Ori-only sparse mode requires both mask modes to be 0."
+NO_MASK_MODE = 0
 CMP_MASK_MODE = 3
+
+
+def _is_plain_sliding_window(attends_compressed: bool,
+                             ori_sparse_indices) -> bool:
+    """Whether this call is sliding-window mode rather than one of the two
+    mode-0 configurations.
+
+    The distinguishing signal is the explicit index list, and it was not a
+    guess: the module docstring recorded that nothing measured separated
+    "ori-only sparse mode" from plain sliding window, and left the constraint
+    unmodelled rather than invent a rule. The operator then answered, by
+    refusing (4, 0) on the first real forward -- a call that supplied
+    ori_sparse_indices with mask mode 4.
+
+    So indices present means the original stream is selected by that list, and
+    the window bounds have nothing left to say.
+    """
+    return not attends_compressed and ori_sparse_indices is None
 
 
 def _check(condition: bool, operator_message: str, detail: str = "") -> None:
@@ -243,9 +269,20 @@ def build_sparse_flash_mla_kwargs(
         metadata=metadata,
         softmax_scale=softmax_scale,
         cmp_ratio=cmp_ratio,
-        ori_mask_mode=COMPRESSED_MASK_MODE if attends_compressed else ORI_ONLY_MASK_MODE,
-        ori_win_left=-1 if attends_compressed else ori_win_left,
-        ori_win_right=-1 if attends_compressed else ori_win_right,
+        # Three configurations, two of which use mode 0 for different reasons:
+        # a compressed stream is present, or the original stream is selected by
+        # an explicit index list. Only the third -- window bounds, no indices --
+        # is sliding-window mode. Window bounds go to -1 whenever the mode is
+        # not 4, because "non-sliding-window modes require ori_win_left =
+        # ori_win_right = -1".
+        ori_mask_mode=(SLIDING_WINDOW_MASK_MODE
+                       if _is_plain_sliding_window(attends_compressed,
+                                                   ori_sparse_indices)
+                       else NO_MASK_MODE),
+        ori_win_left=(ori_win_left if _is_plain_sliding_window(
+            attends_compressed, ori_sparse_indices) else -1),
+        ori_win_right=(ori_win_right if _is_plain_sliding_window(
+            attends_compressed, ori_sparse_indices) else -1),
         layout_q="TND",
         layout_kv=layout_kv,
     )

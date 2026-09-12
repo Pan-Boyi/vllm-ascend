@@ -478,6 +478,11 @@ class AscendDSAReqMetadata:
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
+    #: The per-token slots for this group, published whatever the ratio.
+    #: slot_mapping above is None for compressing groups by design; this is
+    #: not, because V4.1's indexer K writer needs it at every ratio. Placed
+    #: last because a defaulted field cannot precede the undefaulted ones.
+    token_slot_mapping: torch.Tensor | None = None
 
 
 @dataclass
@@ -523,7 +528,24 @@ class AscendDSAMetadata:
 
     @property
     def slot_mapping(self) -> torch.Tensor | None:
-        return None if self.req_metadata is None else self.req_metadata.slot_mapping
+        """Per-token slots, for upstream's V4.1 readers.
+
+        The field of the same name on AscendDSAReqMetadata is deliberately None
+        when the group compresses: that stream is scattered by its own operator
+        and a per-token mapping there would be misleading. V4.1's indexer K
+        writer needs one at every ratio -- it writes the indexer cache at group
+        boundaries, and _produce_k reads it through this name -- so the null is
+        kept as a field and answered here, from the mapping the builder
+        publishes unconditionally.
+
+        Scoped by being a property: V4.0 reads the field directly and is
+        unaffected.
+        """
+        if self.req_metadata is None:
+            return None
+        if self.req_metadata.slot_mapping is not None:
+            return self.req_metadata.slot_mapping
+        return self.req_metadata.token_slot_mapping
 
     @property
     def num_prefill_tokens(self) -> int:
@@ -1367,6 +1389,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_compressed_tokens = self.num_actual_tokens
             slot_mapping = self.slot_mapping[: self.num_actual_tokens]
 
+        # Published whatever the ratio. The variable above is None for
+        # compressing groups on purpose -- their compressed stream is scattered
+        # by its own operator -- but the per-token mapping is computed either
+        # way, and V4.1's indexer K writer needs it at every ratio.
+        token_slot_mapping = self.slot_mapping[: self.num_actual_tokens]
+
         qli_cu_seqlens_q = None
         qli_seqused_k = None
         qli_cmp_residual_k = None
@@ -1382,6 +1410,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             block_table=self.block_table[:num_reqs, ...],
             seq_lens=seq_lens,
             slot_mapping=slot_mapping,
+            token_slot_mapping=token_slot_mapping,
             storage_block_size=self.storage_block_size,
             query_start_loc=query_start_loc,
             num_compressed_tokens=num_compressed_tokens,
@@ -1608,6 +1637,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             block_table=self.block_table[:num_reqs, ...],
             seq_lens=seq_lens,
             slot_mapping=slot_mapping,
+            # Never None on this path, so the two are the same tensor.
+            token_slot_mapping=slot_mapping,
             storage_block_size=self.storage_block_size,
             query_start_loc=query_start_loc,
             num_compressed_tokens=self.num_actual_tokens,
