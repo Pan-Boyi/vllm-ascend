@@ -148,6 +148,51 @@ class AscendStagedEngramEmbedding:
             getattr(self, "part_num_embeddings", -1),
             getattr(self, "dim", -1), _STALE_OFFLOAD_LOG)
 
+        self._allocate_staging_at_construction()
+
+    def _allocate_staging_at_construction(self) -> None:
+        """Size the per-step buffers here, not on first lookup.
+
+        Three constraints and only one place satisfies all of them.
+
+        *Before graph capture.* Replay reads the device addresses recorded at
+        capture, so a buffer allocated later -- on the first lookup, say -- is a
+        different address than the one the graph replays against, and nothing
+        reports it. Construction is the only point guaranteed to precede
+        capture.
+
+        *Once per worker.* Each rank builds its own layer, so this runs exactly
+        once each without a registry to keep in step.
+
+        *Sized to the batch, not the sequence.* ``lookup`` receives one row per
+        token in the forward, so the bound is
+        ``scheduler_config.max_num_batched_tokens`` -- 4096 here -- not
+        ``max_model_len``. Those differ by a factor of two and the wrong one is
+        not free in either direction: too large wastes about 52 MB a layer, too
+        small raises at the first batch that exceeds it. The tight one is taken
+        because ``lookup`` already refuses an oversized batch by name, so a
+        mistake here surfaces as that error rather than as an overrun. It also
+        matches what rope_dsv4 sizes its own per-step buffers with, which is the
+        same quantity for the same reason.
+        """
+        from vllm.config import get_current_vllm_config
+        from vllm.platforms import current_platform
+
+        from vllm_ascend.models.deepseek_v4_1.engram_layout import EngramLayout
+
+        vllm_config = get_current_vllm_config()
+        if vllm_config is None:
+            raise RuntimeError(
+                "engram staging cannot be sized: no vllm config is current "
+                "during construction. Deferring the allocation to the first "
+                "lookup would place it after graph capture, and replay reads "
+                "the addresses recorded at capture -- which fails silently, "
+                "not loudly.")
+        self.allocate_staging(
+            EngramLayout.from_config(vllm_config.model_config.hf_text_config),
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            current_platform.device_type)
+
     # -- guards --------------------------------------------------------------
 
     def _assert_nothing_was_allocated(self) -> None:
