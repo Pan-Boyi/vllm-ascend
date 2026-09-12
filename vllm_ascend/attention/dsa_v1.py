@@ -921,6 +921,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.common_ratio_to_sas_metadata: dict | None = None
         self.seq_lens: torch.Tensor = None
 
+        # 🔴 Reading this first is not enough, and switching it on proved it:
+        # ``compressor_ratio`` itself has two jobs. Below it names the stream
+        # (attends_compressed_stream, the mask decisions), but it also feeds
+        # ``tokens_per_state`` at :1168 and :1681, which
+        # ``AscendDSAMetadata.block_size`` multiplies the storage page by at
+        # :596. So redirecting this reader moved the page size as well: a
+        # ratio-2 layer reported block_size 64 against a (55737, 32, 512)
+        # cache. The field is never *itself* arithmetic -- but the variable it
+        # was routed into is, and stating the first was not a check on the
+        # second. Reviving VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO means splitting
+        # this into two names, not turning it back on.
+        #
         # The layer's configured stream ratio, when a spec states one. It is
         # consulted first because it is the only field here that can hold 0:
         # both fallbacks below are page divisors, which clamp 0 to 1 and make

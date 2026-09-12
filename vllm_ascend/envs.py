@@ -125,9 +125,22 @@ env_variables: dict[str, Callable[[], Any]] = {
     # clamped to 1 for the page arithmetic and read back as "this layer
     # attends a compressed stream". Neither tokens_per_state nor
     # AscendSlidingWindowMLASpec.compress_ratio can carry it: both divide the
-    # page size, and 0 is not a legal divisor. ⚠️ Turning this on also changes
-    # kv-cache *grouping*, because groups are keyed on spec equality: layers
-    # whose streams differ stop sharing a group and a block table.
+    # page size, and 0 is not a legal divisor.
+    #
+    # 🔴 MEASURED, and it is why this is still off: turning it on moves a
+    # variable that has two jobs. The builder's ``compressor_ratio`` names the
+    # stream *and* feeds ``tokens_per_state`` (dsa_v1.py:1168/1681), which
+    # ``AscendDSAMetadata.block_size`` multiplies the storage page by
+    # (dsa_v1.py:596). Redirecting the reader therefore moved the page size
+    # too: a ratio-2 layer reported block_size 32 * 2 = 64 against a real
+    # (55737, 32, 512) cache, and the SWA insert guard refused it. Reviving
+    # this means splitting that variable in two -- a page ratio on the old
+    # chain and a stream ratio on this field -- not re-enabling it as written.
+    #
+    # ⚪ The grouping change predicted here did not happen: measured, kv-cache
+    # groups are already one layer each (max group id 42), so no merge ever
+    # sees two streams and the refusal in _merged_stream_compress_ratio is
+    # unreachable in this configuration.
     "VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO": lambda: os.getenv("VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO", "0"),
 }
 
