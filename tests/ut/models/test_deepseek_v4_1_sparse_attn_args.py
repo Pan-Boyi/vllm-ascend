@@ -135,20 +135,24 @@ def test_a_compressed_stream_must_disable_both_bounds(q):
             _validate(_with_compressed(ori_win_left=left, ori_win_right=right), q)
 
 
-def test_the_unmodelled_mask_mode_rule_is_declared_as_such(q):
-    """One stated constraint is deliberately not checked.
+def test_the_mask_mode_rule_records_how_its_signal_was_found(q):
+    """This rule was declared unmodelled, and then stopped being unmodelled.
 
-    "ori-only sparse mode requires both mask modes to be 0" needs a way to tell
-    ori-only *sparse* mode from plain sliding-window mode, and nothing measured
-    distinguishes them. Leaving it out is a decision; this pins that the
-    decision stays visible rather than becoming a silent gap, and that the
-    validator does not quietly start guessing at it.
+    Leaving it out was a decision: telling ori-only *sparse* mode from plain
+    sliding-window mode needed a signal nothing measured provided, and a
+    guessed rule would have rejected valid calls and accepted invalid ones with
+    equal confidence. The operator then supplied the signal by refusing (4, 0)
+    for a call carrying ori_sparse_indices.
+
+    What this pins is that the docstring says which of the two it is, and on
+    what basis. A rule that arrives without its provenance is indistinguishable
+    from the guess that was deliberately not made.
     """
     from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args
 
-    doc = sparse_attn_args.__doc__
-    assert "not** modelled" in doc
-    assert "ori-only\nsparse mode requires both mask modes to be 0" in doc
+    doc = " ".join(sparse_attn_args.__doc__.split())
+    assert "Ori-only sparse mode requires both mask modes to be 0" in doc
+    assert "from a measurement rather than a reading" in doc
 
     # and it really does accept mask mode 4 on a window-only layer
     assert _validate(_ori_only(ori_mask_mode=4), q) is not None
@@ -362,3 +366,68 @@ def test_every_layout_the_plans_use_has_a_rank():
     assert not unknown, (
         f"{sorted(unknown)} is not in LAYOUTS_KV; a plausible-looking spelling "
         "in this table silently never matches")
+
+
+def _built(**overrides):
+    """build_sparse_flash_mla_kwargs over a minimal valid call."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    args = dict(
+        q=torch.zeros(12, NUM_HEADS, 512, dtype=torch.bfloat16),
+        num_requests=3,
+        swa_kv_cache=torch.zeros(2, 32, 1, 512, dtype=torch.bfloat16),
+        swa_block_table=torch.zeros((3, 4), dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
+        seqused_kv=torch.ones(3, dtype=torch.int32),
+        sinks=torch.zeros(NUM_HEADS, dtype=torch.float32),
+        metadata=torch.zeros(1024, dtype=torch.int32),
+        softmax_scale=0.04,
+        cmp_ratio=1,
+        layout_kv="PA_BBND",
+        attends_compressed=False,
+        ori_win_left=127,
+        ori_win_right=0,
+    )
+    args.update(overrides)
+    return build_sparse_flash_mla_kwargs(**args)
+
+
+def test_explicit_indices_select_mode_zero_not_sliding_window():
+    """The operator refused (4, 0) on the first real forward.
+
+    "Ori-only sparse mode requires both mask modes to be 0", and what puts it
+    in that mode is the explicit index list. This was recorded as unmodelled
+    until the operator said which signal distinguishes it.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        NO_MASK_MODE, build_sparse_flash_mla_kwargs)
+
+    kwargs = _built(attends_compressed=False,
+                    ori_sparse_indices=torch.zeros(3, 8, dtype=torch.int32))
+    assert kwargs["ori_mask_mode"] == NO_MASK_MODE
+    assert kwargs["ori_win_left"] == -1 and kwargs["ori_win_right"] == -1
+
+
+def test_window_bounds_without_indices_stay_sliding_window():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        SLIDING_WINDOW_MASK_MODE, build_sparse_flash_mla_kwargs)
+
+    kwargs = _built(attends_compressed=False, ori_sparse_indices=None,
+                    ori_win_left=127, ori_win_right=0)
+    assert kwargs["ori_mask_mode"] == SLIDING_WINDOW_MASK_MODE
+    assert kwargs["ori_win_left"] == 127
+
+
+def test_a_compressed_stream_is_mode_zero_too_but_for_another_reason():
+    """Two configurations share a value and not a cause; naming the constant
+    after either one is how the first version went wrong."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import NO_MASK_MODE
+
+    kwargs = _built(attends_compressed=True, ori_sparse_indices=None,
+                    cmp_kv=torch.zeros(2, 32, 1, 512, dtype=torch.bfloat16),
+                    cmp_block_table=torch.zeros((3, 4), dtype=torch.int32),
+                    seqused_cmp_kv=torch.ones(3, dtype=torch.int32),
+                    cmp_ratio=2)
+    assert kwargs["ori_mask_mode"] == NO_MASK_MODE
+    assert kwargs["ori_win_left"] == -1
