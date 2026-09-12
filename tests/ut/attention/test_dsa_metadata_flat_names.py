@@ -37,7 +37,7 @@ def _metadata(**kwargs):
 #:   num_decode_tokens, num_prefill_tokens
 UPSTREAM_READS = ("num_decodes", "num_prefills", "num_decode_tokens",
                   "num_prefill_tokens", "max_seq_len", "slot_mapping",
-                  "query_start_loc", "block_table")
+                  "query_start_loc", "block_table", "block_size")
 
 
 def test_upstream_reads_all_of_these_names():
@@ -47,18 +47,46 @@ def test_upstream_reads_all_of_these_names():
     assert not missing, f"upstream reads these and Ascend does not carry them: {missing}"
 
 
-def test_block_size_is_deliberately_absent():
-    """attention.py:880 reads swa_metadata.block_size and this does not have it.
+def test_block_size_is_the_logical_one_not_the_storage_page():
+    """This was deliberately absent, on a premise that turned out to be false.
 
-    Not an oversight and not safe to add by analogy. req_metadata carries
-    storage_block_size, which equals the spec's block_size only at ratio 1 --
-    for the ratio-2 groups they differ by a factor of two, and a property that
-    is right for SWA and wrong for those would be read as authoritative by
-    both. The call sites that want it are in the fused CUDA prolog, which
-    Ascend replaces; if one is ever reached, it should fail here rather than
-    receive a plausible number.
+    The reasoning for leaving it out was sound -- storage_block_size equals the
+    spec's block_size only at ratio 1, so a property returning it would be
+    right for SWA and wrong by a factor of two for the ratio-2 groups. The
+    premise was that nothing would reach it: its call sites are named
+    _fused_qnorm_rope_kv_insert, which read as the CUDA prolog Ascend replaces.
+    They are reached from _prepare_and_attn_eager. A function's name promised a
+    path; the stack decides it.
+
+    So the ambiguity is removed rather than worked around: the ratio is carried
+    on the metadata and the logical block size reconstructed from it, which is
+    correct for every group instead of for the ones where the two coincide.
     """
-    assert not hasattr(_metadata(), "block_size")
+    class _Req:
+        storage_block_size = 128
+        slot_mapping = None
+
+    assert _metadata(req_metadata=_Req(), tokens_per_state=1).block_size == 128
+    assert _metadata(req_metadata=_Req(), tokens_per_state=2).block_size == 256
+
+
+def test_block_size_is_none_without_a_payload():
+    assert _metadata(req_metadata=None).block_size is None
+
+
+def test_the_ratio_reaches_the_metadata_from_the_builder():
+    """Both build sites must set it, or a group silently reports ratio 1.
+
+    A missing one is not a crash: tokens_per_state defaults to 1 and the
+    ratio-2 groups then report half their block size, which upstream's
+    assert on the cache shape would catch -- on a card, at forward time.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+
+    source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
+    assert source.count("tokens_per_state=max(self.compressor_ratio, 1)") == 2
 
 
 def test_prefill_tokens_are_what_is_left_after_the_decodes():

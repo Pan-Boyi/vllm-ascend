@@ -509,6 +509,11 @@ class AscendDSAMetadata:
     # -- so carrying it costs nothing and saves a device read.
     max_seq_len: int = 0
 
+    # This group's compression ratio. Carried so block_size below can be right
+    # for every group rather than only for the ones where the two page sizes
+    # coincide. 1 for SWA and for ratio-1 layers; 2 for V4.1's ratio-2 layers.
+    tokens_per_state: int = 1
+
     # Names upstream's DeepSeek-V4.1 indexer reads straight off this object
     # (vllm/models/deepseek_v4_1/attention.py:1153, :1181). Ascend keeps the
     # per-request payload one level down, in req_metadata, so without these the
@@ -531,6 +536,26 @@ class AscendDSAMetadata:
     @property
     def block_table(self) -> torch.Tensor | None:
         return None if self.req_metadata is None else self.req_metadata.block_table
+
+    @property
+    def block_size(self) -> int | None:
+        """The logical block size: raw scheduler tokens per block.
+
+        Not simply ``storage_block_size``. Ascend holds the storage page fixed
+        and multiplies the spec's ``block_size`` by the compression ratio, so
+        the two coincide only at ratio 1. A property returning the storage page
+        would be right for SWA -- where every reader of this happens to be --
+        and silently wrong by a factor of two for V4.1's ratio-2 groups, while
+        looking equally authoritative to both.
+
+        Reconstructed from the ratio instead, so there is no group for which it
+        is the wrong number. Upstream asserts ``swa_kv_cache.shape[1:] ==
+        (block_size, head_dim)`` against it, which is the check that would have
+        caught the storage-page version on SWA and passed it everywhere else.
+        """
+        if self.req_metadata is None:
+            return None
+        return self.req_metadata.storage_block_size * max(self.tokens_per_state, 1)
 
 
 DSAMetadataDict: TypeAlias = dict[str, AscendDSAMetadata]
@@ -1034,6 +1059,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             req_metadata=req_metadata,
             hadamard=self.hadamard,
             max_seq_len=common_attn_metadata.max_seq_len,
+            tokens_per_state=max(self.compressor_ratio, 1),
         )
 
     def _build_sas_metadata(
@@ -1448,6 +1474,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             req_metadata=req_metadata,
             hadamard=None,
             max_seq_len=common_attn_metadata.max_seq_len,
+            tokens_per_state=max(self.compressor_ratio, 1),
         )
 
     def build_req_metadata_for_drafting(
