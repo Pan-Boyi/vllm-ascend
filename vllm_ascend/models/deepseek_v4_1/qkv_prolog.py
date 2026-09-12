@@ -122,9 +122,9 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
         valid = blocks >= 0
         if not bool(valid.all()):
             blocks, offsets, rows = blocks[valid], offsets[valid], rows[valid]
+        _log_slot_form("(block, offset)", int(blocks.numel()))
         if blocks.numel() == 0:
             return
-        _log_slot_form("(block, offset)")
         # Indexed directly rather than flattened to block * block_size +
         # offset. The flattening is correct but needs block_size, and the two
         # numbers here are already the two the paged write wants.
@@ -142,9 +142,9 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
         rows = rows[valid]
     else:
         slots = slot_mapping
+    _log_slot_form("flat", int(slots.numel()))
     if slots.numel() == 0:
         return
-    _log_slot_form("flat")
     cache.view(-1, cache.shape[-1]).index_copy_(
         0, slots.to(torch.long), rows.to(cache.dtype))
 
@@ -152,11 +152,17 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
 _LOGGED_SLOT_FORMS: set[str] = set()
 
 
-def _log_slot_form(form: str) -> None:
-    """Say which mapping form was taken, once per form.
+def _log_slot_form(form: str, rows: int) -> None:
+    """Say which mapping form was taken, once per form, and how many rows.
 
     Both forms are legal and neither errors when read as the other, so the only
     way to know which one ran is to record it.
+
+    Logged *before* the empty-batch return, and with the row count, because the
+    first version sat after it: profile and dummy runs arrive with every slot
+    at -1, so the function ran and said nothing. That made one line answer
+    "which branch" while being read as an answer to "did this run at all" --
+    and those have different silences.
     """
     if form in _LOGGED_SLOT_FORMS:
         return
@@ -168,8 +174,9 @@ def _log_slot_form(form: str) -> None:
     # taken" look identical in the output.
     from vllm.logger import logger
 
-    logger.info("DSV4.1 SWA cache insert is using the %s slot mapping form.",
-                form)
+    logger.info(
+        "DSV4.1 SWA cache insert is using the %s slot mapping form "
+        "(%d rows to write this call).", form, rows)
 
 
 def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
