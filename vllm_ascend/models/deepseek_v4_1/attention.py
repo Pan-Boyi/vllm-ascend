@@ -78,16 +78,39 @@ def _log_compressed_selection(*, prefix, layer_ratio, attends_compressed,
     from vllm.logger import logger
 
     has_buffer = buffer is not None
-    filled = int((buffer[:num_tokens] >= 0).sum()) if has_buffer else -1
-    state = (layer_ratio, attends_compressed, has_buffer, filled > 0)
-    if state in _LOGGED_SELECTION_STATES:
+    # Deduplicated per layer, not per state. A state key collapses every layer
+    # that shares one into a single line, and "the log names one layer" then
+    # reads as "one layer took this path" -- which is what it was read as.
+    if prefix in _LOGGED_SELECTION_STATES:
         return
-    _LOGGED_SELECTION_STATES.add(state)
+    _LOGGED_SELECTION_STATES.add(prefix)
+
+    if not has_buffer:
+        logger.info(
+            "DSV4.1 %s: layer compress_ratio=%s attends_compressed=%s "
+            "topk_indices_buffer=None num_tokens=%s",
+            prefix, layer_ratio, attends_compressed, num_tokens)
+        return
+
+    rows = buffer[:num_tokens]
+    capacity = int(rows.numel())
+    pad = int((rows == -1).sum())
+    selected = capacity - pad
+    # capacity and pad are both reported because "selected == capacity" is not
+    # "every slot was chosen": a buffer allocated with torch.empty and never
+    # written holds arbitrary values, almost all of them non-negative, and
+    # counts as full. Under a causal mask the early tokens cannot fill 512
+    # slots, so a *written* buffer always carries padding. No padding at all
+    # therefore means unwritten, not saturated -- and those want opposite
+    # investigations.
     logger.info(
         "DSV4.1 %s: layer compress_ratio=%s attends_compressed=%s "
-        "topk_indices_buffer=%s selected_entries=%s num_tokens=%s",
-        prefix, layer_ratio, attends_compressed,
-        "present" if has_buffer else "None", filled, num_tokens)
+        "topk_indices_buffer=present selected=%s pad_minus_one=%s "
+        "capacity=%s num_tokens=%s%s",
+        prefix, layer_ratio, attends_compressed, selected, pad, capacity,
+        num_tokens,
+        "  [no padding at all: the buffer reads as never written]"
+        if pad == 0 else "")
 
 
 class AscendDeepseekV41Attention(DeepseekV4Attention):
