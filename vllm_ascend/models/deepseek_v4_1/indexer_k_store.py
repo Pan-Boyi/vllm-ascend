@@ -259,13 +259,30 @@ def indexer_k_norm_rope_store_ascend(
     # ⇒ 把实参的形状打出来，否则"这个张量几维"要再烧一发起飞才能知道。
     _viewed = k_cache.view(torch.uint8)
     if os.environ.get("DSV41_SFM_CHECK", "") == "1":
+        # tiling 的三档，前两档靠它自己的报错文本区分，第三档【没有任何 host 校验】：
+        #   不是 4 维              -> "dim ... only support 4"
+        #   4 维但 dim2 != 1       -> "third dim ... must be 1"
+        #   4 维且 dim2 == 1 但序错 -> 🔴 不报错，静默按 [blocks,bs,1,D] 算 offset
+        # 而 layout 只有一个合法值(2)，没有参数能表达"另一种序"。
+        # ⇒ 所以要在【修之前】就能看见第三档，得自己打这四个数。
+        # 另：tiling 里 d_ 取自【x】的最后一维、不取 cache 的 ⇒ 两者的宽度【互不校验】。
+        _xw = int(k.shape[-1]) if k.dim() else None
+        _cw = int(_viewed.shape[-1]) if _viewed.dim() else None
+        _st0 = int(_viewed.stride(0)) if _viewed.dim() else None
+        _bs = int(_viewed.shape[1]) if _viewed.dim() >= 2 else None
+        _prod = (_bs * _cw) if (_bs is not None and _cw is not None) else None
         logger.error(
             "【IDX-EPILOG】indexer_compress_cache: ndim=%d shape=%s dtype=%s "
             "(view 前 ndim=%d shape=%s dtype=%s) | x: shape=%s dtype=%s | "
-            "slot_mapping: shape=%s dtype=%s | layout=2",
+            "slot_mapping: shape=%s dtype=%s | layout=2 | "
+            "🔴 x末维=%s cache末维=%s %s | cache.stride(0)=%s cacheBs*cacheD=%s %s",
             _viewed.dim(), tuple(_viewed.shape), _viewed.dtype,
             k_cache.dim(), tuple(k_cache.shape), k_cache.dtype,
-            tuple(k.shape), k.dtype, tuple(slots.shape), slots.dtype)
+            tuple(k.shape), k.dtype, tuple(slots.shape), slots.dtype,
+            _xw, _cw, ("一致" if _xw == _cw else "🔴不一致(无人互校)"),
+            _st0, _prod,
+            ("stride>=乘积" if (_st0 is not None and _prod is not None
+                                and _st0 >= _prod) else "🔴 stride<乘积"))
     torch.ops._C_ascend.indexer_compress_epilog_v2(
         indexer_compress_cache=_viewed,
         x=k.to(torch.bfloat16),
