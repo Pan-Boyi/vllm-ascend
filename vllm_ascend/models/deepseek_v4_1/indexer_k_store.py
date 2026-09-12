@@ -34,7 +34,10 @@ Transcribed, not rederived. Five details are silent if wrong:
 
 from __future__ import annotations
 
+import os
+
 import torch
+from vllm.logger import logger
 
 #: The rope width of the V4.1 indexer key, against a head width of 128.
 #: Upstream passes these to the kernel as separate constants
@@ -408,8 +411,41 @@ def indexer_k_norm_rope_store_ascend(
     # The widths matched, so only the dtype would have differed, and the
     # tiling has no dtype validation to catch what the guard then missed.
     x = k.to(torch.bfloat16)
+    # 同样的理由适用于仪器：它必须打【真正传进去的那个对象】。
+    # _checked_cache 会 view(uint8) 再把 head 轴加回去，所以 k_cache 和它
+    # 【不是同一个形状】—— 打 k_cache.view(uint8) 会记下一个没被传进算子的东西。
+    _cache_arg = _checked_cache(k_cache, x)
+    if os.environ.get("DSV41_SFM_CHECK", "") == "1":
+        # tiling 的三档，前两档靠它自己的报错文本区分，第三档【没有任何 host 校验】：
+        #   不是 4 维              -> "dim ... only support 4"
+        #   4 维但 dim2 != 1       -> "third dim ... must be 1"
+        #   4 维且 dim2 == 1 但序错 -> 🔴 不报错，静默按 [blocks,bs,1,D] 算 offset
+        # 而 layout 只有一个合法值(2)，没有参数能表达"另一种序"。
+        # ⇒ 所以第三档要在【修之前/修之后】都能被看见，得自己打这四个数。
+        _xw = int(x.shape[-1]) if x.dim() else None
+        _cw = int(_cache_arg.shape[-1]) if _cache_arg.dim() else None
+        _st0 = int(_cache_arg.stride(0)) if _cache_arg.dim() else None
+        _bs = int(_cache_arg.shape[1]) if _cache_arg.dim() >= 2 else None
+        _prod = (_bs * _cw) if (_bs is not None and _cw is not None) else None
+        # kernel 从 tiling 源码读到的关系，按等式判、不按字面量：
+        import math as _math
+        _want = (_xw + 4 * _math.ceil(_xw / 128)) if _xw else None
+        logger.error(
+            "【IDX-EPILOG】传给算子的 cache: ndim=%d shape=%s dtype=%s "
+            "(绑定前 k_cache ndim=%d shape=%s dtype=%s) | x: shape=%s dtype=%s | "
+            "slot_mapping: shape=%s dtype=%s | layout=2 | "
+            "dim2==1? %s | x末维=%s cache末维=%s 等式 d+4*ceil(d/128)=%s %s | "
+            "stride(0)=%s cacheBs*cacheD=%s %s",
+            _cache_arg.dim(), tuple(_cache_arg.shape), _cache_arg.dtype,
+            k_cache.dim(), tuple(k_cache.shape), k_cache.dtype,
+            tuple(x.shape), x.dtype, tuple(slots.shape), slots.dtype,
+            (_cache_arg.shape[2] == 1) if _cache_arg.dim() >= 3 else "算不出来",
+            _xw, _cw, _want, ("✅相等" if _cw == _want else "🔴不等"),
+            _st0, _prod,
+            ("stride>=乘积" if (_st0 is not None and _prod is not None
+                                and _st0 >= _prod) else "🔴 stride<乘积"))
     torch.ops._C_ascend.indexer_compress_epilog_v2(
-        indexer_compress_cache=_checked_cache(k_cache, x),
+        indexer_compress_cache=_cache_arg,
         x=x,
         slot_mapping=slots,
         layout=2,
