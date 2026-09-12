@@ -56,7 +56,7 @@ PERM_Y = (1, 0, 2)
 _LOGGED_SELECTION_STATES: set = set()
 
 
-def _log_ori_sparse_indices(prefix, source, idx, num_tokens):
+def _log_ori_sparse_indices(prefix, source, idx, num_tokens, caller=None):
     """Report the original-stream index list by its *content*, not by presence.
 
     ``is None`` is not the question. These lists are built into a preallocated
@@ -76,7 +76,8 @@ def _log_ori_sparse_indices(prefix, source, idx, num_tokens):
     if int(os.environ.get("DSV41_SAS_DUMP_MAX", "0")) <= 0:
         return
     if idx is None:
-        logger.info("【ORI-IDX】%s: ori_sparse_indices=None (来源=无)", prefix)
+        logger.info("【ORI-IDX】%s: ori_sparse_indices=None (来源=无) 调用来自 %s",
+                    prefix, caller)
         return
     try:
         h = idx.detach().to("cpu").contiguous()
@@ -88,9 +89,11 @@ def _log_ori_sparse_indices(prefix, source, idx, num_tokens):
                    else "有 -1 填充(写过)")
         logger.info(
             "【ORI-IDX】%s: 来源=%s shape=%s dtype=%s | min=%s max=%s "
-            "(==-1)=%d %s | 前8=%s | 量程对照: num_tokens=%s",
+            "(==-1)=%d %s | 前8=%s | 量程对照: num_tokens=%s 末维=%s | "
+            "调用来自 %s",
             prefix, source, tuple(h.shape), h.dtype, mn, mx, n_neg1, verdict,
             flat[:8].tolist(), num_tokens,
+            h.shape[-1] if h.dim() else None, caller,
         )
     except Exception as e:
         logger.warning("【ORI-IDX】%s: 读不出来(不致命): %r", prefix, e)
@@ -495,8 +498,10 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         if not attends_compressed and req.dspark_swa_indices is not None:
             ori_sparse_indices = req.dspark_swa_indices
             _ori_idx_src = "dspark_swa_indices"
+        # ④ 同一层可能被两条 impl 各调一次 —— 现在没有任何数据能排除它。
         _log_ori_sparse_indices(swa_prefix, _ori_idx_src, ori_sparse_indices,
-                                num_tokens=q.shape[0])
+                                num_tokens=q.shape[0],
+                                caller=f"{type(self).__module__}.{type(self).__name__}")
 
         _log_compressed_selection(
             prefix=swa_prefix,

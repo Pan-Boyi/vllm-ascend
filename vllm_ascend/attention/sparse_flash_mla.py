@@ -88,6 +88,19 @@ def _check_block_table_fits(kwargs: dict[str, Any]) -> None:
     )
     # descriptor 与调用的三件并排：descriptor 承诺的 vs 调用实际供的。
     # 算子不校验这一对；不一致不报错，表现为 aicore 异常 + tilingKey 0。
+    # ① 键名无条件打一次：「某参数在不在」不该需要再等一轮起飞。
+    #    上一轮 cmp_kv 就是因为没打而只能报「没测到」。
+    # ② cmp_kv / cmp_block_table 的在与形状 —— 它是判「走的哪条 impl」的一项。
+    def _t(x):
+        return f"有{tuple(x.shape)}" if isinstance(x, torch.Tensor) else (
+            "无" if x is None else f"非张量({type(x).__name__})")
+    logger.error(
+        "【SFM-KEYS #%d】键=%s | cmp_kv=%s cmp_block_table=%s "
+        "ori_kv=%s ori_block_table=%s",
+        n, sorted(kwargs.keys()), _t(kwargs.get("cmp_kv")),
+        _t(kwargs.get("cmp_block_table")), _t(kwargs.get("ori_kv")),
+        _t(kwargs.get("ori_block_table")))
+
     md = kwargs.get("metadata")
     if isinstance(md, torch.Tensor):
         h = md.detach().to("cpu", torch.int32).contiguous()
