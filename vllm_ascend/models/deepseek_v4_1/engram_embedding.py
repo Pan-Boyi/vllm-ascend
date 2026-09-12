@@ -402,12 +402,19 @@ def _staged_dequant_launcher():
       ``test_each_scale_covers_its_own_block_only`` checks the broadcast
       positionally -- that one targets the maxdiff-28 failure by construction
       rather than by a tolerance.
-    - ⚠️ This line used to cite ``test_engram_dequant_reference``. No such test
-      exists. The nearest thing is
-      ``build_artifacts/npu_view/test_engram_dequant_staging.py``, which has a
-      different name and sits outside ``tests/ut`` -- so it never runs in the
-      gate. A docstring reporting verification status is itself a claim, and
-      this one named a test that could not be run to check it.
+    - The arithmetic is also checked against **golden's own rows** -- real fp8
+      values, real ue8m0 scales, the bf16 the reference model produced, byte
+      for byte including a negative zero that a value comparison would call
+      equal. That comparison lives in ``build_artifacts/npu_view`` and is now
+      invoked from the gate by
+      ``tests/ut/models/test_deepseek_v4_1_engram_dequant_golden.py``.
+    - ⚠️ This line twice claimed more than it could show. It first cited a
+      test by a name that was not the file's, and then said no such file
+      existed -- a conclusion from grepping for the *string* when the question
+      was whether a *file* was there. Both times the substance was the same:
+      the check was real and the gate never ran it. A docstring reporting
+      verification status is a claim, and "exists" is not the property that
+      matters; "runs" is.
     - ⚠️ The **kernel** route -- the one launched by default -- has no
       in-gate check of its arithmetic. What the torch tests above cover is the
       fallback that ``VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH`` selects, not the
