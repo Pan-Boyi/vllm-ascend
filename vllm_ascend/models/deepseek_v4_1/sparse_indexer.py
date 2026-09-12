@@ -49,12 +49,23 @@ def unpack_indexer_cache(kv_cache):
             "not apply -- the V4.1 indexer is its own cache group with its own "
             "spec. Shapes: "
             f"{[tuple(t.shape) for t in kv_cache if hasattr(t, 'shape')]}")
+    if isinstance(kv_cache, torch.Tensor):
+        # The packed form, which is what the runner actually allocates here:
+        # upstream builds this cache with head_dim already carrying the scale
+        # padding (attention.py:82-90, 128 fp8 + 4 fp32 = 132), so the spec
+        # reports one tensor and there is no separate scale allocation to
+        # unwrap. The two arguments the read operator wants are views into it.
+        from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import \
+            split_indexer_cache
+
+        return split_indexer_cache(kv_cache)
+
     raise ValueError(
-        "the V4.1 indexer cache came back as a single tensor "
-        f"({tuple(kv_cache.shape)}, {kv_cache.dtype}). The quantised values "
-        "and their scales have to be addressed separately for "
-        "npu_quant_lightning_indexer_v2, which takes key and "
-        "key_dequant_scale as two arguments.")
+        f"the V4.1 indexer cache came back as {type(kv_cache).__name__}, "
+        "which is neither a (values, scales) pair nor the packed single "
+        "tensor this knows how to address. npu_quant_lightning_indexer_v2 "
+        "takes key and key_dequant_scale as two arguments and there is "
+        "nothing here to derive them from.")
 
 
 class AscendSparseAttnIndexer(SparseAttnIndexer):

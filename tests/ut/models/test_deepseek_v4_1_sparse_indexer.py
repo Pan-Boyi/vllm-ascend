@@ -136,12 +136,35 @@ def test_missing_req_metadata_names_the_layer(forward_context):
                                torch.zeros(4, HEADS))
 
 
-def test_a_single_tensor_cache_is_refused_by_name():
-    """The op takes key and key_dequant_scale separately; one tensor cannot
-    serve both, and slicing one out by a guessed offset is how a plausible
-    wrong answer gets produced."""
-    with pytest.raises(ValueError, match="single tensor"):
-        unpack_indexer_cache(torch.zeros(2, 4, 8))
+def test_a_single_tensor_cache_is_now_split_into_the_two_arguments():
+    """This used to refuse, and refusing was right while the offset was a guess.
+
+    "One tensor cannot serve both" was never the problem -- the runner really
+    does allocate one, because upstream builds this cache with head_dim already
+    carrying the scale padding. The problem was that slicing it needed a byte
+    layout nobody here had read, and a guessed one produces a plausible wrong
+    answer rather than an error.
+
+    The layout is now read out of the operator's kernel, so the split is done
+    instead of refused. What it must not become is a guess again: the round
+    trip in test_deepseek_v4_1_indexer_cache_view.py is what holds that, and a
+    shape check here would not.
+    """
+    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (
+        SCALE_BYTES, SCALE_GROUP)
+
+    width = SCALE_GROUP + SCALE_BYTES
+    key, scale = unpack_indexer_cache(
+        torch.zeros(2, 4, width, dtype=torch.uint8))
+    assert key.shape == (2, 4, 1, SCALE_GROUP)
+    assert scale.shape == (2, 4, 1, 1)
+
+
+def test_a_single_tensor_of_an_impossible_width_is_still_refused():
+    """The guard that survived: a width that is not values plus scales has no
+    boundary to place, and placing one anyway is the guessed offset again."""
+    with pytest.raises(ValueError, match="between a value and its scale"):
+        unpack_indexer_cache(torch.zeros(2, 4, 8, dtype=torch.uint8))
 
 
 def test_an_unexpected_tuple_arity_reports_what_it_got():
