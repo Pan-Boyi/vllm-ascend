@@ -36,9 +36,20 @@ def unpack_indexer_cache(kv_cache):
 
     The V4.1 indexer cache is its own KV cache group with its own spec
     (``AscendDeepseekV41IndexerCache``), so it does not have V4.0's seven-tuple
-    shape and the V4.0 unpackers do not apply. What the Ascend allocator hands
-    back for a spec carrying ``scale_dim=1`` is a pair; this refuses anything
-    else by name rather than indexing into it and hoping.
+    shape and the V4.0 unpackers do not apply.
+
+    ⚠️ An earlier version of this said the allocator hands back a pair for a
+    spec carrying ``scale_dim=1``. It does not, and nobody should go looking
+    for that behaviour: this cache's ``head_dim`` is already the *packed* byte
+    width (``attention.py:82-90`` -- ``index_head_dim + index_head_dim//128*4``
+    = 132, with upstream's own comment "head_dim already carries the fp8 scale
+    padding"), so there is one allocation and the value/scale split lives
+    inside it. The pair branch below is kept because an allocator that does
+    hand over two tensors needs no splitting, not because this one does.
+
+    The single-tensor case is the real one, and it is split by
+    ``indexer_cache_view.split_indexer_cache`` using the byte offsets read out
+    of the operator's kernel -- not by slicing at a plausible boundary.
     """
     if isinstance(kv_cache, (tuple, list)):
         if len(kv_cache) == 2:
