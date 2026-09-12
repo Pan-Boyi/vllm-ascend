@@ -30,15 +30,7 @@ CUDA_EXTENSION = "torch.ops._C.fused_deepseek_v4_"
 #: Base methods reaching a CUDA extension that Ascend has not implemented yet,
 #: each with why it is still here. Emptying this list is the goal; adding to it
 #: is a decision, which is the point of it being written down.
-DECLARED_UNIMPLEMENTED: dict[str, str] = {
-    "_fused_qnorm_rope_kv_insert":
-        "Upstream fuses q-norm, q-RoPE, kv-norm, kv-RoPE and the paged insert "
-        "into one CUDA op, and all three of its dtype branches call a "
-        "torch.ops._C symbol absent here. Ascend has a named operator for each "
-        "step separately, so this is a decomposition rather than a binding -- "
-        "real work, not wiring. Reached from _prepare_and_attn_eager on every "
-        "forward, so it is the current blocker, not a dormant path.",
-}
+DECLARED_UNIMPLEMENTED: dict[str, str] = {}
 
 
 def _methods_calling_the_cuda_extension() -> set[str]:

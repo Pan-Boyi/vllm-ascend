@@ -161,6 +161,56 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             tokens_per_state=ratio,
         )
 
+    def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+        """Upstream's fused prolog, decomposed. See deepseek_v4_1.qkv_prolog.
+
+        All three dtype branches of the base method call a
+        ``torch.ops._C.fused_deepseek_v4_*`` symbol that does not exist here,
+        and it is reached from ``_prepare_and_attn_eager`` on every forward.
+        """
+        import torch.nn.functional as F
+
+        from vllm_ascend.models.deepseek_v4_1.qkv_prolog import \
+            qnorm_rope_kv_insert
+
+        if not isinstance(attn_metadata, dict):
+            # Profile run. Upstream pads so the downstream MLA sees the right
+            # shape; nothing is written to the cache because nothing is bound.
+            if self.n_local_heads < self.padded_heads:
+                return F.pad(
+                    q, (0, 0, 0, self.padded_heads - self.n_local_heads),
+                    value=0.0)
+            return q
+
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        if swa_metadata is None:
+            raise ValueError(
+                f"no attention metadata under {self.swa_cache_layer.prefix!r}; "
+                "the SWA cache group is where this layer's slot mapping and "
+                "block size come from.")
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        if swa_kv_cache.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"the Ascend prolog covers the bf16 SWA cache; this one is "
+                f"{swa_kv_cache.dtype}. The fp8_ds_mla (uint8) branch also "
+                "zero-fills padded head slots and returns a q the kernel "
+                "allocated, and the per-tensor fp8 branch returns a separate "
+                "fp8 q -- neither is this function with a different dtype.")
+
+        block_size = swa_metadata.block_size
+        if swa_kv_cache.shape[1:] != (block_size, self.head_dim):
+            raise ValueError(
+                f"the SWA cache is {tuple(swa_kv_cache.shape)} and the "
+                f"metadata says block_size {block_size}, head_dim "
+                f"{self.head_dim}. These index each other, so a mismatch "
+                "writes rows at the wrong offset rather than failing.")
+        return qnorm_rope_kv_insert(
+            q=q, kv=kv, positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            swa_kv_cache=swa_kv_cache,
+            slot_mapping=swa_metadata.slot_mapping,
+            eps=self.eps, rope_head_dim=self.rope_head_dim)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
