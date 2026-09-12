@@ -90,14 +90,30 @@ def test_the_vacuous_case_does_not_raise():
         is None
 
 
-@pytest.mark.parametrize("ratio,expect_used,expect_residual",
-                         [(1, [7, 3], [0, 0]), (2, [3, 1], [1, 1]),
-                          (0, [7, 3], [0, 0])])
-def test_compressed_lengths(ratio, expect_used, expect_residual):
-    seq_lens = torch.tensor([7, 3], dtype=torch.int32)
-    used, residual = compressed_lengths(seq_lens, ratio)
-    assert used.tolist() == expect_used
-    assert residual.tolist() == expect_residual
+@pytest.mark.parametrize("ratio", [1, 0])
+def test_ratio_one_yields_no_residual_at_all(ratio):
+    """Null, not zeros. The operator's own rule:
+
+        Cmp_ratio is 1 or sparse_mode is 0, cmp_residual_k must be null
+
+    and it is a check on *presence*. lens % 1 is zero for every request, so
+    an all-zeros tensor carries no information -- and is still refused,
+    because zero is not null. This is the case where a harmless-looking value
+    is worse than no value: it looks like data and is rejected as an argument.
+    Ratio 0 is here too, since the call passes max(ratio, 1).
+    """
+    used, residual = compressed_lengths(torch.tensor([7, 3], dtype=torch.int32),
+                                        ratio)
+    assert used.tolist() == [7, 3]
+    assert used.dtype == torch.int32
+    assert residual is None
+
+
+def test_a_real_ratio_still_gets_its_residual():
+    used, residual = compressed_lengths(torch.tensor([7, 3], dtype=torch.int32),
+                                        2)
+    assert used.tolist() == [3, 1]
+    assert residual.tolist() == [1, 1]
     assert used.dtype == torch.int32 and residual.dtype == torch.int32
 
 
@@ -124,7 +140,8 @@ class _RecordingOp:
                            dtype=torch.int32), torch.empty(0)
 
 
-def _call(op, *, q_scale=None, compress_ratio=2, num_tokens=4, num_heads=32):
+def _call(op, *, q_scale=None, compress_ratio=2, num_tokens=4,
+          num_heads=32, residual="zeros"):
     query = torch.zeros((num_tokens, num_heads, 128),
                         dtype=torch.float8_e4m3fn)
     return select_topk(
@@ -137,7 +154,8 @@ def _call(op, *, q_scale=None, compress_ratio=2, num_tokens=4, num_heads=32):
         compress_ratio=compress_ratio,
         cu_seqlens_q=torch.zeros(3, dtype=torch.int32),
         seqused_k=torch.zeros(2, dtype=torch.int32),
-        cmp_residual_k=torch.zeros(2, dtype=torch.int32),
+        cmp_residual_k=(torch.zeros(2, dtype=torch.int32)
+                        if residual == "zeros" else residual),
         block_table=torch.zeros((2, 4), dtype=torch.int32),
         metadata=torch.zeros(1024, dtype=torch.int32),
         op=op,
@@ -169,8 +187,12 @@ def test_the_layers_own_ratio_reaches_the_operator():
 def test_ratio_zero_reaches_the_operator_as_one():
     """sparse_flash_mla rejects cmp_ratio=0; 0 configured means no compression."""
     op = _RecordingOp()
-    _call(op, compress_ratio=0)
+    # residual=None, because at this ratio the operator refuses one -- the two
+    # go together and a fixture that sets only the ratio is not a
+    # configuration the operator would accept.
+    _call(op, compress_ratio=0, residual=None)
     assert op.calls[-1]["cmp_ratio"] == 1
+    assert op.calls[-1]["cmp_residual_k"] is None
 
 
 def test_the_quant_mode_is_derived_from_the_tensors_not_defaulted():
@@ -200,7 +222,7 @@ def test_an_unsupported_dtype_pair_refuses_rather_than_picking_a_mode():
             compress_ratio=1,
             cu_seqlens_q=torch.zeros(2, dtype=torch.int32),
             seqused_k=torch.zeros(1, dtype=torch.int32),
-            cmp_residual_k=torch.zeros(1, dtype=torch.int32),
+            cmp_residual_k=None,
             block_table=torch.zeros((1, 4), dtype=torch.int32),
             metadata=torch.zeros(1024, dtype=torch.int32),
             op=op,
@@ -229,3 +251,20 @@ def test_a_real_q_scale_is_passed_through_untouched():
     given = torch.full((4, 32), 0.5, dtype=torch.float32)
     _call(op, q_scale=given)
     assert op.calls[-1]["query_dequant_scale"] is given
+
+
+def test_a_residual_smuggled_past_compressed_lengths_is_refused():
+    """The guard sits at the call, not only at the producer.
+
+    compressed_lengths returning None is what makes the normal path correct;
+    this is for the caller that builds the residual some other way. Without
+    it, the operator refuses at tiling and names cmp_residual_k without
+    saying that the *ratio* is what made it illegal.
+    """
+    with pytest.raises(ValueError, match="must be\n?\\s*null"):
+        _call(_RecordingOp(), compress_ratio=1)
+
+
+def test_the_guard_names_the_ratio_that_made_it_illegal():
+    with pytest.raises(ValueError, match="layer ratio 0"):
+        _call(_RecordingOp(), compress_ratio=0)

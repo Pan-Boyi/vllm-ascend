@@ -128,7 +128,7 @@ def select_topk(
     compress_ratio: int,
     cu_seqlens_q: torch.Tensor,
     seqused_k: torch.Tensor,
-    cmp_residual_k: torch.Tensor,
+    cmp_residual_k: torch.Tensor | None,
     block_table: torch.Tensor,
     metadata: torch.Tensor,
     op=None,
@@ -145,6 +145,18 @@ def select_topk(
     """
     if op is None:
         op = torch.ops._C_ascend.npu_quant_lightning_indexer_v2
+    if max(compress_ratio, 1) == 1 and cmp_residual_k is not None:
+        # The operator's own cross-parameter rule, checked here rather than
+        # trusted to compressed_lengths: this is the last point before the
+        # call, and a caller that built the residual itself would otherwise
+        # reach the operator's refusal with no idea which of its arguments
+        # the ratio made illegal.
+        raise ValueError(
+            f"cmp_ratio is 1 (layer ratio {compress_ratio}) and "
+            f"cmp_residual_k was supplied as {tuple(cmp_residual_k.shape)}. "
+            "The operator requires it to be null at this ratio -- "
+            "\"Cmp_ratio is 1 or sparse_mode is 0, cmp_residual_k must be "
+            "null\" -- and it is refused at tiling, before the kernel runs.")
     num_tokens, num_heads = query.shape[0], query.shape[1]
     topk_idxs, _ = op(
         query=query,
@@ -199,5 +211,21 @@ def compressed_lengths(seq_lens: torch.Tensor,
     """
     ratio = max(compress_ratio, 1)
     lens = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
-    return (torch.div(lens, ratio, rounding_mode="floor").to(torch.int32),
-            torch.remainder(lens, ratio).to(torch.int32))
+    seqused_k = torch.div(lens, ratio, rounding_mode="floor").to(torch.int32)
+    if ratio == 1:
+        # 🔴 The operator refuses a residual at this ratio, in its own words:
+        #
+        #     Invalid_Argument(EZ0037): Parameter cmp_residual_k of
+        #     QuantLightningIndexerV2 is invalid. Reason: Cmp_ratio is 1 or
+        #     sparse_mode is 0, cmp_residual_k must be null.
+        #
+        # and the arithmetic agrees: lens % 1 is zero for every request, so
+        # the tensor carries no information. But zero is not null -- an
+        # all-zeros int32 tensor is still a tensor, and the check is on
+        # presence, not on content. This is where a "harmless" value is worse
+        # than no value: it looks like data and is refused as an argument.
+        #
+        # Reaches every ratio-0 layer too, because the call passes
+        # max(ratio, 1) and 0 becomes 1 here as well.
+        return seqused_k, None
+    return seqused_k, torch.remainder(lens, ratio).to(torch.int32)
