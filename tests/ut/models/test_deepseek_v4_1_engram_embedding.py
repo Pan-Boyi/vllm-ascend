@@ -412,3 +412,45 @@ def test_the_switch_is_off_by_default_and_selects_the_torch_route():
         "_staged_dequant_launcher()"), (
         "the switch must be checked before the kernel is even resolved -- "
         "resolving it imports the module whose compilation is under suspicion")
+
+
+def test_staging_is_allocated_at_construction_not_on_first_lookup():
+    """The ordering constraint, stated where it can go red.
+
+    Graph replay reads the device addresses recorded at capture. A buffer
+    allocated on the first lookup is a different address than the one the graph
+    replays against, and that mismatch reports nothing -- it reads whatever is
+    at the captured address. Construction is the only point guaranteed to
+    precede capture, so this pins that the call is there.
+    """
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
+
+    init = inspect.getsource(mod.AscendStagedEngramEmbedding.__init__)
+    assert "_allocate_staging_at_construction" in init, (
+        "staging must be sized during __init__; anywhere later is after "
+        "graph capture")
+    body = inspect.getsource(mod.AscendStagedEngramEmbedding
+                             ._allocate_staging_at_construction)
+    assert "max_num_batched_tokens" in body
+    assert "max_model_len" not in body.split('"""')[2], (
+        "the bound is tokens per forward, not tokens per sequence")
+
+
+def test_an_oversized_batch_is_refused_by_name():
+    """What makes taking the tight bound safe.
+
+    max_num_batched_tokens and max_model_len differ by a factor of two here.
+    Choosing the smaller one is defensible only because exceeding it raises
+    with both numbers in the message rather than writing past the buffer.
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_layout import EngramLayout
+
+    f = _Lookup(_tables())
+    f._layout = EngramLayout(n_hash_cols=24, dim=256, quant_block=32,
+                             layer_ids=(1, 14), num_embeddings=(512, 512))
+    f._max_tokens = 16
+    with pytest.raises(ValueError, match="exceeds the 16"):
+        f.lookup(torch.zeros((32, f.part_n_hash_cols), dtype=torch.int64),
+                 torch.zeros((32, 8)))
