@@ -15,6 +15,8 @@ dangerous value available, which is what makes omitting it a defect rather
 than an omission.
 """
 
+import pathlib
+
 import pytest
 import torch
 
@@ -160,15 +162,73 @@ def test_the_builders_still_return_the_count_this_carries():
             "count it used to supply now has to come from somewhere else")
 
 
-def test_the_call_sites_no_longer_discard_it():
-    """`x, _ = build_...` is how the count was lost for as long as it existed."""
-    import inspect
+#: Builders whose second return value is the per-row valid-entry count.
+_COUNT_RETURNING_BUILDERS = ("build_dspark_swa_indices",
+                             "build_vision_bidirectional_swa_indices")
 
-    from vllm_ascend.attention import dsa_v1
 
-    source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
-    assert "swa_indices, _ = build_" not in source, (
-        "a call site is discarding the valid-entry count again")
+def _discarding_call_sites():
+    """Every place in vllm_ascend that throws away one of those counts.
+
+    Enumerated from the AST across the whole package, not read out of one
+    class. The first version of this check called ``inspect.getsource`` on
+    ``AscendDSAMetadataBuilder`` and asserted the pattern was absent from it.
+    It passed -- and a fourth call site in
+    ``attention/context_parallel/dsa_cp.py`` was discarding the same value
+    from the same function with the same spelling, in a different class in a
+    different file. The check was not wrong about what it looked at; its scope
+    was narrower than the defect's and it said nothing about that.
+
+    Returns ``(sites, files_scanned, calls_seen)`` so the caller can fail on
+    zero coverage. A scan that parses nothing reports no violations, which is
+    indistinguishable from a clean tree.
+    """
+    import ast
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "vllm_ascend"
+    sites, files_scanned, calls_seen = [], 0, 0
+    for path in root.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        files_scanned += 1
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            call = node.value
+            if not (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in _COUNT_RETURNING_BUILDERS):
+                continue
+            calls_seen += 1
+            for target in node.targets:
+                if not isinstance(target, ast.Tuple):
+                    continue
+                for i, element in enumerate(target.elts):
+                    if isinstance(element, ast.Name) and element.id == "_":
+                        sites.append(
+                            f"{path.relative_to(root)}:{node.lineno} "
+                            f"{call.func.id} return[{i}]")
+    return sites, files_scanned, calls_seen
+
+
+def test_no_call_site_discards_the_valid_entry_count():
+    """`x, _ = build_...` is how the count was lost for as long as it existed.
+
+    ⚠️ This still only catches the tuple-unpack spelling. `res = build_(...)`
+    followed by `res[0]` discards the same value and is invisible here. The
+    gap is written down rather than papered over -- but the scope is now the
+    package, which is the half that actually went wrong.
+    """
+    sites, files_scanned, calls_seen = _discarding_call_sites()
+    assert files_scanned > 100 and calls_seen >= 4, (
+        f"coverage collapsed: {files_scanned} files parsed, {calls_seen} "
+        "calls to the count-returning builders found. A scan that sees "
+        "nothing reports no violations and looks exactly like a clean tree.")
+    assert not sites, (
+        "these call sites discard the per-row valid-entry count, which the "
+        "operator needs or it declares the whole row valid: " + ", ".join(sites))
 
 
 # ------------------------------------------- what makes the V4.0 change safe

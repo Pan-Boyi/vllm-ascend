@@ -143,6 +143,10 @@ class AscendDSAReqMetadata:
     ori_win_left: int | None = None
     ori_win_right: int = 0
     dspark_swa_indices: torch.Tensor | None = None
+    #: Valid entries per row of dspark_swa_indices. See
+    #: AscendDSAReqMetadata.ori_topk_length in dsa_v1: without it the operator
+    #: declares the whole row valid and gathers at the -1 padding.
+    ori_topk_length: torch.Tensor | None = None
 
 
 @dataclass
@@ -647,11 +651,12 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
 
         dspark_swa_indices = None
+        dspark_topk_length = None
         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
         if is_noncausal:
             assert self.speculative_config is not None
             # todo: If DSA CP is adapted to v2 DSpark graph mode, there may be issues.
-            global_dspark_indices, _ = build_dspark_swa_indices(
+            global_dspark_indices, global_dspark_lengths = build_dspark_swa_indices(
                 self.block_table[:num_reqs],
                 self.speculative_config.num_speculative_tokens,
                 self.model_config.hf_config.sliding_window,
@@ -668,7 +673,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
             if pad_rows:
                 global_dspark_indices = F.pad(global_dspark_indices, (0, 0, 0, 0, 0, pad_rows), value=-1)
+                # 0, not -1: the padded rows are entirely -1, so the count of
+                # real entries in them is zero. The length has to follow the
+                # table through *both* transforms below -- this pad and the
+                # local slice -- or it describes rows other than its own, and
+                # a length that belongs to another row is worse than none.
+                global_dspark_lengths = F.pad(global_dspark_lengths, (0, pad_rows), value=0)
             dspark_swa_indices = global_dspark_indices[local_start:local_end_with_pad].contiguous()
+            dspark_topk_length = global_dspark_lengths[local_start:local_end_with_pad].contiguous()
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
         assert self.spec_slot_mapping is not None
@@ -769,6 +781,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
+            ori_topk_length=dspark_topk_length,
         )
 
     def _num_compressor_metadata_rows(
@@ -1922,6 +1935,8 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
             kv_plan.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=local_seq_lengths_query)
         if swa_req_metadata.dspark_swa_indices is not None:
             extra_attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
+            if swa_req_metadata.ori_topk_length is not None:
+                extra_attn_kwargs["ori_topk_length"] = swa_req_metadata.ori_topk_length
 
         ori_win_left = self.window_size - 1 if swa_req_metadata.ori_win_left is None else swa_req_metadata.ori_win_left
         ori_win_right = 0 if swa_req_metadata.ori_win_right is None else swa_req_metadata.ori_win_right
