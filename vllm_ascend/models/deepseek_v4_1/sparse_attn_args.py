@@ -100,6 +100,31 @@ def select_ori_sparse_indices(attends_compressed: bool, vision_swa_indices,
     return vision_swa_indices
 
 
+def ori_sparse_selection(attends_compressed: bool, req) -> tuple:
+    """``(indices, topk_length)`` together, because they are one decision.
+
+    Returning them as a pair is the point. The operator reads
+    ``oriSparseBlockCount = hasOriTopkLength ? Min(length, width) : width``,
+    so a call that supplies indices without a length has declared every slot
+    in the row valid -- the ``-1`` padding included -- and the kernel gathers
+    at those. Measured on the bench with one variable changed: the same table
+    crashes at the declared full width and passes at its true length.
+
+    ``Min`` looks like it guards this and does not. It clamps a length that
+    exceeds how wide the table is; nothing downstream knows how many entries
+    were actually written, so nothing can clamp to that.
+
+    The length is carried from whoever built the table -- both builders
+    already compute it and both used to discard it -- and never recounted
+    here. A second count is a second source that can drift from the first.
+    """
+    indices = select_ori_sparse_indices(
+        attends_compressed,
+        getattr(req, "vision_swa_indices", None),
+        getattr(req, "dspark_swa_indices", None))
+    return indices, getattr(req, "ori_topk_length", None)
+
+
 def is_plain_sliding_window(attends_compressed: bool,
                              ori_sparse_indices) -> bool:
     """Whether this call is sliding-window mode rather than one of the two
@@ -436,6 +461,9 @@ def build_sparse_flash_mla_kwargs(
     # Slot space: block_id * storage_block_size + offset. See
     # select_ori_sparse_indices for why this is stated and not left implicit.
     ori_sparse_indices: torch.Tensor | None = None,
+    #: Valid entries per row of ori_sparse_indices. Required whenever indices
+    #: are supplied; see ori_sparse_selection for why the default is unsafe.
+    ori_topk_length: torch.Tensor | None = None,
     cmp_sparse_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Assemble one call, mirroring ``DSAImpl._forward_attention``.
@@ -481,7 +509,16 @@ def build_sparse_flash_mla_kwargs(
     )
 
     if ori_sparse_indices is not None:
+        if ori_topk_length is None:
+            raise ValueError(
+                "ori_sparse_indices was supplied without ori_topk_length. "
+                "The operator then takes the whole row as valid -- "
+                f"{tuple(ori_sparse_indices.shape)} here -- and gathers at "
+                "the -1 padding, which faults every core at one address. "
+                "Omitting the length is not a safe default: it is the most "
+                "dangerous one, and it is what production was doing.")
         kwargs["ori_sparse_indices"] = ori_sparse_indices
+        kwargs["ori_topk_length"] = ori_topk_length
 
     if attends_compressed:
         if cmp_kv is None:

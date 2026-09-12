@@ -455,7 +455,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         from vllm_ascend.attention.dsa_v1 import (_dsa_swa_only_cmp_ratio,
                                                   attends_compressed_stream)
         from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-            build_sparse_flash_mla_kwargs, select_ori_sparse_indices)
+            build_sparse_flash_mla_kwargs, ori_sparse_selection)
 
         attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
         if attn_metadata is None:
@@ -495,9 +495,8 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # span bidirectionally, and a layer with no compressed stream may carry
         # DSpark's instead. A layer that attends a compressed stream keeps the
         # vision ones and does not take DSpark's.
-        ori_sparse_indices = select_ori_sparse_indices(
-            attends_compressed, req.vision_swa_indices,
-            req.dspark_swa_indices)
+        ori_sparse_indices, ori_topk_length = ori_sparse_selection(
+            attends_compressed, req)
 
         _log_compressed_selection(
             prefix=swa_prefix,
@@ -530,6 +529,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             seqused_cmp_kv=req.cu_cmp_seqlen_list if attends_compressed else None,
             cmp_residual_kv=req.qli_cmp_residual_k if attends_compressed else None,
             ori_sparse_indices=ori_sparse_indices,
+            ori_topk_length=ori_topk_length,
             # The indexer's selection. Without it the compressed stream is
             # attended in full: nothing errors, tokens come out, and they are
             # a V4.1 that does no sparse selection. The descriptor's cmp_topk

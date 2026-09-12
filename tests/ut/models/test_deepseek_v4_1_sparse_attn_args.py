@@ -432,8 +432,12 @@ def test_explicit_indices_select_mode_zero_not_sliding_window():
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
         NO_MASK_MODE, build_sparse_flash_mla_kwargs)
 
+    # The length travels with the indices now: without it the operator takes
+    # the whole row as valid and gathers at the -1 padding. Supplying it here
+    # keeps this test about the mask mode rather than about that rule.
     kwargs = _built(attends_compressed=False,
-                    ori_sparse_indices=torch.zeros(3, 8, dtype=torch.int32))
+                    ori_sparse_indices=torch.zeros(3, 8, dtype=torch.int32),
+                    ori_topk_length=torch.full((3, ), 8, dtype=torch.int32))
     assert kwargs["ori_mask_mode"] == NO_MASK_MODE
     assert kwargs["ori_win_left"] == -1 and kwargs["ori_win_right"] == -1
 

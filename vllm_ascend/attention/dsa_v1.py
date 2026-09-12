@@ -499,6 +499,21 @@ class AscendDSAReqMetadata:
     #: not, because V4.1's indexer K writer needs it at every ratio. Placed
     #: last because a defaulted field cannot precede the undefaulted ones.
     token_slot_mapping: torch.Tensor | None = None
+    #: Valid entries per query row in ``ori_sparse_indices``, int32.
+    #:
+    #: Not optional in practice whenever indices are supplied. The operator
+    #: reads ``oriSparseBlockCount = hasOriTopkLength ? Min(length, width) :
+    #: width`` -- so omitting it declares the *whole row* valid, and a row
+    #: padded with -1 then sends the kernel to gather at those slots. Measured
+    #: single-variable on the bench: the same index table crashes at the
+    #: declared full width and passes at its true length. ``Min`` only guards
+    #: "declared more than the table is wide"; it cannot guard "declared more
+    #: than was written", because nothing downstream knows that number.
+    #:
+    #: Carried from whoever built the table, never recounted at the call site:
+    #: both builders already compute it (the per-row count of their ``visible``
+    #: mask) and both used to discard it.
+    ori_topk_length: torch.Tensor | None = None
 
 
 @dataclass
@@ -839,6 +854,24 @@ def build_vision_bidirectional_swa_indices(
     slot_ids = (block_ids * int(block_size) + visible_positions % int(block_size)).to(torch.int32)
     slot_ids = slot_ids.where(visible, torch.full_like(slot_ids, -1))
     return slot_ids.unsqueeze(1), visible_lens.to(torch.int32)
+
+
+def _add_ori_topk_length(attn_kwargs: dict, req_metadata) -> None:
+    """Send the valid-entry count alongside an explicit index list.
+
+    Without it the operator declares the whole row valid and gathers at the
+    -1 padding. The builders here already produce the count for both index
+    kinds, so this is carrying a number that exists rather than deriving one.
+
+    ⚠️ This call site is shared with V4.0, so it is a behaviour change there
+    too: V4.0 was also sending index lists with no length, and its tables come
+    from these same two builders with the same -1 padding. Left absent when
+    the metadata carries none, so a caller that predates the field is
+    unchanged rather than refused.
+    """
+    length = getattr(req_metadata, "ori_topk_length", None)
+    if length is not None:
+        attn_kwargs["ori_topk_length"] = length
 
 
 class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
@@ -1400,6 +1433,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_cmp_kv = None
         dspark_swa_indices = None
         vision_swa_indices = None
+        # Beside the tensors they describe, so a branch that sets one and not
+        # the other is a syntax-level mistake rather than a silent None.
+        dspark_topk_length = None
+        vision_topk_length = None
         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
         if not has_prefill and not common_attn_metadata.causal:
             # DSpark non-causal parallel drafting: every draft query attends to
@@ -1408,7 +1445,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             # current step's block table / sequence lengths, so they must be
             # rebuilt whenever a DSpark draft step runs.
             assert self.speculative_config is not None
-            dspark_swa_indices, _ = build_dspark_swa_indices(
+            dspark_swa_indices, dspark_topk_length = build_dspark_swa_indices(
                 self.block_table[: self.num_decodes],
                 self.speculative_config.num_speculative_tokens,
                 self.model_config.hf_config.sliding_window,
@@ -1438,7 +1475,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
         if has_prefill and max_image_tokens > 0 and mm_ranges_have_spans(mm_ranges):
             actual_reqs = num_reqs if num_actual_reqs is None else num_actual_reqs
-            vision_swa_indices, _ = build_vision_bidirectional_swa_indices(
+            vision_swa_indices, vision_topk_length = \
+                build_vision_bidirectional_swa_indices(
                 block_table=self.block_table[:actual_reqs],
                 window_size=self.model_config.hf_config.sliding_window,
                 max_image_tokens=max_image_tokens,
@@ -1619,6 +1657,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
             vision_swa_indices=vision_swa_indices,
+            ori_topk_length=(vision_topk_length if vision_swa_indices
+                             is not None else dspark_topk_length),
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
             assert num_compressed_tokens is not None
@@ -1716,6 +1756,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         has_prefill = self.num_prefills > 0
 
         dspark_swa_indices = None
+        dspark_topk_length = None
         build_dspark_swa = None
         ori_win_left = self.model_config.hf_config.sliding_window - 1
         ori_win_right = 0
@@ -1746,7 +1787,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     indices_output=dspark_swa_indices,
                 )
             else:
-                dspark_swa_indices, _ = build_dspark_swa_indices(*dspark_swa_args)
+                dspark_swa_indices, dspark_topk_length = build_dspark_swa_indices(
+                    *dspark_swa_args)
                 dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
@@ -1841,6 +1883,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
+            ori_topk_length=dspark_topk_length,
         )
 
     def build_for_graph_capture(
@@ -2615,6 +2658,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         # selection remains active and is supplied independently below.
         if swa_req_metadata.vision_swa_indices is not None:
             attn_kwargs["ori_sparse_indices"] = swa_req_metadata.vision_swa_indices
+            _add_ori_topk_length(attn_kwargs, swa_req_metadata)
 
         # NOTE(dsv41): ratio <= 1 means "no compressed stream" for V4.0, but
         # V4.1 gives layers 20..39 ratio 1 to mean "compressed, pooling
@@ -2625,6 +2669,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if not attends_compressed:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
+                _add_ori_topk_length(attn_kwargs, swa_req_metadata)
         else:
             assert compressor_metadata is not None
             attn_kwargs.update(
