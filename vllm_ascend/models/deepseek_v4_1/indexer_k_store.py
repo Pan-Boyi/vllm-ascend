@@ -258,6 +258,11 @@ def indexer_k_norm_rope_store_ascend(
     # only support 4"），而它失败时只说"只支持 4"，不说【实际是几】。
     # ⇒ 把实参的形状打出来，否则"这个张量几维"要再烧一发起飞才能知道。
     _viewed = k_cache.view(torch.uint8)
+    # 🔴 打【真正传进去的那个值】，不是它上一步的变量。
+    #    第一版打的是 k（fp32），而 kwarg 是 k.to(torch.bfloat16) ——
+    #    于是报出一条"实参 dtype 与代码不符"的假观测，差点传下去。
+    #    顺带也不再转两次。
+    _x = k.to(torch.bfloat16)
     if os.environ.get("DSV41_SFM_CHECK", "") == "1":
         # tiling 的三档，前两档靠它自己的报错文本区分，第三档【没有任何 host 校验】：
         #   不是 4 维              -> "dim ... only support 4"
@@ -266,7 +271,7 @@ def indexer_k_norm_rope_store_ascend(
         # 而 layout 只有一个合法值(2)，没有参数能表达"另一种序"。
         # ⇒ 所以要在【修之前】就能看见第三档，得自己打这四个数。
         # 另：tiling 里 d_ 取自【x】的最后一维、不取 cache 的 ⇒ 两者的宽度【互不校验】。
-        _xw = int(k.shape[-1]) if k.dim() else None
+        _xw = int(_x.shape[-1]) if _x.dim() else None
         _cw = int(_viewed.shape[-1]) if _viewed.dim() else None
         _st0 = int(_viewed.stride(0)) if _viewed.dim() else None
         _bs = int(_viewed.shape[1]) if _viewed.dim() >= 2 else None
@@ -278,14 +283,14 @@ def indexer_k_norm_rope_store_ascend(
             "🔴 x末维=%s cache末维=%s %s | cache.stride(0)=%s cacheBs*cacheD=%s %s",
             _viewed.dim(), tuple(_viewed.shape), _viewed.dtype,
             k_cache.dim(), tuple(k_cache.shape), k_cache.dtype,
-            tuple(k.shape), k.dtype, tuple(slots.shape), slots.dtype,
+            tuple(_x.shape), _x.dtype, tuple(slots.shape), slots.dtype,
             _xw, _cw, ("一致" if _xw == _cw else "🔴不一致(无人互校)"),
             _st0, _prod,
             ("stride>=乘积" if (_st0 is not None and _prod is not None
                                 and _st0 >= _prod) else "🔴 stride<乘积"))
     torch.ops._C_ascend.indexer_compress_epilog_v2(
         indexer_compress_cache=_viewed,
-        x=k.to(torch.bfloat16),
+        x=_x,
         slot_mapping=slots,
         layout=2,
     )
