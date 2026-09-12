@@ -145,10 +145,67 @@ def test_an_all_skipped_batch_writes_nothing():
     assert torch.all(cache == 7.0)
 
 
-def test_a_block_offset_slot_mapping_is_refused():
-    with pytest.raises(ValueError, match=r"\(block, offset\)"):
+def test_the_block_offset_form_writes_where_the_pair_says():
+    """On A5 with a bf16 KV cache this is the default form, not an alternative.
+
+    dsa_v1.py:782 picks flat only when FP8_ATTENTION is available *and* bf16 KV
+    is off -- the configuration we do not run. This used to be refused, which
+    was right while nothing supported it and wrong as a permanent answer.
+    """
+    cache = torch.zeros(3, 4, HEAD_DIM)
+    rows = torch.arange(2, dtype=torch.float32).reshape(2, 1).expand(2, HEAD_DIM)
+    pairs = torch.tensor([[2, 3], [1, 0]], dtype=torch.int64)
+    scatter_rows(cache, rows.contiguous(), pairs, 4)
+    assert torch.all(cache[2, 3] == 0.0)
+    assert torch.all(cache[1, 0] == 1.0)
+    assert torch.all(cache[0] == 0.0), "nothing may land in an unaddressed block"
+
+
+def test_the_two_forms_agree_on_the_same_slots():
+    """The pair (b, o) and the flat slot b * block_size + o are the same place.
+
+    Written as a test because reading one form as the other raises nothing: a
+    [T, 2] mapping read flat is 2T slots with every offset used as a slot, and
+    the rows land on real tokens' entries with values still in range.
+    """
+    block_size = 4
+    pairs = torch.tensor([[2, 3], [1, 0], [0, 2]], dtype=torch.int64)
+    flat = pairs[:, 0] * block_size + pairs[:, 1]
+    rows = torch.randn(3, HEAD_DIM)
+
+    by_pair = torch.zeros(3, block_size, HEAD_DIM)
+    by_flat = torch.zeros(3, block_size, HEAD_DIM)
+    scatter_rows(by_pair, rows, pairs, block_size)
+    scatter_rows(by_flat, rows, flat, block_size)
+    torch.testing.assert_close(by_pair, by_flat)
+
+
+def test_a_negative_block_is_skipped_in_the_pair_form_too():
+    cache = torch.full((2, 4, HEAD_DIM), 7.0)
+    pairs = torch.tensor([[-1, -1], [1, 2]], dtype=torch.int64)
+    scatter_rows(cache, torch.ones(2, HEAD_DIM), pairs, 4)
+    assert torch.all(cache[1, 2] == 1.0)
+    assert torch.all(cache[0, 0] == 7.0)
+
+
+def test_an_unrecognised_slot_shape_is_still_refused():
+    with pytest.raises(ValueError, match=r"\[num_tokens, 2\]"):
         scatter_rows(torch.zeros(2, 4, HEAD_DIM), torch.ones(2, HEAD_DIM),
-                     torch.zeros((2, 2), dtype=torch.int64), 4)
+                     torch.zeros((2, 3), dtype=torch.int64), 4)
+
+
+def test_which_form_ran_is_logged(caplog):
+    """Both forms are legal and neither errors when read as the other, so the
+    only way to know which one ran is that it says so."""
+    import logging
+
+    from vllm_ascend.models.deepseek_v4_1 import qkv_prolog
+
+    qkv_prolog._LOGGED_SLOT_FORMS.clear()
+    with caplog.at_level(logging.INFO):
+        scatter_rows(torch.zeros(2, 4, HEAD_DIM), torch.ones(1, HEAD_DIM),
+                     torch.tensor([[1, 2]], dtype=torch.int64), 4)
+    assert "(block, offset)" in caplog.text
 
 
 def test_the_rows_land_where_the_slots_say():

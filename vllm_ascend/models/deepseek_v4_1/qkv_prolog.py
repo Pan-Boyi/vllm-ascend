@@ -97,16 +97,45 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
                  slot_mapping: torch.Tensor, block_size: int) -> None:
     """Write one row per token into a paged ``[blocks, block_size, dim]`` cache.
 
-    ``slot_mapping`` is flat slot indices; ``-1`` means "do not write", which is
-    how padded and already-cached tokens arrive. Filtered rather than clamped:
-    a clamp would write those rows to slot 0 of block 0, corrupting a real
-    token's entry with no error.
+    Two slot-mapping shapes are legal, and which one arrives is decided by the
+    cache dtype rather than by the caller (``dsa_v1.py:782``)::
+
+        FP8_ATTENTION and not a5_bf16_kv   ->  [num_tokens]      flat slots
+        otherwise                          ->  [num_tokens, 2]   (block, offset)
+
+    On A5 with a bf16 KV cache -- what we run -- the second is the default, not
+    an alternative some plan happens to use.
+
+    Both are accepted and dispatched on shape, because both are valid inputs
+    that raise nothing when read as the other: a ``[T, 2]`` mapping read flat
+    is ``2T`` slots with every offset treated as a slot index. The rows land
+    somewhere real and belong to other tokens, so the values stay in range and
+    the error surfaces only as accuracy. Which branch ran is logged once for
+    that reason.
+
+    ``-1`` means "do not write", which is how padded and already-cached tokens
+    arrive. Filtered, not clamped: a clamp sends those rows to slot 0 of block
+    0, over a real token's entry.
     """
+    if slot_mapping.ndim == 2 and slot_mapping.shape[-1] == 2:
+        blocks, offsets = slot_mapping[:, 0], slot_mapping[:, 1]
+        valid = blocks >= 0
+        if not bool(valid.all()):
+            blocks, offsets, rows = blocks[valid], offsets[valid], rows[valid]
+        if blocks.numel() == 0:
+            return
+        _log_slot_form("(block, offset)")
+        # Indexed directly rather than flattened to block * block_size +
+        # offset. The flattening is correct but needs block_size, and the two
+        # numbers here are already the two the paged write wants.
+        cache.index_put_((blocks.to(torch.long), offsets.to(torch.long)),
+                         rows.to(cache.dtype))
+        return
+
     if slot_mapping.ndim != 1:
         raise ValueError(
-            f"slot_mapping must be flat [num_tokens]; got "
-            f"{tuple(slot_mapping.shape)}. A [num_tokens, 2] mapping is the "
-            "(block, offset) form some plans use, which indexes differently.")
+            f"slot_mapping is {tuple(slot_mapping.shape)}; this takes flat "
+            "[num_tokens] slots or [num_tokens, 2] (block, offset) pairs.")
     valid = slot_mapping >= 0
     if not bool(valid.all()):
         slots = slot_mapping[valid]
@@ -115,8 +144,27 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
         slots = slot_mapping
     if slots.numel() == 0:
         return
+    _log_slot_form("flat")
     cache.view(-1, cache.shape[-1]).index_copy_(
         0, slots.to(torch.long), rows.to(cache.dtype))
+
+
+_LOGGED_SLOT_FORMS: set[str] = set()
+
+
+def _log_slot_form(form: str) -> None:
+    """Say which mapping form was taken, once per form.
+
+    Both forms are legal and neither errors when read as the other, so the only
+    way to know which one ran is to record it.
+    """
+    if form in _LOGGED_SLOT_FORMS:
+        return
+    _LOGGED_SLOT_FORMS.add(form)
+    import logging
+
+    logging.getLogger(__name__).info(
+        "DSV4.1 SWA cache insert is using the %s slot mapping form.", form)
 
 
 def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
