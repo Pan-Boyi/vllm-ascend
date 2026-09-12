@@ -249,8 +249,18 @@ def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
     a config that names its source layers has the V4.1 topology whatever it
     calls itself.
     """
-    hf_config = getattr(getattr(vllm_config, "model_config", None),
-                        "hf_config", None)
+    # hf_config, and measured rather than assumed: the checkpoint's JSON nests
+    # these fields under text_config, but DeepseekV41Config -- the custom
+    # config class vLLM loads -- exposes them at the top level, and
+    # get_hf_text_config returns that same object (hf_text_config is
+    # hf_config). Both spellings therefore find kv_source_layer_ids here.
+    #
+    # This was briefly "fixed" to prefer hf_text_config on the theory that the
+    # field was invisible and the V4.1 branch was silently degrading. It was
+    # not: the predicate has been returning V4.1's answer all along. Recorded
+    # because the JSON's shape makes the wrong story very plausible.
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
     declares_sources = getattr(hf_config, "kv_source_layer_ids", None) is not None
     if declares_sources:
         return compress_ratio >= 1

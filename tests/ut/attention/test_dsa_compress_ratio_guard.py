@@ -147,3 +147,35 @@ def test_configured_ratio_and_operator_parameter_are_not_the_same_thing():
     """
     assert 0 in ANY_PLAN_COMPRESS_RATIOS
     assert validate_compress_ratio(0, "layer", BF16_PLAN) == 0
+
+
+def test_the_source_layer_ids_are_found_on_the_loaded_config():
+    """Measured, not assumed: DeepseekV41Config exposes them at the top level.
+
+    The checkpoint's JSON nests these under text_config, which makes "the
+    predicate cannot see kv_source_layer_ids" a very plausible story -- it was
+    briefly believed here. The custom config class vLLM loads flattens them,
+    and get_hf_text_config returns that same object, so both spellings work.
+    """
+    from types import SimpleNamespace
+
+    from vllm_ascend.attention.dsa_v1 import attends_compressed_stream
+
+    flat = SimpleNamespace(model_type="deepseek_v41",
+                           kv_source_layer_ids=[2, 8, 14, 20])
+    cfg = SimpleNamespace(model_config=SimpleNamespace(hf_config=flat,
+                                                       hf_text_config=flat))
+    assert attends_compressed_stream(1, cfg) is True
+    assert attends_compressed_stream(0, cfg) is False
+
+
+def test_a_v40_config_still_gets_v40s_threshold():
+    from types import SimpleNamespace
+
+    from vllm_ascend.attention.dsa_v1 import attends_compressed_stream
+
+    v40 = SimpleNamespace(model_config=SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        hf_text_config=SimpleNamespace(model_type="deepseek_v4")))
+    assert attends_compressed_stream(1, v40) is False
+    assert attends_compressed_stream(4, v40) is True
