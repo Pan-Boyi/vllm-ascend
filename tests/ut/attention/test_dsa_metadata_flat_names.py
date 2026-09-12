@@ -272,3 +272,46 @@ def test_the_descriptor_and_the_call_agree_on_the_mask_triple():
     # Call side: the same predicate, spelled from the same two facts.
     assert "not attends_compressed and ori_sparse_indices is None" in caller
     assert "plain_window = not attends_cmp and not has_indices" in builder
+
+
+def test_the_topk_promise_and_the_indices_are_one_decision():
+    """cmp_topk in the descriptor and cmp_sparse_indices in the call.
+
+    A descriptor promising a top-k the call does not supply is the same
+    disagreement class that produced the aicore exception. They are computed in
+    one place each and both gated on the same fact -- a compressed stream --
+    rather than by two independent judgements that happen to agree.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+    from vllm_ascend.models.deepseek_v4_1 import attention as v41_attention
+
+    builder = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
+    assert 'if attends_cmp:' in builder
+    assert 'sas_mask_kwargs["cmp_topk"]' in builder
+    assert 'sas_mask_kwargs["seqused_cmp_kv"]' in builder
+
+    caller = inspect.getsource(v41_attention.AscendDeepseekV41Attention.forward_mqa)
+    assert "cmp_sparse_indices=(" in caller
+    assert "if attends_compressed and self.topk_indices_buffer is not None" in caller
+
+
+def test_the_compressed_descriptor_extras_default_to_absent():
+    """V4.0's descriptor keeps the argument list it has today.
+
+    seqused_cmp_kv is omitted entirely when None rather than passed as None:
+    the operator demands it only under PA_BBND with a declared compressed
+    stream and a non-zero mask mode, and V4.0's FP8 plan uses PA_ND, so it has
+    never had to supply one.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+
+    sig = inspect.signature(dsa_v1.AscendDSAMetadataBuilder._build_sas_metadata)
+    assert sig.parameters["cmp_topk"].default is None
+    assert sig.parameters["seqused_cmp_kv"].default is None
+    body = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder._build_sas_metadata)
+    assert '{} if seqused_cmp_kv is None' in body
+    assert "index_topk if self.compressor_ratio == 4 else 0" in body

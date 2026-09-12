@@ -1104,6 +1104,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         ori_win_left: int | None = None,
         ori_win_right: int | None = None,
         has_cmp_kv: bool | None = None,
+        cmp_topk: int | None = None,
+        seqused_cmp_kv: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build the descriptor the sparse-attention operator reads its tiling
         from.
@@ -1152,7 +1154,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=len(seq_lens),
-                cmp_topk=index_topk if self.compressor_ratio == 4 else 0,
+                cmp_topk=((index_topk if self.compressor_ratio == 4 else 0)
+                          if cmp_topk is None else cmp_topk),
                 cmp_ratio=cmp_ratio,
                 # 4: sliding window. None means "what V4.0 passes", so the
                 # descriptor is unchanged for every caller that does not care.
@@ -1166,6 +1169,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 has_ori_kv=True,
                 has_cmp_kv=(self.compressor_ratio > 1
                             if has_cmp_kv is None else has_cmp_kv),
+                # Omitted entirely when None, so V4.0's descriptor keeps the
+                # argument list it has today. The operator demands it under
+                # PA_BBND once a compressed stream is declared and the mask
+                # mode is not 0 -- V4.0's FP8 plan uses PA_ND and never meets
+                # that condition.
+                **({} if seqused_cmp_kv is None
+                   else {"seqused_cmp_kv": seqused_cmp_kv}),
             )
             metadata_cache[layer_name] = sas_metadata
 
@@ -1376,6 +1386,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 "ori_win_right": ori_win_right if plain_window else -1,
                 "has_cmp_kv": attends_cmp,
             }
+            if attends_cmp:
+                # cmp_topk and the indices the call passes are one decision:
+                # a descriptor promising a top-k that the call does not supply
+                # is the same disagreement class as the mask mode, and the
+                # operator requires the compressed lengths alongside them.
+                ratio = max(self.compressor_ratio, 1)
+                lens = seq_lens if seq_lens.dtype == torch.int32 else \
+                    seq_lens.to(torch.int32)
+                sas_mask_kwargs["cmp_topk"] = (
+                    self.model_config.hf_config.index_topk)
+                sas_mask_kwargs["seqused_cmp_kv"] = torch.div(
+                    lens, ratio, rounding_mode="floor").to(torch.int32)
 
         if self._device_metadata_enabled:
 
