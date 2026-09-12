@@ -110,15 +110,24 @@ def test_every_ring_capacity_is_a_supported_block_size(num_speculative_tokens,
     """The ring capacity upstream computes must be one the backend accepts.
 
     Reproduces upstream's formula rather than asserting a constant, so a change
-    to it shows up here instead of as a wrong cache shape. The base backend
-    allows [2, 4, 8, 16, 32, 64, 128], which is why the subclass deliberately
-    does not narrow the list.
+    to it shows up here instead of as a wrong cache shape.
+
+    The accepted set is expressed two ways and both have to be handled. The
+    backend now inherits upstream's CompressorBackend, which returns
+    [MultipleOf(1)] -- a divisibility rule, not an enumeration -- where the DSA
+    base returned [2, 4, 8, ...]. Testing membership with `in` silently fails
+    against the rule form: 8 is not *equal* to MultipleOf(1), and the assertion
+    reads as "the backend rejects 8" when it accepts every integer.
     """
     rows_per_step = num_speculative_tokens + 2
     ring = max(8, 1 << (rows_per_step - 1).bit_length())
     assert ring == expected_ring
     supported = caches.AscendCompressorStateBackend.get_supported_kernel_block_sizes()
-    assert ring in supported
+    assert supported, "an empty set would make this assertion vacuous"
+    accepted = any(
+        ring % entry.base == 0 if hasattr(entry, "base") else ring == entry
+        for entry in supported)
+    assert accepted, f"ring capacity {ring} against {supported}"
 
 
 def test_the_spec_is_left_as_a_circular_buffer():
