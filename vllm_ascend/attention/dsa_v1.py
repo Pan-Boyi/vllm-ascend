@@ -1,4 +1,5 @@
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
@@ -7,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.logger import logger
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
@@ -72,6 +74,96 @@ else:
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
+
+
+# --- 一次性取证仪器（#48）：把 descriptor blob 原样落盘并当场解码 ---------------
+# 判据是 blob 本身，不是摘要：摘要相同的两份 blob 可以在任何一位上不同。
+_SAS_DUMP_N = 0
+_SAS_DUMP_MAX = int(os.environ.get("DSV41_SAS_DUMP_MAX", "0"))
+_SAS_DUMP_DIR = os.environ.get("DSV41_SAS_DUMP_DIR", "")
+_SAS_KEYS_SEEN: set = set()
+
+
+def _dump_sas_metadata(builder, layer_name, blob, query_start_loc, seq_lens,
+                       max_seqlen_q, max_seqlen_kv, cached):
+    """Save the sparse-attention descriptor verbatim, with its provenance.
+
+    The blob is what the operator derives its tiling from; the call it is paired
+    with is validated against nothing. A disagreement is not rejected -- it
+    surfaces as an aicore exception with tilingKey 0 and every core failing at
+    once. So the artifact has to be the full int32[1024], not a summary, and it
+    has to say which run / layer / call it came from or it cannot be compared
+    against anything.
+    """
+    global _SAS_DUMP_N
+    if _SAS_DUMP_MAX <= 0 or _SAS_DUMP_N >= _SAS_DUMP_MAX or not _SAS_DUMP_DIR:
+        return
+    _SAS_DUMP_N += 1
+    n = _SAS_DUMP_N
+    try:
+        os.makedirs(_SAS_DUMP_DIR, exist_ok=True)
+        host = blob.detach().to("cpu", torch.int32).contiguous()
+        vals = host.tolist()
+        qsl = query_start_loc.detach().cpu().tolist() if query_start_loc is not None else None
+        sl = seq_lens.detach().cpu().tolist() if seq_lens is not None else None
+        sq = (builder.seqused_q.detach().cpu().tolist()
+              if getattr(builder, "seqused_q", None) is not None
+              and builder.seqused_q.numel() else None)
+        import json
+        rec = {
+            "这是什么的现场": "生产侧 SparseFlashMla 的 descriptor(sas_metadata) 原始 blob",
+            "第几次调用": n,
+            "cache_key(layer_name)": layer_name,
+            "来自缓存": bool(cached),
+            "device_metadata_enabled": bool(getattr(builder, "_device_metadata_enabled", None)),
+            "compressor_ratio": getattr(builder, "compressor_ratio", None),
+            "cache_group_key": getattr(builder, "cache_group_key", None),
+            "blob_len": len(vals),
+            "blob_int32": vals,
+            "cu_seqlens_q": qsl,
+            "seq_lens": sl,
+            "seqused_q": sq,
+            "max_seqlen_q": int(max_seqlen_q) if not isinstance(max_seqlen_q, torch.Tensor) else int(max_seqlen_q.item()),
+            "max_seqlen_kv": int(max_seqlen_kv) if not isinstance(max_seqlen_kv, torch.Tensor) else int(max_seqlen_kv.item()),
+        }
+        # 当场解码自查：边界数 / 步长 / 末值。三项都报，包括符合的。
+        big = [v for v in vals if v > 100]
+        diffs = [big[i + 1] - big[i] for i in range(len(big) - 1)]
+        rec["解码_大于100的值个数"] = len(big)
+        rec["解码_边界数"] = max(len(big) - 1, 0)
+        rec["解码_步长集合"] = sorted(set(diffs))
+        rec["解码_首值"] = big[0] if big else None
+        rec["解码_末值"] = big[-1] if big else None
+        # blob 反解出"它是按多少 token 建的"。报数，不报布尔 ——
+        # 一个数可以拿去找来源，一个布尔不能。两式不吻合时两个都报，
+        # 不吻合本身就是信息。
+        nseg = len(big)              # 段边界个数
+        if diffs:
+            sd = sorted(diffs)
+            med = sd[len(sd) // 2]
+            rec["解码_步长中位数"] = med
+            rec["T_implied_按步长"] = med * 28
+        else:
+            rec["解码_步长中位数"] = None
+            rec["T_implied_按步长"] = None
+        rec["T_implied_按末值"] = (
+            round(big[-1] * 28 / nseg) if big and nseg else None)
+        rec["解码_非零个数"] = sum(1 for v in vals if v != 0)
+        rec["解码_非零最大下标"] = max((i for i, v in enumerate(vals) if v != 0), default=-1)
+        f = os.path.join(_SAS_DUMP_DIR, f"sas_metadata_call{n}_{layer_name}.json")
+        with open(f, "w") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=1)
+        logger.info(
+            "【SAS-DUMP #%d】%s cached=%s device_built=%s -> %s | 边界数=%s 步长=%s 首=%s 末=%s | "
+            "🔴T_implied 按步长=%s 按末值=%s | R=%s max_seqlen_q=%s",
+            n, layer_name, cached,
+            getattr(builder, "_device_metadata_enabled", None), f,
+            rec["解码_边界数"], rec["解码_步长集合"], rec["解码_首值"],
+            rec["解码_末值"], rec["T_implied_按步长"], rec["T_implied_按末值"],
+            (len(sl) if sl is not None else None), rec["max_seqlen_q"],
+        )
+    except Exception as e:  # 取证失败不能顺带打死这一发
+        logger.warning("【SAS-DUMP #%d】落盘失败(不致命): %r", n, e)
 CompressorMetadataOutput: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 _DSV4_DSA_OVERLAP_STREAM = None
@@ -1265,7 +1357,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # groups within one build, which is why this is safe today rather than
         # by construction. The dict is a local rebuilt every
         # _build_attention_metadata, so nothing survives a forward.
+        # 入口日志：按键去重，每个 layer_name 只打一次。
+        # 「dump 里没有」和「从没建过」是两件事 —— dump 有采样上限，这行没有。
+        if _SAS_DUMP_MAX > 0 and layer_name not in _SAS_KEYS_SEEN:
+            _SAS_KEYS_SEEN.add(layer_name)
+            logger.info("【SAS-ENTRY】_build_sas_metadata 首次见到键 %s "
+                        "(group=%s builder.compressor_ratio=%s buffer_id=%s)",
+                        layer_name, getattr(self, "cache_group_key", None),
+                        getattr(self, "compressor_ratio", None),
+                        id(getattr(self, "sas_metadata_buffer", None)))
         sas_metadata = metadata_cache.get(layer_name)
+        _sas_was_cached = sas_metadata is not None
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
@@ -1320,6 +1422,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
             metadata_cache[layer_name] = sas_metadata
 
+        _dump_sas_metadata(self, layer_name, sas_metadata, query_start_loc,
+                           seq_lens, max_seqlen_q, max_seqlen_kv,
+                           cached=_sas_was_cached)
         self.sas_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = sas_metadata
         return self.sas_metadata_buffer
 
