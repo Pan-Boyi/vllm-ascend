@@ -438,8 +438,8 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
         from vllm_ascend.attention.dsa_v1 import (_dsa_swa_only_cmp_ratio,
                                                   attends_compressed_stream)
-        from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-            build_sparse_flash_mla_kwargs
+        from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+            build_sparse_flash_mla_kwargs, select_ori_sparse_indices)
 
         attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
         if attn_metadata is None:
@@ -479,9 +479,9 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # span bidirectionally, and a layer with no compressed stream may carry
         # DSpark's instead. A layer that attends a compressed stream keeps the
         # vision ones and does not take DSpark's.
-        ori_sparse_indices = req.vision_swa_indices
-        if not attends_compressed and req.dspark_swa_indices is not None:
-            ori_sparse_indices = req.dspark_swa_indices
+        ori_sparse_indices = select_ori_sparse_indices(
+            attends_compressed, req.vision_swa_indices,
+            req.dspark_swa_indices)
 
         _log_compressed_selection(
             prefix=swa_prefix,

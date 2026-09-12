@@ -1447,11 +1447,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # window.
         sas_mask_kwargs: dict = {}
         if is_deepseek_v41_text(self.model_config.hf_text_config):
+            from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+                is_plain_sliding_window, select_ori_sparse_indices)
+
             attends_cmp = attends_compressed_stream(self.compressor_ratio,
                                                     self.vllm_config)
-            has_indices = vision_swa_indices is not None or (
-                not attends_cmp and dspark_swa_indices is not None)
-            plain_window = not attends_cmp and not has_indices
+            # The same two functions the call site uses, on the same two
+            # candidate tensors. Previously this recomputed the predicate from
+            # its own expression; the two agreed, which hid that they were two
+            # sources. They are one now, so a precedence change moves both.
+            plain_window = is_plain_sliding_window(
+                attends_cmp,
+                select_ori_sparse_indices(attends_cmp, vision_swa_indices,
+                                          dspark_swa_indices))
             sas_mask_kwargs = {
                 "ori_mask_mode": 4 if plain_window else 0,
                 "ori_win_left": ori_win_left if plain_window else -1,

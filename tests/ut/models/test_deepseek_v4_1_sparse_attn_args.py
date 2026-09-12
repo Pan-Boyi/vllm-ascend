@@ -25,9 +25,24 @@ def q():
     return torch.zeros(NUM_TOKENS, NUM_HEADS, HEAD_DIM)
 
 
+def _descriptor():
+    """A populated 1024-word descriptor.
+
+    Not ``torch.zeros``: an all-zero blob is what a buffer the metadata
+    operator never wrote into looks like, and the validator refuses it with
+    a query batch present. Contents are not inspected -- and cannot be: a
+    well-formed descriptor built for another configuration is exactly the
+    failure this port hit, and it passes every check there is.
+    """
+    blob = torch.zeros(1024, dtype=torch.int32)
+    blob[0] = 28  # one core-split boundary
+    return blob
+
+
 def _ori_only(**overrides):
     """A layer attending only its own window stream (compress_ratio 0)."""
     kwargs = dict(
+        metadata=_descriptor(),
         layout_q="TND",
         layout_kv="PA_BBND",
         cu_seqlens_q=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
@@ -47,6 +62,7 @@ def _ori_only(**overrides):
 def _with_compressed(**overrides):
     """A layer attending a compressed stream as well (ratio 2, layers 2..19)."""
     kwargs = dict(
+        metadata=_descriptor(),
         layout_q="TND",
         layout_kv="PA_BBND",
         cu_seqlens_q=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
@@ -198,6 +214,19 @@ def test_the_error_quotes_the_operator_rather_than_paraphrasing(q):
 # -- assembling a call from metadata -----------------------------------------
 
 
+def _descriptor():
+    """A populated 1024-word descriptor.
+
+    Not ``torch.zeros``: an all-zero blob is what a buffer the metadata
+    operator never wrote into looks like, and the validator refuses it. Not
+    ``object()`` either -- that makes the descriptor check skip, which these
+    tests would then not be exercising.
+    """
+    blob = torch.zeros(1024, dtype=torch.int32)
+    blob[0] = 28  # one core split boundary; contents are not inspected
+    return blob
+
+
 def _common(**overrides):
     kwargs = dict(
         q=torch.zeros(NUM_TOKENS, NUM_HEADS, HEAD_DIM),
@@ -207,7 +236,7 @@ def _common(**overrides):
         cu_seqlens_q=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
         seqused_kv=torch.tensor([4, 5, 3], dtype=torch.int32),
         sinks=torch.zeros(NUM_HEADS, dtype=torch.float32),
-        metadata=object(),
+        metadata=_descriptor(),
         softmax_scale=0.04419,
         layout_kv="PA_BBND",
         ori_win_left=127,
@@ -381,7 +410,7 @@ def _built(**overrides):
         cu_seqlens_q=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
         seqused_kv=torch.ones(3, dtype=torch.int32),
         sinks=torch.zeros(NUM_HEADS, dtype=torch.float32),
-        metadata=torch.zeros(1024, dtype=torch.int32),
+        metadata=_descriptor(),
         softmax_scale=0.04,
         cmp_ratio=1,
         layout_kv="PA_BBND",

@@ -65,7 +65,42 @@ NO_MASK_MODE = 0
 CMP_MASK_MODE = 3
 
 
-def _is_plain_sliding_window(attends_compressed: bool,
+def select_ori_sparse_indices(attends_compressed: bool, vision_swa_indices,
+                             dspark_swa_indices):
+    """The explicit original-KV index list this call will use, or ``None``.
+
+    Both the descriptor builder and the call site have to reach the same
+    answer, and until now each derived it from its own inputs: the call site
+    from the selected tensor, the builder from a separate ``has_indices``
+    expression over the two candidates. The two happened to agree, which is
+    the worst case -- a structural second source that agrees today is one that
+    disagrees on the first day the precedence changes.
+
+    DSpark's indices override vision's, and only when no compressed stream is
+    attended. That precedence is the call site's, not an interpretation of it.
+
+    🔴 **The returned indices are in slot space**, not token space: each value
+    is ``block_id * storage_block_size + offset_within_block`` (dsa_v1.py, the
+    ``slot_ids`` line at the end of both index builders). That fact used to
+    exist only in a local variable's name and was lost at the first
+    assignment -- after which the tensor is called "indices" everywhere and
+    carries no record of which space it is in.
+
+    This is written down because the two spaces are indistinguishable from the
+    tensor: both are non-negative int32, and a bound taken from the wrong one
+    looks like a working check. A token-space bound (``< seqused``) rejects
+    valid slot-space values: a measured call had ``max() = 5663 = 176*32 + 31``
+    against ``seqused = 4096``. Any range check on this tensor must take its
+    upper bound from *this call's* block table -- ``(block_table.max() + 1) *
+    storage_block_size`` -- and must refuse to check, out loud, when the
+    caller cannot say which space it is handing over.
+    """
+    if not attends_compressed and dspark_swa_indices is not None:
+        return dspark_swa_indices
+    return vision_swa_indices
+
+
+def is_plain_sliding_window(attends_compressed: bool,
                              ori_sparse_indices) -> bool:
     """Whether this call is sliding-window mode rather than one of the two
     mode-0 configurations.
@@ -169,6 +204,82 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any],
                 "paths; a length past the end reads another allocation.")
 
 
+#: The descriptor blob the ``*_metadata`` operator produces, in int32 words.
+#: Same number as ``dsa_v1.DSA_METADATA_BUFFER_SIZE``, restated here rather
+#: than imported: this module is the argument contract and importing the
+#: builder's constant would make the check pass by construction.
+DESCRIPTOR_WORDS = 1024
+
+
+def _check_descriptor_is_populated(kwargs: dict[str, Any],
+                                   q: torch.Tensor) -> None:
+    """The coarsest possible check on ``metadata``, and it is worth saying
+    exactly how coarse.
+
+    The descriptor is a 1024-word blob carrying the per-core split of query
+    tokens. Nothing here can tell whether its *contents* match this call --
+    the disagreement that produced an aicore exception was a descriptor built
+    for "has a compressed stream" against a call that supplied none, and that
+    blob was perfectly well-formed: 83 non-zero words, a legal descriptor for
+    a different configuration. ⚠️ So "not all zeros" catches only the case
+    where nobody ever ran the metadata operator. A blob that belongs to
+    someone else passes every check in this function.
+
+    Three states, deliberately. Zero query tokens means the split cannot be
+    populated and silence would be indistinguishable from a pass, so that case
+    is reported as *not checked* rather than allowed through quietly.
+    """
+    metadata = kwargs.get("metadata")
+    _check(metadata is not None,
+           "metadata must be provided",
+           "the operator takes its tiling from the descriptor; without one "
+           "the tiling key comes out 0 and every core faults at the same pc")
+
+    numel = getattr(metadata, "numel", None)
+    if numel is None:
+        # A pointer or an opaque handle. Nothing to inspect, and inventing an
+        # interpretation of it would be worse than saying so.
+        _log_descriptor_not_checked("metadata is not a tensor")
+        return
+
+    _check(numel() == DESCRIPTOR_WORDS,
+           f"metadata must be {DESCRIPTOR_WORDS} int32 words",
+           f"got {numel()}; a short blob is read past its end by the kernel")
+
+    num_tokens = int(q.shape[0]) if q.ndim >= 1 else 0
+    if num_tokens == 0:
+        _log_descriptor_not_checked(
+            "the batch has no query tokens, so an all-zero split is what an "
+            "empty batch legitimately produces")
+        return
+
+    _check(bool(metadata.any()),
+           "metadata must be a populated descriptor",
+           f"all {DESCRIPTOR_WORDS} words are zero while this call has "
+           f"{num_tokens} query tokens, so the metadata operator never wrote "
+           "into this buffer. Note the converse does not hold: a non-zero "
+           "blob may still have been built for another configuration.")
+
+
+_LOGGED_DESCRIPTOR_SKIPS: set[str] = set()
+
+
+def _log_descriptor_not_checked(reason: str) -> None:
+    """Say that the descriptor check was skipped, once per reason.
+
+    A skipped check and a passed check produce the same absence of output,
+    and this port has already spent a day on a negative control that was only
+    a dead instrument.
+    """
+    if reason in _LOGGED_DESCRIPTOR_SKIPS:
+        return
+    _LOGGED_DESCRIPTOR_SKIPS.add(reason)
+    from vllm.logger import logger
+
+    logger.info("DSV4.1 sparse_flash_mla: descriptor contents NOT checked -- %s",
+                reason)
+
+
 def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                                    num_requests: int) -> dict[str, Any]:
     """Check one assembled call. Returns the kwargs so it can wrap a build."""
@@ -248,6 +359,7 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                    "cmp_residual_kv incorrect shape dim. It should be 1",
                    f"got {residual.numel()} values for {num_requests} requests")
 
+    _check_descriptor_is_populated(kwargs, q)
     _check_block_table_addresses_this_cache(kwargs)
     return kwargs
 
@@ -321,6 +433,8 @@ def build_sparse_flash_mla_kwargs(
     cmp_block_table: torch.Tensor | None = None,
     seqused_cmp_kv: torch.Tensor | None = None,
     cmp_residual_kv: torch.Tensor | None = None,
+    # Slot space: block_id * storage_block_size + offset. See
+    # select_ori_sparse_indices for why this is stated and not left implicit.
     ori_sparse_indices: torch.Tensor | None = None,
     cmp_sparse_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
@@ -355,12 +469,12 @@ def build_sparse_flash_mla_kwargs(
         # not 4, because "non-sliding-window modes require ori_win_left =
         # ori_win_right = -1".
         ori_mask_mode=(SLIDING_WINDOW_MASK_MODE
-                       if _is_plain_sliding_window(attends_compressed,
+                       if is_plain_sliding_window(attends_compressed,
                                                    ori_sparse_indices)
                        else NO_MASK_MODE),
-        ori_win_left=(ori_win_left if _is_plain_sliding_window(
+        ori_win_left=(ori_win_left if is_plain_sliding_window(
             attends_compressed, ori_sparse_indices) else -1),
-        ori_win_right=(ori_win_right if _is_plain_sliding_window(
+        ori_win_right=(ori_win_right if is_plain_sliding_window(
             attends_compressed, ori_sparse_indices) else -1),
         layout_q="TND",
         layout_kv=layout_kv,

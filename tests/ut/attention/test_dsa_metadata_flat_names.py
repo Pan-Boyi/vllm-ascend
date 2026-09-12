@@ -256,9 +256,13 @@ def test_the_descriptor_and_the_call_agree_on_the_mask_triple():
     """The invariant, stated without reference to V4.0.
 
     The kernel takes its tiling from the descriptor and then receives the real
-    arguments; a disagreement is not rejected. Both sides derive the triple
-    from the same two facts, so this pins that they use the same rule rather
-    than two rules that happen to agree.
+    arguments; a disagreement is not rejected.
+
+    This used to pin that the two sides spelled the same rule. Spelling it
+    twice was itself the defect: the two expressions agreed, and agreement is
+    also the acceptance criterion, so a second source in that state announces
+    nothing. The builder now calls the call site's own functions, and what is
+    pinned here is that it still does.
     """
     import inspect
 
@@ -266,12 +270,14 @@ def test_the_descriptor_and_the_call_agree_on_the_mask_triple():
     from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args
 
     builder = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
-    caller = inspect.getsource(sparse_attn_args._is_plain_sliding_window)
+    caller = inspect.getsource(sparse_attn_args.is_plain_sliding_window)
     # Descriptor side: mode 4 only when plain sliding window.
     assert '"ori_mask_mode": 4 if plain_window else 0' in builder
-    # Call side: the same predicate, spelled from the same two facts.
+    # Call side: the predicate itself, unchanged.
     assert "not attends_compressed and ori_sparse_indices is None" in caller
-    assert "plain_window = not attends_cmp and not has_indices" in builder
+    # One source: the builder asks the predicate rather than restating it.
+    assert "plain_window = is_plain_sliding_window(" in builder
+    assert "select_ori_sparse_indices(attends_cmp" in builder
 
 
 def test_the_topk_promise_and_the_indices_are_one_decision():
