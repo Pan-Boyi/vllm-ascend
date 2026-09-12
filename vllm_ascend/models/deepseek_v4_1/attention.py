@@ -416,6 +416,16 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             seqused_cmp_kv=req.cu_cmp_seqlen_list if attends_compressed else None,
             cmp_residual_kv=req.qli_cmp_residual_k if attends_compressed else None,
             ori_sparse_indices=ori_sparse_indices,
+            # The indexer's selection. Without it the compressed stream is
+            # attended in full: nothing errors, tokens come out, and they are
+            # a V4.1 that does no sparse selection. The descriptor's cmp_topk
+            # is set from the same config value, in the builder, because a
+            # top-k promised there and not supplied here is the same
+            # disagreement that produced the aicore exception.
+            cmp_sparse_indices=(
+                self.topk_indices_buffer[:q.shape[0]]
+                if attends_compressed and self.topk_indices_buffer is not None
+                else None),
         )
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
