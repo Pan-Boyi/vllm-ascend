@@ -147,3 +147,38 @@ def test_configured_ratio_and_operator_parameter_are_not_the_same_thing():
     """
     assert 0 in ANY_PLAN_COMPRESS_RATIOS
     assert validate_compress_ratio(0, "layer", BF16_PLAN) == 0
+
+
+def test_the_source_layer_ids_are_read_from_the_text_config():
+    """V4.1 is multimodal: its real fields live under text_config.
+
+    Reading hf_config alone finds no kv_source_layer_ids, and the predicate
+    then falls back to V4.0's `ratio > 1` -- which is a legitimate answer for a
+    different model, so nothing looks wrong. Layers 20..39 carry ratio 1
+    meaning "compressed, pooling disabled", and under the fallback they report
+    "no compressed stream": their cmp_kv and the indexer's selection are both
+    dropped at the call while the descriptor still declares one.
+    """
+    from types import SimpleNamespace
+
+    from vllm_ascend.attention.dsa_v1 import attends_compressed_stream
+
+    text = SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20])
+    multimodal = SimpleNamespace(model_config=SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v41"),
+        hf_text_config=text))
+    assert attends_compressed_stream(1, multimodal) is True
+    assert attends_compressed_stream(2, multimodal) is True
+    assert attends_compressed_stream(0, multimodal) is False
+
+
+def test_a_v40_config_still_gets_v40s_threshold():
+    from types import SimpleNamespace
+
+    from vllm_ascend.attention.dsa_v1 import attends_compressed_stream
+
+    v40 = SimpleNamespace(model_config=SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        hf_text_config=SimpleNamespace(model_type="deepseek_v4")))
+    assert attends_compressed_stream(1, v40) is False
+    assert attends_compressed_stream(4, v40) is True

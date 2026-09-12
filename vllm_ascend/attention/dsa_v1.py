@@ -249,8 +249,17 @@ def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
     a config that names its source layers has the V4.1 topology whatever it
     calls itself.
     """
-    hf_config = getattr(getattr(vllm_config, "model_config", None),
-                        "hf_config", None)
+    # hf_text_config first. V4.1 is a multimodal checkpoint: its top-level
+    # hf_config carries only architectures / model_type / vision_config /
+    # text_config / quantization_config, and every field this predicate is
+    # about lives one level down. Reading hf_config alone finds no
+    # kv_source_layer_ids, so the whole V4.1 branch below silently degrades to
+    # V4.0's rule -- and the degradation is invisible, because the fallback is
+    # a legitimate answer for a different model. The identical mistake was
+    # found in use_compress a few rounds ago.
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None)
     declares_sources = getattr(hf_config, "kv_source_layer_ids", None) is not None
     if declares_sources:
         return compress_ratio >= 1

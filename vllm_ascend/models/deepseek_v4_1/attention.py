@@ -52,6 +52,44 @@ PERM_X2 = (0, 1, 2)
 PERM_Y = (1, 0, 2)
 
 
+#: One line per distinct state, not per layer per step.
+_LOGGED_SELECTION_STATES: set = set()
+
+
+def _log_compressed_selection(*, prefix, layer_ratio, attends_compressed,
+                              buffer, num_tokens) -> None:
+    """Say whether the indexer's selection actually reaches the operator.
+
+    A register-level diff of two launches showed no zero argument slot becoming
+    an address after cmp_sparse_indices started being passed -- so it never
+    arrived, while the descriptor went on declaring cmp_topk. That is the
+    descriptor-versus-call disagreement again, one level down: the code says
+    both are gated on the same fact, and at runtime one of them did not fire.
+
+    The layer's ratio is printed beside the gate because the descriptor's
+    version of "attends a compressed stream" is computed in the metadata
+    builder from the *cache group's* ratio, and this one from the *layer's*.
+    Those are two different objects with the same meaning, and nothing so far
+    has shown them to agree.
+
+    Four numbers, because three of them cannot separate "no indices at all"
+    from "indices whose rows are all -1".
+    """
+    from vllm.logger import logger
+
+    has_buffer = buffer is not None
+    filled = int((buffer[:num_tokens] >= 0).sum()) if has_buffer else -1
+    state = (layer_ratio, attends_compressed, has_buffer, filled > 0)
+    if state in _LOGGED_SELECTION_STATES:
+        return
+    _LOGGED_SELECTION_STATES.add(state)
+    logger.info(
+        "DSV4.1 %s: layer compress_ratio=%s attends_compressed=%s "
+        "topk_indices_buffer=%s selected_entries=%s num_tokens=%s",
+        prefix, layer_ratio, attends_compressed,
+        "present" if has_buffer else "None", filled, num_tokens)
+
+
 class AscendDeepseekV41Attention(DeepseekV4Attention):
     """Sparse-MLA attention on Ascend.
 
@@ -392,6 +430,13 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         ori_sparse_indices = req.vision_swa_indices
         if not attends_compressed and req.dspark_swa_indices is not None:
             ori_sparse_indices = req.dspark_swa_indices
+
+        _log_compressed_selection(
+            prefix=swa_prefix,
+            layer_ratio=self.compress_ratio,
+            attends_compressed=attends_compressed,
+            buffer=self.topk_indices_buffer,
+            num_tokens=q.shape[0])
 
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
