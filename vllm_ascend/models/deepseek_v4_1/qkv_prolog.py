@@ -161,10 +161,15 @@ def _log_slot_form(form: str) -> None:
     if form in _LOGGED_SLOT_FORMS:
         return
     _LOGGED_SLOT_FORMS.add(form)
-    import logging
+    # vllm.logger, not logging.getLogger(__name__): vLLM configures its own
+    # logging and a bare module logger produces no output at all once that has
+    # happened. This line exists to prove which branch ran, and a silent
+    # instrument proves nothing -- "the log is dumb" and "the path was not
+    # taken" look identical in the output.
+    from vllm.logger import logger
 
-    logging.getLogger(__name__).info(
-        "DSV4.1 SWA cache insert is using the %s slot mapping form.", form)
+    logger.info("DSV4.1 SWA cache insert is using the %s slot mapping form.",
+                form)
 
 
 def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,

@@ -194,18 +194,70 @@ def test_an_unrecognised_slot_shape_is_still_refused():
                      torch.zeros((2, 3), dtype=torch.int64), 4)
 
 
-def test_which_form_ran_is_logged(caplog):
+def test_which_form_ran_is_logged_audibly(caplog):
     """Both forms are legal and neither errors when read as the other, so the
-    only way to know which one ran is that it says so."""
+    only way to know which one ran is that it says so -- *in the output*.
+
+    The first version of this line used logging.getLogger(__name__), which
+    emits nothing once vLLM has configured logging. It ran for two launches and
+    left no trace, and "the instrument is silent" looks exactly like "the path
+    was not taken". So this asserts on vllm.logger's own logger, which is what
+    the other 125 files in the tree use.
+    """
     import logging
+
+    from vllm.logger import logger as vllm_logger
 
     from vllm_ascend.models.deepseek_v4_1 import qkv_prolog
 
     qkv_prolog._LOGGED_SLOT_FORMS.clear()
-    with caplog.at_level(logging.INFO):
+    # The handler is attached to vLLM's logger directly: it does not propagate
+    # to root, so caplog's default capture sees nothing -- which is the same
+    # silence this test exists to rule out.
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    vllm_logger.addHandler(handler)
+    try:
         scatter_rows(torch.zeros(2, 4, HEAD_DIM), torch.ones(1, HEAD_DIM),
                      torch.tensor([[1, 2]], dtype=torch.int64), 4)
-    assert "(block, offset)" in caplog.text
+    finally:
+        vllm_logger.removeHandler(handler)
+    assert any("(block, offset)" in m for m in records), records
+
+
+def test_the_path_evidence_logs_do_not_use_a_bare_module_logger():
+    """A silent instrument proves nothing, and proves it quietly.
+
+    vLLM configures logging; logging.getLogger(__name__) produces no output
+    afterwards. 125 files in this tree import vllm.logger and 11 do not. The
+    ones that matter here are the lines whose whole purpose is to show that a
+    path executed.
+    """
+    import ast
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import qkv_prolog
+
+    # Parsed, not grepped: this module's own comment explains why not to use a
+    # bare module logger, and a text search matches that explanation. A check
+    # that its own prose can fail is a check about spelling, not about calls.
+    tree = ast.parse(inspect.getsource(qkv_prolog))
+    bare = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "getLogger"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "logging"
+    ]
+    assert not bare, (
+        f"{len(bare)} bare logging.getLogger call(s); vLLM configures logging "
+        "and these emit nothing afterwards")
+    assert "from vllm.logger import logger" in inspect.getsource(qkv_prolog)
 
 
 def test_the_rows_land_where_the_slots_say():
