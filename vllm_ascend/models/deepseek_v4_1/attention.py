@@ -56,6 +56,80 @@ PERM_Y = (1, 0, 2)
 _LOGGED_SELECTION_STATES: set = set()
 
 
+def _describe_topk_length(topk_length, idx_host):
+    """`ori_topk_length` 只有一个正确性判据：逐行等于该行真实有效数。
+
+    不传它 ⇒ 算子按满宽度当「整行有效」，去 -1 padding 的槽 gather。
+    传一个属于【别的行】的 length，比不传更糟 —— 它看起来是对的。
+    ⇒ 所以这里不报"传了没有"，报的是它和索引表【对不对得上】。
+    """
+    if topk_length is None:
+        return "🔴 未传（算子会按满宽度当整行有效）"
+    try:
+        import torch
+        t = topk_length.detach().to("cpu")
+        real = (idx_host != -1).sum(dim=-1).reshape(-1)
+        got = t.reshape(-1)
+        if got.numel() != real.numel():
+            return (f"🔴 长度数不匹配: length {tuple(t.shape)} -> {got.numel()} 行，"
+                    f"索引表 {real.numel()} 行")
+        bad = int((got != real).sum().item())
+        if bad == 0:
+            return (f"✅ 逐行相等（{got.numel()} 行）"
+                    f" min={int(got.min())} max={int(got.max())}")
+        return (f"🔴 {bad}/{got.numel()} 行不等 —— 这个 length 描述的不是这张表"
+                f" (length max={int(got.max())} 实际 max={int(real.max())})")
+    except Exception as e:  # 取证失败不能顺带打死这一发
+        return f"⚠️ 算不出来（不算通过）: {e!r}"
+
+def _log_ori_sparse_indices(prefix, source, idx, num_tokens, caller=None,
+                            topk_length=None):
+    """Report the original-stream index list by its *content*, not by presence.
+
+    ``is None`` is not the question. These lists are built into a preallocated
+    buffer, and a buffer that was never written is neither None nor zero -- it
+    holds whatever was there. The operator gathers the original stream through
+    it, so a never-written buffer is an out-of-range gather, which is what an
+    aicore exception with non-zero MTE error info looks like.
+
+    The tell is the padding: a list that was really built carries -1 in the
+    slots it did not fill. No -1 at all, with a large or unpatterned maximum,
+    means nothing wrote it.
+    """
+    import os
+
+    from vllm.logger import logger
+
+    if int(os.environ.get("DSV41_SAS_DUMP_MAX", "0")) <= 0:
+        return
+    if idx is None:
+        logger.info("【ORI-IDX】%s: ori_sparse_indices=None (来源=无) "
+                    "ori_topk_length=%s 调用来自 %s",
+                    prefix, "无" if topk_length is None else "🔴非空但索引是None",
+                    caller)
+        return
+    try:
+        h = idx.detach().to("cpu").contiguous()
+        flat = h.reshape(-1)
+        n_neg1 = int((flat == -1).sum().item())
+        mx = int(flat.max().item()) if flat.numel() else None
+        mn = int(flat.min().item()) if flat.numel() else None
+        verdict = ("🔴从未写过的buffer嫌疑(无 -1 填充)" if n_neg1 == 0
+                   else "有 -1 填充(写过)")
+        logger.info(
+            "【ORI-IDX】%s: 来源=%s shape=%s dtype=%s | min=%s max=%s "
+            "(==-1)=%d %s | 前8=%s | 量程对照: num_tokens=%s 末维=%s | "
+            "🔴ori_topk_length: %s | 调用来自 %s",
+            prefix, source, tuple(h.shape), h.dtype, mn, mx, n_neg1, verdict,
+            flat[:8].tolist(), num_tokens,
+            h.shape[-1] if h.dim() else None,
+            _describe_topk_length(topk_length, h),
+            caller,
+        )
+    except Exception as e:
+        logger.warning("【ORI-IDX】%s: 读不出来(不致命): %r", prefix, e)
+
+
 def _log_compressed_selection(*, prefix, layer_ratio, attends_compressed,
                               buffer, num_tokens) -> None:
     """Say whether the indexer's selection actually reaches the operator.
@@ -497,6 +571,21 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # vision ones and does not take DSpark's.
         ori_sparse_indices, ori_topk_length = ori_sparse_selection(
             attends_compressed, req)
+        # 来源按【身份】判，不重算那个选择 —— 重算一遍等于给同一个问题写第二个判据，
+        # 两个判据会分头漂，而日志说的来源就不再是实际用的那个。
+        if ori_sparse_indices is None:
+            _ori_idx_src = None
+        elif ori_sparse_indices is getattr(req, "dspark_swa_indices", None):
+            _ori_idx_src = "dspark_swa_indices"
+        elif ori_sparse_indices is getattr(req, "vision_swa_indices", None):
+            _ori_idx_src = "vision_swa_indices"
+        else:
+            _ori_idx_src = "【两个都不是】"
+        # 同一层可能被两条 impl 各调一次 —— 现在没有任何数据能排除它。
+        _log_ori_sparse_indices(swa_prefix, _ori_idx_src, ori_sparse_indices,
+                                num_tokens=q.shape[0],
+                                caller=f"{type(self).__module__}.{type(self).__name__}",
+                                topk_length=ori_topk_length)
 
         _log_compressed_selection(
             prefix=swa_prefix,
