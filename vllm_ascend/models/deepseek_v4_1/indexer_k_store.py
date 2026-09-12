@@ -136,6 +136,74 @@ def _rope_interleaved_tail(k: torch.Tensor, cos_sin_cache: torch.Tensor,
     return out
 
 
+def _page_size_of(slot_mapping: torch.Tensor) -> int:
+    """The storage page the mapping was built against, found by identity.
+
+    ``format_dsa_slot_mapping`` splits a flat slot with the *builder's own*
+    ``storage_block_size``, and every group has its own. So inverting it needs
+    that group's number, and there is no way to recover it from the tensor:
+    a ``(block, offset)`` pair is valid arithmetic under any page size, and the
+    wrong one produces in-range slots belonging to other tokens.
+
+    So the page size is taken from the metadata object that *is* carrying this
+    tensor -- matched by object identity, not by layer name or by shape. A name
+    match would accept a sibling group's metadata, which is exactly the failure
+    mode ("addresses a different cache") this has to exclude. No match is a
+    refusal, never a default: a guessed page size here writes index keys over
+    other tokens' entries with nothing raised.
+    """
+    from vllm.forward_context import get_forward_context
+
+    try:
+        context = get_forward_context()
+    except AssertionError:
+        # Outside a forward, get_forward_context asserts rather than returning
+        # None. Same answer either way -- there is nothing to take the page
+        # size from -- so it is reported as that rather than escaping as an
+        # AssertionError from a frame that says nothing about slot mappings.
+        context = None
+    attn_metadata = getattr(context, "attn_metadata", None)
+    if not isinstance(attn_metadata, dict):
+        raise ValueError(
+            "indexer slot mapping is (block, offset) but there is no attention "
+            "metadata dict to take the storage page size from.")
+
+    seen = []
+    for layer_name, metadata in attn_metadata.items():
+        req = getattr(metadata, "req_metadata", None)
+        if req is None:
+            continue
+        page = getattr(req, "storage_block_size", None)
+        if page is None:
+            continue
+        candidates = (getattr(req, "slot_mapping", None),
+                      getattr(req, "token_slot_mapping", None))
+        if any(c is slot_mapping for c in candidates):
+            return int(page)
+        seen.append((layer_name, page))
+
+    raise ValueError(
+        "the indexer's (block, offset) slot mapping is not the slot mapping of "
+        "any attention metadata in this forward, so the storage page size it "
+        "was split with is unknown. Inverting it with another group's page "
+        f"size writes into other tokens' entries silently. Groups seen: {seen}")
+
+
+def flatten_block_offset_slots(slot_mapping: torch.Tensor) -> torch.Tensor:
+    """``[T, 2]`` ``(block, offset)`` back to the flat slots it was split from.
+
+    The exact inverse of ``DsaAttnKvPlan.format_dsa_slot_mapping``, including
+    its sentinel: that function writes ``-1`` into *both* columns for an
+    invalid slot, so a row is invalid iff its block is negative, and stays one
+    value rather than becoming ``-block_size - 1``.
+    """
+    blocks, offsets = slot_mapping[:, 0], slot_mapping[:, 1]
+    page = _page_size_of(slot_mapping)
+    flat = blocks.to(torch.int64) * page + offsets.to(torch.int64)
+    return torch.where(blocks >= 0, flat,
+                       torch.full_like(flat, -1)).to(slot_mapping.dtype)
+
+
 def indexer_k_norm_rope_store_ascend(
     k_pre: torch.Tensor,
     positions: torch.Tensor,
@@ -160,16 +228,14 @@ def indexer_k_norm_rope_store_ascend(
         raise ValueError(
             f"indexer k_pre must be [num_tokens, {INDEX_HEAD_DIM}], got "
             f"{tuple(k_pre.shape)}")
-    if kv_slot_mapping.ndim != 1:
-        # The DSA builder can format slots as [T, 2] (block, offset) for plans
-        # that want block-relative addressing. The fused epilog operator wants
-        # flat slots and divides by the block size itself, so a [T, 2] mapping
-        # here would be read as twice as many tokens.
+    if kv_slot_mapping.ndim == 2 and kv_slot_mapping.shape[-1] == 2:
+        kv_slot_mapping = flatten_block_offset_slots(kv_slot_mapping)
+        num_tokens = kv_slot_mapping.shape[0]
+    elif kv_slot_mapping.ndim != 1:
         raise ValueError(
-            "indexer kv_slot_mapping must be flat [num_tokens]; got "
-            f"{tuple(kv_slot_mapping.shape)}. A [num_tokens, 2] mapping means "
-            "the plan formatted slots as (block, offset), which "
-            "indexer_compress_epilog_v2 does not take.")
+            "indexer kv_slot_mapping must be flat [num_tokens] or "
+            f"[num_tokens, 2] (block, offset); got "
+            f"{tuple(kv_slot_mapping.shape)}.")
     if num_tokens == 0:
         return
 

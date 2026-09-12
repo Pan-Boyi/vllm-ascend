@@ -204,13 +204,20 @@ def test_mxfp4_says_upstream_cannot_reach_it_either(epilog):
             torch.zeros(1, dtype=torch.int32), 1, True)
 
 
-def test_a_block_offset_slot_mapping_is_refused(epilog):
-    """The DSA builder can format slots as [T, 2]; the operator takes flat.
+def test_a_block_offset_slot_mapping_without_its_page_size_is_refused(epilog):
+    """This used to refuse the [T, 2] form outright, and that was right while
+    nothing here could know the page size it was split with.
 
-    Passed through, the operator would read twice as many tokens from a tensor
-    whose odd entries are block offsets.
+    It is now converted -- but only when the page size can be taken from the
+    metadata that is carrying this exact tensor. With no forward context there
+    is no such metadata, and the refusal stands rather than a plausible
+    constant being substituted: a (block, offset) pair is valid arithmetic
+    under any page size, and the wrong one lands on another token's slot
+    without leaving the cache.
+
+    The conversion itself is pinned in test_deepseek_v4_1_indexer_slot_form.py.
     """
-    with pytest.raises(ValueError, match=r"\(block, offset\)"):
+    with pytest.raises(ValueError, match="attention metadata"):
         indexer_k_norm_rope_store_ascend(
             torch.zeros(2, INDEX_HEAD_DIM, dtype=torch.bfloat16),
             torch.zeros(2, dtype=torch.int64),
