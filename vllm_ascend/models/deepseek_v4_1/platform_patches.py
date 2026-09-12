@@ -245,6 +245,18 @@ def apply_all() -> list[str]:
     if apply_indexer_k_store_patch():
         applied.append("indexer_k_norm_rope_store")
 
+    # The compressor's latent publish. Not a Triton concern: upstream's
+    # function is fine, it is the slot mapping that arrives in the other form.
+    # A5 with a bf16 KV cache formats slots as (block, offset); upstream reads
+    # slot_mapping.numel() as the token count and the kernel divides a flat
+    # slot by its own block length, so the paired form is 2T tokens of
+    # nonsense -- caught by upstream's own assertion, as a bare AssertionError.
+    from vllm_ascend.models.deepseek_v4_1.compressor_insert import \
+        apply_compressor_insert_patch
+
+    if apply_compressor_insert_patch():
+        applied.append("rope_quant_insert")
+
     if not applied:
         raise RuntimeError(
             "apply_all() applied nothing. Either upstream changed shape and "
