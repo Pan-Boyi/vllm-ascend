@@ -28,12 +28,25 @@ import os
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ref"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "ref"))
 from model import select_candidate_blocks                              # noqa: E402
 
-TOPK_BLOCKS = 2048          # config.json: candidate_topk_blocks
-BLOCK = 8                   # config.json: candidate_block_size
-BINDS_ABOVE = TOPK_BLOCKS * BLOCK      # 16384 -- the filter is a no-op at or below this
+# 🔴 Read from the checkpoint's own config, not copied out of it.  These used to be
+# literals with a comment naming where they came from -- which is exactly the shape
+# that survives a config change while silently testing parameters the model no longer
+# uses.  A positive control fails by staying green.
+def _cfg():
+    import json
+    with open(os.path.join(HERE, "ref", "config.json")) as f:
+        return json.load(f)
+
+
+_C = _cfg()
+TOPK_BLOCKS = _C["candidate_topk_blocks"]
+BLOCK = _C["candidate_block_size"]
+SOURCE_LAYER = _C["candidate_source_layer"]
+BINDS_ABOVE = TOPK_BLOCKS * BLOCK      # the filter is a no-op at or below this
 
 fails = 0
 
