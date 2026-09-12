@@ -240,6 +240,12 @@ class StreamingEngramEmbedding(nn.Module):
         return values.masked_fill(mask.unsqueeze(-1), 0)
 
 
+# Filled in by StreamingMoE when --ep-sim is on; read by run_golden.py.  Kept at
+# module scope because the blocks are built and freed one at a time, so there is no
+# surviving object to hang it off.
+EP_SIM_STATS: list[dict] = []
+
+
 class StreamingMoE(nn.Module):
     """``model.MoE`` with the routed experts read on demand.
 
@@ -277,6 +283,12 @@ class StreamingMoE(nn.Module):
         self.routing_override = None   # (layer_id, positions, weights, indices) -> (weights, indices)
         self.routing_positions = None  # [n_rows] absolute sequence position of each gate row
         self.record_forced = None      # set by _attach_taps when dumping
+        # --ep-sim: how many expert-parallel ranks to simulate.  The NPU side runs
+        # EP>1, where each rank sums only the experts it owns and an all_reduce adds
+        # the partial sums; the golden sums all of them in expert-id order.  Same
+        # terms, different association -- so this is a floor, not a bug.  See the
+        # note in forward().
+        self.ep_sim = None
 
     def _bind_expert(self, i: int):
         p = f"{self.prefix}ffn.experts.{i}."
@@ -340,16 +352,142 @@ class StreamingMoE(nn.Module):
             )
             if self.record_forced is not None:
                 self.record_forced(weights, indices)
+        if getattr(self, "probs_bf16", False):
+            # Models the AllGather combine path as it stands today: the fp32 routing
+            # weights are handed to npu_moe_token_unpermute as
+            # ``probs=topk_weights.to(hidden_states.dtype)``, i.e. rounded to bf16
+            # (token_dispatcher.py:98).  The MC2 path passes ``.to(torch.float32)``
+            # instead, so the two paths disagree.  Everything else is unchanged --
+            # accumulation stays fp32 and the output is rounded once -- because that
+            # part was measured to match the operator already.
+            weights = weights.to(torch.bfloat16).float()
         y = torch.zeros_like(x, dtype=torch.float32)
+        # --ep-sim only: one extra fp32 accumulator per simulated rank.  The expert
+        # outputs are computed once and added into both, so this costs no expert
+        # arithmetic -- it isolates the *association* of the sum, which is the only
+        # thing expert parallelism changes.
+        ep = self.ep_sim
+        parts = None
+        if ep:
+            assert self.n_routed_experts % ep == 0, (
+                f"{self.n_routed_experts} experts do not divide across {ep} ranks; "
+                f"ref/model.py asserts the same thing")
+            n_local = self.n_routed_experts // ep
+            parts = [torch.zeros_like(y) for _ in range(ep)]
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.n_routed_experts):
             if counts[i] == 0:
                 continue
             expert = self._bind_expert(i)
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
+            out = expert(x[idx], weights[idx, top, None])
+            y[idx] += out
+            if parts is not None:
+                parts[i // n_local][idx] += out
+        if parts is not None:
+            _record_ep_sim(self.layer_id, y, parts, self.shared_experts(x), x.dtype)
         y += self.shared_experts(x)
         return y.type_as(x).view(shape)
+
+
+def _wrap_indexer_post_rope(block, args):
+    """--indexer-post-rope: feed the indexer a RoPE'd copy of the latent.
+
+    ``ref/model.py:749`` states the order as a requirement: *"the indexer needs the
+    latent before RoPE, so it runs before the cache is written"*.  Getting it wrong
+    raises nothing -- the indexer just returns top-k over different scores, i.e. it
+    **selects different tokens**, which is indistinguishable from a correct run
+    unless something compares the selections.  And moving RoPE one step earlier looks
+    like a pure optimisation (one less pass over the latent), so whoever does it will
+    not think they changed semantics.
+
+    This is the negative arm.  It hands the indexer a *clone* with RoPE applied and
+    leaves the real latent untouched, so exactly one thing differs: what the indexer
+    saw.  Everything downstream -- the cache write, the quantization, the attention --
+    is bit-identical to a normal run.
+
+    ⚠️ The ``freqs`` slicing below mirrors ``ref/model.py:752-757`` and must stay in
+    step with it.  A latent stands for the FIRST token of its group, so group j takes
+    position ``j * ratio`` -- not its own index, which is the intuition everyone has.
+    """
+    attn = block.attn
+    if not getattr(attn, "is_kv_source", False):
+        return
+    ratio = attn.compress_ratio
+    _orig = attn._compress_topk_idxs
+
+    def _spy(x, qr, latent, start_pos, offset, compress_len, _o=_orig):
+        if latent is not None:
+            seqlen = x.size(1)
+            freqs = (attn.freqs_cis[: seqlen - seqlen % ratio : ratio]
+                     if start_pos == 0
+                     else attn.freqs_cis[start_pos + 1 - ratio].unsqueeze(0))
+            roped = latent.clone()
+            M.apply_rotary_emb(roped[..., -attn.rope_head_dim:], freqs)
+            latent = roped
+        return _o(x, qr, latent, start_pos, offset, compress_len)
+
+    attn._compress_topk_idxs = _spy
+
+
+def _record_ep_sim(layer_id, y_seq, parts, shared, out_dtype):
+    """Compare the golden's id-order sum against every plausible grouping of it.
+
+    ⚠️ **This models arithmetic, not a specific operator.**  An earlier version of this
+    docstring framed it as ``dist.all_reduce``, which is wrong for this deployment:
+    the TP group has world_size 1 (A5 forces TP=1), and
+    ``vllm/distributed/parallel_state.py:737-739`` returns the input unchanged in that
+    case -- so the three ``tensor_model_parallel_all_reduce`` calls in
+    ``vllm_ascend/ops/fused_moe/fused_moe.py`` (200/241/259) are no-ops.  Ascend does
+    the reduction inside its own dispatch/combine path instead (the comment at
+    fused_moe.py:245 says so), i.e. in ``npu_moe_distribute_combine_v2``.
+    (All four of those readings verified directly, not relayed.)
+    
+    What the two numbers below do and do not establish:
+    
+    * **fp32 variant -- dataflow independent.**  Summing the *same* contributions in
+      fp32 in any order or grouping lands bit-identically after the cast to the
+      residual dtype, because fp32 re-association is orders of magnitude below one
+      bf16 ULP.  This holds whoever does the summing, so "we shard experts and the
+      golden does not" cannot explain a ``moe.out`` mismatch.
+    * **low-precision variant -- models ONE implementation choice.**  It rounds each
+      group's partial sum to the residual dtype before combining.  Whether any
+      operator on the real path does that is **unmeasured**; do not read it as a
+      property of the NPU.  It is the price of rounding intermediate partial sums,
+      whoever rounds them.
+    """
+    import itertools
+    worst_pre, worst_out, worst_bf16, worst_order = 0.0, 0.0, 0.0, None
+    seq_out = (y_seq + shared).to(out_dtype).float()
+    for order in itertools.permutations(range(len(parts))):
+        acc = parts[order[0]].clone()
+        for k in order[1:]:
+            acc = acc + parts[k]
+        d_pre = float((acc - y_seq).abs().max())
+        d_out = float(((acc + shared).to(out_dtype).float() - seq_out).abs().max())
+        # The fp32 result above assumes the all_reduce carries fp32.  An
+        # implementation that reduces in the residual dtype rounds each rank's
+        # partial sum first, which is a different and much coarser question -- and
+        # it is the one that decides whether EP is invisible at the dumped
+        # precision.  Measured separately rather than assumed away.
+        acc16 = parts[order[0]].to(out_dtype)
+        for k in order[1:]:
+            acc16 = (acc16 + parts[k].to(out_dtype)).to(out_dtype)
+        d16 = float(((acc16.float() + shared).to(out_dtype).float() - seq_out).abs().max())
+        if d_pre > worst_pre:
+            worst_pre, worst_order = d_pre, order
+        worst_out = max(worst_out, d_out)
+        worst_bf16 = max(worst_bf16, d16)
+    denom = max(float(y_seq.abs().max()), 1e-30)
+    EP_SIM_STATS.append({
+        "layer": layer_id, "ranks": len(parts),
+        "max_abs_pre_shared": worst_pre,
+        "rel_pre_shared": worst_pre / denom,
+        "max_abs_moe_out": worst_out,          # after + shared and the cast to out_dtype
+        "max_abs_moe_out_reduce_in_out_dtype": worst_bf16,
+        "out_dtype": str(out_dtype),
+        "worst_order": worst_order,
+    })
 
 
 class _NullMoE(nn.Module):
@@ -423,7 +561,97 @@ class Recorder:
             json.dump({"tensors": self.manifest, **extra}, f, indent=2)
 
 
+# The recorder the quantization taps below should write into.  A list because the
+# wrappers are installed once on the model module while the blocks run one at a
+# time, so the destination has to be swappable without rewrapping.
+_CURRENT_REC: list = [None]
+
+
+def _install_quant_taps():
+    """Record the input and output of the two in-place KV quantizers.
+
+    Both streams are quantized in place -- ``dequant(quant(x))`` is written back over
+    ``x`` -- so by the time anything downstream sees the tensor, the pre-quantization
+    value is gone.  Without these taps the only way to check a quantizer is to find
+    two dumps that happen not to have diverged upstream yet, which is a coincidence
+    that the next change of input destroys.  With them, a reference gets the exact
+    pair (in, out) and depends on nothing else.
+
+    The non-inplace calls are for Linear weights and are not recorded.
+    """
+    if getattr(M.act_quant, "_golden_tapped", False):
+        return
+    _real_aq, _real_fq = M.act_quant, M.fp4_act_quant
+
+    def _aq(x, *a, **k):
+        r = _CURRENT_REC[0]
+        inplace = bool(k.get("inplace") or (len(a) >= 4 and a[3]))
+        if r is not None and inplace:
+            r.add("quant.window.in", x.clone())
+        out = _real_aq(x, *a, **k)
+        if r is not None and inplace:
+            r.add("quant.window.out", x.clone())
+        return out
+
+    def _fq(x, *a, **k):
+        r = _CURRENT_REC[0]
+        inplace = bool(k.get("inplace") or (len(a) >= 2 and a[1]))
+        if r is not None and inplace:
+            r.add("quant.compress.in", x.clone())
+            r.add("quant.compress.group", torch.tensor(
+                [int(a[0]) if a else int(k.get("block_size", 32))], dtype=torch.int32))
+        out = _real_fq(x, *a, **k)
+        if r is not None and inplace:
+            r.add("quant.compress.out", x.clone())
+        return out
+
+    _aq._golden_tapped = _fq._golden_tapped = True
+    M.act_quant, M.fp4_act_quant = _aq, _fq
+
+    # The candidate mask (level one of the two-level top-k) had no dump point at all,
+    # so nothing could be compared about it -- found by asking, for every discrete
+    # decision in the model, "is there a criterion on the decision itself, or only on
+    # the numbers downstream of it?".  It is the one place the answer was "neither".
+    #
+    # It only exists on candidate_source_layer (20), and only bites above
+    # candidate_topk_blocks * candidate_block_size = 16384 positions; below that the
+    # mask is all-True and comparing it proves nothing (see section 0.4 row 15a).
+    _real_cand = M.select_candidate_blocks
+
+    def _cand(*a, **k):
+        out = _real_cand(*a, **k)
+        r = _CURRENT_REC[0]
+        if r is not None:
+            r.add("candidates", out.clone())
+            # What makes the no-op visible is the BLOCK count, not the True count.
+            # Measured at 27 tokens: 465/729 positions are True, not all of them --
+            # because the mask also carries reachability at block granularity (query
+            # j keeps whole blocks up to floor(j/8); summing that over 27 queries is
+            # exactly 465).  So "all True" is the wrong test: the filter is already a
+            # no-op there, it just does not look like it.  The right test is whether
+            # `topk_blocks` binds at all.
+            n_pos = out.shape[-1]
+            # block_size and topk_blocks come from the call, not from a constant here:
+            # select_candidate_blocks(logits, compress_lens, topk_blocks, block_size)
+            topk_blocks = int(a[2]) if len(a) > 2 else int(k.get("topk_blocks", 0))
+            blk = int(a[3]) if len(a) > 3 else int(k.get("block_size", 8))
+            num_blocks = (n_pos + blk - 1) // blk
+            kept_blocks = (int(out.reshape(-1, n_pos)[:, ::blk].sum(-1).max())
+                           if n_pos and blk else 0)
+            r.add("candidates.kept", torch.tensor(
+                [int(out.sum()), int(out.numel())], dtype=torch.int64))
+            # [最大保留块数, 总块数, topk_blocks] -- 筛子咬没咬到 = topk_blocks < 总块数
+            r.add("candidates.blocks", torch.tensor(
+                [kept_blocks, num_blocks, topk_blocks], dtype=torch.int64))
+        return out
+
+    _cand._golden_tapped = True
+    M.select_candidate_blocks = _cand
+
+
 def _attach_taps(block, rec: Recorder):
+    _install_quant_taps()
+    _CURRENT_REC[0] = rec
     """Hook every sublayer boundary worth comparing, plus the three hc helpers.
 
     Module hooks give the sublayer inputs/outputs without touching the reference
@@ -470,6 +698,88 @@ def _attach_taps(block, rec: Recorder):
     # will any implementation whose window KV is laid out differently.  Recording
     # the offset makes the tensor interpretable instead of only comparable against
     # an identically-shaped run.
+    # The attention output before the o-projection.  ``attn.out`` is what comes
+    # out the far side of three steps -- inverse RoPE, the block-diagonal wo_a
+    # einsum, then wo_b -- so when it disagrees, those three plus the sparse
+    # attention itself are indistinguishable.  Two of the four fail *quietly*: an
+    # inverse RoPE with the wrong convention (GPT-J interleaved vs half-rotated)
+    # and a wo_a treated as dense instead of block-diagonal both produce
+    # plausible numbers rather than an error.
+    #
+    # ``apply_rotary_emb(o[..., -rd:], freqs_cis, True)`` mutates in place, so
+    # o_raw has to be cloned before it runs; o_unroped is the same storage read
+    # afterwards (``.view`` rebinds the name without copying and the einsum does
+    # not write back).
+    _afwd = block.attn.forward
+
+    def _attn_o_tap(*aa, _orig=_afwd, **kw):
+        holder = {}
+        real_sa = M.sparse_attn
+
+        def sa_spy(*a, **k):
+            # Record what actually reached sparse_attn, not just what came out.  A
+            # sha on the output tells a comparison "different" without saying where;
+            # with the inputs the other side can compare pointwise and localise.
+            # Signature: sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale).
+            if len(a) >= 4:
+                rec.add("sa_in.q", a[0].clone())
+                rec.add("sa_in.kv", a[1].clone())        # already the concatenated
+                rec.add("sa_in.attn_sink", a[2].clone())  # [window ; compressed]
+                rec.add("sa_in.topk_idxs", a[3].clone())
+                if len(a) >= 5:
+                    rec.add("sa_in.softmax_scale",
+                            torch.tensor([float(a[4])], dtype=torch.float32))
+            out = real_sa(*a, **k)
+            rec.add("attn.o_raw", out.clone())      # before the in-place inverse RoPE
+            holder["o"] = out
+            return out
+
+        M.sparse_attn = sa_spy
+        try:
+            res = _orig(*aa, **kw)
+        finally:
+            M.sparse_attn = real_sa
+        if "o" in holder:
+            rec.add("attn.o_unroped", holder["o"])   # after it
+        return res
+
+    block.attn.forward = _attn_o_tap
+
+    # ``indexer_score`` -- the scores the indexer takes its top-k of.  Needed
+    # because the indexer's selection is a *discrete* verdict computed on
+    # quantised q/k (fp4 in the reference, fp8 on Ascend), so a quantisation
+    # difference can flip which positions win.  With only the chosen indices, a
+    # comparison can say "N positions changed" but not "did it matter" -- exactly
+    # where MoE routing was before moe_routing_margin existed.
+    #
+    # The score is a local in ``Indexer.forward``, so rather than duplicate ~25
+    # lines of the reference (which would then be free to drift from it), capture
+    # it by noting what ``topk`` was called on.  The scoping is deliberately
+    # narrow: the patch is installed only for the duration of that one forward and
+    # always removed.  ``select_candidate_blocks`` also calls topk, and it runs
+    # *before* the final ``index_score.topk``, so the last capture is the one.
+    if block.attn.indexer is not None:
+        _ifwd = block.attn.indexer.forward
+
+        def _indexer_tap(*aa, _orig=_ifwd, **kw):
+            seen = []
+            real_topk = torch.Tensor.topk
+
+            def spy(self, *a, **k):
+                seen.append(self)
+                return real_topk(self, *a, **k)
+
+            torch.Tensor.topk = spy
+            try:
+                out = _orig(*aa, **kw)
+            finally:
+                torch.Tensor.topk = real_topk
+            if seen:
+                rec.add("indexer_score", seen[-1].float())
+            return out
+
+        block.attn.indexer.forward = _indexer_tap
+
     if block.attn.compress_ratio:
         _wkv = block.attn._window_kv
 
@@ -645,6 +955,12 @@ class GoldenModel:
         with _lean_block_construction():
             block = M.Block(layer_id, self.args, self.engram_layout)
         block.ffn = StreamingMoE(layer_id, self.args, self.ckpt, f"layers.{layer_id}.")
+        # set by run_golden.py --ep-sim; diagnostic only, the dumped values are
+        # unchanged because the golden's own sum is still the one that is returned
+        block.ffn.ep_sim = getattr(self, "ep_sim", 0) or None
+        block.ffn.probs_bf16 = getattr(self, "probs_bf16", False)
+        if getattr(self, "indexer_post_rope", False):
+            _wrap_indexer_post_rope(block, self.args)
         return block
 
     # -- forward -----------------------------------------------------------
@@ -652,7 +968,8 @@ class GoldenModel:
     def forward(self, input_ids: torch.Tensor, rec: Recorder | None = None,
                 n_layers: int | None = None, full_logits: bool = True,
                 start_pos: int = 0, routing_plan=None, layer_in_dir: str | None = None,
-                state: "LayerStateStore | None" = None):
+                state: "LayerStateStore | None" = None,
+                perturb_ulp: tuple[int, int] | None = None):
         """``layer_in_dir`` turns every block into an independent comparison.
 
         Forced routing removes the discrete verdict but not the *accumulation*: the
@@ -675,15 +992,28 @@ class GoldenModel:
         # Absolute sequence position of every token in this call -- the key the
         # forced-routing plan is addressed by.  Deliberately *not* the row index:
         # see section 0 of ROUTING_INJECTION.md.
+        # One entry per row of the flattened [batch*seqlen, dim] gate input, in that
+        # order.  For a batch of identical sequences (``--batch N``) every row maps
+        # to the same plan position, so the positions tile.
         positions = torch.arange(start_pos, start_pos + input_ids.size(1))
+        if input_ids.size(0) > 1:
+            positions = positions.repeat(input_ids.size(0))
         if routing_plan is not None:
-            assert input_ids.size(0) == 1, (
-                f"a routing plan describes one sequence; got batch {input_ids.size(0)}. "
-                "Use one plan per request."
-            )
+            if input_ids.size(0) > 1:
+                # A plan describes one sequence.  A mixed batch would need one plan
+                # per row, which this runner does not carry; a batch of identical
+                # rows is the same sequence N times, which is exactly what the
+                # batch-consistency check feeds it.
+                first = input_ids[0]
+                assert all(torch.equal(input_ids[b], first)
+                           for b in range(input_ids.size(0))), (
+                    f"batch {input_ids.size(0)} with a routing plan is only supported "
+                    "when every row carries the same sequence."
+                )
             # Every call, not just the first: a decode step's tokens are just as
             # capable of coming from the wrong text.
-            routing_plan.check_input_ids(input_ids, start_pos)
+            # Row 0 stands for all of them, their identity having just been asserted.
+            routing_plan.check_input_ids(input_ids[:1], start_pos)
 
         engram_hashes = None
         if self.engram_hash is not None:
@@ -693,6 +1023,25 @@ class GoldenModel:
             engram_hashes = self.engram_hash(input_ids, start_pos, None)
 
         h = F.embedding(input_ids, self.embed_weight)
+        if perturb_ulp is not None:
+            # Move ONE element of the embedding by exactly one bf16 ULP, by
+            # incrementing its bit pattern.  This is the smallest difference the
+            # residual stream can represent, and it is the size of the difference
+            # two *different implementations* start with -- nine orders of
+            # magnitude above the 3.6e-12 that two rows of one batched GEMM start
+            # with.  Running it forward measures what that becomes after 40
+            # layers, which decides whether end-to-end layer-wise numerical
+            # comparison between implementations is possible at all.
+            tok, dim = perturb_ulp
+            bits = h.view(torch.int16)
+            before = float(h[0, tok, 0, dim]) if h.dim() == 4 else float(h[0, tok, dim])
+            flat = bits[0, tok, dim] if bits.dim() == 3 else bits[0, tok, 0, dim]
+            bits[0, tok, dim] = flat + 1
+            after = float(h[0, tok, dim])
+            if self.verbose:
+                print(f"perturbed embed.out[0,{tok},{dim}]: {before!r} -> {after!r} "
+                      f"(one bf16 ULP, rel {abs(after - before) / max(abs(before), 1e-30):.3e})",
+                      flush=True)
         rec.add("embed.out", h)
         h = h.unsqueeze(2).repeat(1, 1, args.hc_mult, 1)
         pre_mix = M.make_identity_pre_mix(h, args.hc_mult)
@@ -740,8 +1089,19 @@ class GoldenModel:
             rec.add("pre_mix.in", pre_mix)
 
             if block.engram is not None:
-                idx = block.engram.layer_hash_index
-                h = block.engram(h, engram_hashes[:, :, idx, :], None)
+                if engram_hashes is None:
+                    # --no-engram: no tokenizer, so no hash ids to look up.  The
+                    # flag promised to skip these layers and did not -- it left
+                    # engram_hashes None and then subscripted it, which is how a
+                    # 40-layer memory measurement died at layer 1.  Skipping is
+                    # what the flag means; the run is then not a numerical
+                    # reference, which is why it says so out loud.
+                    if self.verbose:
+                        print(f"  layer {i:2d}  engram SKIPPED (no tokenizer) -- "
+                              f"this run is not numerically comparable", flush=True)
+                else:
+                    idx = block.engram.layer_hash_index
+                    h = block.engram(h, engram_hashes[:, :, idx, :], None)
 
             h, pre_mix = block(h, start_pos, pre_mix, None)
 

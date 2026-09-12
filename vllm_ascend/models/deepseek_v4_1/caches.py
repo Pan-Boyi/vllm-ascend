@@ -20,47 +20,75 @@ import torch
 from vllm.config import VllmConfig
 from vllm.models.deepseek_v4_1.common.engram import ParallelEngramEmbedding
 from vllm.models.deepseek_v4_1.attention import DeepseekV4IndexerCache
-from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
+from vllm.models.deepseek_v4_1.compressor import (CompressorBackend,
+                                                  CompressorStateCache)
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
     AscendStagedEngramEmbedding
 
 
-class AscendCompressorStateBackend(AscendDSABackend):
-    """Backend for the compressor's ring buffer.
+class AscendCompressorStateBackend(CompressorBackend):
+    """Upstream's compressor backend, plus the one method Ascend needs.
 
-    ⚠️ The sentence that used to open this docstring -- "it exists for one
-    inherited method" -- was wrong, and wrong in a way no grep shows: it also
-    inherited ``get_builder_cls`` from ``AscendDSABackend``, so the ring group
-    was handed an ``AscendDSAMetadataBuilder``, whose first act is to read
-    ``kv_cache_spec.storage_block_size``. A ``CircularBufferSpec`` has no such
-    attribute, and a ring does no attention at all -- upstream gives it
-    ``CompressorMetadataBuilder``. Inheriting from the DSA backend to borrow one
-    method brought the rest of the class with it.
+    🔴 这个类【曾经】继承 ``AscendDSABackend``，docstring 开头写的是"它只为一个
+    继承来的方法而存在"（``get_kv_cache_shape``）。那句话是错的，而且错在一个
+    **grep 看不见**的地方：它还继承了 ``get_builder_cls``，于是环组被塞了一个
+    ``AscendDSAMetadataBuilder``，而那个 builder 第一件事就是读
+    ``kv_cache_spec.storage_block_size`` —— ``CircularBufferSpec`` 没有这个属性。
+    2026-09-11 第十六次起飞就死在
+    ``AttributeError: 'CircularBufferSpec' object has no attribute 'storage_block_size'``。
+    环根本不做 attention：它的读写是 compressor 自己的 Triton kernel，
+    上游为它配的是 ``CompressorMetadataBuilder``（算环槽位映射）。
+    **为了借一个方法去继承 DSA backend，把那个类的其余部分一起带了过来。**
 
-    Upstream's ``CompressorBackend``
-    defines ``get_name`` / ``get_supported_kernel_block_sizes`` /
-    ``get_supported_head_sizes`` / ``get_builder_cls`` and no
-    ``get_kv_cache_shape`` -- and neither does ``AttentionBackend``, which only
-    concrete backends implement. The Ascend runner's generic attention branch
-    calls it while reshaping, so on this platform the state cache would fail
-    with an AttributeError during KV cache setup, before any forward pass.
+    ⇒ 正确的基类是上游的 ``CompressorBackend``：它定义了 ``get_name`` /
+    ``get_supported_kernel_block_sizes`` / ``get_supported_head_sizes`` /
+    ``get_builder_cls``，唯独没有 ``get_kv_cache_shape`` —— ``AttentionBackend``
+    也没有，那是只有具体 backend 才实现的方法。而昇腾 runner 的通用 attention
+    分支在 reshape 时会调它，所以在本平台上，状态 cache 会在 KV cache 建立阶段、
+    任何一次前向之前就以 AttributeError 失败。⇒ 这里只补那一个方法。
 
-    Deliberately no ``get_supported_kernel_block_sizes`` override: the base
-    already allows [2, 4, 8, 16, 32, 64, 128], which covers every ring capacity
-    the spec can ask for (8 with no speculation, 16 at seven draft tokens).
-    Narrowing it here would be asserting something about the kernel that has
-    not been measured.
+    ⚠️ ``get_kv_cache_shape`` 的维序必须是 ``(B, N, H, C)``，头维在 **-2**，
+    和主 MLA / indexer K 同一个约定。
+
+    🔴 我一度把它改成 ``(B, H, N, C)``，理由是上游
+    ``CompressorStateCache.bind_kv_cache`` 做 ``kv_cache.squeeze(1)``、
+    注释写 ``[B, H=1, N, C] -> [B, N, C]``。**那个理由整条不成立**：
+    昇腾这条路根本不调用每层的 ``bind_kv_cache`` ——
+    ``model_runner_v1.py:4292-4313`` 对 V4 家族是**直接赋**
+    ``static_forward_context[name].kv_cache = bind_value(kv_cache)``。
+    上游那三处 ``squeeze(1)`` 在本平台是死代码，改声明去迎合它不生效。
+    而真正读这个形状的是 ``deepseek_v4_1/kv_binding.py`` 的 ``bind_value``，
+    它按 ``HEAD_AXIS = -2`` 找头维：``(B, H, N, C)`` 下 ``shape[-2]`` 是环容量 8，
+    不是 1 ⇒ 它认不出这个布局，**退回 list 包装**，而
+    ``compressor.py:268`` 直接把它喂给 kernel，期待三维 tensor。
+    ⇒ 症状是下一帧的类型错，不是这里的形状错。
+
+    ⚪ 这条是 dsv41-model 用实跑数据纠正的，不是推理：
+       ``bind_value((B,H=1,N=8,C)) -> list``；``bind_value((B,N=8,H=1,C)) -> Tensor``。
+    ⚪ 值得记住的是**为什么我的判据拦不住**：H=1 时两种维序的字节和 stride
+       完全相同，没有任何一条形状断言能区分它们 ——
+       能区分的只有"谁在读这个形状、他从哪一轴找头"。
     """
 
     @staticmethod
     def get_name() -> str:
         return "ASCEND_DSV41_COMPRESSOR_STATE"
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "",
+    ) -> tuple[int, ...]:
+        # [B, N, H, C]：头维在 -2，bind_value 就是从那一轴找它的。
+        return num_blocks, block_size, num_kv_heads, head_size
 
 
 class AscendDeepseekV41CompressorStateCache(CompressorStateCache):
