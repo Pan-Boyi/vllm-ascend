@@ -454,3 +454,56 @@ def test_an_oversized_batch_is_refused_by_name():
     with pytest.raises(ValueError, match="exceeds the 16"):
         f.lookup(torch.zeros((32, f.part_n_hash_cols), dtype=torch.int64),
                  torch.zeros((32, 8)))
+
+
+def _layout_two_layers(rows=(512, 640)):
+    from vllm_ascend.models.deepseek_v4_1.engram_layout import EngramLayout
+
+    return EngramLayout(n_hash_cols=24, dim=256, quant_block=32,
+                        layer_ids=(1, 14), num_embeddings=rows)
+
+
+class _Identifiable(AscendStagedEngramEmbedding):
+    def __init__(self, num_embeddings):
+        self.num_embeddings = num_embeddings
+
+
+def test_the_layer_identity_comes_from_the_row_count():
+    """Upstream's constructor carries neither a prefix nor a layer id.
+
+    The two engram layers have different vocabularies, so the row count names
+    the layer. Pinned because the alternative -- guessing, or defaulting to the
+    first -- binds the other layer's table and then maps, gathers and returns
+    embeddings from it with no error anywhere.
+    """
+    layout = _layout_two_layers()
+    assert _Identifiable(512)._own_layer_id(layout) == 1
+    assert _Identifiable(640)._own_layer_id(layout) == 14
+
+
+def test_an_ambiguous_row_count_refuses():
+    """Two layers with equal vocabularies would make this a coin flip."""
+    layout = _layout_two_layers(rows=(512, 512))
+    with pytest.raises(RuntimeError, match="cannot tell which engram layer"):
+        _Identifiable(512)._own_layer_id(layout)
+
+
+def test_an_unmatched_row_count_refuses_and_shows_the_table():
+    with pytest.raises(RuntimeError) as exc:
+        _Identifiable(999)._own_layer_id(_layout_two_layers())
+    msg = str(exc.value)
+    assert "999 rows" in msg and "1: 512" in msg and "14: 640" in msg
+
+
+def test_both_construction_time_hooks_are_called():
+    """The family, enumerated: two methods documented "after construction",
+    both wired in the same place. Grown from failures this list was one short
+    for two launches running."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
+
+    body = inspect.getsource(mod.AscendStagedEngramEmbedding
+                             ._allocate_staging_at_construction)
+    assert "allocate_staging(" in body
+    assert "bind_staged_tables(" in body

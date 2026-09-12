@@ -188,10 +188,38 @@ class AscendStagedEngramEmbedding:
                 "lookup would place it after graph capture, and replay reads "
                 "the addresses recorded at capture -- which fails silently, "
                 "not loudly.")
+        layout = EngramLayout.from_config(vllm_config.model_config.hf_text_config)
         self.allocate_staging(
-            EngramLayout.from_config(vllm_config.model_config.hf_text_config),
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            layout, vllm_config.scheduler_config.max_num_batched_tokens,
             current_platform.device_type)
+        self.bind_staged_tables(layout, self._own_layer_id(layout))
+
+    def _own_layer_id(self, layout) -> int:
+        """Which engram layer this instance is, from its own row count.
+
+        Upstream's constructor takes ``num_embeddings, dim, head_sizes,
+        block_size, cpu_offload`` -- no prefix and no layer id -- so there is
+        nothing to read the identity off directly. The row count supplies it:
+        the two engram layers have different vocabularies (384006168 and
+        384016682 in this checkpoint), and the layout carries the pairing.
+
+        Ambiguity refuses rather than picking the first match. Two layers with
+        equal row counts would make this a coin flip, and the wrong table maps
+        cleanly, gathers cleanly, and returns embeddings from the other layer --
+        no error at any point.
+        """
+        rows = getattr(self, "num_embeddings", None)
+        matches = [lid for lid, n in zip(layout.layer_ids, layout.num_embeddings)
+                   if n == rows]
+        if len(matches) == 1:
+            return matches[0]
+        raise RuntimeError(
+            f"cannot tell which engram layer this is: {rows} rows matches "
+            f"{matches or 'none'} of {dict(zip(layout.layer_ids, layout.num_embeddings))}. "
+            "The identity comes from the row count because upstream's "
+            "constructor carries neither a prefix nor a layer id. Binding the "
+            "wrong layer's table would map, gather and return embeddings from "
+            "the other layer without erroring anywhere.")
 
     # -- guards --------------------------------------------------------------
 
