@@ -577,6 +577,33 @@ def _get_kv_cache_config_deepseek_v4_main(
         f"环区排完后 offset={ring_offset} 与 backing_size={backing_size} 不符"
     )
 
+    # 🔴 把 num_blocks 和它的每一个因子打出来,并让它们【自洽】。
+    #    2026-09-11 我拿上游那行 "GPU KV cache size: N tokens" 当容量,说了一句
+    #    "容量掉了一半" —— 而 bytes/block 我自己算出来是【变小】的,方向相反。
+    #    两个数没对上之前那句话不能说。
+    #    ⚪ token 数 / num_blocks 如果不等于任何一个组的 block_size,
+    #      那它报的就不是"容量",是【某一个特定组的】容量。
+    block_sizes = sorted({
+        one.block_size
+        for group in kv_cache_groups
+        for one in (group.kv_cache_spec.kv_cache_specs.values()
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else [group.kv_cache_spec])
+    })
+    logger.info(
+        "DSV4 排布: num_blocks=%d  bytes/block=%d (= tuple %d × %d slots + 环 %d)  "
+        "backing=%.3f GiB  预算=%.3f GiB  占用率=%.4f  各组 block_size=%s",
+        num_blocks, bytes_per_tuple * num_tuple_slots + ring_bytes_per_block,
+        bytes_per_tuple, num_tuple_slots, ring_bytes_per_block,
+        backing_size / 1024 ** 3, available_memory / 1024 ** 3,
+        backing_size / available_memory if available_memory else float("nan"),
+        block_sizes,
+    )
+    logger.info(
+        "  若上游按某个组报 token 数: %s",
+        {bs: num_blocks * bs for bs in block_sizes},
+    )
+
     return num_blocks, tensors
 
 
@@ -807,9 +834,28 @@ def _log_groups(groups: list[KVCacheGroupSpec], branch: str) -> list[KVCacheGrou
         if isinstance(sp, UniformTypeKVCacheSpecs):
             kinds = sorted({type(one).__name__ for one in sp.kv_cache_specs.values()})
             inner = f" of {{{', '.join(kinds)}}}"
+        # 🔴 页大小是【派生量】,只打它说不出它为什么变。
+        #    SWA 的页 = block_size × num_kv_heads × head_size × itemsize,
+        #    2026-09-11 合并 model 线之后它 65536→131072 正好翻倍,而 block_size
+        #    两轮都是 32 ⇒ 只可能是 head_size 或 itemsize。这两个数当时【一个都没打】,
+        #    于是"页翻倍"这件事无法归因,只能再起一轮。
+        #    ⇒ 派生量和它的每一个因子要一起打。
+        specs = list(sp.kv_cache_specs.values()) if isinstance(sp, UniformTypeKVCacheSpecs) else [sp]
+        def _u(attr):
+            vals = sorted({str(getattr(one, attr, "-")) for one in specs})
+            return vals[0] if len(vals) == 1 else "|".join(vals)
         logger.info(
-            "  组%d: %s%s  block_size=%s  page_size->层数=%s  层数=%d  例: %s",
+            "  组%d: %s%s  组block_size=%s  层block_size=%s  head_size=%s  dtype=%s  "
+            "cache_dtype=%s  sliding_window=%s  ratio=%s  tokens_per_state=%s  "
+            "page_size->层数=%s  层数=%d  例: %s",
             i, type(sp).__name__, inner, getattr(sp, "block_size", "?"),
+            # 🔴 组的 block_size 和层的 block_size 是【两个层级】,可以不相等。
+            #    2026-09-11 我据"组 block_size 两轮都是 32"排除了 block_size 变化,
+            #    而页恰恰是从【层】的 block_size 算的 —— 实测它 64→128,页随之 65536→131072。
+            #    ⇒ 一个只打组级、却和层级派生量并排显示的数,会让人做出相反的排除。
+            _u("block_size"),
+            _u("head_size"), _u("dtype"), _u("cache_dtype_str"),
+            _u("sliding_window"), _u("compress_ratio"), _u("tokens_per_state"),
             _page_sizes_of(g), len(g.layer_names), g.layer_names[:2],
         )
     return groups
