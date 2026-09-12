@@ -703,6 +703,59 @@ def build_dspark_swa_indices(
     return per_token_slots, per_token_lens
 
 
+def mm_ranges_have_spans(mm_ranges) -> bool:
+    """Whether these multimodal document ranges contain an actual image span.
+
+    ``mm_req_doc_ranges`` is ``{req_index: [(start, end), ...]}`` and the
+    runner builds it for **every** request whenever the checkpoint is a
+    mm-prefix LM, appending nothing when a request carries no image
+    (``model_runner_v1.py:3386-3409``). A text-only request on V4.1-Flash
+    therefore arrives as ``{0: []}`` -- a truthy dict of empty lists.
+
+    Testing the dict rather than its contents is what put every text-only
+    prefill through the bidirectional-vision index path. Measured on this
+    checkpoint: ``vision_config.num_hidden_layers = 32`` so
+    ``DeepseekV41Config`` sets ``vision_n_layers = 32``, ``vision_max_n_token
+    = 1024`` and ``is_mm_prefix_lm = True``. V4.0 never saw it because a
+    text-only V4.0 checkpoint has ``vision_n_layers = 0``, which zeroes
+    ``max_image_tokens`` and short-circuits the same condition one term
+    earlier. The distinguishing fact here is that the *model* is multimodal
+    while the *request* is not.
+
+    What the vision path then produces is not garbage -- with no spans it is
+    exactly the causal sliding window, written in full and padded with -1. It
+    is still the wrong configuration: an explicit index list puts the operator
+    in ori-only sparse mode (mask 0, window bounds disabled) and makes the
+    index width ``sliding_window + vision_max_n_token`` = 1152, where plain
+    sliding window would have passed mask 4 and no list at all.
+
+    ⚠️ This stops text-only requests from *entering* the vision index path. It
+    does not fix that path, and a genuine image request still takes it -- a
+    configuration that has never completed a single forward. The kernel bench
+    has run ``mask 0 / win -1 / ori-only`` only with ``indices=None``; a
+    non-empty ``[T, 1, 1152]`` index list has never been passed to the
+    operator by anyone. Recording that here because "fixed" would otherwise be
+    remembered as "the vision index path works", and its actual state is
+    "never verified, merely no longer reached by text".
+
+    Behind a switch, default off, so that this and the kv-cache-spec change
+    can be attributed separately: two mechanisms enabled in one launch cannot
+    be told apart by whether it crashes.
+    """
+    if not mm_ranges:
+        return False
+    from vllm_ascend import envs
+
+    if envs.VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS != "1":
+        return True
+    values = getattr(mm_ranges, "values", None)
+    if values is None:
+        # Not a mapping. Fall back to the container's own truthiness rather
+        # than guessing at a shape; the switch is about empty *span lists*.
+        return True
+    return any(bool(ranges) for ranges in values())
+
+
 def build_vision_bidirectional_swa_indices(
     block_table: torch.Tensor,
     window_size: int,
@@ -1356,7 +1409,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             > 0
             else 0
         )
-        if has_prefill and max_image_tokens > 0 and mm_ranges:
+        if has_prefill and max_image_tokens > 0 and mm_ranges_have_spans(mm_ranges):
             actual_reqs = num_reqs if num_actual_reqs is None else num_actual_reqs
             vision_swa_indices, _ = build_vision_bidirectional_swa_indices(
                 block_table=self.block_table[:actual_reqs],

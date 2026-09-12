@@ -109,6 +109,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # triton-ascend compiler assertion aborts the process rather than raising,
     # so the only cheap way to attribute one is to remove a kernel and look.
     "VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH", "0"),
+    # DeepSeek-V4.1 vision SWA gate: "1" requires an actual image span before
+    # the bidirectional-vision index path runs. Default "0" keeps the current
+    # behaviour, which tests the *container*: a text-only request on a
+    # multimodal checkpoint gets ``mm_req_doc_ranges = {0: []}`` -- a truthy
+    # dict of empty span lists -- so the vision branch fires, the call is put
+    # in ori-only sparse mode (mask 0, no window), and a 1152-wide index list
+    # is handed to an operator that would otherwise run plain sliding window.
+    # Separate from the spec switch below on purpose: two mechanisms enabled
+    # together cannot be attributed by a single launch.
+    "VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS": lambda: os.getenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "0"),
 }
 
 # end-env-vars-definition
