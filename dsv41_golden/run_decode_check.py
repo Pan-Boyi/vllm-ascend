@@ -15,8 +15,8 @@ Two modes, because one of them cannot answer the question on its own
 **End-to-end** (default) compares the decode logits against the full prefill's.
 It answers "does decode produce the same answer", but its noise floor is not
 small: a 20-token prefill and the first 20 positions of a 27-token prefill are
-*already* different, because every GEMM runs with a different M and rounds
-differently, and bf16 plus causal attention spreads that (see
+*already* different, because the sliding-window index tensor is a different width
+and its reduction rounds differently, and bf16 plus causal attention spreads that (see
 ALIGNMENT_PROTOCOL.md section 0.2).  So this mode measures that floor in the same
 run -- the shared prefill prefix -- and reports it as the control.  Its verdict is
 **top-1 agreement**, which is the business-level reading of G-1.
@@ -54,11 +54,16 @@ sys.path.insert(0, HERE)
 from run_golden import GOLDEN_PROMPT  # noqa: E402  the one fixed input
 
 # Per-layer limits for the isolated mode, from ALIGNMENT_PROTOCOL.md section 6.2.
-ISOLATED_LIMITS = {
-    "layer.out": 1.5e-2, "hc_post": 1.5e-2, "attn.out": 1.5e-2,
-    "moe.out": 4e-2, "hc_mixes": 5e-3, "logits": 1e-2,
-    "_default": 5e-3,
-}
+# 🔴 Imported, not restated.  This table used to be a second copy of
+# ``compare_dumps.TOLERANCES["isolated"]``.  The numbers matched, so a diff of the
+# two files said "fine" -- while the *logic* around them had already diverged: the
+# per-token gate, the three-way non-finite split, the permutation signature and the
+# forced-routing exemption were all added to compare_dumps and none of them reached
+# here.  Two copies of a value need nobody to pick the wrong one; they only need time.
+from compare_dumps import (TOLERANCES as _TOL, ULP as _ULP,
+                           FLOOR_ULP as _FLOOR_ULP, tol_for)
+
+ISOLATED_LIMITS = _TOL["isolated"]
 # Never gated.
 #   moe_routing_margin -- a difference of two adjacent selection scores, so its
 #     relative noise is large by construction; it is a diagnostic, not a threshold.
@@ -75,24 +80,24 @@ NEVER_GATE = ("moe_routing_margin", "indexer_kv_offset")
 NEAR_TIE_MARGIN = 1e-3
 
 
-# See compare_dumps.BF16_FLOOR: 1 bf16 ULP is 3.9e-3 relative per element, so a
-# purely systematic one-ULP shift already reaches that with nothing wrong.
-BF16_FLOOR = 3 * 2 ** -8         # 1.17e-2
-BF16_TENSORS = (
-    "layer.in", "layer.out", "hc_pre", "hc_post", "attn_norm.out", "attn.in",
-    "attn.out", "ffn_norm.out", "moe.in", "moe.out", "engram.out",
-    "compressor.out",
-)
+# The floor comes from the tensor's own dtype rather than a list of names, for the
+# reason spelled out in compare_dumps: a hand-kept list drifts, and it drifts
+# towards being too tight.  1 bf16 ULP is 3.9e-3 relative per element, and a
+# purely systematic one-ULP shift already costs that with nothing wrong.
+ULP, FLOOR_ULP = _ULP, _FLOOR_ULP      # same source as the table above
 
 
-def limit_for(name: str) -> float:
-    best, best_len = ISOLATED_LIMITS["_default"], -1
-    for k, v in ISOLATED_LIMITS.items():
-        if k != "_default" and name.startswith(k) and len(k) > best_len:
-            best, best_len = v, len(k)
-    if name.startswith(BF16_TENSORS):
-        best = max(best, BF16_FLOOR)
-    return best
+def limit_for(name: str, dtype: "torch.dtype | None" = None) -> float:
+    """The rel_l2 limit for one tensor -- resolved by ``compare_dumps.tol_for``.
+
+    ⚠️ This used to re-implement the lookup against a local copy of the table.  The
+    two copies held the same numbers but **not the same shape** (this one stored bare
+    floats, the shared one stores ``(rel, cos)`` pairs), which a key-by-key diff
+    reported as "identical".  Sharing the resolver, not just the numbers, is what
+    makes that class of drift impossible.
+    """
+    rel, _cos = tol_for(name, ISOLATED_LIMITS, dtype)
+    return rel
 
 
 def _unoffset(idxs: torch.Tensor, offset: torch.Tensor | None):
@@ -223,7 +228,7 @@ def compare_step_to_golden(rec: MemoryRecorder, dump_dir: str, pos: int, n_layer
                 rows.append((i, name, 0.0 if same else float("nan"), 0.0, gated))
                 continue
             r = rel_l2(got, want)
-            lim = limit_for(name)
+            lim = limit_for(name, want.dtype)
             gated = not name.startswith(NEVER_GATE)
             if forced and name == "moe_gate.out.0" and r > lim:
                 # Same reasoning as out.1: these are the layer's own weights, not
@@ -374,10 +379,11 @@ def main():
             per_pos[p] = {"seconds": round(dt, 1), "rel_l2": r,
                           "top1_ref": t_ref, "top1_got": t_got,
                           "top1_same": t_ref == t_got,
-                          "vs_control": r / control if control else None}
+                          "vs_control": (r / control) if control else None}
             flag = "ok  " if t_ref == t_got else "FAIL"
+            vc = f"{r / control:5.1f}x control" if control else "control is 0"
             print(f"      {flag} decode pos {p:3d}  rel_l2={r:.3e} "
-                  f"({r / control:5.1f}x control)  top1 {t_got}"
+                  f"({vc})  top1 {t_got}"
                   f"{'' if t_ref == t_got else f' != {t_ref}'}  ({dt:.1f}s)")
 
     print()
@@ -397,8 +403,16 @@ def main():
         worst = max(per_pos.values(), key=lambda v: v["rel_l2"])
         ok = all_top1
         print(f"control (two prefills)   {control:.3e}")
-        print(f"worst decode rel_l2      {worst['rel_l2']:.3e}  "
-              f"({worst['rel_l2'] / control:.1f}x control)")
+        if control:
+            print(f"worst decode rel_l2      {worst['rel_l2']:.3e}  "
+                  f"({worst['rel_l2'] / control:.1f}x control)")
+        else:
+            # A zero control is informative, not a division problem: it means the
+            # two prefills agreed bit for bit, so any decode difference is the
+            # decode path's alone rather than sitting on top of a shared floor.
+            print(f"worst decode rel_l2      {worst['rel_l2']:.3e}  "
+                  f"(control is exactly 0 -- the two prefills were bit-identical, "
+                  f"so this is decode's own contribution with nothing subtracted)")
         print(f"top-1 all agree          {all_top1}")
         print("(rel_l2 is reported against the control, not gated: prefill and decode")
         print(" reach the same value by different arithmetic. top-1 is the verdict.)")

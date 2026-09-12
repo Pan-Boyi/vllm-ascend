@@ -3,13 +3,19 @@
 Why this exists
 ---------------
 ``Gate.forward`` picks experts with ``(scores + bias).topk(k)`` -- a *discrete*
-verdict read off continuous values.  Measured on this model (``dumps/smoke3`` vs
-``dumps/smoke3_fp64``, i.e. the same code with the GEMM accumulator widened from
-fp32 to fp64, a change that is strictly *more* accurate and moves a single GEMM
-by ~1e-7): 0% of tokens route differently at layer 0, 7.4% at layer 1, and
-**55.6% at layer 2**.  Two different experts differ by O(1), so once routing
+verdict read off continuous values.  Measured on this model (``smoke3`` vs
+``smoke3_fp64``, i.e. the same code with the GEMM accumulator widened from fp32
+to fp64, a change that is strictly *more* accurate and moves a single GEMM by
+~1e-7): 0% of tokens route to a different expert *set* at layer 0, 0% at layer 1,
+and **22.2% at layer 2**.  Two different experts differ by O(1), so once routing
 forks the hidden state is incomparable, and by layer 2 the selection margin no
 longer separates "near-tie" from "real bug" -- the two distributions overlap.
+
+(An earlier version of this docstring said 7.4% and 55.6%.  Those came from
+comparing the top-k output element-wise, which counts a pure reordering as a
+flip; topk order does not affect the result, since MoE sums over the chosen
+experts and accumulates in expert-id order.  Nine of the fifteen "flipped" tokens
+at layer 2 were reorderings, and both of layer 1's were.  Compare as sets.)
 
 So layer-by-layer numerical comparison past layer 2 is measuring noise unless the
 discrete verdict is taken out of the equation.  This module takes it out: the

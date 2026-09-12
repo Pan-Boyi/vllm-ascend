@@ -10,7 +10,7 @@
 
 | 文档 | 给谁 | 内容 |
 |---|---|---|
-| [ALIGNMENT_PROTOCOL.md](ALIGNMENT_PROTOCOL.md) | **model 线 + kernel 线** | 逐层对齐协议：喂什么、dump 哪些点、阈值多少。第 10 节是单算子对照（kernel 线专用），第 11 节是 decode |
+| [ALIGNMENT_PROTOCOL.md](ALIGNMENT_PROTOCOL.md) | **model 线 + kernel 线** | 逐层对齐协议：喂什么、dump 哪些点、阈值多少。**先看第 0.4 节的判据清单**（16 条，标了门禁/诊断、跑什么、失败了看哪里）。第 10 节是单算子对照（kernel 线专用），第 11 节是 decode |
 | [ROUTING_INJECTION.md](ROUTING_INJECTION.md) | **model 线** | 强制路由注入的接口规范 |
 | [ENGRAM_NOTES.md](ENGRAM_NOTES.md) | **协调方 + model 线** | engram 的技术底账：G-3 判据的前提验证、两份官方实现的哈希对比、`ElasticBuffer` 为什么用不了、三个待拍板的选项 |
 | [REPORT.md](REPORT.md) | 协调方 | 结论、实测数据、人天估计 |
@@ -39,7 +39,10 @@
 | `routing_plan.py` | 从 dump 蒸出强制路由方案（271 MB → 58 KB），并提供参考消费实现 |
 | `run_decode_check.py` | **判据 G-1**：prefill↔decode 自洽验证，两个模式 |
 | `engram_hash_ref.py` | **独立**的 n-gram 哈希参考，9 秒，不加载权重 |
-| `engram_lookup_ref.py` | **判据 G-3**：engram 查表参考 + 逐位相同前提的实测验证 |
+| `engram_lookup_ref.py` | **判据 G-3**：engram 查表参考(可 import)+ 逐位相同前提的实测验证 + `--verify` 判据 |
+| `compare_batch_rows.py` | batch>1 的首个分歧定位,把「真 batch bug」的特征做成可执行判据 |
+| `check_docs_interfaces.py` | **文档自检**：文档承诺的每个 flag / 脚本 / 函数 / dump 目录是否真的存在（`--root` 指定扫描树，零覆盖显式失败）|
+| `run_logged.sh` | `source` 它拿到 `run` —— 正确取退出码 + 全量落盘变成默认路径，不再靠「记得别用 head/tail」。`bash run_logged.sh --self-test` 有 6 个对照 |
 | `compare_dumps.py` | golden ↔ NPU dump 比对工具（per-tensor 阈值、集合比路由、逐 token 统计）|
 | `ref/` | `/workspace/models/.../inference/` 的**逐字副本**，只把 `kernel.py` 换成 CPU 版 |
 
