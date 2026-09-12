@@ -45,39 +45,21 @@ import kernel_cpu as kc                                       # noqa: E402
 DUMPS = "/workspace/code/dsv4_single_card/vllm_project/golden_dumps"
 
 
-def sparse_attn_pv(q, kv, attn_sink, topk_idxs, softmax_scale, p_dtype=None):
-    """``kernel_cpu.sparse_attn`` with one knob: the dtype P carries into P·V.
+def run_with_p_dtype(dt, q, kv, sink, idxs, scale):
+    """Call the shipped ``kernel_cpu.sparse_attn`` with P carried at ``dt``.
 
-    Deliberately a copy rather than a flag on the shipped function -- the golden's
-    own path must stay exactly as it is while this measures an alternative.
+    ⚠️ An earlier version of this file re-implemented sparse_attn to add the knob.
+    The knob already existed (``kernel_cpu.SPARSE_ATTN_P_DTYPE``, :422/488) and
+    ALIGNMENT_PROTOCOL section 10.6 documents it in so many words -- the copy was
+    written *after* reading that section.  Two implementations of one kernel drift,
+    and the drift would show up as a wrong measurement here, not as an error.
     """
-    b, m, h, d = q.shape
-    topk = topk_idxs.size(-1)
-    out = torch.empty_like(q)
-    sink = attn_sink[:h].float()
-    kv_f = kv.float()
-    if topk == 0:
-        out.zero_()
-        return out
-    for start in range(0, m, kc.SPARSE_ATTN_Q_CHUNK):
-        stop = min(start + kc.SPARSE_ATTN_Q_CHUNK, m)
-        idx = topk_idxs[:, start:stop].long()
-        valid = idx >= 0
-        safe = idx.clamp_min(0)
-        gather_idx = safe.reshape(b, -1, 1).expand(-1, -1, d)
-        kv_g = torch.gather(kv_f, 1, gather_idx).view(b, stop - start, topk, d)
-        kv_g = kv_g * valid.unsqueeze(-1)
-        qc = q[:, start:stop].float()
-        scores = torch.einsum("bchd,bctd->bcht", qc, kv_g) * softmax_scale
-        scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
-        mx = scores.amax(dim=-1).clamp_min(-1e30)
-        p = torch.exp(scores - mx.unsqueeze(-1))
-        denom = p.sum(dim=-1) + torch.exp(sink.view(1, 1, h) - mx)
-        # 🔴 the one variable: tilelang materialises P in bf16 before the gemm
-        p_pv = p.to(p_dtype).float() if p_dtype is not None else p
-        o = torch.einsum("bcht,bctd->bchd", p_pv, kv_g) / denom.unsqueeze(-1)
-        out[:, start:stop] = o.to(q.dtype)
-    return out
+    prev = kc.SPARSE_ATTN_P_DTYPE
+    try:
+        kc.SPARSE_ATTN_P_DTYPE = dt
+        return kc.sparse_attn(q, kv, sink, idxs, scale)
+    finally:
+        kc.SPARSE_ATTN_P_DTYPE = prev
 
 
 def main():
@@ -106,8 +88,8 @@ def main():
         q, kv = b["sa_in.q"], b["sa_in.kv"]
         sink, idxs = b["sa_in.attn_sink"], b["sa_in.topk_idxs"]
         scale = float(b["sa_in.softmax_scale"][0])
-        o32 = sparse_attn_pv(q, kv, sink, idxs, scale, None)
-        o16 = sparse_attn_pv(q, kv, sink, idxs, scale, torch.bfloat16)
+        o32 = run_with_p_dtype(torch.float32, q, kv, sink, idxs, scale)
+        o16 = run_with_p_dtype(torch.bfloat16, q, kv, sink, idxs, scale)
         d = (o32.float() - o16.float())
         rel = float(d.norm() / max(o32.float().norm().item(), 1e-30))
         nz = o32.float().abs() > 1e-6

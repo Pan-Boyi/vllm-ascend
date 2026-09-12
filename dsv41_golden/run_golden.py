@@ -172,21 +172,19 @@ def main():
 
     if args_cli.pv_bf16:
         # tilelang materialises P in bf16 before the P.V gemm; the CPU reference
-        # keeps it fp32 (ALIGNMENT_PROTOCOL section 10.6 P1).  Patched rather than
-        # branched inside kernel_cpu so the golden's own path is untouched.
+        # keeps it fp32 (ALIGNMENT_PROTOCOL section 10.6 P1).
+        #
+        # ⚠️ kernel_cpu already ships the knob for this (SPARSE_ATTN_P_DTYPE, :422/488)
+        # and section 10.6 says so in its last line.  The first version of this flag
+        # monkeypatched a *copy* of sparse_attn instead -- written after reading that
+        # very section.  Two implementations of the same kernel drift; use the knob.
         # Patch the name in the MODEL module -- model.py does `from kernel import
         # sparse_attn`, so the call site resolves against its own namespace.  This is
         # the second time this bit was got wrong: --no-quant hit it, was fixed, and
         # the lesson was written into that patch's comment rather than applied when
         # the next patch was written.
-        import model as _mm
-        import measure_p1_pv_bf16 as _m
-
-        def _sa(q, kv, attn_sink, topk_idxs, softmax_scale):
-            return _m.sparse_attn_pv(q, kv, attn_sink, topk_idxs, softmax_scale,
-                                     torch.bfloat16)
-
-        _mm.sparse_attn = _sa
+        import kernel_cpu as _kc
+        _kc.SPARSE_ATTN_P_DTYPE = torch.bfloat16
         print("!!! --pv-bf16: softmax probabilities rounded to bf16 before P.V. "
               "Models the tilelang kernel, NOT the reference.", flush=True)
 
