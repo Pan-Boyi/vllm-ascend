@@ -368,9 +368,22 @@ def _staged_dequant_launcher():
 
     Verification status, stated here because binding is not endorsing:
 
-    - The arithmetic is settled. ``test_engram_dequant_reference`` checks it on
-      the CPU against golden's authoritative rows, byte for byte, including the
-      negative zero a value comparison would report as equal.
+    - The arithmetic is settled **for the torch route**, in the gate:
+      ``test_torch_dequant_matches_an_independent_computation`` checks it
+      against a separately written expression, and
+      ``test_each_scale_covers_its_own_block_only`` checks the broadcast
+      positionally -- that one targets the maxdiff-28 failure by construction
+      rather than by a tolerance.
+    - ⚠️ This line used to cite ``test_engram_dequant_reference``. No such test
+      exists. The nearest thing is
+      ``build_artifacts/npu_view/test_engram_dequant_staging.py``, which has a
+      different name and sits outside ``tests/ut`` -- so it never runs in the
+      gate. A docstring reporting verification status is itself a claim, and
+      this one named a test that could not be run to check it.
+    - ⚠️ The **kernel** route -- the one launched by default -- has no
+      in-gate check of its arithmetic. What the torch tests above cover is the
+      fallback that ``VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH`` selects, not the
+      Triton kernel.
     - The kernel has run on hardware. Triton compiles at first launch, and
       ``/root/.triton/cache`` holds two compilations of ``engram_dequant_staging``
       (2026-09-11 10:48:43 and 11:35:35).
