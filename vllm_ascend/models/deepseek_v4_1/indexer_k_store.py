@@ -136,6 +136,157 @@ def _rope_interleaved_tail(k: torch.Tensor, cos_sin_cache: torch.Tensor,
     return out
 
 
+# ⚠️ The three constants below are read out of *another repository's* source
+# (the custom operator under csrc/attention/indexer_compress_epilog_v2/). A
+# cross-repo constant goes stale exactly like a local one and looks identical
+# while it does, so each carries where it was read -- and the width rule is
+# written as the operator's formula rather than as the 132 it happens to
+# produce today, so a different head_dim moves both sides together.
+
+#: The operator's scale grouping: its tiling computes
+#: ``scaleCol_ = ceil(d_ / 128)`` over x's last dimension.
+#: Read at ``indexer_compress_epilog_v2_tiling.cpp:49`` (PER_BLOCK).
+SCALE_GROUP = 128
+
+#: Bytes per scale column. Read at ``..._single_row.h:45``
+#: (``RoundUp<float>(scaleCol) * sizeof(float)``) and cross-checked against
+#: ``..._base.h:39`` (``B32_INTERPRE_TO_B8_RATIO = 4``). Spelled from
+#: float32's own width so it moves if the scale dtype does.
+SCALE_BYTES = torch.finfo(torch.float32).bits // 8
+
+#: What the operator's registration accepts for x. Its compiled binList holds
+#: bfloat16 and float16 only. This call site sends bfloat16; the assertion is
+#: the registered set rather than our narrower choice, so it never refuses a
+#: call the operator would have accepted.
+REGISTERED_X_DTYPES = (torch.bfloat16, torch.float16)
+
+#: 🔴 Not enforced here, and on our own roadmap: the tiling budgets UB as
+#: ``rowFactor_ * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER`` (tiling:161) -- x's
+#: element width hard-coded to 2 bytes -- while the kernel's element type is a
+#: compile-time parameter. Those agree today by coincidence, not by
+#: constraint, and the condition that breaks it is "someone widens the dtype
+#: support", which is what moving to an fp8 KV cache would do.
+
+
+def check_epilog_cache(cache: torch.Tensor, x: torch.Tensor) -> None:
+    """Refuse a cache the operator would mis-address rather than reject.
+
+    The tiling (our own custom op, not CANN's) reads the cache as
+    ``[num_blocks, cacheBs_, 1, cacheD_]`` with ``cacheD_`` in bytes, and it
+    checks two of those itself -- rank 4, and the third dim being 1. What it
+    does **not** check is the pair that matters most:
+
+    * there is no dtype validation anywhere in the tiling;
+    * ``d_`` is taken from **x**'s last dimension, never from the cache's, and
+      the two are never compared.
+
+    So a width disagreement is not rejected: the operator computes offsets
+    from one number and writes into a buffer laid out by the other. That is
+    the same shape as the SWA ``block_size`` guard one file over -- two
+    quantities that index each other with nobody comparing them -- and the
+    reason for a guard here is the same one: not that a particular defect is
+    foreseen, but that the disagreement is unobservable.
+
+    ⚠️ Three states, because the exact width relation is *not* established
+    here. The operator's ``d_`` counts x's elements while ``cacheD_`` counts
+    bytes of a quantised row plus its scale, and which of those the cache's
+    last dim holds depends on a layout this code cannot read. A cache row
+    narrower than x's row is wrong under every candidate encoding, so that
+    raises. Anything else is reported once and passed, saying it was not
+    checked -- never silently accepted as if it had been.
+    """
+    if cache.ndim != 4:
+        raise ValueError(
+            f"indexer_compress_cache must be rank 4, got {cache.ndim} "
+            f"{tuple(cache.shape)} (the tiling reports this as EZ1008 "
+            '"only support 4" without saying what it received)')
+    if cache.shape[2] != 1:
+        raise ValueError(
+            f"indexer_compress_cache dim2 must be 1, got {cache.shape[2]} in "
+            f"{tuple(cache.shape)}. The tiling reads [num_blocks, "
+            "tokens_per_block, 1, bytes_per_token]; a dim2 above 1 means the "
+            "axis order is not the one it assumes.")
+
+    tokens_per_block, cache_width = int(cache.shape[1]), int(cache.shape[3])
+    row_stride = int(cache.stride(0))
+    if row_stride and row_stride < tokens_per_block * cache_width:
+        raise ValueError(
+            f"indexer_compress_cache block stride {row_stride} is smaller "
+            f"than one block ({tokens_per_block} x {cache_width} bytes); "
+            "consecutive blocks overlap and the operator would write over "
+            "the previous block's tail.")
+
+    # ⚠️ Strength, stated: bf16 is *this call site's* contract, not something
+    # read out of the tiling. The operator's own source contains no dtype
+    # validation anywhere, and its ``d_`` is an element count -- it must pick
+    # a width from an assumed dtype to turn that into bytes. So nothing on the
+    # far side would refuse another dtype; this pins what we promise to send.
+    if x.dtype not in REGISTERED_X_DTYPES:
+        raise ValueError(
+            f"x is {x.dtype}; indexer_compress_epilog_v2 registers x as "
+            f"{sorted(str(d) for d in REGISTERED_X_DTYPES)} only. The tiling "
+            "itself validates no dtype at all -- it turns x's element count "
+            "into bytes using an assumed width -- so an unregistered dtype "
+            "is not refused on the far side.")
+
+    x_width = int(x.shape[-1])
+    expected = x_width + SCALE_BYTES * -(-x_width // SCALE_GROUP)
+    if cache_width != expected:
+        raise ValueError(
+            f"indexer_compress_cache is {cache_width} bytes per token; this x "
+            f"needs {expected} = {x_width} quantised values + {SCALE_BYTES} "
+            f"bytes x {-(-x_width // SCALE_GROUP)} scale column(s). The "
+            "operator takes its width from x alone and never compares the "
+            "two, so a disagreement is written at the wrong offset rather "
+            "than refused.")
+
+
+
+def _checked_cache(k_cache: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """The cache as the operator will see it, checked against the x beside it."""
+    cache = with_head_axis(k_cache.view(torch.uint8))
+    check_epilog_cache(cache, x)
+    return cache
+
+
+def with_head_axis(cache: torch.Tensor) -> torch.Tensor:
+    """Put back the unit head axis the kv binding dropped.
+
+    ``indexer_compress_epilog_v2`` takes a rank-4 cache. The operator says so
+    only as ``EZ1008: the dim of indexer_compress_cache only support 4``,
+    without saying what it got -- but V4.0 drives the *same* operator and its
+    warmup states the rank outright::
+
+        device_op.py:1150  dummy_cache_shape = (1, 1, 1, hidden_states.shape[-1])
+        device_op.py:1152  indexer_compress_epilog_v2(..., layout=2)
+
+    V4.1 arrives at rank 3 instead, because binding drops the unit head axis
+    (``kv_binding._drop_head_axis``, and upstream's own ``squeeze(1)``).
+    V4.0 never loses it: its cache comes from ``unfold_kvcache`` and goes to
+    the operator untouched.
+
+    ⚠️ What V4.0's warmup does *not* establish is the axis **order** -- all
+    four of its dims are 1. So this restores the axis that was dropped, at the
+    position it was dropped from, and nothing else. Reshaping into an axis
+    order that looks right would be a new assumption wearing the same shape,
+    and the operator would accept it: rank is all it checks here.
+
+    ``HEAD_AXIS`` is imported rather than written as -2, so the drop and this
+    restore cannot come apart.
+    """
+    from vllm_ascend.models.deepseek_v4_1.kv_binding import HEAD_AXIS
+
+    if cache.ndim == 4:
+        return cache
+    if cache.ndim != 3:
+        raise ValueError(
+            f"indexer k cache has rank {cache.ndim} {tuple(cache.shape)}; "
+            "indexer_compress_epilog_v2 takes rank 4, and only a rank-3 cache "
+            "(the bound form, with its unit head axis dropped) can be "
+            "restored to one without inventing an axis order.")
+    return cache.unsqueeze(HEAD_AXIS)
+
+
 def _page_size_of(slot_mapping: torch.Tensor) -> int:
     """The storage page the mapping was built against, found by identity.
 
@@ -251,9 +402,15 @@ def indexer_k_norm_rope_store_ascend(
     # Quantisation, value store and scale store, in one operator. The layout
     # matches upstream's fp8 branch byte for byte: whole-block values first,
     # then the per-token fp32 scales.
+    # Bound once. The first version checked the cache against `k` while the
+    # operator received `k.to(torch.bfloat16)` -- the guard reading a
+    # different object than the call, which is the failure it exists to stop.
+    # The widths matched, so only the dtype would have differed, and the
+    # tiling has no dtype validation to catch what the guard then missed.
+    x = k.to(torch.bfloat16)
     torch.ops._C_ascend.indexer_compress_epilog_v2(
-        indexer_compress_cache=k_cache.view(torch.uint8),
-        x=k.to(torch.bfloat16),
+        indexer_compress_cache=_checked_cache(k_cache, x),
+        x=x,
         slot_mapping=slots,
         layout=2,
     )

@@ -54,6 +54,20 @@ def ctx(monkeypatch):
     return _install
 
 
+def _bound_cache():
+    """Rank 3, and the width the operator's own rule asks for.
+
+    Not an arbitrary shape: the store now cross-checks the cache against x,
+    so a fixture with a made-up width stops exercising the path it is here to
+    exercise and starts exercising the guard.
+    """
+    from vllm_ascend.models.deepseek_v4_1.indexer_k_store import (
+        INDEX_HEAD_DIM, SCALE_BYTES, SCALE_GROUP)
+
+    width = INDEX_HEAD_DIM + SCALE_BYTES * -(-INDEX_HEAD_DIM // SCALE_GROUP)
+    return torch.zeros(4, 32, width, dtype=torch.uint8)
+
+
 def _split(flat, page=PAGE):
     """Produce the (block, offset) form the same way the plan does."""
     valid = flat >= 0
@@ -166,7 +180,7 @@ def test_the_store_accepts_the_block_offset_form_now(ctx, monkeypatch):
         cos_sin_cache=torch.zeros(8, indexer_k_store.INDEX_ROPE_HEAD_DIM),
         rms_norm_weight=torch.ones(indexer_k_store.INDEX_HEAD_DIM),
         rms_norm_eps=1e-6,
-        k_cache=torch.zeros(4, 32, 128, dtype=torch.uint8),
+        k_cache=_bound_cache(),
         kv_slot_mapping=pairs,
         compress_ratio=1,
         use_fp4_cache=False,
@@ -184,7 +198,7 @@ def test_a_three_column_mapping_is_still_refused(ctx):
             cos_sin_cache=torch.zeros(8, indexer_k_store.INDEX_ROPE_HEAD_DIM),
             rms_norm_weight=torch.ones(indexer_k_store.INDEX_HEAD_DIM),
             rms_norm_eps=1e-6,
-            k_cache=torch.zeros(4, 32, 128, dtype=torch.uint8),
+            k_cache=_bound_cache(),
             kv_slot_mapping=torch.zeros(2, 3, dtype=torch.int32),
             compress_ratio=1,
             use_fp4_cache=False,

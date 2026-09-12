@@ -14,8 +14,21 @@ import torch
 
 from vllm_ascend.models.deepseek_v4_1 import indexer_k_store as mod
 from vllm_ascend.models.deepseek_v4_1.indexer_k_store import (
-    INDEX_HEAD_DIM, INDEX_ROPE_HEAD_DIM, SKIP_SLOT, group_boundary_slots,
-    indexer_k_norm_rope_store_ascend)
+    INDEX_HEAD_DIM, INDEX_ROPE_HEAD_DIM, SCALE_BYTES, SCALE_GROUP, SKIP_SLOT,
+    group_boundary_slots, indexer_k_norm_rope_store_ascend)
+
+
+# 640 bytes per token is the *main MLA* page (512 + 128); the indexer's row is
+# 128 quantised values plus one fp32 scale column. These fixtures carried 640
+# from the day they were written and nothing noticed, because until the
+# operator cross-check landed nothing compared the cache's width with x's.
+CACHE_WIDTH = INDEX_HEAD_DIM + SCALE_BYTES * -(-INDEX_HEAD_DIM // SCALE_GROUP)
+
+
+def _bound_cache(blocks=2, tokens_per_block=64):
+    """The cache as binding leaves it: rank 3, unit head axis dropped."""
+    return torch.zeros(blocks, tokens_per_block, CACHE_WIDTH,
+                       dtype=torch.uint8)
 
 
 def test_the_rope_is_narrower_than_the_head():
@@ -109,7 +122,7 @@ def _store(epilog, *, num_tokens=4, ratio=2, slots=None, positions=None,
     indexer_k_norm_rope_store_ascend(
         k_pre, positions, cos_sin,
         torch.ones(INDEX_HEAD_DIM, dtype=torch.bfloat16), 1e-6,
-        torch.zeros(2, 64, 640, dtype=torch.uint8), slots, ratio, False)
+        _bound_cache(), slots, ratio, False)
     return k_pre
 
 
@@ -166,7 +179,7 @@ def test_the_rotation_uses_the_groups_first_position(epilog):
 
     torch.manual_seed(0)
     k_pre = torch.randn(2, INDEX_HEAD_DIM, dtype=torch.bfloat16)
-    cache = torch.zeros(2, 64, 640, dtype=torch.uint8)
+    cache = _bound_cache()
     # ratio 1 so both tokens publish; positions 2 and 3 are one group at ratio
     # 2 but distinct rows at ratio 1 -- run both and compare.
     for ratio, positions in ((1, [2, 3]), (2, [2, 3])):
@@ -200,7 +213,7 @@ def test_mxfp4_says_upstream_cannot_reach_it_either(epilog):
             torch.zeros(1, dtype=torch.int64),
             torch.zeros(4, INDEX_ROPE_HEAD_DIM),
             torch.ones(INDEX_HEAD_DIM), 1e-6,
-            torch.zeros(2, 64, 640, dtype=torch.uint8),
+            _bound_cache(),
             torch.zeros(1, dtype=torch.int32), 1, True)
 
 
@@ -223,7 +236,7 @@ def test_a_block_offset_slot_mapping_without_its_page_size_is_refused(epilog):
             torch.zeros(2, dtype=torch.int64),
             torch.zeros(4, INDEX_ROPE_HEAD_DIM),
             torch.ones(INDEX_HEAD_DIM), 1e-6,
-            torch.zeros(2, 64, 640, dtype=torch.uint8),
+            _bound_cache(),
             torch.zeros((2, 2), dtype=torch.int32), 1, False)
 
 
@@ -233,7 +246,7 @@ def test_an_empty_batch_does_not_call_the_operator(epilog):
         torch.zeros(0, dtype=torch.int64),
         torch.zeros(4, INDEX_ROPE_HEAD_DIM),
         torch.ones(INDEX_HEAD_DIM), 1e-6,
-        torch.zeros(2, 64, 640, dtype=torch.uint8),
+        _bound_cache(),
         torch.zeros(0, dtype=torch.int32), 1, False)
     assert not epilog.calls
 
@@ -258,7 +271,7 @@ def test_the_norm_round_trips_through_bf16_before_the_rotation(epilog):
 
     indexer_k_norm_rope_store_ascend(
         k_pre, torch.zeros(64, dtype=torch.int64), cos_sin, weight, 1e-6,
-        torch.zeros(2, 64, 640, dtype=torch.uint8),
+        _bound_cache(),
         torch.arange(64, dtype=torch.int32), 1, False)
     (call,) = epilog.calls
 
@@ -299,7 +312,7 @@ def test_the_post_rotation_round_trip_is_a_no_op_on_this_route(epilog):
 
     indexer_k_norm_rope_store_ascend(
         k_pre, torch.zeros(32, dtype=torch.int64), cos_sin, weight, 1e-6,
-        torch.zeros(2, 64, 640, dtype=torch.uint8),
+        _bound_cache(),
         torch.arange(32, dtype=torch.int32), 1, False)
     (call,) = epilog.calls
 
