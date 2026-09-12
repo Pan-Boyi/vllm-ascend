@@ -93,3 +93,58 @@ def test_the_docstring_still_makes_the_promise_this_checks():
 
     promise = " ".join(attention.__doc__.split())
     assert "raise rather than silently doing the CUDA thing" in promise
+
+
+def test_every_attribute_forward_reads_is_stored_at_construction():
+    """nn.Module defers a missing attribute to the first forward.
+
+    forward_mqa reads self.vllm_config three times and nothing assigned it, so
+    the failure arrived on a card, inside upstream frames, as
+    "'AscendDeepseekV41Attention' object has no attribute 'vllm_config'".
+    Construction-time state that only the forward reads has no earlier check --
+    so the check is here, derived from the source rather than from a list.
+    """
+    import ast
+    import inspect
+
+    import textwrap
+
+    # dedent, not cleandoc: cleandoc strips the leading indent of the *first*
+    # line only, which for a class leaves the body indented under an
+    # unindented `class` line and fails to parse.
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(AscendDeepseekV41Attention)))
+
+    read, assigned = set(), set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"):
+            continue
+        if isinstance(node.ctx, ast.Store):
+            assigned.add(node.attr)
+        else:
+            read.add(node.attr)
+
+    # Methods are read through self too and are defined, not assigned.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assigned.add(node.name)
+
+    # Names the base class provides are legitimately read without assignment
+    # here. dir() is not enough: most of them are instance attributes set in
+    # the base's __init__, which is exactly the kind this is looking for, so
+    # the base's stores have to be parsed the same way.
+    base_tree = ast.parse(textwrap.dedent(
+        inspect.getsource(DeepseekV4Attention)))
+    base_names = set(dir(DeepseekV4Attention))
+    for node in ast.walk(base_tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and isinstance(node.ctx, ast.Store)):
+            base_names.add(node.attr)
+
+    missing = {n for n in read - assigned if n not in base_names}
+    assert not missing, (
+        f"read on self but assigned nowhere and absent from the base class: "
+        f"{sorted(missing)}. These surface as AttributeError at forward time.")
