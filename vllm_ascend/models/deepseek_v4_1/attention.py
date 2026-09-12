@@ -113,6 +113,35 @@ def _log_compressed_selection(*, prefix, layer_ratio, attends_compressed,
         if pad == 0 else "")
 
 
+def _log_batch_shape(prefix, query_start_loc, seq_lens) -> None:
+    """The batch's segmentation, printed whole.
+
+    Not summarised as "num_requests", because the question this answers is
+    whether the batch is one prompt or a profile run's many dummy segments, and
+    a single count invites the reading that produced the last table: a value
+    derived from "there is one prompt" when that premise was never measured.
+    The segment boundaries are the evidence; the count is a consequence.
+    """
+    from vllm.logger import logger
+
+    if prefix in _LOGGED_BATCH_SHAPES:
+        return
+    _LOGGED_BATCH_SHAPES.add(prefix)
+    starts = query_start_loc.tolist() if query_start_loc is not None else None
+    lens = seq_lens.tolist() if seq_lens is not None else None
+    logger.info(
+        "DSV4.1 %s batch: num_segments=%s cu_seqlens_q=%s seq_lens=%s",
+        prefix,
+        (len(starts) - 1) if starts else None,
+        starts if starts is None or len(starts) <= 40 else
+        f"{starts[:8]} ... {starts[-8:]} (len {len(starts)})",
+        lens if lens is None or len(lens) <= 40 else
+        f"{lens[:8]} ... {lens[-8:]} (len {len(lens)})")
+
+
+_LOGGED_BATCH_SHAPES: set = set()
+
+
 class AscendDeepseekV41Attention(DeepseekV4Attention):
     """Sparse-MLA attention on Ascend.
 
@@ -460,6 +489,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             attends_compressed=attends_compressed,
             buffer=self.topk_indices_buffer,
             num_tokens=q.shape[0])
+        _log_batch_shape(swa_prefix, req.query_start_loc, req.seq_lens)
 
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
