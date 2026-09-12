@@ -22,8 +22,15 @@ from vllm_ascend.models.deepseek_v4_1 import caches, platform_patches
 HEAD_DIM, WINDOW, BLOCK = 512, 2048, 32
 
 
-def _swa_cache(cache_dtype="auto", dtype=torch.bfloat16):
-    """A DeepseekV4SWACache without running __init__ (it registers a prefix)."""
+def _swa_cache(cache_dtype="auto", dtype=torch.bfloat16, stream_ratio=0):
+    """A DeepseekV4SWACache without running __init__ (it registers a prefix).
+
+    ``stream_ratio`` is attached the way the attention layer attaches it, so
+    this stands in for a real cache rather than for one whose layer never ran.
+    A cache carrying none is a separate case with its own test; conflating the
+    two here would make every spec test double as a guard test and neither
+    would say what it means.
+    """
     cache = object.__new__(caches.AscendDeepseekV41SWACache)
     torch.nn.Module.__init__(cache)
     cache.head_dim = HEAD_DIM
@@ -32,6 +39,7 @@ def _swa_cache(cache_dtype="auto", dtype=torch.bfloat16):
     cache.dtype = dtype
     cache.cache_config = SimpleNamespace(cache_dtype=cache_dtype)
     cache.backend_cls = object
+    cache.stream_compress_ratio = stream_ratio
     return cache
 
 

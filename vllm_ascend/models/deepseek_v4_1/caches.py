@@ -31,6 +31,40 @@ from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
     AscendStagedEngramEmbedding
 
 
+def stated_stream_ratio(cache) -> int | None:
+    """This cache's layer stream ratio to report in its spec, or ``None``.
+
+    ``None`` when the switch is off, which leaves the spec byte-identical to
+    what it was and the builder on its old fallback chain -- so an A/B
+    attributes a launch to this change and nothing else.
+
+    When the switch is on and no ratio was attached, this raises. A silent
+    ``None`` there would reproduce exactly the defect the switch claims to
+    fix, under a flag that says it is fixed, which is worse than the defect.
+    """
+    from vllm_ascend import envs
+
+    if envs.VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO != "1":
+        return None
+    ratio = getattr(cache, "stream_compress_ratio", None)
+    if ratio is None:
+        # On a cache object -- not on a spec -- ``compress_ratio`` is the
+        # layer's configured compress_ratios entry, unclamped, which is the
+        # quantity wanted here. The indexer cache carries it; the SWA cache
+        # has no such attribute, which is why the attention layer attaches
+        # one. Only the *spec* fields of that name are page divisors.
+        ratio = getattr(cache, "compress_ratio", None)
+    if ratio is None:
+        raise ValueError(
+            f"{type(cache).__name__} was asked for its compressed-stream "
+            "ratio with VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO=1 and carries "
+            "none. The V4.1 attention layer attaches it after the base "
+            "constructor builds the cache; a cache built anywhere else has "
+            "to do the same, because falling back here would report ratio 0 "
+            "layers as ratio 1 again.")
+    return int(ratio)
+
+
 class AscendCompressorStateBackend(CompressorBackend):
     """Upstream's compressor backend, plus the one method Ascend needs.
 
@@ -137,6 +171,7 @@ class AscendDeepseekV41SWACache(DeepseekV4SWACache):
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
             model_version="deepseek_v4",
+            stream_compress_ratio=stated_stream_ratio(self),
             # None, following the Ascend V4.0 path, which runs the same SWA
             # backend and does its own page arithmetic -- not upstream's
             # 576/512, which pad for FlashMLA and FlashInfer packing.
@@ -226,6 +261,9 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
             scale_dim=1 if self.head_dim == 128 else 0,
             scale_dtype=torch.float if compressed else torch.float16,
             tokens_per_state=states_ratio,
+            # states_ratio is the clamped page divisor; this is the ratio the
+            # layer was configured with, 0 kept as 0.
+            stream_compress_ratio=stated_stream_ratio(self),
         )
 
     def get_attn_backend(self):

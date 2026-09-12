@@ -241,6 +241,8 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # Zero would make block_size 0, which select_common_block_size does not
         # reject -- 0 % n == 0 for every n, so it silently takes the largest.
         ratio = max(self.compress_ratio, 1)
+        from vllm_ascend.models.deepseek_v4_1.caches import \
+            stated_stream_ratio
         return AscendMLAAttentionSpec(
             # The scheduler counts raw tokens; the kernels use the compressed
             # page that storage_block_size names. block_size is the product.
@@ -251,6 +253,11 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             model_version="deepseek_v4",
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
             tokens_per_state=ratio,
+            # `ratio` above is the clamped page divisor; this is the layer's
+            # configured entry. They differ only at 0, and only kv-source
+            # layers reach here, so on this path they always agree -- which is
+            # precisely why it has to be passed rather than assumed equal.
+            stream_compress_ratio=stated_stream_ratio(self),
         )
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
@@ -366,6 +373,15 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             compress_ratio=self.compress_ratio,
             head_size=self.rope_head_dim,
         )
+
+        # The SWA cache reports this layer's kv-cache spec but knows nothing
+        # about compression: upstream's DeepseekV4SWACache takes head_dim,
+        # window, dtype, prefix, cache_config, backend and block_size, and is
+        # constructed inside the base __init__ with a fixed argument list that
+        # a subclass cannot extend. So the ratio is attached here, after the
+        # base has built it -- the one point where the per-layer ratio and the
+        # per-layer cache object are both in scope.
+        self.swa_cache_layer.stream_compress_ratio = self.compress_ratio
 
     # -- upstream's abstract surface ---------------------------------------
 

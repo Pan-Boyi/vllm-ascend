@@ -119,6 +119,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Separate from the spec switch below on purpose: two mechanisms enabled
     # together cannot be attributed by a single launch.
     "VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS": lambda: os.getenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "0"),
+    # DeepSeek-V4.1 kv-cache spec: "1" makes the layer's configured
+    # compress_ratios entry -- 0 included -- reach the metadata builder as its
+    # own spec field. Default "0" keeps today's behaviour, where ratio 0 is
+    # clamped to 1 for the page arithmetic and read back as "this layer
+    # attends a compressed stream". Neither tokens_per_state nor
+    # AscendSlidingWindowMLASpec.compress_ratio can carry it: both divide the
+    # page size, and 0 is not a legal divisor. ⚠️ Turning this on also changes
+    # kv-cache *grouping*, because groups are keyed on spec equality: layers
+    # whose streams differ stop sharing a group and a block table.
+    "VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO": lambda: os.getenv("VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO", "0"),
 }
 
 # end-env-vars-definition

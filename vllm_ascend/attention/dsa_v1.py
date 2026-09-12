@@ -921,12 +921,27 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.common_ratio_to_sas_metadata: dict | None = None
         self.seq_lens: torch.Tensor = None
 
+        # The layer's configured stream ratio, when a spec states one. It is
+        # consulted first because it is the only field here that can hold 0:
+        # both fallbacks below are page divisors, which clamp 0 to 1 and make
+        # a pure-sliding-window layer look like one with a compressed stream.
+        #
+        # ⚠️ The fallback chain is V4.0's and is kept only because there the
+        # two coincide -- V4.0's compress_ratio divides the page *and* names
+        # the stream, so reading one for the other is exact. It is not a
+        # general substitution, and a third model should state the field
+        # rather than inherit this chain.
+        #
         # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
-        self.compressor_ratio = getattr(
-            kv_cache_spec,
-            "compress_ratio",
-            getattr(kv_cache_spec, "tokens_per_state", 0),
-        )
+        stated = getattr(kv_cache_spec, "stream_compress_ratio", None)
+        if stated is not None:
+            self.compressor_ratio = stated
+        else:
+            self.compressor_ratio = getattr(
+                kv_cache_spec,
+                "compress_ratio",
+                getattr(kv_cache_spec, "tokens_per_state", 0),
+            )
         if not layer_names:
             raise ValueError("DSV4 compressor metadata builder requires at least one layer name")
         # vLLM assigns the builder result to every layer in an attention group.
