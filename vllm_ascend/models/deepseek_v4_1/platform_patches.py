@@ -257,6 +257,16 @@ def apply_all() -> list[str]:
     if apply_compressor_insert_patch():
         applied.append("rope_quant_insert")
 
+    # The selection buffer's second writer. The short-context path fills it
+    # with a triton kernel and returns index_q=None, so indexer_op -- and the
+    # bookkeeping in forward_oot -- never runs. Without this the reader cannot
+    # tell a written buffer from an untouched one.
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import \
+        apply_short_context_accounting_patch
+
+    if apply_short_context_accounting_patch():
+        applied.append("_fill_short_context_topk_indices")
+
     if not applied:
         raise RuntimeError(
             "apply_all() applied nothing. Either upstream changed shape and "

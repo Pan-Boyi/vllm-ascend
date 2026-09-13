@@ -39,9 +39,38 @@ NO_TOKEN = -1
 _ROWS_WRITTEN_ATTR = "_dsv41_rows_written"
 
 
+def _current_forward() -> object | None:
+    """The object identifying the forward pass now running, if there is one.
+
+    ``set_forward_context`` builds a fresh ``ForwardContext`` per model
+    forward and every layer inside that forward sees the same one, so its
+    identity is a step token that needs no counter of ours to stay in sync
+    with the thing it is counting.
+
+    ``None`` outside a forward -- unit tests, and anything that reaches this
+    module off the model path. That is a third state, not a step.
+    """
+    try:
+        return get_forward_context()
+    except Exception:
+        return None
+
+
 def mark_rows_written(buffer, num_rows: int) -> None:
-    """Record how many leading rows of ``buffer`` this step actually wrote."""
-    setattr(buffer, _ROWS_WRITTEN_ATTR, int(num_rows))
+    """Record how many leading rows of ``buffer`` this step actually wrote.
+
+    The forward pass is recorded alongside the count. A bare integer cannot
+    tell "4000 rows written just now" from "4000 rows written eight steps
+    ago", and those are opposite answers: the first says the rows are this
+    step's, the second says every one of them is residue. A check bit that
+    does not move with the thing it certifies gives a green light exactly
+    where the defect is.
+
+    ⚠️ This keeps the context object alive until the next mark. That is one
+    object, replaced every step, and it is deliberate: ``id()`` alone is reused
+    after collection, so identity comparison needs the reference.
+    """
+    setattr(buffer, _ROWS_WRITTEN_ATTR, (_current_forward(), int(num_rows)))
 
 
 def rows_written(buffer) -> "int | None":
@@ -52,8 +81,41 @@ def rows_written(buffer) -> "int | None":
     HBM -- and reading that is one of the two explanations for a forward that
     is not deterministic under greedy. Distinguishing it from a real zero
     matters: one is "no tokens selected", the other is "do not read this".
+
+    When the recorded forward is not the one now running, the count belongs to
+    an earlier step. That is reported -- loudly, once -- and the count is still
+    returned: a raise here would stop a launch on a hypothesis, and the
+    hypothesis is exactly what the launch is supposed to test. The log line is
+    the instrument; it cannot block a flight and it says so when the buffer
+    being read is last step's.
     """
-    return getattr(buffer, _ROWS_WRITTEN_ATTR, None)
+    record = getattr(buffer, _ROWS_WRITTEN_ATTR, None)
+    if record is None:
+        return None
+    marked, rows = record
+    current = _current_forward()
+    if marked is not None and current is not None and marked is not current:
+        _warn_selection_is_last_steps(rows)
+    return rows
+
+
+_WARNED_STALE_SELECTION = False
+
+
+def _warn_selection_is_last_steps(rows: int) -> None:
+    global _WARNED_STALE_SELECTION
+    if _WARNED_STALE_SELECTION:
+        return
+    _WARNED_STALE_SELECTION = True
+    from vllm.logger import logger
+
+    logger.warning(
+        "DSV4.1 indexer: topk_indices_buffer is being read in a forward pass "
+        "that never wrote it -- the %d recorded rows were written by an "
+        "earlier step. Every row read this step is that step's selection. "
+        "This is one of the two candidate explanations for greedy decode "
+        "being non-deterministic; it is logged rather than raised so the run "
+        "continues and the other one stays observable.", rows)
 
 
 def unpack_indexer_cache(kv_cache):
@@ -240,3 +302,77 @@ def register(ops: dict) -> None:
     is what makes the V4.1 construction site build this without being told.
     """
     ops["SparseAttnIndexer"] = AscendSparseAttnIndexer
+
+
+class _MarkingKernelLaunch:
+    """Upstream's short-context kernel, with the row count recorded after it.
+
+    🔴 ``topk_indices_buffer`` has two writers and only one of them was
+    keeping books. ``forward_oot`` marks what it writes; the short-context
+    path never reaches it -- ``DeepseekV4Indexer.forward`` fills the buffer
+    with this triton kernel and returns ``index_q=None``, so
+    ``if self.indexer is not None and index_q is not None`` is false,
+    ``indexer_op`` is never called, and the mark is never set.
+
+    The guard reading that mark then reported "never written" about a buffer
+    that had just been written -- it was reading its own bookkeeping bit
+    rather than the object it judges. Accounting has to follow *every* writer,
+    not the writer someone happened to think of.
+
+    The count comes from the launch grid, which is ``(num_tokens,)`` and is
+    also exactly the range the kernel writes. Taking it from there rather than
+    from a parallel argument keeps it from disagreeing with what actually ran.
+
+    ⚠️ Rows at or past ``num_tokens`` are still unwritten on this path too, so
+    the over-read check applies here unchanged -- it was simply unreachable
+    while the first check fired.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getitem__(self, grid):
+        launch = self._inner[grid]
+        rows = grid[0] if isinstance(grid, (tuple, list)) else grid
+
+        def _run(buffer, *args, **kwargs):
+            result = launch(buffer, *args, **kwargs)
+            mark_rows_written(buffer, int(rows))
+            return result
+
+        return _run
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+_SHORT_CONTEXT_MODULE = "vllm.models.deepseek_v4_1.attention"
+_SHORT_CONTEXT_NAME = "_fill_short_context_topk_indices"
+
+
+def apply_short_context_accounting_patch() -> bool:
+    """Make the second writer of the selection buffer keep books too."""
+    import importlib
+
+    module = importlib.import_module(_SHORT_CONTEXT_MODULE)
+    inner = getattr(module, _SHORT_CONTEXT_NAME, None)
+    if inner is None:
+        raise AttributeError(
+            f"{_SHORT_CONTEXT_MODULE} no longer defines "
+            f"{_SHORT_CONTEXT_NAME!r}. Until this is repointed the "
+            "short-context path writes topk_indices_buffer without recording "
+            "how many rows, and the reader cannot tell a written buffer from "
+            "an untouched one -- which is uninitialised memory deciding the "
+            "output.")
+    if isinstance(inner, _MarkingKernelLaunch):
+        return False
+    setattr(module, _SHORT_CONTEXT_NAME, _MarkingKernelLaunch(inner))
+    return True
+
+
+def short_context_accounting_patched() -> bool:
+    import importlib
+
+    module = importlib.import_module(_SHORT_CONTEXT_MODULE)
+    return isinstance(getattr(module, _SHORT_CONTEXT_NAME, None),
+                      _MarkingKernelLaunch)
