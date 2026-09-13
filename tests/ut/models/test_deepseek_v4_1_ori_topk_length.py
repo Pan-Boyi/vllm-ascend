@@ -453,3 +453,48 @@ def test_the_call_site_adds_the_axis_rather_than_reshaping_the_buffer():
 
     source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
     assert "self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)" in source
+
+
+# ------------------------------------------- every KV argument, not the last one
+
+def test_a_compressed_cache_one_axis_short_is_refused():
+    """"Cmp_kv strideVec size[3] not match kvLayout expect len[4]".
+
+    Third parameter of this call to arrive missing the same unit head axis --
+    after indexer_compress_cache and cmp_sparse_indices. The operator happened
+    to say so clearly this time; one launch earlier the same class of message
+    came back truncated.
+    """
+    with pytest.raises(ValueError, match="cmp_kv must have 4 axes"):
+        build_sparse_flash_mla_kwargs(
+            **_common(attends_compressed=True, cmp_ratio=2,
+                      cmp_kv=torch.zeros(4, 8, HEAD_DIM),     # 3-D
+                      seqused_cmp_kv=torch.ones(NUM_REQUESTS, dtype=torch.int32)))
+
+
+def test_the_original_cache_is_held_to_the_same_rule():
+    """The guard covers every KV argument, not the one that failed last."""
+    with pytest.raises(ValueError, match="ori_kv must have 4 axes"):
+        build_sparse_flash_mla_kwargs(
+            **_common(swa_kv_cache=torch.zeros(4, 32, HEAD_DIM)))
+
+
+def test_both_caches_go_through_the_same_rank_helper():
+    """Derived from the source. The helper existed and one of the two callers
+    used it, which is how cmp_kv arrived short."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    assert source.count("kv_with_layout_rank(") == 2, (
+        "one of the KV cache arguments is not going through the rank helper")
+
+
+def test_the_helper_is_no_longer_documented_as_being_for_one_parameter():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        kv_with_layout_rank
+
+    doc = " ".join(kv_with_layout_rank.__doc__.split())
+    assert "a helper that one of two callers uses" in doc

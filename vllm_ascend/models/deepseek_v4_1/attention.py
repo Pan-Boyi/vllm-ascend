@@ -514,7 +514,15 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
 
         cmp_kv = cmp_block_table = None
         if attends_compressed:
-            cmp_kv = self._unwrap_cache(self._compressed_kv_cache())
+            # Through the same rank helper ori_kv uses. It was written for
+            # ori_kv and only ori_kv was routed through it, so cmp_kv reached
+            # the operator one axis short -- "Cmp_kv strideVec size[3] not
+            # match kvLayout expect len[4]". Third parameter of this call to
+            # arrive missing the same head axis; fixing them one at a time is
+            # what produced the third.
+            cmp_kv = kv_with_layout_rank(
+                self._unwrap_cache(self._compressed_kv_cache()),
+                plan.layout_kv)
             cmp_block_table = req.block_table
 
         # Explicit original-KV indices, following dsa_v1's precedence: a vision

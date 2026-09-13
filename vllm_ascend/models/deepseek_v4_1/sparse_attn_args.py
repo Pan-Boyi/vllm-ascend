@@ -413,6 +413,23 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                   "this parameter wants seq_lens // cmp_ratio."
                   if seqused_cmp_kv.numel() == num_requests + 1 else ""))
 
+    expected_rank = LAYOUT_KV_RANK.get(layout_kv)
+    if expected_rank is not None:
+        for name in ("ori_kv", "cmp_kv"):
+            cache = kwargs.get(name)
+            if cache is None:
+                continue
+            # Checked here as well as fixed at the call site, because the
+            # operator saying so clearly this time is a property of the
+            # operator, not a guarantee we hold. The same class of mistake
+            # arrived truncated one launch earlier.
+            _check(cache.ndim == expected_rank,
+                   f"{name} must have {expected_rank} axes under "
+                   f"layout_kv={layout_kv}",
+                   f"got {cache.ndim} {tuple(cache.shape)}; the unit KV-head "
+                   "axis is the one usually missing -- pass the cache through "
+                   "kv_with_layout_rank rather than adding it by hand")
+
     _check_descriptor_is_populated(kwargs, q)
     _check_block_table_addresses_this_cache(kwargs)
     return kwargs
@@ -434,7 +451,13 @@ LAYOUT_KV_RANK = {
 
 
 def kv_with_layout_rank(cache, layout_kv: str):
-    """Give the operator ``ori_kv`` at the rank ``layout_kv`` describes.
+    """Give the operator a KV cache at the rank ``layout_kv`` describes.
+
+    ⚠️ Named for ``ori_kv`` when it was written, and for a while only ``ori_kv``
+    went through it -- so ``cmp_kv`` reached the operator one axis short and
+    was refused ("Cmp_kv strideVec size[3] not match kvLayout expect len[4]").
+    Every KV cache argument of this call goes through here; a helper that one
+    of two callers uses is a helper that will be missed again.
 
     The head axis is dropped on the way in and has to come back here. It is
     dropped for a real reason -- upstream's own V4.1 consumers read the cache
