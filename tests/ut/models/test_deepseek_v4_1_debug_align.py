@@ -583,3 +583,57 @@ def test_the_writer_identity_prefers_the_rank_but_keeps_the_pid():
     # dp_rank may be None off the model path; what must always hold is that
     # the pid is there, because it is what the path falls back to.
     assert set(identity) == {"pid", "dp_rank", "dp_rank_source"}
+
+
+# --------------------- a dump with no prologue says so
+
+def _lines_of(fn):
+    import logging
+
+    from vllm.logger import logger
+
+    captured = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    try:
+        fn()
+    finally:
+        logger.removeHandler(handler)
+    return captured
+
+
+def test_a_dump_without_a_prologue_says_so(tmp_path):
+    """🔴 The prologue is the only observation point before layer 0, and its
+    absence is indistinguishable from "there was nothing to record" -- which
+    is how that section stayed at zero coverage for a day while every flight
+    reported success."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    lines = _lines_of(rec.flush)
+    assert any("has no prologue section" in line for line in lines), lines
+    assert any("not 'there was nothing to record'" in line
+               for line in lines), lines
+
+
+def test_a_dump_with_a_prologue_is_quiet(tmp_path):
+    """Two arms: the report has to be able to stay silent, or it becomes the
+    background noise it exists to escape."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("prologue", "embed.out", torch.zeros(4))
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    lines = _lines_of(rec.flush)
+    assert not any("no prologue section" in line for line in lines), lines
+
+
+def test_an_empty_prologue_tag_counts_as_missing(tmp_path):
+    """A tag that exists with nothing in it is the same artifact as no tag."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec._bufs["prologue"] = {}
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    lines = _lines_of(rec.flush)
+    assert any("has no prologue section" in line for line in lines), lines

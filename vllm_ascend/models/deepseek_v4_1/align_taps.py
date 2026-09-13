@@ -565,6 +565,22 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
         handles.append(embed.register_forward_pre_hook(_prologue_pre))
         handles.append(embed.register_forward_hook(_prologue_post))
         taps_installed += 2
+    else:
+        # 🔴 Said out loud. The prologue is the only observation point before
+        # layer 0, and a dump without it is missing the one section that
+        # could show whether the embedding is right. "No prologue hooks were
+        # installed" and "the prologue had nothing to record" produce the
+        # same artifact -- an absent prologue.safetensors -- and only this
+        # line tells them apart.
+        from vllm.logger import logger
+
+        logger.error(
+            "DSV4.1 alignment: no prologue hooks installed. %s.embed_tokens "
+            "is %s, so input_ids and embed.out will be absent from every "
+            "dump this process writes. That is the section before layer 0, "
+            "and its absence is not evidence that there was nothing to "
+            "record.", type(inner).__name__,
+            "missing" if embed is None else type(embed).__name__)
     for layer_id, layer in _decoder_layers(model):
         # First, so the boundary hooks below it in the same layer see this
         # layer's positions rather than the previous layer's.

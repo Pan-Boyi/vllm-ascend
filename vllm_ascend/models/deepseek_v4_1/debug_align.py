@@ -251,6 +251,7 @@ class AlignRecorder:
                                for tag, keys in self._bufs.items()}
         manifest["golden_coverage"] = self._golden_coverage()
         manifest["injection_scope"] = self._injection_scope()
+        self._report_missing_prologue()
         problems = self._coverage_problems()
         manifest["position_coverage"] = {
             "state": "ok" if not problems else "incomplete",
@@ -376,6 +377,32 @@ class AlignRecorder:
                                  or None)
         _log_coverage(report, self.dump_dir)
         return report
+
+    def _report_missing_prologue(self) -> None:
+        """Say when this dump has no prologue, because nothing else will.
+
+        🔴 The prologue is the only observation point before layer 0. A dump
+        without it cannot answer whether the embedding is right, and its
+        absence is indistinguishable from "there was nothing to record" --
+        which is how this section stayed at zero coverage for a day while
+        every flight reported success.
+
+        Not an error: a pipeline rank that does not hold the embedding has
+        no prologue and is behaving correctly. What must not happen is that
+        it passes unremarked.
+        """
+        if "prologue" in self._bufs and self._bufs["prologue"]:
+            return
+        from vllm.logger import logger
+
+        logger.error(
+            "DSV4.1 alignment: %s has no prologue section. input_ids, "
+            "positions and embed.out are not in it, so nothing in this dump "
+            "speaks about the model before layer 0 -- and the earliest known "
+            "divergence is *at* layer 0. This is expected on a pipeline rank "
+            "that does not hold the embedding and is a defect anywhere else; "
+            "either way it is not 'there was nothing to record'.",
+            self.dump_dir)
 
     def _coverage_problems(self) -> list:
         """Keys whose positions were not written exactly once."""
