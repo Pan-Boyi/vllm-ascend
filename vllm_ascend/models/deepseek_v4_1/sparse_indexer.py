@@ -123,8 +123,18 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             # Profile and dummy runs. Upstream returns the buffer untouched
-            # here too; the caller reads the buffer, not the return value, and
-            # during profiling nothing reads it at all.
+            # here too; the caller reads the buffer, not the return value.
+            #
+            # 🔴 The line that used to be here said "during profiling nothing
+            # reads it at all". That was wrong, and a traceback proved it:
+            # _dummy_run -> _sparse_indexer_and_attn -> forward_mqa reads the
+            # buffer on exactly this path. The read is real; what does not
+            # follow from it is any conclusion about a real request, because
+            # the values are uninitialised either way.
+            #
+            # The buffer is deliberately left unwritten and unmarked, so a
+            # reader can tell "nobody wrote this" from "zero rows selected".
+            # forward_mqa checks that distinction rather than assuming it.
             return self.topk_indices_buffer
 
         metadata = attn_metadata[self.k_cache.prefix]

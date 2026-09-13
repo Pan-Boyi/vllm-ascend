@@ -142,6 +142,48 @@ def _log_batch_shape(prefix, query_start_loc, seq_lens) -> None:
 _LOGGED_BATCH_SHAPES: set = set()
 
 
+def _is_real_batch() -> bool:
+    """Whether this forward has scheduler metadata behind it.
+
+    The same test ``sparse_indexer.forward_oot`` uses to decide not to write
+    the selection buffer, so the reader and the writer agree on what a dummy
+    run is instead of each having its own idea.
+    """
+    from vllm.forward_context import get_forward_context
+
+    try:
+        context = get_forward_context()
+    except AssertionError:
+        return False
+    return isinstance(getattr(context, "attn_metadata", None), dict)
+
+
+_WARNED_UNWRITTEN_SELECTION = False
+
+
+def _warn_unwritten_selection_on_dummy_run() -> None:
+    """Once per process, not once per layer per step.
+
+    Said at all because the traceback that produced this branch also falsified
+    a comment: forward_oot said "during profiling nothing reads it at all",
+    and forward_mqa demonstrably does. Reading uninitialised memory on a dummy
+    run is harmless for the output, and it is still worth one line that it
+    happens.
+    """
+    global _WARNED_UNWRITTEN_SELECTION
+    if _WARNED_UNWRITTEN_SELECTION:
+        return
+    _WARNED_UNWRITTEN_SELECTION = True
+    from vllm.logger import logger
+
+    logger.warning(
+        "DSV4.1: a dummy/profile forward read the indexer selection buffer "
+        "before anything wrote it. Expected on that path -- the indexer skips "
+        "the write when there is no metadata -- and reported once because the "
+        "same buffer is uninitialised memory and a real batch reading it "
+        "would be a defect.")
+
+
 class AscendDeepseekV41Attention(DeepseekV4Attention):
     """Sparse-MLA attention on Ascend.
 
@@ -711,12 +753,23 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
 
         written = rows_written(self.topk_indices_buffer)
         if written is None:
+            # ⚠️ Three states, and the first version had two. On a dummy or
+            # profile run the indexer returns the buffer without writing it --
+            # this line's own early return in forward_oot -- so "never
+            # written" is the expected state there, not a defect. Raising on
+            # it fired where the premise does not hold and, worse, stopped the
+            # launch before the first real request, so neither arm of the
+            # question got answered.
+            if not _is_real_batch():
+                _warn_unwritten_selection_on_dummy_run()
+                return self.topk_indices_buffer[:num_tokens].unsqueeze(1)
             raise ValueError(
-                f"{self.prefix}: this layer attends a compressed stream and "
-                "the indexer selection buffer has never been written. It is "
-                "allocated with torch.empty, so every row of it is whatever "
-                "was in HBM -- reading it would make the output depend on the "
-                "contents of device memory rather than on the prompt.")
+                f"{self.prefix}: this layer attends a compressed stream on a "
+                "real batch and the indexer selection buffer has never been "
+                "written. It is allocated with torch.empty, so every row of "
+                "it is whatever was in HBM -- reading it would make the "
+                "output depend on the contents of device memory rather than "
+                "on the prompt.")
         if num_tokens > written:
             raise ValueError(
                 f"{self.prefix}: reading {num_tokens} rows of the indexer "

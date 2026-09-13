@@ -690,17 +690,26 @@ def _sel_bind(buffer):
     return _SelLayer(buffer)
 
 
-def test_a_selection_buffer_nobody_wrote_is_refused():
+def test_a_selection_buffer_nobody_wrote_is_refused_on_a_real_batch(monkeypatch):
     """torch.empty upstream: every row is whatever was in HBM. Reading it
     makes the output depend on device memory rather than on the prompt --
     which is what a greedy decode giving three answers to one prompt looks
-    like."""
+    like.
+
+    Scoped to a real batch: the dummy-run state is normal and is covered
+    separately.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import attention as attn_mod
+
+    monkeypatch.setattr(attn_mod, "_is_real_batch", lambda: True)
     layer = _sel_bind(torch.empty(8, 512, dtype=torch.int32))
     with pytest.raises(ValueError, match="never been written"):
         layer._checked_selection(4)
 
 
 def test_reading_past_the_written_rows_is_refused():
+    """This one fires whatever the batch is: rows were written, so the
+    dummy-run escape does not apply."""
     from vllm_ascend.models.deepseek_v4_1.sparse_indexer import mark_rows_written
 
     buffer = torch.full((8, 512), -1, dtype=torch.int32)
@@ -742,3 +751,56 @@ def test_zero_written_rows_is_not_the_same_as_unwritten():
     assert rows_written(buffer) == 0, (
         "0 and None have to stay distinct: one is 'no tokens selected', the "
         "other is 'do not read this'")
+
+
+def test_a_dummy_run_reading_the_unwritten_buffer_is_not_a_defect(monkeypatch):
+    """Three states, and the first version had two.
+
+    The indexer deliberately does not write the buffer when there is no
+    metadata, so "never written" is the expected state on a dummy run.
+    Raising there fired where the premise does not hold and stopped the launch
+    before the first real request -- so neither arm of the question it was
+    written to answer got an answer.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import attention as attn_mod
+
+    monkeypatch.setattr(attn_mod, "_is_real_batch", lambda: False)
+    layer = _sel_bind(torch.empty(8, 512, dtype=torch.int32))
+    got = layer._checked_selection(4)
+    assert got.shape == (4, 1, 512)
+
+
+def test_a_real_batch_reading_the_unwritten_buffer_still_raises(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1 import attention as attn_mod
+
+    monkeypatch.setattr(attn_mod, "_is_real_batch", lambda: True)
+    layer = _sel_bind(torch.empty(8, 512, dtype=torch.int32))
+    with pytest.raises(ValueError, match="on a real batch"):
+        layer._checked_selection(4)
+
+
+def test_the_reader_and_the_writer_agree_on_what_a_dummy_run_is():
+    """Both test isinstance(attn_metadata, dict). Two different notions of
+    "dummy run" is how the reader would fire on a state the writer considers
+    normal -- which is what happened."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import attention as attn_mod
+    from vllm_ascend.models.deepseek_v4_1 import sparse_indexer
+
+    reader = inspect.getsource(attn_mod._is_real_batch)
+    writer = inspect.getsource(sparse_indexer.AscendSparseAttnIndexer.forward_oot)
+    assert "isinstance(getattr(context, \"attn_metadata\", None), dict)" in reader
+    assert "if not isinstance(attn_metadata, dict):" in writer
+
+
+def test_the_falsified_comment_is_gone():
+    """A traceback showed forward_mqa reads the buffer during profiling, so
+    the claim that nothing does had to go rather than be worked around."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import sparse_indexer
+
+    source = inspect.getsource(
+        sparse_indexer.AscendSparseAttnIndexer.forward_oot)
+    assert "nothing reads it at all" not in source
