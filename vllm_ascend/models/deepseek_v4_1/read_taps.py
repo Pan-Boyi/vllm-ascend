@@ -198,9 +198,20 @@ def _tap_block_contents(layer_id: int, key: str, cache, kept) -> None:
     from vllm_ascend.models.deepseek_v4_1.layer_trace import (
         coarse_fingerprint_tensor, fingerprint_tensor)
 
+    _describe_once("cmp/ori cache", cache, kept)
     exact, coarse = [], []
     for index in kept.reshape(-1).tolist():
-        block = cache[int(index)]
+        # 🔴 The view is free; consuming it is not. The failure that killed
+        # two flights was not the index operator -- the traceback's third
+        # line names ``AsStridedAiCore`` and its last line says "Convert
+        # tensor to contiguous failed", so what failed is the contiguity
+        # conversion op-plugin inserts for a non-contiguous input. A basic
+        # index returns a view, and the next op that needs contiguous memory
+        # inserts the same AsStrided. So the landing is attempted here,
+        # where it can be reported as its own step.
+        block = _landed(cache[int(index)], index)
+        if block is None:
+            return
         exact.append(fingerprint_tensor(block).reshape(1))
         coarse.append(coarse_fingerprint_tensor(block).reshape(1))
     if not exact:
@@ -251,6 +262,72 @@ def tap_operator_rows(layer_id: int, cache, block_table, seqused) -> None:
              torch.tensor([-1 if rows is None else rows]))
 
 
+def _landed(view, index: int):
+    """A copy of ``view`` that later ops can consume, or ``None`` with a say.
+
+    Tried as ``clone``; a failure here is the AsStrided wall and is reported
+    as **that step**, not folded into the caller's "tap failed". The two have
+    different remedies: a failure to land means the tensor cannot be read at
+    all on this device, while a failure in the caller means the addressing
+    was wrong.
+    """
+    try:
+        return view.clone()
+    except Exception as exc:                                 # noqa: BLE001
+        from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+        announce_once(
+            "read_taps_land_failed",
+            "could not materialise block %d of the cache (%r). This is the "
+            "contiguity conversion, not the indexing: a basic index gives a "
+            "view and the first op needing contiguous memory inserts "
+            "AsStrided. Block digests are absent from this dump; the block "
+            "ids are not.", index, exc)
+        return None
+
+
+_DESCRIBED: set = set()
+
+
+def _describe_once(what: str, tensor, ids) -> None:
+    """Shape, strides, contiguity and the index range -- before anything can
+    fail on them.
+
+    🔴 Printed unconditionally rather than only on failure, because the two
+    candidate causes are decided by exactly these numbers and one of them
+    does not raise:
+
+        not contiguous, ids in range   the conversion is the problem
+        ids out of range               this call's addressing is wrong,
+                                       which also explains why it is
+                                       intermittent
+
+    ⚠️ Self-contained on purpose. The quantities that would have answered
+    this were already being logged elsewhere, under another switch, on
+    another line -- and a diagnosis split across two lines that are not
+    always both present is one nobody assembles.
+    """
+    if what in _DESCRIBED:
+        return
+    _DESCRIBED.add(what)
+    from vllm.logger import logger
+
+    try:
+        ids_list = [int(v) for v in ids.reshape(-1)[:8]]
+        logger.info(
+            "DSV4.1 read tap %s: shape=%s stride=%s contiguous=%s "
+            "storage_offset=%d numel=%d dtype=%s | ids=%s max_id=%s "
+            "dim0=%d -> in_range=%s", what, tuple(tensor.shape),
+            tuple(tensor.stride()), tensor.is_contiguous(),
+            tensor.storage_offset(), tensor.numel(), tensor.dtype,
+            ids_list, max(ids_list) if ids_list else None,
+            tensor.shape[0],
+            all(0 <= i < tensor.shape[0] for i in ids_list))
+    except Exception as exc:                                 # noqa: BLE001
+        logger.info("DSV4.1 read tap %s: could not be described (%r)",
+                    what, exc)
+
+
 def _block_ids(block_table: torch.Tensor):
     """Valid block ids in this table, de-duplicated, in order."""
     flat = block_table.reshape(-1)
@@ -286,6 +363,7 @@ def reset_for_test() -> None:
     global _DECLARED
     _DECLARED = False
     _DISABLED.clear()
+    _DESCRIBED.clear()
 
 
 def _report_truncated(layer_id: int, key: str, total: int) -> None:

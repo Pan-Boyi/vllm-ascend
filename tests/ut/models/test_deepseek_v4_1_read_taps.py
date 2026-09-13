@@ -248,3 +248,65 @@ def test_a_layer_that_is_not_selected_records_nothing(monkeypatch):
         lambda *a: recorded.append("tapped"))
     read_taps.tap_read(3, "seqused_cmp_kv", torch.zeros(3))
     assert recorded == []
+
+
+# ------------------- the diagnosis that decides between the two causes
+
+def test_the_cache_is_described_before_anything_can_fail(lines):
+    """🔴 Printed unconditionally, not only on failure.
+
+    The traceback's own last lines say "Convert tensor to contiguous failed"
+    after an AsStrided, and two candidate causes fit: a non-contiguous input
+    the conversion cannot handle, or an index that is out of range. Exactly
+    these numbers decide it, and one of the two does not raise -- so waiting
+    for a failure to print them answers only half the question.
+    """
+    cache = torch.zeros(6, 2, 4)
+    read_taps._tap_block_contents(2, "ori_kv", cache,
+                                  torch.tensor([1, 4], dtype=torch.int32))
+    line = [ln for ln in lines if "DSV4.1 read tap" in ln]
+    assert line, lines
+    for field in ("shape=", "stride=", "contiguous=", "storage_offset=",
+                  "ids=", "in_range="):
+        assert field in line[0], (field, line[0])
+
+
+def test_the_description_says_when_an_index_is_out_of_range(lines):
+    """"The output element is out of input range" is the operator's own
+    wording; this makes the same judgement before the call, where it can
+    name the id."""
+    read_taps._tap_block_contents(2, "ori_kv", torch.zeros(3, 2),
+                                  torch.tensor([0, 9], dtype=torch.int32))
+    line = [ln for ln in lines if "DSV4.1 read tap" in ln][0]
+    assert "in_range=False" in line and "max_id=9" in line, line
+
+
+def test_a_view_that_cannot_be_landed_is_reported_as_that_step(lines,
+                                                               monkeypatch):
+    """⚠️ Its own step, not the caller's "tap failed". A failure to land
+    means the tensor cannot be read on this device; a failure in the caller
+    means the addressing was wrong. Different remedies."""
+    class _Unlandable(torch.Tensor):
+        pass
+
+    view = torch.zeros(2, 4)
+    monkeypatch.setattr(
+        torch.Tensor, "clone",
+        lambda self, *a, **k: (_ for _ in ()).throw(
+            RuntimeError("Convert tensor to contiguous failed")))
+    assert read_taps._landed(view, 3) is None
+    assert any("could not materialise block 3" in ln for ln in lines), lines
+    assert any("not the indexing" in ln for ln in lines), lines
+    del _Unlandable
+
+
+def test_the_block_ids_survive_a_landing_failure(lines, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole",
+        lambda layer, key, tensor: recorded.append(key))
+    monkeypatch.setattr(read_taps, "_landed", lambda view, index: None)
+    read_taps.tap_cache_read(2, "ori_kv", torch.zeros(4, 2),
+                             torch.tensor([[0, 1]], dtype=torch.int32))
+    assert "read.ori_kv.block_ids" in recorded
+    assert not any("block_digest" in key for key in recorded)
