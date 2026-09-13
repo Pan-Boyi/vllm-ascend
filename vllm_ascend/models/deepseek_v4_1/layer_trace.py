@@ -41,6 +41,29 @@ _ENV = "VLLM_ASCEND_DSV41_TRACE_LAYERS"
 #: mistaken for each other when a comparison is done by grep.
 _STEP = 0
 
+#: The mixing constant, written as the **signed** value with the same 64 bits
+#: as the golden-ratio constant 0x9E3779B97F4A7C15.
+#:
+#: 🔴 Spelled unsigned it is 11400714819323198485, larger than int64's maximum
+#: of 9223372036854775807. CPU torch accepts it; the NPU does not --
+#: ``aclnnBitwiseXorScalar`` fails -- and the failure landed in an ``except``
+#: that returned the -1 sentinel. The result was a trace whose lines were 100%
+#: sentinel, and a sentinel is a *constant*, so the obvious reading of that log
+#: is "every layer agrees".
+#:
+#: ⚠️ Twenty-four unit tests were green while the instrument was dead on the
+#: target, because every one of them ran on CPU. "Can be computed on CPU" and
+#: "can be computed on Ascend" are two claims, and the first passing looks
+#: exactly like the second passing. The check that catches it without a device
+#: is the one on DEVICE_INT_CONSTANTS: the value has to fit in int64.
+MIX = 0x9E3779B97F4A7C15 - (1 << 64)
+
+#: Every integer constant this module hands to a torch op, so one test can
+#: check the property that was violated rather than this one value.
+DEVICE_INT_CONSTANTS = (MIX, )
+
+
+
 
 def trace_spec() -> str:
     """The raw selection, or "" when tracing is off."""
@@ -133,10 +156,12 @@ def fingerprint_tensor(tensor: torch.Tensor) -> torch.Tensor:
         # multiplier* and folding the high bits back down does not factor
         # out. The test that caught it is the one that compares a tensor with
         # its own reverse.
-        mixed = (raw ^ 0x9E3779B97F4A7C15) * (index * 2 + 1)
+        mixed = (raw ^ MIX) * (index * 2 + 1)
         return (mixed ^ (mixed >> 29)).sum()
-    except Exception:                                        # noqa: BLE001
+    except Exception as exc:                                 # noqa: BLE001
+        _report_sentinel("exact", exc)
         return torch.full((), -1, dtype=torch.int64)
+
 
 
 #: Quantisation levels for the coarse digest. 1/64 is about 1.6e-2 relative,
@@ -184,11 +209,30 @@ def coarse_fingerprint_tensor(tensor: torch.Tensor) -> torch.Tensor:
         quantised = (flat / safe * COARSE_LEVELS).round().to(torch.int64)
         index = torch.arange(quantised.numel(), device=quantised.device,
                              dtype=torch.int64)
-        mixed = (quantised ^ 0x9E3779B97F4A7C15) * (index * 2 + 1)
+        mixed = (quantised ^ MIX) * (index * 2 + 1)
         digest = (mixed ^ (mixed >> 29)).sum()
         return torch.where(torch.isfinite(scale) & (scale != 0), digest, zero)
-    except Exception:                                        # noqa: BLE001
+    except Exception as exc:                                 # noqa: BLE001
+        _report_sentinel("coarse", exc)
         return torch.full((), -1, dtype=torch.int64)
+
+
+def _report_sentinel(which: str, exc: BaseException) -> None:
+    """Say why a digest could not be computed, the first time it happens.
+
+    🔴 The sentinel is a *constant*, so a trace made entirely of sentinels
+    reads as "every layer agrees" -- the strongest possible wrong conclusion,
+    and it is produced by the failure being silent. The only line that could
+    have said otherwise was the one the except clause was swallowing.
+    """
+    from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+    announce_once(
+        "trace_sentinel_" + which,
+        "the %s layer digest could not be computed (%r). Every line from here "
+        "carries the -1 sentinel, which is a constant and therefore reads as "
+        "'all layers agree'. Treat this trace as no reading at all.",
+        which, exc)
 
 
 def install_layer_trace(model: torch.nn.Module) -> list:

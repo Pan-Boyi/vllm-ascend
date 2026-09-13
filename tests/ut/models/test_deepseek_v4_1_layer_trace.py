@@ -451,3 +451,97 @@ def test_a_model_whose_layer_holder_is_missing_is_refused(monkeypatch):
     handles = install_layer_trace(bare)
     for h in handles:
         h.remove()
+
+
+# --------------------------- constants that a device op will actually accept
+
+def test_every_device_constant_fits_in_int64():
+    """🔴 The check that catches a dead instrument without a device.
+
+    0x9E3779B97F4A7C15 spelled unsigned is 11400714819323198485, past int64's
+    maximum. CPU torch accepts it; the NPU's aclnnBitwiseXorScalar does not,
+    and the failure landed in an except that returned the -1 sentinel -- so
+    every trace line was the same constant, which reads as "all layers
+    agree".
+
+    ⚠️ Twenty-four tests here were green while the instrument was dead on the
+    target, because all of them run on CPU. "Can be computed on CPU" and "can
+    be computed on Ascend" are two claims and the first looks like the second.
+    This asserts the property that differs.
+    """
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import (
+        DEVICE_INT_CONSTANTS, MIX)
+
+    assert DEVICE_INT_CONSTANTS, "nothing is being checked"
+    for value in DEVICE_INT_CONSTANTS:
+        assert -2 ** 63 <= value < 2 ** 63, hex(value & (2 ** 64 - 1))
+        # and it survives the round trip a torch op would put it through
+        assert int(torch.tensor(value, dtype=torch.int64)) == value
+    assert MIX & (2 ** 64 - 1) == 0x9E3779B97F4A7C15, (
+        "the signed spelling must keep the same 64 bits, or the digest is a "
+        "different function than the one the tests characterised")
+
+
+def test_the_module_holds_no_unsigned_spelling_of_the_constant():
+    """The literal is allowed in the comment that explains it, and nowhere a
+    torch op can reach. Checked by AST so the explanation does not trip it --
+    a substring check went red on its own documentation once already."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm_ascend.models.deepseek_v4_1 import layer_trace
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(layer_trace)))
+    too_big = [node.value for node in ast.walk(tree)
+               if isinstance(node, ast.Constant)
+               and isinstance(node.value, int)
+               and not isinstance(node.value, bool)
+               and node.value >= 2 ** 63]
+    # Two allowed, for opposite reasons. The golden-ratio literal appears
+    # exactly once, as the operand of the subtraction that signs it. The
+    # 64-bit mask appears in the log formatting, where it is applied to a
+    # Python int with Python's & -- no torch op ever sees it, which is the
+    # property that matters here.
+    assert set(too_big) == {0x9E3779B97F4A7C15, 0xFFFFFFFFFFFFFFFF}, too_big
+    assert too_big.count(0x9E3779B97F4A7C15) == 1
+    # ...and the only one is the operand of the subtraction that signs it.
+    signed = [node for node in ast.walk(tree)
+              if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)
+              and isinstance(node.left, ast.Constant)
+              and node.left.value == 0x9E3779B97F4A7C15]
+    assert len(signed) == 1
+
+
+def test_a_failed_digest_says_the_trace_is_not_a_reading(monkeypatch):
+    """⚠️ The sentinel is a constant, so a trace of sentinels reads as 'all
+    layers agree' -- and the only line that could say otherwise was the one
+    the except clause swallowed."""
+    import logging
+
+    from vllm.logger import logger
+
+    from vllm_ascend.models.deepseek_v4_1 import layer_trace
+    from vllm_ascend.models.deepseek_v4_1.switch_log import reset_for_test
+
+    captured = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    reset_for_test()
+
+    class _Explodes:
+        def detach(self):
+            raise RuntimeError("aclnnBitwiseXorScalar failed")
+
+    try:
+        assert layer_trace.fingerprint(_Explodes()) == -1
+    finally:
+        logger.removeHandler(handler)
+        reset_for_test()
+
+    assert any("no reading at all" in line for line in captured), captured
