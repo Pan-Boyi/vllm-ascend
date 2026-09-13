@@ -23,10 +23,25 @@ CACHE_DIM = 512
 
 
 class _Req:
-    def __init__(self, mapping, page=PAGE):
+    """The fields the builder publishes, copied from AscendDSAReqMetadata.
+
+    block_table and query_start_loc are here because the compressed-stream
+    rebuild reads them (dsa_v1.py:1795-1800 publishes all four together). A
+    double without them passes a rebuild that never runs, which is how the
+    previous double let the dense mapping through.
+    """
+
+    def __init__(self, mapping, page=PAGE, block_table=None,
+                 query_start_loc=None):
         self.slot_mapping = mapping
         self.token_slot_mapping = mapping
         self.storage_block_size = page
+        rows = mapping.shape[0]
+        self.block_table = (torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+                            if block_table is None else block_table)
+        self.query_start_loc = (
+            torch.tensor([0, rows], dtype=torch.int32)
+            if query_start_loc is None else query_start_loc)
 
 
 class _Meta:
@@ -98,7 +113,7 @@ def test_the_paired_form_reaches_upstream_flat(ctx, upstream):
     flat = torch.tensor([0, 31, 32, 255], dtype=torch.int32)
     pairs = _split(flat)
     ctx({"compressor": _Meta(_Req(pairs))})
-    _call(pairs)
+    _call(pairs, ratio=1)
     torch.testing.assert_close(upstream["slot_mapping"], flat)
 
 
@@ -110,14 +125,14 @@ def test_the_token_count_upstream_derives_is_now_right(ctx, upstream):
     pairs = _split(torch.arange(4, dtype=torch.int32))
     ctx({"compressor": _Meta(_Req(pairs))})
     assert pairs.numel() == 8
-    _call(pairs)
+    _call(pairs, ratio=1)
     assert upstream["slot_mapping"].numel() == 4
 
 
 def test_an_already_flat_mapping_is_passed_through(ctx, upstream):
     flat = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     ctx({"compressor": _Meta(_Req(flat))})
-    _call(flat)
+    _call(flat, ratio=1)
     torch.testing.assert_close(upstream["slot_mapping"], flat)
 
 
@@ -136,7 +151,7 @@ def test_the_sentinel_survives_the_flattening(ctx, upstream):
     pairs = _split(flat)
     assert pairs[0].tolist() == [-1, -1]
     ctx({"compressor": _Meta(_Req(pairs))})
-    _call(pairs)
+    _call(pairs, ratio=1)
     assert upstream["slot_mapping"].tolist() == [-1, 64, -1]
 
 
@@ -155,7 +170,7 @@ def test_the_two_sources_must_agree(ctx, upstream):
 def test_agreement_is_what_lets_it_through(ctx, upstream):
     pairs = _split(torch.tensor([300], dtype=torch.int32), page=128)
     ctx({"compressor": _Meta(_Req(pairs, page=128))})
-    _call(pairs, kv_cache=_cache(page=128))
+    _call(pairs, kv_cache=_cache(page=128), ratio=1)
     assert upstream["slot_mapping"].tolist() == [300]
 
 
@@ -328,7 +343,7 @@ def test_the_write_side_is_recorded_before_the_operator_runs(monkeypatch):
                        torch.zeros(2, 4), torch.zeros(4, 4))
     assert order == ["compressor.rope_quant_insert.00.slots",
                      "compressor.rope_quant_insert.00.latent",
-                     "compressor.rope_quant_insert.00.cache_ptr"]
+                     "compressor.rope_quant_insert.00.cache_id"]
 
 
 def test_calls_are_numbered_so_a_forward_can_be_ordered(monkeypatch):
@@ -390,15 +405,72 @@ def test_a_failing_write_tap_does_not_reach_the_operator(monkeypatch):
                        torch.zeros(1, 4), torch.zeros(4, 4))
 
 
-def test_the_slots_recorded_are_the_flattened_ones(monkeypatch):
-    """The slots the operator is handed, not the (block, offset) pairs the
-    caller had -- those are two different values and only one of them is
-    what the write lands on."""
+def test_the_slots_recorded_are_the_ones_the_operator_gets():
+    """The slots the operator is handed, not the mapping the caller had --
+    those are two different values and only one is what the write lands on.
+
+    Walked as an AST rather than matched as text: there are now two branches
+    that produce the mapping, and a substring check would pass while one of
+    them handed something else to the tap or to upstream.
+    """
+    import ast
     import inspect
+    import textwrap
 
     import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
 
-    body = inspect.getsource(ci.rope_quant_insert_ascend)
-    assert body.index("flat = flatten_slot_mapping") < \
-        body.index("_tap_write_side")
-    assert "_tap_write_side(\"rope_quant_insert\", flat" in body
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(ci.rope_quant_insert_ascend)))
+    calls = {
+        node.func.id: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_tap_write_side" in calls and "rope_quant_insert" in calls
+
+    def _mapping_argument(call, index):
+        arg = call.args[index]
+        assert isinstance(arg, ast.Name), ast.dump(arg)
+        return arg.id
+
+    recorded = _mapping_argument(calls["_tap_write_side"], 1)
+    passed = _mapping_argument(calls["rope_quant_insert"], 4)
+    assert recorded == passed == "flat"
+
+    assigned = {
+        target.id
+        for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+    } | {
+        element.id
+        for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Tuple)
+        for element in target.elts if isinstance(element, ast.Name)
+    }
+    assert "flat" in assigned
+
+
+# ------------------------------------ the mapping the compressing path builds
+
+def test_a_compressing_ratio_hands_upstream_a_per_token_mapping(ctx, upstream):
+    """🔴 The defect, end to end.
+
+    The builder publishes V4.0's dense mapping; upstream's kernel indexes it
+    per token. Reverting this path to flattening turns this red: upstream
+    would receive [10752, 10753, -1, 0, 0], which writes entry #1, never
+    entry #0, and sends position 3 to flat slot 0.
+    """
+    dense = torch.tensor([10752, 10753, -1, 0, 0], dtype=torch.int32)
+    req = _Req(dense, page=128,
+               block_table=torch.tensor([[84, 85]], dtype=torch.int32),
+               query_start_loc=torch.tensor([0, 5], dtype=torch.int32))
+    ctx({"c2": _Meta(req)})
+    compressor_insert.rope_quant_insert_ascend(
+        torch.zeros(5, 512, dtype=torch.bfloat16),
+        torch.arange(5),
+        torch.zeros(8, 64),
+        _cache(page=128),
+        dense,
+        2,
+    )
+    assert upstream["slot_mapping"].tolist() == [-1, 10752, -1, 10753, -1]

@@ -50,11 +50,35 @@ def rope_quant_insert_ascend(
     the compressor already calls. Everything except the mapping is handed
     through untouched: the kernel choice, the dtype branches and the
     assertions are upstream's and stay upstream's.
+
+    The mapping is where the two ports disagree, and at a compressing ratio it
+    is rebuilt rather than reformatted -- see
+    :mod:`vllm_ascend.models.deepseek_v4_1.compressed_slots`.
     """
     from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import \
         rope_quant_insert
 
-    flat = flatten_slot_mapping(slot_mapping, kv_cache)
+    from vllm_ascend.models.deepseek_v4_1.compressed_slots import (
+        check_per_token, layer_owning, per_token_compressed_slots)
+
+    if compress_ratio > 1:
+        # 🔴 Not the mapping we were handed. At a compressing ratio the
+        # builder publishes V4.0's DENSE mapping -- one row per compressed
+        # state -- while this kernel indexes per token
+        # (fused_compress_quant_cache.py:354-394). Reading the dense one per
+        # token skips entry #0 entirely and sends a later token to flat slot
+        # 0, another request's row. See compressed_slots for the derivation
+        # and the measurements.
+        flat, layer_name = per_token_compressed_slots(slot_mapping, positions,
+                                                      compress_ratio, kv_cache)
+    else:
+        # Ratio 1 has no group boundaries, so the builder's per-token mapping
+        # (dsa_v1.py:1298, the branch that does run) is already the right
+        # convention; only the (block, offset) form has to come off.
+        flat = flatten_slot_mapping(slot_mapping, kv_cache)
+        layer_name = layer_owning(slot_mapping)
+    check_per_token(flat, positions, compress_ratio, "rope_quant_insert",
+                    layer_name, handed=slot_mapping)
     _tap_write_side("rope_quant_insert", flat, latent, kv_cache)
     rope_quant_insert(latent, positions, cos_sin_cache, kv_cache, flat,
                       compress_ratio, fp8_scale)
@@ -193,10 +217,16 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
         prefix = f"compressor.{who}.{index:02d}"
         align_taps.tap_whole(0, f"{prefix}.slots", flat_slots)
         align_taps.tap_whole(0, f"{prefix}.latent", latent)
+        # 🔴 Hashed, not raw. A process-local address differs between ranks
+        # by construction, so a raw one makes the same-state comparison --
+        # four ranks' dumps expected to be byte-identical -- report ten
+        # differences every time. A baseline criterion that always carries
+        # noise stops being a baseline. The hash still identifies *which*
+        # cache within one process, which is all this key is for.
+        raw = cache.data_ptr() if hasattr(cache, "data_ptr") else 0
         align_taps.tap_whole(
-            0, f"{prefix}.cache_ptr",
-            torch.tensor([cache.data_ptr() if hasattr(cache, "data_ptr")
-                          else 0], dtype=torch.int64))
+            0, f"{prefix}.cache_id",
+            torch.tensor([(raw * 0x9E3779B1) & 0xFFFFFFFF], dtype=torch.int64))
     except Exception:                                        # noqa: BLE001
         # Instrument. It has already cost one flight to let one of these
         # propagate; it will not cost a second.

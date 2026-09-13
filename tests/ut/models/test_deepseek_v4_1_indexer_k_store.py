@@ -98,6 +98,60 @@ class _RecordingEpilog:
                            for k, v in kwargs.items()})
 
 
+class _Req:
+    """The builder's published fields, copied from AscendDSAReqMetadata.
+
+    Source: vllm_ascend/attention/dsa_v1.py:1793-1800 -- block_table,
+    query_start_loc, storage_block_size and the two slot mappings are
+    published together, and the compressed-stream rebuild reads all of them.
+    """
+
+    def __init__(self, mapping, page, block_table, query_start_loc):
+        self.slot_mapping = mapping
+        self.token_slot_mapping = mapping
+        self.storage_block_size = page
+        self.block_table = block_table
+        self.query_start_loc = query_start_loc
+
+
+class _Meta:
+    def __init__(self, req):
+        self.req_metadata = req
+
+
+@pytest.fixture
+def owns(monkeypatch):
+    """Register a slot mapping as belonging to a group, by identity.
+
+    Needed from the moment the ratio-2 path stopped reformatting the mapping
+    it was handed and started rebuilding one from that group's block table.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import compressed_slots
+    compressed_slots.reset_for_test()
+    holder = {"ctx": None}
+
+    class _Ctx:
+        attn_metadata = None
+
+    def _register(mapping, page=8, blocks=((5, 6, 7, 8), ), starts=None):
+        ctx = _Ctx()
+        rows = mapping.shape[0]
+        ctx.attn_metadata = {
+            "indexer": _Meta(_Req(
+                mapping, page,
+                torch.tensor(blocks, dtype=torch.int32),
+                torch.tensor(starts if starts is not None else [0, rows],
+                             dtype=torch.int32)))
+        }
+        holder["ctx"] = ctx
+        return mapping
+
+    import vllm.forward_context as fc
+    monkeypatch.setattr(fc, "get_forward_context",
+                        lambda: holder["ctx"] or _Ctx())
+    return _register
+
+
 @pytest.fixture
 def epilog(monkeypatch):
     rec = _RecordingEpilog()
@@ -126,10 +180,19 @@ def _store(epilog, *, num_tokens=4, ratio=2, slots=None, positions=None,
     return k_pre
 
 
-def test_the_gate_reaches_the_operator_as_the_slot_mapping(epilog):
-    _store(epilog, num_tokens=4, ratio=2)
+def test_the_gate_reaches_the_operator_as_the_slot_mapping(epilog, owns):
+    """Non-boundary tokens reach the operator as -1, boundary ones as the
+    destination this group's block table gives.
+
+    At a compressing ratio the destinations are *rebuilt*: the mapping the
+    builder publishes is V4.0's dense one, whose valid rows are 0 and 1, not
+    1 and 3. Block 5 and page 8 make the rebuilt values readable: position 1
+    is compressed state 0 (slot 40) and position 3 is state 1 (slot 41).
+    """
+    slots = owns(torch.arange(4, dtype=torch.int32))
+    _store(epilog, num_tokens=4, ratio=2, slots=slots)
     (call,) = epilog.calls
-    assert call["slot_mapping"].tolist() == [-1, 1, -1, 3]
+    assert call["slot_mapping"].tolist() == [-1, 40, -1, 41]
     assert call["layout"] == 2
 
 
@@ -164,7 +227,7 @@ def test_the_rotation_leaves_the_nope_half_alone(epilog):
                            normed[:, nope:].to(torch.bfloat16))
 
 
-def test_the_rotation_uses_the_groups_first_position(epilog):
+def test_the_rotation_uses_the_groups_first_position(epilog, owns):
     """compressed_pos = (position // ratio) * ratio.
 
     A latent stands for the first token of its group, so both tokens of a
@@ -184,10 +247,11 @@ def test_the_rotation_uses_the_groups_first_position(epilog):
     # 2 but distinct rows at ratio 1 -- run both and compare.
     for ratio, positions in ((1, [2, 3]), (2, [2, 3])):
         epilog.calls.clear()
+        mapping = owns(torch.tensor([0, 1], dtype=torch.int32))
         indexer_k_norm_rope_store_ascend(
             k_pre, torch.tensor(positions, dtype=torch.int64), cos_sin,
             torch.ones(INDEX_HEAD_DIM, dtype=torch.bfloat16), 1e-6,
-            cache, torch.tensor([0, 1], dtype=torch.int32), ratio, False)
+            cache, mapping, ratio, False)
         if ratio == 1:
             at_two, at_three = epilog.calls[0]["x"][0], epilog.calls[0]["x"][1]
         else:

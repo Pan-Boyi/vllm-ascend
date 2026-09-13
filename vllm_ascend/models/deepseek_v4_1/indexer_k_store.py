@@ -346,48 +346,16 @@ def _page_size_of(slot_mapping: torch.Tensor) -> int:
     a ``(block, offset)`` pair is valid arithmetic under any page size, and the
     wrong one produces in-range slots belonging to other tokens.
 
-    So the page size is taken from the metadata object that *is* carrying this
-    tensor -- matched by object identity, not by layer name or by shape. A name
-    match would accept a sibling group's metadata, which is exactly the failure
-    mode ("addresses a different cache") this has to exclude. No match is a
-    refusal, never a default: a guessed page size here writes index keys over
-    other tokens' entries with nothing raised.
+    The identity walk that finds the owning metadata now lives in
+    :func:`~vllm_ascend.models.deepseek_v4_1.compressed_slots.owning_req_metadata`,
+    because the compressed-stream rebuild needs the same object for its block
+    table. Two copies of a walk that must not drift is how the page size ends
+    up taken from a sibling group by one caller and not the other.
     """
-    from vllm.forward_context import get_forward_context
+    from vllm_ascend.models.deepseek_v4_1.compressed_slots import \
+        owning_req_metadata
 
-    try:
-        context = get_forward_context()
-    except AssertionError:
-        # Outside a forward, get_forward_context asserts rather than returning
-        # None. Same answer either way -- there is nothing to take the page
-        # size from -- so it is reported as that rather than escaping as an
-        # AssertionError from a frame that says nothing about slot mappings.
-        context = None
-    attn_metadata = getattr(context, "attn_metadata", None)
-    if not isinstance(attn_metadata, dict):
-        raise ValueError(
-            "indexer slot mapping is (block, offset) but there is no attention "
-            "metadata dict to take the storage page size from.")
-
-    seen = []
-    for layer_name, metadata in attn_metadata.items():
-        req = getattr(metadata, "req_metadata", None)
-        if req is None:
-            continue
-        page = getattr(req, "storage_block_size", None)
-        if page is None:
-            continue
-        candidates = (getattr(req, "slot_mapping", None),
-                      getattr(req, "token_slot_mapping", None))
-        if any(c is slot_mapping for c in candidates):
-            return int(page)
-        seen.append((layer_name, page))
-
-    raise ValueError(
-        "the indexer's (block, offset) slot mapping is not the slot mapping of "
-        "any attention metadata in this forward, so the storage page size it "
-        "was split with is unknown. Inverting it with another group's page "
-        f"size writes into other tokens' entries silently. Groups seen: {seen}")
+    return int(owning_req_metadata(slot_mapping)[1].storage_block_size)
 
 
 def flatten_block_offset_slots(slot_mapping: torch.Tensor) -> torch.Tensor:
@@ -424,24 +392,55 @@ def indexer_k_norm_rope_store_ascend(
     if use_fp4_cache:
         raise NotImplementedError(_MXFP4_UNREACHABLE)
 
-    num_tokens = kv_slot_mapping.shape[0]
+    from vllm_ascend.models.deepseek_v4_1.compressed_slots import (
+        check_per_token, layer_owning, per_token_compressed_slots)
+
+    # Kept under its own name: the rebuild below is matched to the metadata
+    # object by identity, and flattening makes a new tensor.
+    handed = kv_slot_mapping
+    num_tokens = handed.shape[0]
     if k_pre.ndim != 2 or k_pre.shape[1] != INDEX_HEAD_DIM:
         raise ValueError(
             f"indexer k_pre must be [num_tokens, {INDEX_HEAD_DIM}], got "
             f"{tuple(k_pre.shape)}")
-    if kv_slot_mapping.ndim == 2 and kv_slot_mapping.shape[-1] == 2:
-        kv_slot_mapping = flatten_block_offset_slots(kv_slot_mapping)
-        num_tokens = kv_slot_mapping.shape[0]
-    elif kv_slot_mapping.ndim != 1:
+    if handed.ndim == 2 and handed.shape[-1] == 2:
+        pass
+    elif handed.ndim != 1:
         raise ValueError(
             "indexer kv_slot_mapping must be flat [num_tokens] or "
             f"[num_tokens, 2] (block, offset); got "
-            f"{tuple(kv_slot_mapping.shape)}.")
+            f"{tuple(handed.shape)}.")
     if num_tokens == 0:
         return
 
+    if compress_ratio > 1:
+        # 🔴 The second consumer of the same defect. At a compressing ratio
+        # the builder publishes V4.0's DENSE mapping (one row per compressed
+        # state) while this writer, like the compressed-stream one, indexes
+        # per token -- group_boundary_slots below tests
+        # ``(positions[t] + 1) % ratio`` at index t. See compressed_slots.
+        #
+        # ⚠️ No cache cross-check on the page here, unlike the compressed
+        # stream: the indexer's cache reaches this function in two ranks and
+        # carries its fp8 scales alongside the values, so ``shape[1]`` is not
+        # a second source for the page until that layout is read rather than
+        # assumed. One source, said out loud, beats a check on a guess.
+        kv_slot_mapping, layer_name = per_token_compressed_slots(
+            handed, positions, compress_ratio)
+        num_tokens = kv_slot_mapping.shape[0]
+    else:
+        # Ratio 1: every token is its own group, so the builder's per-token
+        # mapping is already the right convention (dsa_v1.py:1298 fills it
+        # exactly in this case); only the (block, offset) form comes off.
+        if handed.ndim == 2:
+            kv_slot_mapping = flatten_block_offset_slots(handed)
+            num_tokens = kv_slot_mapping.shape[0]
+        layer_name = layer_owning(handed)
+
     slots = group_boundary_slots(kv_slot_mapping, positions[:num_tokens],
                                  compress_ratio)
+    check_per_token(slots, positions, compress_ratio, "indexer_k_store",
+                    layer_name, handed=handed)
     k = _rms_norm(k_pre[:num_tokens], rms_norm_weight, rms_norm_eps)
     # A latent stands for the first token of its group.
     compressed_pos = torch.div(positions[:num_tokens], compress_ratio,
