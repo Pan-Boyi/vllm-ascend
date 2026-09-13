@@ -627,8 +627,30 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 "module's table -- rebuilding one here would be a second copy "
                 "of the per-layer theta and YaRN parameters, free to drift.")
 
+        # The two attention-output keys, either side of the one step between
+        # them. Recorded here rather than where the operator returns, because
+        # "before and after this rotation" is what distinguishes them and only
+        # this function sees both.
+        #
+        # Sliced to n_local_heads: `o` is [tokens, padded_heads, head_dim] and
+        # golden's is 64 heads. The padding rows are zeros, so including them
+        # would not change any value -- it would change the shape, and a
+        # shape mismatch is what the format check is there to catch. Slicing
+        # is the same fact stated where it can be checked.
+        from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+        if align_taps.alignment_active():
+            tap_layer = align_taps.layer_index(
+                self.prefix, self.vllm_config.model_config.hf_text_config)
+            align_taps.tap(tap_layer, "attn.o_raw",
+                           o[:, :self.n_local_heads], positions)
+
         o = inverse_rope_from_cos_sin_cache(o, positions, cos_sin_cache,
                                             self.rope_head_dim)
+
+        if align_taps.alignment_active():
+            align_taps.tap(tap_layer, "attn.o_unroped",
+                           o[:, :self.n_local_heads], positions)
 
         num_tokens = o.shape[0]
         group_in = o.shape[1] * o.shape[2] // self.n_local_groups
