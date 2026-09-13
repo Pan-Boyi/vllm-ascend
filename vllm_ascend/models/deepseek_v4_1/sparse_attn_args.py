@@ -163,7 +163,8 @@ def ori_sparse_selection(attends_compressed: bool, req) -> tuple:
 
 
 def is_plain_sliding_window(attends_compressed: bool,
-                             ori_sparse_indices) -> bool:
+                             ori_sparse_indices,
+                             cmp_ratio: int = 2) -> bool:
     """Whether this call is sliding-window mode rather than one of the two
     mode-0 configurations.
 
@@ -177,15 +178,36 @@ def is_plain_sliding_window(attends_compressed: bool,
     So indices present means the original stream is selected by that list, and
     the window bounds have nothing left to say.
 
+    🔵 ``cmp_ratio`` is what decides whether the window may be sent at all,
+    and it splits V4.1's compressed layers in two. The operator's rule is
+    "SWA mode requires cmp_ratio=1"; ``_dsa_swa_only_cmp_ratio`` sends 1 for
+    every layer whose configured ratio is 0 or 1, so:
+
+        layers 0,1    ratio 0 -> cmp_ratio 1, no compressed stream  mode 4
+        layers 20..39 ratio 1 -> cmp_ratio 1                        mode 4
+        layers 2..19  ratio 2 -> cmp_ratio 2, window forbidden      not mode 4
+
+    ⚠️ So twenty of the thirty-eight unmasked layers can have the real window
+    back, not a bare causal mask. Treating all thirty-eight the same was the
+    first shape of this fix and it was "less wrong", not right: it would have
+    thrown away ``sliding_window=128`` on the half of them entitled to it.
+
     ⚠️ This is the **mode-4 predicate**, and only that. What masks the
     original stream on a layer that is *not* mode 4 is a separate question
     with a separate answer -- see ``ori_mask_mode_for``. Folding the two
     together is what left 38 layers with no masking at all.
     """
-    return not attends_compressed and ori_sparse_indices is None
+    if ori_sparse_indices is not None:
+        return False
+    if not attends_compressed:
+        return True
+    # A compressed layer may still take the window, but only where the
+    # operator allows one: "SWA mode requires cmp_ratio=1".
+    return _causal_without_indices() and cmp_ratio == 1
 
 
-def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices) -> int:
+def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices,
+                      cmp_ratio: int = 2) -> int:
     """What masks this layer's original stream.
 
     Three configurations, and the third one had no answer:
@@ -226,7 +248,9 @@ def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices) -> int:
     Behind ``VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES``, default off, so
     the numerics change is one variable in one flight.
     """
-    if is_plain_sliding_window(attends_compressed, ori_sparse_indices):
+    if is_plain_sliding_window(attends_compressed, ori_sparse_indices,
+                               cmp_ratio):
+        _count_mask_mode(SLIDING_WINDOW_MASK_MODE, cmp_ratio)
         return SLIDING_WINDOW_MASK_MODE
     if (ori_sparse_indices is None and attends_compressed
             and _causal_without_indices()):
@@ -237,8 +261,43 @@ def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices) -> int:
             "ORI_WINDOW_WITHOUT_INDICES=1 sent ori_mask_mode=%d on a layer "
             "attending a compressed stream; without it this call would be "
             "NO_MASK.", CAUSAL_MASK_MODE)
+        _count_mask_mode(CAUSAL_MASK_MODE, cmp_ratio)
         return CAUSAL_MASK_MODE
+    _count_mask_mode(NO_MASK_MODE, cmp_ratio)
     return NO_MASK_MODE
+
+
+#: What was actually sent, by (mask mode, cmp_ratio). Runtime evidence, not a
+#: guard: an assertion says the code was changed, this says the change reached
+#: the operator. Both are needed and neither substitutes for the other -- an
+#: experiment whose only observable is "the variable was set" cannot tell
+#: "the branch did not run" from "the branch ran and did not help".
+_MASK_MODE_COUNTS: dict = {}
+
+
+def _count_mask_mode(mode: int, cmp_ratio: int) -> None:
+    key = (mode, cmp_ratio)
+    first = key not in _MASK_MODE_COUNTS
+    _MASK_MODE_COUNTS[key] = _MASK_MODE_COUNTS.get(key, 0) + 1
+    if first:
+        from vllm.logger import logger
+
+        logger.info(
+            "DSV4.1 ori_mask_mode: first call with mode=%d at cmp_ratio=%d "
+            "(0=NO_MASK, 3=CAUSAL, 4=SLIDING_WINDOW). Histogram so far: %s",
+            mode, cmp_ratio, mask_mode_histogram())
+
+
+def mask_mode_histogram() -> dict:
+    """``{"mode=M,cmp_ratio=R": calls}`` -- what the operator was actually
+    handed, so a run that changed nothing is distinguishable from a run whose
+    switch never reached the branch."""
+    return {f"mode={mode},cmp_ratio={ratio}": count
+            for (mode, ratio), count in sorted(_MASK_MODE_COUNTS.items())}
+
+
+def reset_mask_mode_histogram() -> None:
+    _MASK_MODE_COUNTS.clear()
 
 
 def _causal_without_indices() -> bool:
@@ -457,16 +516,22 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
 
     windowed = (kwargs.get("ori_win_left"), kwargs.get("ori_win_right")) != (-1, -1)
     if windowed:
+        # 🔴 The operator's rule is about the *ratio*, not about the presence
+        # of a compressed stream. This used to check both, and the second
+        # check was wider than the text it quoted: it refused
+        # cmp_ratio=1 layers that also carry a compressed stream, which is
+        # every one of layers 20..39 -- exactly the twenty that are entitled
+        # to the window. A guard stricter than the rule it cites reads as
+        # rigour and costs the configuration it excluded.
         _check(cmp_ratio == 1, "SWA mode requires cmp_ratio = 1",
                f"window bounds are set but cmp_ratio={cmp_ratio}")
-        _check(not has_cmp_kv, "SWA mode requires cmp_ratio = 1",
-               "window bounds are set alongside a compressed stream; the two "
-               "configurations are mutually exclusive at this boundary")
     if has_cmp_kv:
-        _check(not windowed,
+        _check(not windowed or cmp_ratio == 1,
                "non-sliding-window modes require ori_win_left = ori_win_right = -1",
-               f"a compressed stream is present but the window bounds are "
-               f"{kwargs.get('ori_win_left')!r}/{kwargs.get('ori_win_right')!r}")
+               f"a compressed stream at cmp_ratio={cmp_ratio} cannot be in "
+               "sliding-window mode, but the window bounds are "
+               f"{kwargs.get('ori_win_left')!r}/"
+               f"{kwargs.get('ori_win_right')!r}")
 
     # 🔴 There is deliberately no "has_cmp_kv requires seqused_cmp_kv" rule
     # here, and the absence is the finding.
@@ -718,11 +783,11 @@ def build_sparse_flash_mla_kwargs(
         # not 4, because "non-sliding-window modes require ori_win_left =
         # ori_win_right = -1".
         ori_mask_mode=ori_mask_mode_for(attends_compressed,
-                                        ori_sparse_indices),
+                                        ori_sparse_indices, cmp_ratio),
         ori_win_left=(ori_win_left if is_plain_sliding_window(
-            attends_compressed, ori_sparse_indices) else -1),
+            attends_compressed, ori_sparse_indices, cmp_ratio) else -1),
         ori_win_right=(ori_win_right if is_plain_sliding_window(
-            attends_compressed, ori_sparse_indices) else -1),
+            attends_compressed, ori_sparse_indices, cmp_ratio) else -1),
         layout_q="TND",
         layout_kv=layout_kv,
     )

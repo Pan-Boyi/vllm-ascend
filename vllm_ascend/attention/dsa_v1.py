@@ -1649,13 +1649,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             # sources. They are one now, so a precedence change moves both.
             ori_indices = select_ori_sparse_indices(
                 attends_cmp, vision_swa_indices, dspark_swa_indices)
-            plain_window = is_plain_sliding_window(attends_cmp, ori_indices)
+            # The same cmp_ratio the call will pass, so the descriptor and
+            # the call cannot disagree about whether a window is allowed.
+            descriptor_cmp_ratio = _dsa_swa_only_cmp_ratio(
+                self.compressor_ratio, self.vllm_config)
+            plain_window = is_plain_sliding_window(attends_cmp, ori_indices,
+                                                   descriptor_cmp_ratio)
             sas_mask_kwargs = {
                 # The mode, from the same function the call site uses. It was
                 # spelled here as "4 if plain_window else 0", which is the
                 # two-configuration reading -- and the third configuration,
                 # no indices with a compressed stream, silently took the 0.
-                "ori_mask_mode": ori_mask_mode_for(attends_cmp, ori_indices),
+                "ori_mask_mode": ori_mask_mode_for(attends_cmp, ori_indices,
+                                                   descriptor_cmp_ratio),
                 "ori_win_left": ori_win_left if plain_window else -1,
                 "ori_win_right": ori_win_right if plain_window else -1,
                 "has_cmp_kv": attends_cmp,

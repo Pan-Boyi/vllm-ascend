@@ -227,6 +227,11 @@ def test_a_paged_compressed_stream_without_lengths_is_left_to_the_adapter(q):
 def test_cmp_residual_kv_is_one_value_per_request_not_kv_data(q):
     """Despite the name. The operator's own words: 'incorrect shape dim 3.
     It should be 1'."""
+    # ⚠️ These two were passing for the wrong reason until 2026-09-13: at
+    # cmp_ratio=1 with a compressed stream the *window* check fired first,
+    # and a bare `pytest.raises(ValueError)` was satisfied by it. The match=
+    # string is what makes the assertion about the residual rather than about
+    # whichever check happens to be first.
     with pytest.raises(ValueError, match="It should be 1"):
         _validate(_with_compressed(cmp_ratio=1,
                                    cmp_residual_kv=torch.zeros(NUM_REQUESTS, 8, 512)), q)
@@ -750,3 +755,94 @@ def test_the_switch_reaches_the_mask_triple(monkeypatch):
         "today's default: NO_MASK on a layer whose original stream has "
         "neither a window nor an index list")
     assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1)
+
+
+# --------------- the window is allowed on half of the compressed layers
+
+def test_a_ratio_one_layer_gets_its_window_back(monkeypatch):
+    """🔵 Twenty of the thirty-eight unmasked layers are entitled to the real
+    window, not a bare causal mask.
+
+    The operator's rule is "SWA mode requires cmp_ratio=1", and
+    _dsa_swa_only_cmp_ratio sends 1 for every layer whose configured ratio is
+    0 or 1 -- which is layers 20..39. Treating all thirty-eight the same was
+    the first shape of this fix and it would have thrown sliding_window=128
+    away on the half entitled to it.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        is_plain_sliding_window, ori_mask_mode_for)
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
+    assert ori_mask_mode_for(True, None, cmp_ratio=1) == 4
+    assert is_plain_sliding_window(True, None, cmp_ratio=1) is True
+    # ...and a ratio-2 layer still cannot have one.
+    assert ori_mask_mode_for(True, None, cmp_ratio=2) == 3
+    assert is_plain_sliding_window(True, None, cmp_ratio=2) is False
+
+
+def test_the_ratio_one_window_reaches_the_call(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
+    built = build_sparse_flash_mla_kwargs(**_common(
+        cmp_ratio=1,
+        attends_compressed=True,
+        cmp_kv=torch.zeros(4, 32, 1, HEAD_DIM),
+        cmp_block_table=torch.zeros(NUM_REQUESTS, 4, dtype=torch.int32),
+        seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32),
+    ))
+    assert built["ori_mask_mode"] == 4
+    assert (built["ori_win_left"], built["ori_win_right"]) == (127, 0)
+
+
+def test_the_switch_off_is_unchanged_everywhere(monkeypatch):
+    """Two arms. With the switch off both ratios still send NO_MASK, so the
+    flight measures one variable."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        ori_mask_mode_for
+
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES",
+                       raising=False)
+    assert ori_mask_mode_for(True, None, cmp_ratio=1) == 0
+    assert ori_mask_mode_for(True, None, cmp_ratio=2) == 0
+
+
+# ------------------------------------- runtime evidence, not an assertion
+
+def test_the_histogram_records_what_was_actually_sent(monkeypatch):
+    """🔴 An experiment whose only observable is "the variable was set"
+    cannot tell "the branch did not run" from "the branch ran and did not
+    help" -- and those have opposite next steps."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        mask_mode_histogram, ori_mask_mode_for, reset_mask_mode_histogram)
+
+    reset_mask_mode_histogram()
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
+    for _ in range(18):
+        ori_mask_mode_for(True, None, cmp_ratio=2)
+    for _ in range(20):
+        ori_mask_mode_for(True, None, cmp_ratio=1)
+    for _ in range(2):
+        ori_mask_mode_for(False, None, cmp_ratio=1)
+
+    assert mask_mode_histogram() == {
+        "mode=3,cmp_ratio=2": 18,
+        "mode=4,cmp_ratio=1": 22,
+    }
+    reset_mask_mode_histogram()
+
+
+def test_the_histogram_shows_the_switch_off_shape(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        mask_mode_histogram, ori_mask_mode_for, reset_mask_mode_histogram)
+
+    reset_mask_mode_histogram()
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES",
+                       raising=False)
+    for _ in range(38):
+        ori_mask_mode_for(True, None, cmp_ratio=2)
+    assert mask_mode_histogram() == {"mode=0,cmp_ratio=2": 38}, (
+        "38 layers on NO_MASK is the shape the switch is supposed to change; "
+        "if a flight shows this with the switch on, the branch never ran")
+    reset_mask_mode_histogram()
