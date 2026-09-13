@@ -468,12 +468,15 @@ def check_ring_mapping(
                 "group boundaries -- the per-token criterion does not apply "
                 "here and would refuse this. A read count of 0 means the "
                 "ring was written and never read, so this forward carries no "
-                "evidence about the reader either way.", consumer,
+                "evidence about the reader either way.%s", consumer,
                 label(layer_names), capacity, num_tokens,
-                int(valid.sum()), num_tokens, readers, requests)
+                int(valid.sum()), num_tokens, readers, requests,
+                "" if ring_check_is_strict() else
+                " REPORTING ONLY -- this criterion has not yet run clean on "
+                "the device; VLLM_ASCEND_DSV41_RING_CHECK_STRICT=1 arms it.")
         return
 
-    raise ValueError(
+    complaint = (
         f"DSV4.1 {consumer} on layers {label(layer_names)} has a state-ring "
         f"mapping whose rows {_short(wrong)} are not congruent to their "
         f"positions modulo the ring capacity {capacity}. The reader takes "
@@ -481,6 +484,32 @@ def check_ring_mapping(
         "else, so an offset that is merely consecutive lands in a real row "
         "the reader will never look at, and the pooled group then carries "
         "whatever that row held.")
+    if not ring_check_is_strict():
+        # 🔴 Reports, does not raise -- and this prices "has never executed
+        # here", not "might be wrong". Unlike the two per-token checks, which
+        # have now run on the card, this one has not, and it fires on *every*
+        # forward including each decode step, so its blast radius is an order
+        # of magnitude larger. A flight has already been lost to a tap that
+        # had never flown. Trigger, not a date: once one flight logs
+        # "ring-mapping addressing OK" from the device,
+        # VLLM_ASCEND_DSV41_RING_CHECK_STRICT=1 makes it a refusal.
+        logger.error("%s ⚠️ NOT raising: this criterion has not yet run clean "
+                     "on the device, so it reports only. Set "
+                     "VLLM_ASCEND_DSV41_RING_CHECK_STRICT=1 to arm it.",
+                     complaint)
+        return
+    raise ValueError(complaint)
+
+
+def ring_check_is_strict() -> bool:
+    """Whether an incongruent ring mapping refuses the run.
+
+    Default off, with a trigger rather than a date: arm it once a flight has
+    logged the OK line from the device.
+    """
+    import os
+
+    return os.environ.get("VLLM_ASCEND_DSV41_RING_CHECK_STRICT", "0") == "1"
 
 
 def ring_readers_this_forward(query_start_loc, positions) -> tuple:

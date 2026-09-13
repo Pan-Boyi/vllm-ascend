@@ -542,14 +542,49 @@ def test_the_ring_mapping_has_its_own_criterion(ctx, monkeypatch):
         torch.zeros(3), torch.arange(3), _cache(), pairs,
         None, None, torch.ones(4), 1e-6, 2, torch.zeros(3, 4))
 
-    # Shifted by one: still in range, still a real row, and refused.
+    # Shifted by one: still in range, still a real row, and caught.
     compressed_slots.reset_for_test()
     shifted = _split(torch.tensor([97, 98, 99], dtype=torch.int32))
     ctx({"compressor": _Meta(_Req(shifted))})
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_RING_CHECK_STRICT", "1")
     with pytest.raises(ValueError, match="not congruent to their positions"):
         compressor_insert.fused_save_compress_norm_ascend(
             torch.zeros(3), torch.arange(3), _cache(), shifted,
             None, None, torch.ones(4), 1e-6, 2, torch.zeros(3, 4))
+
+
+def test_the_ring_criterion_reports_without_raising_until_it_is_armed(
+        ctx, monkeypatch, caplog):
+    """🔴 Priced for "has never executed here", not for "might be wrong".
+
+    It fires on every forward including each decode step, and it has not run
+    on the device; a flight has already been lost to a tap that had never
+    flown. So a violation is loud and the run continues, until one flight
+    logs the OK line from the card and the switch arms it.
+    """
+    import vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache as m
+    monkeypatch.setattr(m, "fused_save_compress_norm", lambda *a: None)
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_RING_CHECK_STRICT", raising=False)
+
+    from vllm_ascend.models.deepseek_v4_1 import compressed_slots
+    compressed_slots.reset_for_test()
+    monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: False)
+    assert compressed_slots.ring_check_is_strict() is False
+
+    shifted = _split(torch.tensor([97, 98, 99], dtype=torch.int32))
+    ctx({"compressor": _Meta(_Req(shifted))})
+    seen = []
+    monkeypatch.setattr("vllm.logger.logger.error",
+                        lambda fmt, *a: seen.append(fmt % a))
+    # No raise, and the message says both what is wrong and that it is not
+    # being enforced -- a silent downgrade would be worse than no criterion.
+    compressor_insert.fused_save_compress_norm_ascend(
+        torch.zeros(3), torch.arange(3), _cache(), shifted,
+        None, None, torch.ones(4), 1e-6, 2, torch.zeros(3, 4))
+    assert len(seen) == 1
+    assert "not congruent to their positions" in seen[0]
+    assert "NOT raising" in seen[0]
+    assert "VLLM_ASCEND_DSV41_RING_CHECK_STRICT=1" in seen[0]
 
 
 def test_the_ring_reader_count_is_reported(ctx, monkeypatch):
