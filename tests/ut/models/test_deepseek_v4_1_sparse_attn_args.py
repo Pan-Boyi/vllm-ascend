@@ -846,3 +846,46 @@ def test_the_histogram_shows_the_switch_off_shape(monkeypatch):
         "38 layers on NO_MASK is the shape the switch is supposed to change; "
         "if a flight shows this with the switch on, the branch never ran")
     reset_mask_mode_histogram()
+
+
+def test_seqused_cmp_kv_is_held_to_its_rank_as_well_as_its_count(q):
+    """⚠️ The count alone does not pin the rank: a [1, 1] tensor has one
+    element too. cu_seqlens_q and cmp_residual_kv have had both checks from
+    the start; this one had only the count, and "two of the three parameters
+    are checked" is the shape that produced the last three defects here."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        validate_sparse_flash_mla_args
+
+    kwargs = _with_compressed(
+        cmp_ratio=2,
+        seqused_cmp_kv=torch.tensor([[2, 3, 2]], dtype=torch.int32))
+    with pytest.raises(ValueError, match="1-D per-request array"):
+        validate_sparse_flash_mla_args(kwargs, q, NUM_REQUESTS)
+
+
+def test_the_rank_message_names_where_the_value_should_come_from(q):
+    """Attribution, not only the symptom: a reader who sees this needs to
+    know which field to go and change."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        validate_sparse_flash_mla_args
+
+    kwargs = _with_compressed(
+        cmp_ratio=2,
+        seqused_cmp_kv=torch.tensor([[2, 3, 2]], dtype=torch.int32))
+    with pytest.raises(ValueError) as exc:
+        validate_sparse_flash_mla_args(kwargs, q, NUM_REQUESTS)
+    assert "not from cu_cmp_seqlen_list" in str(exc.value)
+
+
+def test_a_cumulative_array_is_still_named_as_one(q):
+    """The check that has been running since 00cda201c: every production run
+    that reached layer 39 has already passed it, which is why a cumulative
+    array cannot be what is being sent."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        validate_sparse_flash_mla_args
+
+    kwargs = _with_compressed(
+        cmp_ratio=2,
+        seqused_cmp_kv=torch.tensor([0, 2, 5, 7], dtype=torch.int32))
+    with pytest.raises(ValueError, match="cumulative"):
+        validate_sparse_flash_mla_args(kwargs, q, NUM_REQUESTS)

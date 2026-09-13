@@ -134,6 +134,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 1 (the default) keeps the single-directory layout every existing tool
     # reads.
     "VLLM_ASCEND_DSV41_DUMP_REQUESTS": lambda: os.getenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "1"),
+    # Which layers also record what they *read* (cache blocks, selections)
+    # into the dump. Only has an effect while dumping. Default "2": the first
+    # layer with a compressed stream and the first that diverged.
+    "VLLM_ASCEND_DSV41_TAP_READ_LAYERS": lambda: os.getenv("VLLM_ASCEND_DSV41_TAP_READ_LAYERS", "2"),
     # DeepSeek-V4.1 kv-cache spec: "1" makes the layer's configured
     # compress_ratios entry -- 0 included -- reach the metadata builder as its
     # own spec field. Default "0" keeps today's behaviour, where ratio 0 is

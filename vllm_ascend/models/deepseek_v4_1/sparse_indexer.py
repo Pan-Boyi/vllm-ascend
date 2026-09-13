@@ -258,6 +258,14 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         # convention. Clearing first makes the rows this call does not cover
         # correct; it cannot fix a row the operator pads with something else.
         # First thing to compare against a golden tap.
+        # 🔴 The indexer's own output and the lengths behind it. Until now
+        # the whole indexer was NOT MEASURED in the dump -- and "not in the
+        # table I listed" was being read as "did not change". It is the
+        # sparse operator's direct input: identical q and kv with different
+        # indices is enough on its own for a different attention output.
+        _tap_indexer_reads(self, req, topk_idxs, seqused_k, cmp_residual_k,
+                           values)
+
         self.topk_indices_buffer[:num_tokens] = NO_TOKEN
         flat = topk_idxs.squeeze(1) if topk_idxs.ndim == 3 else topk_idxs
         self.topk_indices_buffer[:num_tokens, :self.topk_tokens] = flat
@@ -304,6 +312,31 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
             device=str(seqused_k.device),
         )
 
+
+
+def _tap_indexer_reads(indexer, req, topk_idxs, seqused_k, cmp_residual_k,
+                       key_values) -> None:
+    """What the indexer produced, and what it read to produce it.
+
+    Recorded at the point the values exist and before the buffer is
+    overwritten, so ``indexer.topk_idxs`` is this call's selection rather
+    than whatever the shared buffer holds afterwards.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
+
+    if not align_taps.alignment_active():
+        return
+    layer = align_taps.layer_index(
+        indexer.k_cache.prefix,
+        indexer.vllm_config.model_config.hf_text_config)
+    if not read_taps.records_reads(layer):
+        return
+
+    read_taps.tap_read(layer, "indexer.topk_idxs", topk_idxs)
+    read_taps.tap_read(layer, "indexer.seqused_k", seqused_k)
+    read_taps.tap_read(layer, "indexer.cmp_residual_k", cmp_residual_k)
+    read_taps.tap_cache_read(layer, "indexer.k_cache", key_values,
+                             getattr(req, "block_table", None))
 
 def register(ops: dict) -> None:
     """Add the Ascend indexer to the OOT registry table.

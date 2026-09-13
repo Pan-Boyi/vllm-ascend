@@ -606,6 +606,18 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                   "sequence-length array. cu_cmp_seqlen_list is that array; "
                   "this parameter wants seq_lens // cmp_ratio."
                   if seqused_cmp_kv.numel() == num_requests + 1 else ""))
+        # ⚠️ And the rank, which the count alone does not pin: a [1, 1]
+        # tensor has one element too. Its two siblings here -- cu_seqlens_q
+        # and cmp_residual_kv -- have had both checks from the start; this
+        # one had only the count, and "two of the three parameters are
+        # checked" is the shape that produced the last three defects in this
+        # file.
+        _check(seqused_cmp_kv.ndim == 1,
+               "seqused_cmp_kv must be a 1-D per-request array",
+               f"got {seqused_cmp_kv.ndim} dims, shape "
+               f"{tuple(seqused_cmp_kv.shape)}; the value comes from the "
+               "compressed group's req metadata (seqused_cmp_kv, computed as "
+               "seq_lens // cmp_ratio), not from cu_cmp_seqlen_list")
 
     expected_rank = LAYOUT_KV_RANK.get(layout_kv)
     if expected_rank is not None:
@@ -627,6 +639,7 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
     _check_descriptor_is_populated(kwargs, q)
     _check_block_table_addresses_this_cache(kwargs)
     _check_modes_are_not_both_requested(kwargs)
+    _report_compressed_arguments(kwargs)
 
     return kwargs
 
@@ -644,6 +657,56 @@ LAYOUT_KV_RANK = {
     "BSND": 4,      # batch, seq, heads, dim
     "TND": 3,       # tokens, heads, dim
 }
+
+
+_REPORTED_COMPRESSED: set = set()
+
+
+def _report_compressed_arguments(kwargs: dict[str, Any]) -> None:
+    """Say once, per distinct shape, what the compressed stream was handed.
+
+    🔴 Printed from the kwargs the operator receives, not from the variables
+    that produced them -- the two have come apart twice on this line already
+    (the pre-adapter vocabulary, and a descriptor built from another group).
+
+    ⚠️ Shape, not just presence. ``seqused_cmp_kv`` wants one value per
+    request; the cumulative ``cu_cmp_seqlen_list`` is rank 1 as well and one
+    element longer, so a rank check passes on either. The rank table can stop
+    a wrong *shape* and not a wrong *source*, and "how far the operator
+    reads" is exactly the kind of input that changes the output without
+    changing anything that looks wrong.
+    """
+    if not kwargs.get("attends_compressed", "cmp_kv" in kwargs):
+        return
+
+    def _shape(key):
+        value = kwargs.get(key)
+        if value is None:
+            return f"{key}=None"
+        if isinstance(value, torch.Tensor):
+            return f"{key}{tuple(value.shape)}:{value.dtype}"
+        return f"{key}={value!r}"
+
+    parts = [_shape(k) for k in ("seqused_cmp_kv", "cmp_residual_kv",
+                                 "cmp_sparse_indices", "cmp_topk_length",
+                                 "cmp_block_table", "cmp_mask_mode",
+                                 "cmp_ratio")]
+    signature = " ".join(parts)
+    if signature in _REPORTED_COMPRESSED:
+        return
+    _REPORTED_COMPRESSED.add(signature)
+    from vllm.logger import logger
+
+    values = kwargs.get("seqused_cmp_kv")
+    logger.info(
+        "DSV4.1 compressed args (as passed to the operator): %s | "
+        "seqused_cmp_kv values=%s", signature,
+        "n/a" if not isinstance(values, torch.Tensor)
+        else [int(v) for v in values.reshape(-1)[:8].detach().cpu()])
+
+
+def reset_compressed_report() -> None:
+    _REPORTED_COMPRESSED.clear()
 
 
 def _check_modes_are_not_both_requested(kwargs: dict[str, Any]) -> None:

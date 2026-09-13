@@ -186,6 +186,58 @@ def _warn_unwritten_selection_on_dummy_run() -> None:
         "would be a defect.")
 
 
+
+def _tap_what_this_layer_read(attn, kwargs: dict, req, cmp_req) -> None:
+    """Everything the operator is about to be handed, plus the blocks behind
+    the two block tables.
+
+    ⚪ Taken from ``kwargs`` rather than from the variables that produced
+    them: what is wanted is what the operator receives, and this line has
+    already been bitten twice by the gap between the two (the pre-adapter
+    vocabulary, and the descriptor built from another group).
+
+    ⚠️ Only on the layers ``read_taps`` selects, and only while a dump is
+    being recorded. The caches behind these tables are gigabytes; gathering
+    them for forty layers would produce a dump nobody can compare.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
+
+    if not align_taps.alignment_active():
+        return
+    layer = align_taps.layer_index(attn.prefix,
+                                   attn.vllm_config.model_config.hf_text_config)
+    if not read_taps.records_reads(layer):
+        return
+
+    # The selections and lengths: the indexer's output is the sparse
+    # operator's direct input, and until now it was NOT MEASURED rather than
+    # measured-and-equal. Identical q and kv with different indices is enough
+    # on its own to produce a different output.
+    for key in ("ori_sparse_indices", "cmp_sparse_indices", "ori_topk_length",
+                "cmp_topk_length", "seqused_ori_kv", "seqused_kv",
+                "seqused_cmp_kv", "cmp_residual_kv", "metadata",
+                "ori_win_left", "ori_win_right", "ori_mask_mode",
+                "cmp_mask_mode", "cmp_ratio"):
+        value = kwargs.get(key)
+        if isinstance(value, torch.Tensor):
+            read_taps.tap_read(layer, key, value)
+        elif isinstance(value, int):
+            read_taps.tap_read(layer, key, torch.tensor([value]))
+
+    # The two caches, gathered by the block tables this call passes.
+    read_taps.tap_cache_read(layer, "ori_kv", kwargs.get("ori_kv"),
+                             kwargs.get("ori_block_table"))
+    read_taps.tap_cache_read(layer, "cmp_kv", kwargs.get("cmp_kv"),
+                             kwargs.get("cmp_block_table"))
+    # candidate blocks, which only some layers carry; absent is absent, not
+    # an empty tensor.
+    for source in (cmp_req, req):
+        candidates = getattr(source, "candidate_blocks", None)
+        if isinstance(candidates, torch.Tensor):
+            read_taps.tap_read(layer, "candidate_blocks", candidates)
+            break
+
+
 class AscendDeepseekV41Attention(DeepseekV4Attention):
     """Sparse-MLA attention on Ascend.
 
@@ -755,6 +807,14 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 self._compressed_topk_length(cmp_selection)
                 if cmp_selection is not None else None),
         )
+
+        # 🔴 Here, immediately before the call, because these are caches and
+        # selections: recorded after the forward they answer "what does the
+        # cache hold now", which is a different question from "what did this
+        # layer read". Two requests with byte-identical q/kv/scale/sink
+        # produced different attn.o_raw, so the difference entered through an
+        # input that was not in the dump -- and every candidate is here.
+        _tap_what_this_layer_read(self, kwargs, req, cmp_req)
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
 
