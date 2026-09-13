@@ -725,3 +725,40 @@ def test_the_arming_hook_runs_before_every_tap():
 
     source = inspect.getsource(align_taps.install_alignment_taps)
     assert source.index("_arm_recording") < source.index("_capture_positions")
+
+
+def test_arming_is_reported_too(monkeypatch, with_recorder):
+    """🔴 "disarmed" alone cannot be read.
+
+    The first forward of a server is a profile run with no request, so it
+    disarms; without a line for the success case, "disarmed" is the only
+    thing in the log whether or not a real forward ever armed -- and those
+    are opposite readings.
+    """
+    import logging
+
+    from vllm.logger import logger
+
+    from vllm_ascend.models.deepseek_v4_1.switch_log import reset_for_test
+
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 77)
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    reset_for_test()
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+        reset_for_test()
+
+    assert any("recording armed at seq_len=77" in line for line in lines), lines

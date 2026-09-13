@@ -186,6 +186,25 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
         return
     recorder.set_seq_len(seq_len)
     _ARMED = True
+    _report_armed(seq_len)
+
+
+def _report_armed(seq_len: int) -> None:
+    """Say, once, that recording did arm.
+
+    🔴 Needed as much as the disarm line, and for a reason that bit here
+    already: the first forward of a server is a profile run with no request,
+    so it disarms, and "disarmed" would be the only thing in the log whether
+    or not a real forward ever armed. One line each makes "never armed" and
+    "armed on the real forward" different readings instead of the same one.
+    """
+    from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+    announce_once(
+        "align_armed",
+        "alignment recording armed at seq_len=%d. If a 'recording is "
+        "disabled' line appeared before this one it was a profile or dummy "
+        "forward, not this run's request.", seq_len)
 
 
 def _report_disarmed(reason: str) -> None:
