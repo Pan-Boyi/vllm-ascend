@@ -481,8 +481,12 @@ def test_the_indices_and_their_length_describe_one_object():
     assert "cmp_selection = (" in source
     assert "cmp_sparse_indices=cmp_selection," in source
     assert "self._compressed_topk_length(cmp_selection)" in source
-    assert source.count("self.topk_indices_buffer[:q.shape[0]]") == 1, (
-        "the selection is built in more than one place again")
+    # The buffer is now sliced in exactly one place, and that place also
+    # checks provenance -- forward_mqa must not reach into it directly again.
+    assert "self.topk_indices_buffer[" not in source, (
+        "forward_mqa slices the selection buffer itself again, bypassing the "
+        "written-rows check")
+    assert "self._checked_selection(q.shape[0])" in source
 
 
 def test_a_row_count_that_is_not_the_token_count_is_refused():
@@ -497,16 +501,18 @@ def test_a_row_count_that_is_not_the_token_count_is_refused():
                                                      dtype=torch.int32)))
 
 
-def test_the_call_site_adds_the_axis_rather_than_reshaping_the_buffer():
-    """Derived from the source: the buffer is shared with upstream's own
-    consumer, so the axis belongs at the call, not in the buffer."""
+def test_the_axis_is_added_where_the_slice_is_taken_not_in_the_buffer():
+    """The buffer is shared with upstream's own consumer, so the axis belongs
+    at the call. It moved from forward_mqa into _checked_selection when that
+    slice grew a provenance check -- same place, one function deeper."""
     import inspect
 
     from vllm_ascend.models.deepseek_v4_1.attention import \
         AscendDeepseekV41Attention
 
-    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
-    assert "self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)" in source
+    source = inspect.getsource(
+        AscendDeepseekV41Attention._checked_selection)
+    assert "self.topk_indices_buffer[:num_tokens].unsqueeze(1)" in source
 
 
 # ------------------------------------------- every KV argument, not the last one
@@ -662,3 +668,77 @@ def test_every_compressed_argument_comes_from_the_compressed_group():
     for wrong in ("req.seqused_cmp_kv if attends",
                   "req.qli_cmp_residual_k if attends"):
         assert wrong not in source, wrong
+
+
+# ------------------------------- provenance of the selection rows
+
+class _SelLayer:
+    prefix = "layers.3.attn"
+
+    def __init__(self, buffer):
+        self.topk_indices_buffer = buffer
+
+    _checked_selection = None
+
+
+def _sel_bind(buffer):
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    _SelLayer._checked_selection = \
+        AscendDeepseekV41Attention._checked_selection
+    return _SelLayer(buffer)
+
+
+def test_a_selection_buffer_nobody_wrote_is_refused():
+    """torch.empty upstream: every row is whatever was in HBM. Reading it
+    makes the output depend on device memory rather than on the prompt --
+    which is what a greedy decode giving three answers to one prompt looks
+    like."""
+    layer = _sel_bind(torch.empty(8, 512, dtype=torch.int32))
+    with pytest.raises(ValueError, match="never been written"):
+        layer._checked_selection(4)
+
+
+def test_reading_past_the_written_rows_is_refused():
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import mark_rows_written
+
+    buffer = torch.full((8, 512), -1, dtype=torch.int32)
+    mark_rows_written(buffer, 4)
+    layer = _sel_bind(buffer)
+    with pytest.raises(ValueError, match="only 4 were written"):
+        layer._checked_selection(6)
+
+
+def test_the_written_rows_are_returned_with_the_head_axis():
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import mark_rows_written
+
+    buffer = torch.full((8, 512), -1, dtype=torch.int32)
+    mark_rows_written(buffer, 8)
+    got = _sel_bind(buffer)._checked_selection(5)
+    assert got.shape == (5, 1, 512)
+
+
+def test_the_count_lives_on_the_buffer_not_on_the_indexer():
+    """The scope lesson, made executable: one buffer is shared by every layer
+    while self.indexer exists only on index sources, so a count kept on the
+    indexer is invisible to the buffer's other readers."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
+        mark_rows_written, rows_written)
+
+    buffer = torch.zeros(4, 8, dtype=torch.int32)
+    assert rows_written(buffer) is None
+    mark_rows_written(buffer, 3)
+    # Any holder of the buffer sees it, not just whoever wrote it.
+    assert rows_written(buffer) == 3
+
+
+def test_zero_written_rows_is_not_the_same_as_unwritten():
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
+        mark_rows_written, rows_written)
+
+    buffer = torch.zeros(4, 8, dtype=torch.int32)
+    mark_rows_written(buffer, 0)
+    assert rows_written(buffer) == 0, (
+        "0 and None have to stay distinct: one is 'no tokens selected', the "
+        "other is 'do not read this'")

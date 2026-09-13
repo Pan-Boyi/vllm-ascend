@@ -612,7 +612,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # Bound once, so the indices and the length describe the same object.
         # Two expressions producing "the selection" is how they come apart.
         cmp_selection = (
-            self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)
+            self._checked_selection(q.shape[0])
             if attends_compressed and self.topk_indices_buffer is not None
             else None)
 
@@ -686,6 +686,46 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         )
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
+
+    def _checked_selection(self, num_tokens: int) -> torch.Tensor:
+        """The indexer's selection for these rows, refusing unwritten ones.
+
+        🔴 ``topk_indices_buffer`` is allocated with ``torch.empty`` upstream
+        and cleared only over the rows the indexer wrote this step. Reading
+        past that returns either the previous step's selection or, on the
+        first step, whatever was in HBM -- and both make the forward depend on
+        something other than its input, which is what a greedy decode that
+        gives three different answers to the same prompt looks like.
+
+        Range and content cannot tell the two apart: a stale row holds
+        perfectly plausible non-negative block indices, and the length this
+        line derives from it (``(selection >= 0).sum()``) counts them as real.
+        So the check is on provenance -- how many rows were written -- not on
+        the values.
+
+        Raises rather than clamping. Clamping would silently drop the tokens
+        beyond the boundary, which is a wrong answer that no longer looks
+        wrong; the whole point of finding this is to see whether it happens.
+        """
+        from vllm_ascend.models.deepseek_v4_1.sparse_indexer import rows_written
+
+        written = rows_written(self.topk_indices_buffer)
+        if written is None:
+            raise ValueError(
+                f"{self.prefix}: this layer attends a compressed stream and "
+                "the indexer selection buffer has never been written. It is "
+                "allocated with torch.empty, so every row of it is whatever "
+                "was in HBM -- reading it would make the output depend on the "
+                "contents of device memory rather than on the prompt.")
+        if num_tokens > written:
+            raise ValueError(
+                f"{self.prefix}: reading {num_tokens} rows of the indexer "
+                f"selection but only {written} were written this step. The "
+                f"remaining {num_tokens - written} hold the previous step's "
+                "selection -- plausible non-negative indices that "
+                "_compressed_topk_length would count as valid, pointing into "
+                "blocks that belong to another request.")
+        return self.topk_indices_buffer[:num_tokens].unsqueeze(1)
 
     @staticmethod
     def _compressed_topk_length(selection: torch.Tensor) -> torch.Tensor:

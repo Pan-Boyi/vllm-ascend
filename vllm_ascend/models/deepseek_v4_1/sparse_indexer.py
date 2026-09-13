@@ -30,6 +30,31 @@ from vllm_ascend.models.deepseek_v4_1.indexer_select import (
 #: Upstream's "no token here" sentinel in topk_indices_buffer.
 NO_TOKEN = -1
 
+#: Where the written-row count is recorded. It lives **on the buffer tensor**
+#: rather than on this module or on the indexer, and that is the point:
+#: ``topk_indices_buffer`` is one object shared by every layer, while
+#: ``self.indexer`` exists only on index-source layers. A count kept anywhere
+#: narrower than the buffer is a count the buffer's other readers cannot see,
+#: which is exactly how the last companion value came apart.
+_ROWS_WRITTEN_ATTR = "_dsv41_rows_written"
+
+
+def mark_rows_written(buffer, num_rows: int) -> None:
+    """Record how many leading rows of ``buffer`` this step actually wrote."""
+    setattr(buffer, _ROWS_WRITTEN_ATTR, int(num_rows))
+
+
+def rows_written(buffer) -> "int | None":
+    """Rows written into ``buffer`` this step, or ``None`` if unrecorded.
+
+    ``None`` means nothing has written it since the process started. Upstream
+    allocates it with ``torch.empty``, so its contents are then whatever was in
+    HBM -- and reading that is one of the two explanations for a forward that
+    is not deterministic under greedy. Distinguishing it from a real zero
+    matters: one is "no tokens selected", the other is "do not read this".
+    """
+    return getattr(buffer, _ROWS_WRITTEN_ATTR, None)
+
 
 def unpack_indexer_cache(kv_cache):
     """``(values, scales)`` out of whatever the runner bound for this group.
@@ -153,6 +178,7 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         self.topk_indices_buffer[:num_tokens] = NO_TOKEN
         flat = topk_idxs.squeeze(1) if topk_idxs.ndim == 3 else topk_idxs
         self.topk_indices_buffer[:num_tokens, :self.topk_tokens] = flat
+        mark_rows_written(self.topk_indices_buffer, num_tokens)
 
         return self.topk_indices_buffer
 
