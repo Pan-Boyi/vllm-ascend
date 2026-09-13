@@ -126,7 +126,10 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
         return []
 
     handles: list = []
-    inner = getattr(model, "model", model)
+    inner = _find_inner_model(model)
+    if inner is None:
+        _report_nothing_found(model)
+        return []
     # 🔴 First, and on the model rather than on a layer. The layer-level
     # capture below runs only once the first decoder layer starts, which is
     # *after* embed_tokens -- so a prologue tap reading positions would get
@@ -178,10 +181,10 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
             "yes" if embed is not None else "MISSING")
     else:
         logger.error(
-            "DSV4.1 alignment: a recorder is active but zero taps were "
-            "installed -- no embed_tokens and no decoder layers were found "
-            "under %s. Every inline tap will reach record() before "
-            "set_seq_len() and raise.", type(model).__name__)
+            "DSV4.1 alignment: found %s (it has embed_tokens and layers) but "
+            "installed zero taps -- it holds no decoder layers this "
+            "recognises. Every inline tap will reach record() before "
+            "set_seq_len() and raise.", type(inner).__name__)
     return handles
 
 
@@ -287,14 +290,65 @@ def _attach(module: torch.nn.Module, layer_id: int, key: str,
     return module.register_forward_hook(_post)
 
 
+def _find_inner_model(model: torch.nn.Module) -> torch.nn.Module | None:
+    """The module that actually holds ``embed_tokens`` and ``layers``.
+
+    Searched by capability, not by path. ``model.model`` was hard-coded here
+    and found nothing, because V4.1-Flash is a multimodal checkpoint and the
+    real path is ``model.language_model.model`` -- one wrapper deeper.
+
+    🔴 That wrapper has now broken three different assumptions, each one
+    written for the shape of a text-only model, and each failing silently:
+
+        the config      use_compress read hf_config where compress_ratios
+                        lives under hf_text_config
+        the request     mm_req_doc_ranges is ``{0: []}`` for a text-only
+                        request -- a truthy dict of empty lists -- which put
+                        every text prefill through the vision index path and
+                        was the aicore exception's root cause
+        the module tree this function, returning zero taps
+
+    So the fix is not to hard-code one more level. A path that names
+    ``language_model`` would work today and go silently empty behind the next
+    wrapper, which is the same failure with a different address. Breadth-first
+    so the outermost match wins, and depth-limited so a pathological tree
+    cannot make model construction crawl.
+    """
+    queue = [(model, 0)]
+    while queue:
+        module, depth = queue.pop(0)
+        # ``layers`` alone, not layers *and* embed_tokens. A pipeline rank
+        # that is not the first has a PPMissingLayer where the embedding
+        # would be, and requiring both would find nothing there and tap
+        # nothing -- silently, which is the failure this function exists to
+        # stop. The prologue is looked up separately and is allowed to be
+        # absent for exactly that reason.
+        if getattr(module, "layers", None) is not None:
+            return module
+        if depth < 4:
+            queue.extend((child, depth + 1) for child in module.children())
+    return None
+
+
+def _report_nothing_found(model: torch.nn.Module) -> None:
+    from vllm.logger import logger
+
+    logger.error(
+        "DSV4.1 alignment: a recorder is active but no module under %s has "
+        "decoder layers, so zero taps were installed. Every "
+        "inline tap will reach record() before set_seq_len() and raise. "
+        "Children searched: %s", type(model).__name__,
+        [name for name, _ in model.named_children()])
+
+
 def _decoder_layers(model: torch.nn.Module):
     """``(layer_index, module)`` for each decoder layer, or nothing.
 
-    Indices come from the layer's position in ``model.layers``, offset by
+    Indices come from the layer's position in ``layers``, offset by
     ``start_layer`` so they are global under pipeline parallelism rather than
     local to this rank -- golden's tags are global.
     """
-    inner = getattr(model, "model", model)
+    inner = _find_inner_model(model) or model
     layers = getattr(inner, "layers", None)
     if layers is None:
         return

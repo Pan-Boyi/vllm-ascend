@@ -401,12 +401,86 @@ def test_zero_handles_with_a_recorder_present_is_reported_as_a_defect(
     handler = Capture()
     vllm_logger.addHandler(handler)
     try:
-        # One handle comes back -- the positions capture, which always
-        # registers. What must be zero is the *taps*, and that is what the
-        # report is about.
-        handles = align_taps.install_alignment_taps(torch.nn.Identity())
-        assert len(handles) == 1
+        # A model with no decoder layers at all now returns before
+        # registering anything, including the positions capture -- there is
+        # nothing to capture positions for.
+        assert align_taps.install_alignment_taps(torch.nn.Identity()) == []
     finally:
         vllm_logger.removeHandler(handler)
 
     assert any("zero taps were installed" in m for m in records), records
+    assert any("no module under" in m for m in records), records
+
+
+# ------------------------------------------- found by capability, not by path
+
+class _Wrapped(torch.nn.Module):
+    """The real shape: a multimodal wrapper one level deeper."""
+
+    def __init__(self, record):
+        super().__init__()
+        self.language_model = _ModelWithEmbed(record)
+
+    def forward(self, input_ids, positions):
+        return self.language_model(input_ids, positions)
+
+
+def test_taps_are_installed_through_a_multimodal_wrapper(prologue_recorder):
+    """model.model was hard-coded and found nothing: V4.1-Flash is a
+    multimodal checkpoint and the real path is language_model.model."""
+    model = _Wrapped([])
+    align_taps.install_alignment_taps(model)
+    model(torch.arange(3), torch.arange(3))
+    assert ("prologue", "embed.out") in prologue_recorder["calls"]
+    assert any(tag.startswith("layer_") for tag, _ in prologue_recorder["calls"])
+
+
+def test_the_search_is_by_capability_not_by_a_named_level():
+    """A path naming language_model would work today and go silently empty
+    behind the next wrapper -- the same failure at a different address."""
+    import inspect
+
+    source = inspect.getsource(align_taps._find_inner_model)
+    body = source.split('"""')[2]
+    assert "language_model" not in body, (
+        "the search hard-codes a wrapper name again")
+    assert "layers" in body
+
+
+def test_a_rank_without_an_embedding_still_taps_its_layers(prologue_recorder):
+    """A pipeline rank that is not the first has no usable embed_tokens.
+
+    Requiring both capabilities would find nothing there and tap nothing --
+    silently, which is exactly the failure this search exists to stop.
+    """
+    model = _Model([])          # layers, no embed_tokens
+    handles = align_taps.install_alignment_taps(model)
+    assert handles, "a model with layers but no embedding was not tapped"
+
+
+def test_an_unrecognisable_model_reports_what_it_looked_at(with_recorder):
+    """Zero taps is a defect, not a quiet no-op, and the message has to carry
+    enough to act on -- the last diagnosis needed the children's names."""
+    import logging
+
+    from vllm.logger import logger as vllm_logger
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    class _Opaque(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.something_else = torch.nn.Identity()
+
+    handler = Capture()
+    vllm_logger.addHandler(handler)
+    try:
+        assert align_taps.install_alignment_taps(_Opaque()) == []
+    finally:
+        vllm_logger.removeHandler(handler)
+
+    assert any("something_else" in m for m in records), records
