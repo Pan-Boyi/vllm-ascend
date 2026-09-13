@@ -506,6 +506,51 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             num_tokens=q.shape[0])
         _log_batch_shape(swa_prefix, req.query_start_loc, req.seq_lens)
 
+        # The alignment taps for the three values that exist only here. Behind
+        # alignment_active() so the tap functions are not entered at all when
+        # no dump directory is set -- the same guarantee the boundary hooks
+        # get structurally, stated at each site because these are calls.
+        #
+        # sa_in.* is the group that splits responsibility the first time a
+        # comparison disagrees: all three right and attn.o_raw wrong points at
+        # the attention operator; these wrong points upstream of it. Recording
+        # them is what makes that a lookup instead of a bisection.
+        from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+        if align_taps.alignment_active():
+            tap_layer = align_taps.layer_index(
+                self.prefix, self.vllm_config.model_config.hf_text_config)
+            align_taps.tap(tap_layer, "sa_in.q", q, positions)
+            align_taps.tap(tap_layer, "sa_in.kv", kv, positions)
+            # No token axis: per-head and scalar. record_whole, or the
+            # coverage assertion could never be satisfied for them.
+            align_taps.tap_whole(tap_layer, "sa_in.attn_sink", self.attn_sink)
+            align_taps.tap_whole(
+                tap_layer, "sa_in.softmax_scale",
+                torch.tensor([self.softmax_scale], dtype=torch.float32))
+            # 🔴 sa_in.topk_idxs is deliberately NOT recorded here yet, and
+            # the gap is left visible in the key difference rather than
+            # filled. Measured from golden's own layer_00 dump: that key is
+            # [1, 1100, 128] holding *token positions* -- row t is
+            # max(0, t-127)..t, -1 padded, max value 1099 -- i.e. the causal
+            # sliding window, 128 = sliding_window.
+            #
+            # Three things that are not what we have:
+            #   * width 128 is the window, not index_topk (512);
+            #   * layers 0/1 have no indexer at all
+            #     (index_source_layer_ids = 2,8,14,20,24,28,32,36), so
+            #     topk_indices_buffer is not their selection;
+            #   * it is token space, while every index this line produces is
+            #     slot space (block * storage_block_size + offset).
+            #
+            # We could synthesise the window list to make the comparison run.
+            # That would be a tap on nothing: the operator derives the window
+            # internally from mask mode 4, so the recorded tensor would be our
+            # reconstruction being compared against golden's, with the thing
+            # actually used by the kernel never entering the comparison.
+            # Waiting on golden for what this key means on a mask-mode-4
+            # layer instead.
+
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
             num_requests=req.query_start_loc.numel() - 1,

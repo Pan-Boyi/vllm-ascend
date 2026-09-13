@@ -191,3 +191,70 @@ def expected_keys(dump_dir: str, layers: tuple[int, ...]) -> set[str]:
             "set makes every coverage comparison vacuous -- it would report "
             "full agreement against nothing.")
     return wanted
+
+
+def alignment_active() -> bool:
+    """Whether anything should be recorded at all.
+
+    Called at each inline tap site; the tap function itself is not entered
+    when this is False, which is the same guarantee the hooks give
+    structurally. Kept as one call rather than an attribute lookup so the tap
+    sites read the same way the hook installer does.
+    """
+    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
+
+    return get_recorder() is not None
+
+
+def layer_index(prefix: str, hf_text_config) -> int:
+    """The layer number golden tags with, out of the module prefix.
+
+    Uses the project's own extractor rather than a split on ".", because MTP
+    layers keep their original namespace and are addressed after the main
+    layers -- a naive parse tags them as 0..n and silently overwrites the
+    real layer 0.
+    """
+    from vllm_ascend.utils import extract_dsv4_layer_index
+
+    return extract_dsv4_layer_index(hf_text_config, prefix)
+
+
+def tap(layer_id: int, key: str, tensor: torch.Tensor,
+        positions: torch.Tensor) -> None:
+    """One position-sharded tensor, from inside a forward that owns it.
+
+    For values that are not module boundaries -- ``sa_in.*``, ``hc_*``,
+    ``moe_gate.*``, ``pre_mix.*``. A hook cannot see these: they never cross a
+    module edge, and hooking the module whose name they carry is how you get a
+    tap that never fires (see this module's docstring on attn_norm).
+    """
+    _record_with(layer_id, key, tensor, positions)
+
+
+def tap_whole(layer_id: int, key: str, tensor: torch.Tensor) -> None:
+    """One tensor that is not sharded by position.
+
+    ``sa_in.attn_sink`` is per head and ``sa_in.softmax_scale`` is a scalar --
+    neither has a token axis, so scattering them by row would be meaningless
+    and the coverage assertion would never be satisfied.
+    """
+    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
+
+    recorder = get_recorder()
+    if recorder is None:
+        return
+    recorder.record_whole(f"layer_{layer_id:02d}", key, tensor)
+
+
+def _record_with(layer_id: int, key: str, tensor: torch.Tensor,
+                 positions: torch.Tensor) -> None:
+    from vllm_ascend.models.deepseek_v4_1.debug_align import (
+        current_row_to_pos, get_recorder)
+
+    recorder = get_recorder()
+    if recorder is None:
+        return
+    row_to_pos = current_row_to_pos(positions)
+    if row_to_pos is None:
+        return
+    recorder.record_layer(layer_id, key, tensor, row_to_pos)
