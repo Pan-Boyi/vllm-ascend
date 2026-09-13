@@ -126,6 +126,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Whether the engram staging H2D waits before its host source may be
     # reused. Default "0" keeps today's non_blocking=True.
     "VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "0"),
+    # Per-layer output fingerprints in the log: "all", or a comma list of
+    # layer indices. Empty (the default) registers no hooks at all.
+    "VLLM_ASCEND_DSV41_TRACE_LAYERS": lambda: os.getenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", ""),
     # DeepSeek-V4.1 kv-cache spec: "1" makes the layer's configured
     # compress_ratios entry -- 0 included -- reach the metadata builder as its
     # own spec field. Default "0" keeps today's behaviour, where ratio 0 is

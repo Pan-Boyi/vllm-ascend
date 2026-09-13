@@ -59,6 +59,13 @@ class AscendDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
             install_alignment_taps
 
         self._alignment_tap_handles = install_alignment_taps(self)
+        # Independent of the recorder: the trace answers "where did two
+        # identical requests stop agreeing", which needs no golden dump and
+        # no fixed sequence length. Default off, and off registers no hooks.
+        from vllm_ascend.models.deepseek_v4_1.layer_trace import \
+            install_layer_trace
+
+        install_layer_trace(self)
 
 
 def _assert_patches_applied() -> None:
