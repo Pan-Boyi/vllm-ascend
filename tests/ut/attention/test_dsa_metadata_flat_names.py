@@ -299,7 +299,10 @@ def test_the_topk_promise_and_the_indices_are_one_decision():
     assert 'sas_mask_kwargs["seqused_cmp_kv"]' in builder
 
     caller = inspect.getsource(v41_attention.AscendDeepseekV41Attention.forward_mqa)
-    assert "cmp_sparse_indices=(" in caller
+    # The selection is bound once now and passed by name, so that the indices
+    # and their length cannot be built from two different expressions.
+    assert "cmp_selection = (" in caller
+    assert "cmp_sparse_indices=cmp_selection," in caller
     assert "if attends_compressed and self.topk_indices_buffer is not None" in caller
 
 

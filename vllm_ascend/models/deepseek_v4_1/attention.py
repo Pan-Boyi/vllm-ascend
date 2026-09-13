@@ -609,6 +609,13 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             # Waiting on golden for what this key means on a mask-mode-4
             # layer instead.
 
+        # Bound once, so the indices and the length describe the same object.
+        # Two expressions producing "the selection" is how they come apart.
+        cmp_selection = (
+            self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)
+            if attends_compressed and self.topk_indices_buffer is not None
+            else None)
+
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
             num_requests=req.query_start_loc.numel() - 1,
@@ -667,36 +674,39 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             # way; the shape the operator wants is not a property of the
             # buffer, so the axis is added here rather than by changing the
             # buffer everyone else reads.
-            cmp_sparse_indices=(
-                self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)
-                if attends_compressed and self.topk_indices_buffer is not None
-                else None),
+            cmp_sparse_indices=cmp_selection,
             # 🔴 Travels with the indices, same rule as ori_topk_length. The
             # selection buffer is -1 padded; declaring the whole row valid
             # sends the kernel to gather at those slots, which is the
             # mechanism kernel proved single-variable on the ori side. Taken
             # from the indexer that wrote the rows, never recounted here.
-            cmp_topk_length=(self._compressed_topk_length(q.shape[0])
-                             if attends_compressed else None),
+            cmp_topk_length=(
+                self._compressed_topk_length(cmp_selection)
+                if cmp_selection is not None else None),
         )
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
 
-    def _compressed_topk_length(self, num_tokens: int):
-        """Valid entries per row of the indexer's selection, or ``None``.
+    @staticmethod
+    def _compressed_topk_length(selection: torch.Tensor) -> torch.Tensor:
+        """Valid entries per row of the selection **being sent**.
 
-        ``None`` when the indexer has not published one -- a layer whose
-        source has not run this step. The operator then falls back to the full
-        width, which is the unsafe default, so this returning ``None`` is a
-        state worth being able to see rather than a quiet omission; the
-        argument builder refuses indices without a length on the ori side and
-        the same rule is what makes this visible on the cmp side.
+        Counted from that exact tensor, which is the one case where counting
+        at the consumer is not a second source: it cannot disagree with the
+        table it describes, because it *is* that table. The rows are -1 padded
+        from the right, so the count of non-negative entries is the number of
+        leading valid ones -- which is what the operator's length means.
+
+        🔴 The first version published a count from the indexer instead, on the
+        principle that the writer should own it. That principle is right and
+        the scope was wrong: ``topk_indices_buffer`` is one buffer shared by
+        every layer, while ``self.indexer`` is None on every layer that is not
+        an index source. So consumers read shared indices and found no
+        length, and the guard fired on a call that was otherwise fine. A value
+        and its companion have to live at the same scope or they drift apart
+        by construction.
         """
-        indexer = getattr(self, "indexer", None)
-        lengths = getattr(indexer, "topk_lengths_buffer", None)
-        if lengths is None:
-            return None
-        return lengths[:num_tokens]
+        return (selection >= 0).sum(dim=-1, dtype=torch.int32)
 
     def _compressed_group_metadata(self, attn_metadata: dict):
         """The metadata of the group that owns this layer's compressed cache.

@@ -449,16 +449,40 @@ def test_compressed_indices_without_their_length_are_refused():
                                                      dtype=torch.int32)))
 
 
-def test_the_indexer_publishes_the_count_rather_than_the_consumer_deriving_it():
-    """A count taken at the consumer is a second source, free to disagree with
-    the table it describes. It is computed where the rows are written."""
+def test_the_length_is_counted_from_the_tensor_that_is_sent():
+    """The one case where counting at the consumer is not a second source.
+
+    It cannot disagree with the table it describes, because it *is* that
+    table. The first version published a count from the indexer instead --
+    right principle, wrong scope: topk_indices_buffer is one buffer shared by
+    every layer while self.indexer is None on every layer that is not an index
+    source, so consumers read shared indices and found no length.
+    """
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    selection = torch.full((4, 1, 8), -1, dtype=torch.int32)
+    selection[0, 0, :3] = torch.tensor([5, 6, 7])
+    selection[1, 0, :8] = torch.arange(8)
+    lengths = AscendDeepseekV41Attention._compressed_topk_length(selection)
+    assert lengths.tolist() == [[3], [8], [0], [0]]
+    assert lengths.dtype == torch.int32
+
+
+def test_the_indices_and_their_length_describe_one_object():
+    """Derived from the source: two expressions producing "the selection" is
+    how the pair comes apart, so it is bound once."""
     import inspect
 
-    from vllm_ascend.models.deepseek_v4_1 import sparse_indexer
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
 
-    source = inspect.getsource(sparse_indexer.AscendSparseAttnIndexer.forward_oot)
-    assert "self.topk_lengths_buffer" in source
-    assert "(flat >= 0).sum(" in source
+    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    assert "cmp_selection = (" in source
+    assert "cmp_sparse_indices=cmp_selection," in source
+    assert "self._compressed_topk_length(cmp_selection)" in source
+    assert source.count("self.topk_indices_buffer[:q.shape[0]]") == 1, (
+        "the selection is built in more than one place again")
 
 
 def test_a_row_count_that_is_not_the_token_count_is_refused():
