@@ -134,6 +134,11 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     # This also clears the value, so a forward that never reaches the capture
     # cannot leave the last one visible to the next.
     handles.append(inner.register_forward_pre_hook(_capture_positions))
+    # Counted apart from the positions capture, which always registers. Using
+    # len(handles) would have made the "nothing was tapped" branch below
+    # unreachable -- a guard that cannot fire, which is worse than none
+    # because it reads as coverage.
+    taps_installed = 0
     embed = getattr(inner, "embed_tokens", None)
     if embed is not None and type(embed).__name__ != "PPMissingLayer":
         # 🔴 The prologue is not optional plumbing. AlignRecorder.record()
@@ -147,6 +152,7 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
         # key. A separate "prologue" module does not exist to hook.
         handles.append(embed.register_forward_pre_hook(_prologue_pre))
         handles.append(embed.register_forward_hook(_prologue_post))
+        taps_installed += 2
     for layer_id, layer in _decoder_layers(model):
         # First, so the boundary hooks below it in the same layer see this
         # layer's positions rather than the previous layer's.
@@ -156,6 +162,26 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
             if module is None:
                 continue
             handles.append(_attach(module, layer_id, key, side))
+            taps_installed += 1
+
+    # Said out loud, because the two failures so far were both diagnosed by
+    # inferring "the hooks were never installed" from "the dump is empty" --
+    # two steps away from the fact. Zero handles with a recorder present is a
+    # defect, not a quiet no-op, so it is reported as one.
+    from vllm.logger import logger
+
+    if taps_installed:
+        logger.info(
+            "DSV4.1 alignment: installed %d taps (%d decoder layers, "
+            "prologue %s)", taps_installed,
+            sum(1 for _ in _decoder_layers(model)),
+            "yes" if embed is not None else "MISSING")
+    else:
+        logger.error(
+            "DSV4.1 alignment: a recorder is active but zero taps were "
+            "installed -- no embed_tokens and no decoder layers were found "
+            "under %s. Every inline tap will reach record() before "
+            "set_seq_len() and raise.", type(model).__name__)
     return handles
 
 

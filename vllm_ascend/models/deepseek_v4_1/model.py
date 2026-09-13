@@ -45,6 +45,21 @@ class AscendDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
         _assert_patches_applied()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
+        # 🔴 The alignment taps' only production call site. Without it the
+        # hooks are never registered, and the symptom is not "no hooks" -- the
+        # six inline taps in attention.py still run, reach record() before any
+        # set_seq_len(), and raise, so the dump comes back empty and the cause
+        # is two inferences away. That happened twice.
+        #
+        # Here rather than in the runner because this is the one place that
+        # sees the built model and belongs to this line. It returns an empty
+        # list and registers nothing when no dump directory is set, so the
+        # off case is unchanged by construction.
+        from vllm_ascend.models.deepseek_v4_1.align_taps import \
+            install_alignment_taps
+
+        self._alignment_tap_handles = install_alignment_taps(self)
+
 
 def _assert_patches_applied() -> None:
     """Refuse to build out of upstream's CUDA-selected parts.

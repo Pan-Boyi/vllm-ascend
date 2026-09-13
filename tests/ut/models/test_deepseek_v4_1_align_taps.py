@@ -333,3 +333,80 @@ def test_a_forward_without_positions_clears_the_previous_ones(no_recorder):
     align_taps._CURRENT_POSITIONS = torch.tensor([1, 2, 3])
     align_taps._capture_positions(torch.nn.Identity(), (torch.zeros(3),))
     assert align_taps._current_positions() is None
+
+
+# --------------------------------------------- the premise, not the convention
+
+def test_the_production_model_installs_the_taps():
+    """"This function is correct" and "this function is called" are two things.
+
+    The taps were written, tested and merged with zero production call sites,
+    and the symptom was not "no hooks": the six inline taps in attention.py
+    still ran, reached record() before any set_seq_len(), and raised -- so the
+    dump came back empty and the cause was two inferences away. Twice.
+
+    Derived from the source, because the failure is an absence and an absence
+    is what a test of behaviour cannot see.
+    """
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.model import \
+        AscendDeepseekV41ForCausalLM
+
+    source = inspect.getsource(AscendDeepseekV41ForCausalLM.__init__)
+    assert "install_alignment_taps(self)" in source, (
+        "nothing in the production model installs the alignment taps; the "
+        "hooks will never register and every inline tap will raise")
+
+
+def test_a_tap_before_set_seq_len_says_what_is_missing(prologue_recorder,
+                                                       monkeypatch):
+    """The invariant itself, not "who should call whom".
+
+    Guarding the convention ("the model must call install") only catches the
+    wiring that was forgotten last time. This catches any path that reaches a
+    tap with no sequence length set, however it got there.
+    """
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    monkeypatch.setattr(align_taps, "_CURRENT_POSITIONS", torch.arange(3))
+
+    class _Unprepared:
+        def record_layer(self, *a, **k):
+            raise RuntimeError(
+                "set_seq_len() must be called before record()")
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Unprepared())
+    with pytest.raises(RuntimeError, match="set_seq_len"):
+        align_taps.tap(0, "sa_in.q", torch.zeros(3, 4), torch.arange(3))
+
+
+def test_zero_handles_with_a_recorder_present_is_reported_as_a_defect(
+        with_recorder, monkeypatch):
+    """A model with nothing to hook is not a quiet no-op.
+
+    Both diagnoses so far went "the dump is empty" -> "the hooks were never
+    installed", two steps from the fact. This makes the fact itself appear.
+    """
+    import logging
+
+    from vllm.logger import logger as vllm_logger
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture()
+    vllm_logger.addHandler(handler)
+    try:
+        # One handle comes back -- the positions capture, which always
+        # registers. What must be zero is the *taps*, and that is what the
+        # report is about.
+        handles = align_taps.install_alignment_taps(torch.nn.Identity())
+        assert len(handles) == 1
+    finally:
+        vllm_logger.removeHandler(handler)
+
+    assert any("zero taps were installed" in m for m in records), records
