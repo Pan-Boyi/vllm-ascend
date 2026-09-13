@@ -128,9 +128,23 @@ KEY_SEMANTICS: dict = {
     #                   between the two is therefore not evidence about the
     #                   values until that is settled.
     "read.ori_kv": "rows of the original-stream KV cache: post-RoPE, bf16, "
-                   "[448 NoPE | 64 RoPE], addressed block*block_size+offset",
+                   "[448 NoPE | 64 RoPE], addressed block*page+offset. "
+                   "The page is taken from THIS tensor's own shape, never "
+                   "written down: the serve log has four different block "
+                   "sizes (SWA 32, compressed 128 and 256, compressor ring "
+                   "8) and each is correct in its own group, so a number "
+                   "recorded here would be wrong in three of them",
     "read.cmp_kv": "rows of the compressed-stream KV cache; same layout as "
-                   "read.ori_kv",
+                   "read.ori_kv and the same rule about the page. Its "
+                   "spec block_size is the physical page MULTIPLIED BY the "
+                   "compression ratio -- this port's convention, the "
+                   "opposite of upstream, which keeps block_size at the "
+                   "config value and lets the storage page shrink by the "
+                   "ratio. So a block_size // ratio read anywhere in this "
+                   "tree cannot be judged without first knowing which "
+                   "convention its dividend came from: same field name, "
+                   "two meanings, and the two versions of the code look "
+                   "identical",
     "read.write.ori_kv.latent_pre_rope":
         "⚠️ the KV latent handed to the original-stream cache insert, "
         "**before** rope. The cached row is this after rope, so comparing "
