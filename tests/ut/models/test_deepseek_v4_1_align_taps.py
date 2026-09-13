@@ -858,3 +858,50 @@ def test_the_disarm_line_says_which_step_came_up_empty(monkeypatch,
     # Off the model path there is no forward context, which is one of the
     # four and must be named as that one rather than as "not available".
     assert "no forward context here at all" in disarm[0], disarm
+
+
+def test_a_forward_whose_rows_are_all_padding_records_nothing(monkeypatch,
+                                                              with_recorder):
+    """🔴 What stopped the dump flight.
+
+    The run armed on a real request and then met a forward whose rows all
+    mapped to no position. Recording it created buffers whose coverage was
+    zero everywhere, and the flush reported the whole key as missing -- which
+    is the same artifact as a broken row mapping, and a different defect.
+    """
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    monkeypatch.setattr(debug_align, "current_row_to_pos",
+                        lambda positions: torch.full_like(
+                            positions.to(torch.int64), -1))
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 8)
+
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert not [c for c in with_recorder if isinstance(c, tuple)], (
+        "an all-padding forward still wrote, which is what produced a dump "
+        "whose keys were entirely missing")
+
+
+def test_a_forward_with_some_real_rows_still_records(monkeypatch,
+                                                     with_recorder):
+    """Two arms: the skip must not swallow a forward that has real rows."""
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    monkeypatch.setattr(debug_align, "current_row_to_pos",
+                        lambda positions: torch.tensor([-1, 1, -1]))
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 8)
+
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert [c for c in with_recorder if isinstance(c, tuple)]

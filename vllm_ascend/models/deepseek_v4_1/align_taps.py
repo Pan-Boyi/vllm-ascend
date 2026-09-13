@@ -117,6 +117,19 @@ def _record(tag_layer: int, key: str, tensor: torch.Tensor) -> None:
         # Profile run, dummy run or graph capture. Reported by the resolver,
         # not swallowed here.
         return
+    if not bool((row_to_pos >= 0).any()):
+        # 🔴 Every row is padding. Recording this creates a buffer whose
+        # coverage is zero everywhere, and the flush then reports the whole
+        # key as missing -- which is what stopped a dump flight: the run had
+        # armed on a real request and then met a forward whose rows all
+        # mapped to nothing.
+        #
+        # Skipping is the honest outcome: the key is simply not in this dump,
+        # and golden_coverage lists it as missing. Creating an empty buffer
+        # instead would make "this forward had nothing to contribute" and
+        # "the mapping is broken" the same artifact.
+        _report_all_padding(tag_layer, key, row_to_pos.numel())
+        return
     rows = tensor.reshape(row_to_pos.numel(), -1) if tensor.dim() > 2 else tensor
     recorder.record_layer(tag_layer, key, rows.reshape(tensor.shape), row_to_pos)
 
@@ -211,6 +224,17 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
     from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
 
     rotate_recorder()
+
+
+def _report_all_padding(layer: int, key: str, rows: int) -> None:
+    from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+    announce_once(
+        "align_all_padding",
+        "a forward reached the taps with all %d of its rows mapping to no "
+        "position (first seen at layer %d, key %r). Nothing was recorded for "
+        "it. If a whole key is missing from this dump, this is why -- not a "
+        "broken row mapping on the rows that do exist.", rows, layer, key)
 
 
 def _report_armed(seq_len: int) -> None:

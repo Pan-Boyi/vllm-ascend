@@ -218,11 +218,19 @@ class AlignRecorder:
         self._meta.update(kw)
 
     def flush(self, strict: bool = True) -> None:
-        """Validate coverage, then write one safetensors file per tag."""
-        from safetensors.torch import save_file
+        """Write every tag, then judge what was written.
 
-        if strict:
-            self._assert_full_coverage()
+        🔴 The order used to be the other way round, and it cost a flight. The
+        coverage assertion ran first and raised, so **nothing reached disk** --
+        a dump that says "I am incomplete, here is how" is far more useful
+        than no dump, and the run that would have produced it is a server
+        start and a warm-up away.
+
+        Same shape as the trace's sentinel refusal and the golden-coverage
+        report: the artifact is written, and then the artifact declares what
+        is wrong with it. A report must not destroy the thing it reports on.
+        """
+        from safetensors.torch import save_file
 
         for tag, keys in self._bufs.items():
             scattered = self._coverage.get(tag, {})
@@ -243,8 +251,26 @@ class AlignRecorder:
                                for tag, keys in self._bufs.items()}
         manifest["golden_coverage"] = self._golden_coverage()
         manifest["injection_scope"] = self._injection_scope()
+        problems = self._coverage_problems()
+        manifest["position_coverage"] = {
+            "state": "ok" if not problems else "incomplete",
+            "problems": problems,
+            "note": ("Every position of every recorded key must be written "
+                     "exactly once. Anything else means the row->position "
+                     "mapping is wrong, and the symptom downstream looks like "
+                     "a routing mismatch rather than a mapping bug."),
+        }
         with open(os.path.join(self.dump_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
+
+        if problems and strict:
+            raise AssertionError(
+                "position coverage is not exactly 1 for every token -- the "
+                "row->position mapping is wrong, and the symptom would "
+                "otherwise look like a routing mismatch. The tensors and a "
+                f"manifest saying so were written to {self.dump_dir} first, "
+                "so this dump is readable and self-describing rather than "
+                "absent:\n" + "\n".join(problems))
 
     #: Keys an injector can replace, in the order it should prefer them. Layer
     #: 0 is the exception the whole structure exists for: it receives a 2-D
@@ -351,21 +377,18 @@ class AlignRecorder:
         _log_coverage(report, self.dump_dir)
         return report
 
-    def _assert_full_coverage(self) -> None:
+    def _coverage_problems(self) -> list:
+        """Keys whose positions were not written exactly once."""
         problems = []
-        for tag, keys in self._coverage.items():
-            for key, cov in keys.items():
+        for tag, keys in sorted(self._coverage.items()):
+            for key, cov in sorted(keys.items()):
                 if not torch.all(cov == 1):
                     missing = (cov == 0).nonzero().flatten().tolist()
                     dupes = (cov > 1).nonzero().flatten().tolist()
-                    problems.append(f"  {tag}/{key}: missing={missing[:8]} "
-                                    f"duplicated={dupes[:8]}")
-        if problems:
-            raise AssertionError(
-                "position coverage is not exactly 1 for every token -- the "
-                "row->position mapping is wrong, and the symptom would "
-                "otherwise look like a routing mismatch:\n" +
-                "\n".join(problems))
+                    problems.append(
+                        f"  {tag}/{key}: seq_len={cov.numel()} "
+                        f"missing={missing[:8]} duplicated={dupes[:8]}")
+        return problems
 
 
 def build_row_to_pos(positions: torch.Tensor, *, num_actual_tokens: int,

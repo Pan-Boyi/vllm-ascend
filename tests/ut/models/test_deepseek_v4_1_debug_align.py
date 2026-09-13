@@ -462,3 +462,53 @@ def test_the_single_dump_case_declares_itself_too(tmp_path, monkeypatch):
         open(os.path.join(str(tmp_path), "manifest.json")))
     assert manifest["request_index"] == 0
     assert manifest["dump_requests"] == 1
+
+
+# ------------------------- a bad dump is written, and says it is bad
+
+def test_an_incomplete_dump_is_written_before_it_is_judged(tmp_path):
+    """🔴 The order used to be the other way round and it cost a flight.
+
+    The coverage assertion ran first and raised, so nothing reached disk. A
+    dump that says "I am incomplete, here is how" is far more useful than no
+    dump, and the run that would have produced it is a server start and a
+    warm-up away. A report must not destroy the thing it reports on.
+    """
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_layer(0, "attn.out", torch.zeros(2, 4),
+                     torch.tensor([0, 0]))          # position 0 written twice
+
+    with pytest.raises(AssertionError, match="self-describing rather than"):
+        rec.flush()
+
+    assert os.path.exists(os.path.join(str(tmp_path), "layer_00.safetensors"))
+    coverage = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["position_coverage"]
+    assert coverage["state"] == "incomplete"
+    assert any("duplicated=[0]" in p for p in coverage["problems"]), coverage
+
+
+def test_a_complete_dump_says_so(tmp_path):
+    rec = da.AlignRecorder(str(tmp_path), seq_len=3)
+    rec.record_layer(0, "attn.out", torch.zeros(3, 4),
+                     torch.tensor([0, 1, 2]))
+    rec.flush()
+
+    coverage = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["position_coverage"]
+    assert coverage["state"] == "ok" and coverage["problems"] == []
+
+
+def test_the_problem_line_names_the_sequence_length(tmp_path):
+    """⚠️ "missing=[0..7]" without a seq_len cannot be read: eight missing out
+    of eight is a forward that recorded nothing, eight out of 201 is a
+    mapping that dropped a chunk, and those are different defects."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=8)
+    rec.record_layer(0, "attn.out", torch.zeros(1, 4), torch.tensor([-1]))
+    try:
+        rec.flush()
+    except AssertionError:
+        pass
+    coverage = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["position_coverage"]
+    assert any("seq_len=8" in p for p in coverage["problems"]), coverage
