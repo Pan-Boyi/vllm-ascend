@@ -209,6 +209,64 @@ def test_a_head_major_ordering_is_wrong_without_being_invalid(layout):
             "nothing downstream can notice")
 
 
+def test_an_off_by_one_row_shift_is_wrong_without_being_invalid(layout):
+    """The other silent mis-pairing: a shift, not a transposition.
+
+    ``test_a_head_major_ordering_is_wrong_without_being_invalid`` covers a
+    transposition. This covers a shift, and neither covers the other: a
+    transposition leaves row 0 alone and moves distant rows far, a shift moves
+    every row by exactly one. A guard that catches one can be blind to the
+    other, so both need a case that fails.
+
+    A shift is the likelier of the two to be written by hand -- it is what
+    ``token * n_hash_cols + col - 1``, an off-by-one in a loop bound, or a
+    buffer written from index 1 all produce -- and it is the harder to see,
+    because 24 of every 25 rows still land inside the same token's block.
+
+    The point of the test is the second half: nothing refuses it. Every row is
+    still a genuine table row, the buffer is still exactly the right length,
+    and ``gather_into_staging`` accepts it without complaint. The only symptom
+    is accuracy, which is why this has to be a test and cannot be a guard.
+    """
+    import numpy as np
+    from vllm_ascend.models.deepseek_v4_1.engram_layout import \
+        gather_into_staging
+
+    num_tokens, rows = 7, 512
+    wt, st = _synthetic_tables(layout, rows)
+    rng = np.random.default_rng(11)
+    hash_ids = rng.integers(0, rows, size=(num_tokens, layout.n_hash_cols))
+    n_staging = num_tokens * layout.n_hash_cols
+
+    def build(shift):
+        ids = np.empty(n_staging, dtype=np.int64)
+        for t in range(num_tokens):
+            for c in range(layout.n_hash_cols):
+                ids[(layout.row_index(t, c) + shift) % n_staging] = hash_ids[t, c]
+        ow, os_ = _empty_staging(layout, num_tokens)
+        gather_into_staging(wt, st, ids, ow, os_)
+        return ow
+
+    correct = build(0)
+
+    # The criterion must be able to say "same" as well as "different", or its
+    # disagreement below proves nothing about the shift.
+    assert np.array_equal(correct, build(0)), (
+        "the same ordering must reproduce itself -- otherwise the comparison "
+        "is picking up something other than the row assignment")
+
+    shifted = build(-1)
+    assert not np.array_equal(correct, shifted), (
+        "an off-by-one row shift must change the staging buffer")
+
+    # ... and here is why nothing downstream can notice.
+    assert shifted.shape == correct.shape, "the shift does not change the length"
+    for r in range(shifted.shape[0]):
+        assert np.any(np.all(wt == shifted[r], axis=1)), (
+            "every row of the shifted buffer is still a real table row: the "
+            "bytes are well-formed, only the pairing with a token is wrong")
+
+
 def test_threading_does_not_change_the_result(layout):
     import numpy as np
     from vllm_ascend.models.deepseek_v4_1.engram_layout import \
