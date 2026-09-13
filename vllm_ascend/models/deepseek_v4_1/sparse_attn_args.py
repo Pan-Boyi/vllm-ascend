@@ -64,6 +64,39 @@ SLIDING_WINDOW_MASK_MODE = 4
 NO_MASK_MODE = 0
 CMP_MASK_MODE = 3
 
+#: The operator's own mode rules, read out of its host library rather than
+#: inferred from the error we happened to hit:
+#:
+#:   /workspace/code/l00960396/cann92/cann-9.2.0-beta.2/opp/built-in/
+#:     op_impl/ai_core/tbe/op_host/lib/linux/x86_64/libophost_transformer.so
+#:
+#: verbatim, via ``strings``:
+#:
+#:   "ori_sparse_indices is only supported in SWA mode."
+#:   "SWA mode requires cmp_mask_mode=0"
+#:   "SWA mode requires cmp_ratio=1"
+#:   "Sparse ori_kv mode requires ori_mask_mode=cmp_mask_mode=0"
+#:   "Ori_topk_length is required for SWA ori sparse"
+#:   "Cmp_topk_length is only supported in CSA mode"
+#:   "When cmp_sparse_indices is not nullptr(CSA), cmp_sparse_indices cannot
+#:    be empty tensor"
+#:   "cmp_residual_k is required when mask_mode is 3 with cmp_ratio not equal
+#:    to 1!"
+#:
+#: 🔴 This resolves a contradiction that looked like two rules about one
+#: parameter: one text demanded ``cmp_mask_mode != 0``, another demanded
+#: ``cmp_mask_mode == 0``. They are not about one mode. Supplying
+#: ``ori_sparse_indices`` *selects* SWA, and SWA's rules then apply to
+#: everything else in the call -- so the two texts are each correct within
+#: their own mode, and a call that satisfies both entry conditions at once
+#: satisfies neither mode's requirements. The contradiction was the finding.
+#:
+#: ⚠️ What is **not** established: which mode a call lands in when several
+#: optional tensors are present, beyond the two implications quoted above
+#: (ori_sparse_indices -> SWA, cmp_sparse_indices -> CSA). The strings name
+#: ORI_SPARSE, ORI_CMP_SPARSE, CSA, HCA and SWA; nothing here says how they
+#: are chosen, and none of it is guessed at.
+
 
 def select_ori_sparse_indices(attends_compressed: bool, vision_swa_indices,
                              dspark_swa_indices):
@@ -442,6 +475,8 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
 
     _check_descriptor_is_populated(kwargs, q)
     _check_block_table_addresses_this_cache(kwargs)
+    _check_modes_are_not_both_requested(kwargs)
+
     return kwargs
 
 
@@ -458,6 +493,56 @@ LAYOUT_KV_RANK = {
     "BSND": 4,      # batch, seq, heads, dim
     "TND": 3,       # tokens, heads, dim
 }
+
+
+def _check_modes_are_not_both_requested(kwargs: dict[str, Any]) -> None:
+    """Refuse a call that asks the operator for two modes at once.
+
+    ``ori_sparse_indices`` is not an extra input to whatever mode the call is
+    already in -- it *selects* SWA ("ori_sparse_indices is only supported in
+    SWA mode"), and SWA then constrains the rest of the call: cmp_mask_mode
+    must be 0 and cmp_ratio must be 1. Sending it alongside a compressed
+    stream at mode 3 asks for SWA and for compressed-causal simultaneously,
+    and the operator rejects the pair rather than either half::
+
+        EZ0027: Parameters ori_mask_mode and cmp_mask_mode of SparseFlashMla
+                have incorrect values 0, 3.
+                Reason: Sparse ori_kv mode requires ori_mask_mode=
+                cmp_mask_mode=0.
+
+    ⚠️ The likely origin for a text-only request is not this file. Both index
+    builders run whenever the checkpoint is a mm-prefix LM, and
+    ``mm_req_doc_ranges`` for a text-only request is ``{0: []}`` -- truthy.
+    ``mm_ranges_have_spans`` exists to stop that and is **default off**
+    (``VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS``), so today every text-only
+    prefill still builds vision indices, ``select_ori_sparse_indices`` returns
+    them, and a ratio-2 layer arrives here holding both. Setting that switch
+    to "1" is the single-variable way to test it.
+
+    Raising rather than dropping the indices. Dropping them would produce a
+    call the operator accepts, and nothing downstream would say the layer's
+    original stream is no longer being selected the way the caller asked --
+    a wrong answer that stops looking wrong. The operator refuses this pair
+    anyway; all this adds is which of the two decisions to go and change.
+    """
+    if kwargs.get("ori_sparse_indices") is None:
+        return
+    cmp_mask_mode = kwargs.get("cmp_mask_mode", NO_MASK_MODE)
+    if cmp_mask_mode == NO_MASK_MODE:
+        return
+    _check(
+        False,
+        "Sparse ori_kv mode requires ori_mask_mode=cmp_mask_mode=0 (EZ0027); "
+        "and separately, ori_sparse_indices is only supported in SWA mode, "
+        "which requires cmp_ratio=1",
+        f"this call supplies ori_sparse_indices "
+        f"{tuple(kwargs['ori_sparse_indices'].shape)} together with "
+        f"cmp_mask_mode={cmp_mask_mode} and cmp_ratio="
+        f"{kwargs.get('cmp_ratio')}. Those select two different modes. For a "
+        "text-only request the indices most likely come from the vision "
+        "builder, which runs because mm_req_doc_ranges is {0: []} and "
+        "VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS is off; setting it to 1 "
+        "is the one-variable test.")
 
 
 def kv_with_layout_rank(cache, layout_kv: str):

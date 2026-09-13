@@ -566,3 +566,100 @@ def test_the_bounds_come_from_the_tensor_not_a_configured_value():
     body = inspect.getsource(
         sparse_attn_args._check_block_table_addresses_this_cache)
     assert "int(cache.shape[0])" in body and "int(cache.shape[1])" in body
+
+
+# --------------------------------------------- two modes asked for at once
+
+def test_ori_indices_with_a_compressed_stream_are_refused():
+    """🔴 EZ0027, in this frame instead of in the operator.
+
+    ori_sparse_indices does not add to whatever mode the call is in -- it
+    selects SWA ("ori_sparse_indices is only supported in SWA mode"), and SWA
+    then requires cmp_mask_mode=0 and cmp_ratio=1. Sending it next to a
+    compressed stream at mode 3 asks for two modes, and the operator rejects
+    the pair rather than either half.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        _check_modes_are_not_both_requested)
+
+    kwargs = {
+        "ori_sparse_indices": torch.zeros(4, 1, 1152, dtype=torch.int32),
+        "cmp_mask_mode": 3,
+        "cmp_ratio": 2,
+    }
+    with pytest.raises(ValueError) as excinfo:
+        _check_modes_are_not_both_requested(kwargs)
+    message = str(excinfo.value)
+    assert "only supported in SWA mode" in message
+    assert "MM_RANGES_REQUIRE_SPANS" in message, (
+        "the message names the rule and not the switch that most likely "
+        "produced it; the reader is mid-launch")
+
+
+def test_ori_indices_alone_are_fine():
+    """Two arms. Ori-only sparse is a mode the operator supports -- this
+    guard must not be reachable by the configuration it is not about."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        _check_modes_are_not_both_requested)
+
+    _check_modes_are_not_both_requested({
+        "ori_sparse_indices": torch.zeros(4, 1, 1152, dtype=torch.int32),
+        "cmp_mask_mode": 0,
+    })
+
+
+def test_a_compressed_stream_alone_is_fine():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        _check_modes_are_not_both_requested)
+
+    _check_modes_are_not_both_requested({"cmp_mask_mode": 3, "cmp_ratio": 2})
+
+
+def test_a_call_with_neither_is_fine():
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        _check_modes_are_not_both_requested)
+
+    _check_modes_are_not_both_requested({})
+
+
+def test_the_operators_own_rules_are_recorded_with_their_provenance():
+    """⚠️ These were read out of the operator's host library, not inferred
+    from the one error we hit. Pinning the provenance here because the next
+    contradiction in this family will be resolved by re-reading that file,
+    and a rule with no source is a rule nobody can re-check."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args
+
+    source = inspect.getsource(sparse_attn_args)
+    assert "libophost_transformer.so" in source
+    for rule in ("ori_sparse_indices is only supported in SWA mode",
+                 "SWA mode requires cmp_mask_mode=0",
+                 "SWA mode requires cmp_ratio=1",
+                 "Cmp_topk_length is only supported in CSA mode"):
+        assert rule in source, rule
+
+
+def test_the_builder_actually_runs_the_two_mode_check():
+    """⚠️ Placement, not presence.
+
+    Mutation-tested: removing the call from the validator left every direct
+    test of the guard green. A guard nothing on the production path invokes
+    is the same shape as install_alignment_taps, which had twelve callers and
+    all of them tests.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    indices = torch.zeros(NUM_TOKENS, 1, 1152, dtype=torch.int32)
+    with pytest.raises(ValueError, match="only supported in SWA mode"):
+        build_sparse_flash_mla_kwargs(**_common(
+            cmp_ratio=2,
+            attends_compressed=True,
+            cmp_kv=torch.zeros(4, 32, 1, HEAD_DIM),
+            cmp_block_table=torch.zeros(NUM_REQUESTS, 4, dtype=torch.int32),
+            seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32),
+            cmp_residual_kv=torch.zeros(NUM_REQUESTS, dtype=torch.int32),
+            ori_sparse_indices=indices,
+            ori_topk_length=torch.ones(NUM_TOKENS, 1, dtype=torch.int32),
+        ))
