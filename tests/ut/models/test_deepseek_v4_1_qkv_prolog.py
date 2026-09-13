@@ -324,7 +324,7 @@ def test_the_pre_rope_value_is_offered_to_the_caller():
         eps=1e-6, rope_head_dim=4,
         tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
 
-    assert set(seen) == {"rope.q.in"}
+    assert set(seen) == {"rope.q.in", "rope.kv.out"}
     # The normed q before the rotation, and only the slice the rotation
     # touches: the leading dims pass through and are already in sa_in.q.
     normed = rms_norm_weightless(q, 1e-6)
@@ -374,3 +374,38 @@ def test_no_tap_is_the_default_and_changes_nothing():
         q=q, kv=kv, swa_kv_cache=torch.zeros(2, 4, 8),
         tap=lambda key, tensor: None, **args)
     assert torch.equal(a, b)
+
+
+def test_the_post_rope_kv_is_offered_and_is_what_reaches_the_cache():
+    """🔴 The key the kv path did not have.
+
+    sa_in.kv is this function's *argument*, which upstream's contract keeps
+    unrotated ("kv is unchanged; attention reads kv solely via
+    swa_kv_cache"), so over the rope slice it sits a stage below golden's key
+    of the same name -- and a difference there has the exact signature of a
+    missing rotation. Measured on flight-24 that it is a stage mismatch and
+    not a missing rotation; this key is what makes the slice comparable
+    again.
+    """
+    seen = {}
+    kv = torch.randn(3, 8, dtype=torch.bfloat16)
+    cache = torch.zeros(2, 4, 8, dtype=torch.bfloat16)
+    cos_sin = torch.zeros(16, 4, dtype=torch.float32)
+    cos_sin[:, :2] = 0.5
+    cos_sin[:, 2:] = 0.25
+    slots = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+    qnorm_rope_kv_insert(
+        q=torch.randn(3, 1, 8, dtype=torch.bfloat16), kv=kv,
+        positions=torch.arange(3), cos_sin_cache=cos_sin,
+        swa_kv_cache=cache, slot_mapping=slots, eps=1e-6, rope_head_dim=4,
+        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
+
+    # It is the rotated kv, not the argument.
+    assert not torch.allclose(seen["rope.kv.out"][:, -4:].to(torch.float32),
+                              kv[:, -4:].to(torch.float32))
+    # And it is what landed in the cache -- the whole point of the key.
+    for t in range(3):
+        torch.testing.assert_close(
+            cache[0, t].to(torch.float32),
+            seen["rope.kv.out"][t].to(torch.float32), rtol=1e-2, atol=1e-2)

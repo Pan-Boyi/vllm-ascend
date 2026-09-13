@@ -1170,19 +1170,45 @@ def test_positions_are_recorded_under_their_own_key():
     assert entries["attn.in"] == "hidden_states"
 
 
-def test_the_kv_layout_is_declared_with_what_is_not_established():
+def test_the_kv_layout_declares_the_grade_of_each_claim():
     """⚠️ A comparison against golden that does not know the layout produces
     a number that looks like a finding -- a cosine of 0.15 between two
-    tensors that are not the same thing."""
+    tensors that are not the same thing.
+
+    🔴 What this now checks is not "is anything marked unknown" but "does
+    every claim carry how it was graded". The block once held a ✅ whose
+    basis was the operator's signature; the grade read as measured, so it
+    was not re-checked, and its subject was a different object from the one
+    people applied it to. Both faults are invisible unless the grade and the
+    subject travel with the claim.
+    """
+    import inspect
+
     text = align_taps.KEY_SEMANTICS["read.ori_kv"]
     assert "post-RoPE" in text and "448 NoPE | 64 RoPE" in text
-    source = align_taps.KEY_SEMANTICS.__str__()
-    del source
-    import inspect
     module = inspect.getsource(align_taps)
-    assert "NOT established" in module, (
-        "the layout block states only what is known; the half that is not "
-        "known is what stops a low cosine from being read as a finding")
+    # Grades, and each one saying what earned it.
+    assert "✅ measured" in module and "E_err/E_gold" in module, (
+        "a claim graded as measured must carry the measurement, or the grade "
+        "is the same words as an inference")
+    assert "🔴 SCOPE" in module, (
+        "the block is about cache rows; without the scope line a reader "
+        "applies it to sa_in.kv, which is a different object")
+
+
+def test_the_two_kv_keys_say_they_are_not_comparable_where_they_are_not():
+    """🔴 The one-day defect this ended.
+
+    Ours is pre-rope, golden's is post-rope and post-quant, so over the rope
+    slice the two keys are not comparable at all -- and a difference there
+    has the exact signature of a missing rotation. The limitation has to be
+    on the key that gets read, not next to it: it lived in read.ori_kv's
+    block while the judgement being made was about sa_in.kv.
+    """
+    text = align_taps.KEY_SEMANTICS["sa_in.kv"]
+    assert "pre-RoPE" in text
+    assert "NOT COMPARABLE" in text and "[448:512]" in text
+    assert "[0:448]" in text, "and where they ARE comparable, which is the half"
 
 
 def test_the_renamed_key_says_dumps_across_it_are_not_comparable():

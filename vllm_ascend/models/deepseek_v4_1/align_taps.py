@@ -108,9 +108,22 @@ KEY_SEMANTICS: dict = {
                  "pass through unchanged and are already in sa_in.q, so "
                  "recording them again would be the same numbers at eight "
                  "times the size. Named to match golden's rope.kv.in",
+    "rope.kv.out": "🔵 the **post-RoPE** kv, i.e. the rows written to the SWA "
+                   "cache. This is the key to compare with golden's "
+                   "rope.kv.out; sa_in.kv is a stage below it and is not "
+                   "comparable over [448:512]. ⚠️ On this plan there is no "
+                   "quantisation after the rotation, so unlike golden there "
+                   "is no separate quant.window.in/out between this and the "
+                   "cache -- this value and the cache row are the same "
+                   "numbers (measured, E_err/E_gold = 1e-6)",
     "sa_in.q": "the query handed to the sparse-attention operator, after "
                "rope and quantisation, sliced to n_local_heads",
-    "sa_in.kv": "🔴 the **pre-RoPE**, post-kv_norm kv: the argument this "
+    "sa_in.kv": "🔴 the **pre-RoPE**, post-kv_norm kv -- ✅ measured, not "
+                "inferred (flight-24; see read.ori_kv's block above for the "
+                "numbers and the method). golden's key of the same name is "
+                "post-rope AND post-quant, so over [448:512] the two are NOT "
+                "COMPARABLE and a difference there is a stage mismatch; over "
+                "[0:448] they are the same stage. Detail: the argument this "
                 "layer was handed, not what the operator reads. Upstream's "
                 "contract is 'kv is unchanged; attention reads kv solely via "
                 "swa_kv_cache' (qkv_prolog.py:80-83), so the rotation is "
@@ -141,18 +154,29 @@ KEY_SEMANTICS: dict = {
     # like a finding. Measured against upstream's own docstring
     # (fused_compress_quant_cache.py:231-238) plus this line's plan:
     #
-    #   📖 read, not measured  RoPE is already applied **to the rows in the
-    #                   cache**: rope_quant_insert takes positions and
-    #                   cos_sin_cache and writes the roped latent. The grade
-    #                   is the operator's signature, not a comparison -- it
-    #                   was carrying a ✅ that read as measured, and a whole
-    #                   day passed without anyone re-examining rope because
-    #                   of it.
+    #   ✅ measured  RoPE is applied **to the rows in the cache**. Grade
+    #                   earned on flight-24, from this line's own dump and
+    #                   without reference to golden: over [448:512],
+    #                   ``read.ori_kv.rows`` against
+    #                   ``rope(read.write.ori_kv.latent_pre_rope)`` gives
+    #                   E_err/E_gold = 0.000001, against the unrotated
+    #                   tensor 0.544731, with the [0:448] scale reading
+    #                   0.000000 (the rotation does not touch it). The
+    #                   criterion needed no cos/sin reconstruction: a
+    #                   rotation leaves the leading dims untouched and
+    #                   preserves the tail's norm, and those two properties
+    #                   are enough.
+    #                   ⚠️ Before that it carried a ✅ whose actual basis was
+    #                   the operator's *signature*. Two faults at once: the
+    #                   grade said measured, so nobody re-checked; and the
+    #                   subject was ``rope_quant_insert``'s cache rows, so
+    #                   anyone who did re-check would have checked the wrong
+    #                   object. A day passed without rope being reconsidered.
     #   🔴 SCOPE  the line above is about **cache rows**, and it does not
     #                   transfer to ``sa_in.kv``. That key is the pre-rope
     #                   argument (see its own entry), and reading this line
     #                   as covering it is how a stage mismatch between the
-    #                   two dumps can look like a rope defect.
+    #                   two dumps looked, for one day, like a rope defect.
     #   ✅ established  On the A5 bf16 plan nothing is quantised: the cache
     #                   dtype is bfloat16 and fp8_scale is None. The uint8
     #                   fp8_ds_mla layout is a different plan.
@@ -160,11 +184,16 @@ KEY_SEMANTICS: dict = {
     #                   that order -- upstream's words for the bfloat16 case.
     #   ✅ established  Addressing is PA_BBND: a row is at
     #                   block * block_size + offset, flat.
-    #   🔴 NOT established  whether golden's sa_in.kv rows are in this same
-    #                   [448|64] order and post-rope, or normalised some
-    #                   other way before it records them. A low cosine
-    #                   between the two is therefore not evidence about the
-    #                   values until that is settled.
+    #   ✅ established  golden's ``sa_in.kv`` is **post-rope and
+    #                   post-quant**: golden measured its own chain,
+    #                   ``rope.kv.out == quant.window.in`` and
+    #                   ``quant.window.out == sa_in.kv[..., -64:]``. Ours is
+    #                   pre-rope. ⇒ Over **[448:512] the two keys are not
+    #                   comparable at all**, and a difference there is a
+    #                   stage mismatch, not a finding. Over [0:448] they are
+    #                   the same stage -- the rotation does not reach it --
+    #                   which is what makes "the kv projection is clean,
+    #                   0.099% error energy" a real result.
     "read.ori_kv": "rows of the original-stream KV cache: post-RoPE, bf16, "
                    "[448 NoPE | 64 RoPE], addressed block*page+offset. "
                    "The page is taken from THIS tensor's own shape, never "

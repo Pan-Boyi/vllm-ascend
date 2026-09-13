@@ -191,10 +191,11 @@ def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
     both are rotated over the same trailing slice at the same positions, so the
     cos/sin pair is built once.
 
-    ``tap`` -- optional ``(key, tensor) -> None`` -- is offered the rotation's
-    input, the trailing ``rope_head_dim`` of the normed q. Passed in rather
-    than imported here because this module has no layer identity and the
-    caller does.
+    ``tap`` -- optional ``(key, tensor) -> None`` -- is offered two values
+    that exist only inside this function: the rotation's input on the q side
+    (its trailing ``rope_head_dim``) and its output on the kv side. Passed in
+    rather than imported here because this module has no layer identity and
+    the caller does.
     """
     cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
     q_normed = rms_norm_weightless(q, eps)
@@ -208,5 +209,15 @@ def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
     q_out = rope_tail(q_normed, cos, sin, rope_head_dim)
     # kv arrives normed; the op's name says kv_rope, not kv_norm_rope.
     kv_out = rope_tail(kv, cos, sin, rope_head_dim)
+    if tap is not None:
+        # 🔴 The value that actually goes to the cache. Without it the kv
+        # path had no post-rope key at all: ``sa_in.kv`` is this function's
+        # *argument*, which upstream's contract keeps unrotated, so over the
+        # rope slice it is a stage below golden's key of the same name and
+        # the two are not comparable there. Measured on flight-24 --
+        # ``read.ori_kv.rows`` against the rotation of the pre-rope tensor
+        # gives E_err/E_gold = 1e-6 -- so this is the tensor golden's
+        # ``rope.kv.out`` should be compared with, and it is named for it.
+        tap("rope.kv.out", kv_out)
     scatter_rows(swa_kv_cache, kv_out, slot_mapping, swa_kv_cache.shape[1])
     return q_out.to(q.dtype)
