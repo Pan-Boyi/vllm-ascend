@@ -51,6 +51,12 @@ _LAYER_TAG = re.compile(r"layer_\d+")
 #: moves fails loudly instead of recording the neighbour.
 _BOUNDARY_TAPS: tuple[tuple[str, str, str, "str | None"], ...] = (
     ("attn", "attn.in", "in", "hidden_states"),
+    # 🔵 Recorded in its own right, not kept for compatibility. positions is
+    # one of the inputs that reaches layer 0, and the earliest divergence is
+    # *at* layer 0 -- so "input_ids matched but positions did not" produces
+    # exactly the symptom of "the embedding is wrong", and only this key
+    # tells the two apart.
+    ("attn", "attn.positions", "in", "positions"),
     ("attn", "attn.out", "out", None),
     ("ffn", "moe.in", "in", "hidden_states"),
     ("ffn", "moe.out", "out", None),
@@ -61,7 +67,13 @@ _BOUNDARY_TAPS: tuple[tuple[str, str, str, "str | None"], ...] = (
 #: Two keys have already turned out to mean different things on the two
 #: sides; once that happens to one key, every other key is unverified too.
 KEY_SEMANTICS: dict = {
-    "attn.in": "the attention module's input hidden state (not positions)",
+    "attn.in": "the attention module's input hidden state. ⚠️ Before "
+               "fc8536f05 this key held `positions` instead -- an int64 [T] "
+               "vector under a name golden uses for a bf16 [T, 5120] hidden "
+               "state. Dumps from before and after that commit are two "
+               "different keys and must not be compared",
+    "attn.positions": "the attention module's `positions` argument: the "
+                      "position of each row within its own request",
     "attn.out": "the attention module's output, before the residual add",
     "moe.in": "the FFN/MoE module's input hidden state",
     "moe.out": "the FFN/MoE module's output",
@@ -89,6 +101,31 @@ KEY_SEMANTICS: dict = {
         "++ [these]; on this side they are two separate arguments, so the "
         "relation is: golden sa_in.kv == ours sa_in.kv ++ ours "
         "read.sa_in.cmp_kv_rows",
+    # ⚠️ What is actually stored in the KV caches, because a comparison
+    # against golden that does not know this produces a number that looks
+    # like a finding. Measured against upstream's own docstring
+    # (fused_compress_quant_cache.py:231-238) plus this line's plan:
+    #
+    #   ✅ established  RoPE is **already applied**: rope_quant_insert takes
+    #                   positions and cos_sin_cache and writes the roped
+    #                   latent. Reading a cache row and comparing it with a
+    #                   pre-rope tensor compares two different things.
+    #   ✅ established  On the A5 bf16 plan nothing is quantised: the cache
+    #                   dtype is bfloat16 and fp8_scale is None. The uint8
+    #                   fp8_ds_mla layout is a different plan.
+    #   ✅ established  Row layout is [448 NoPE | 64 RoPE] within the 512, in
+    #                   that order -- upstream's words for the bfloat16 case.
+    #   ✅ established  Addressing is PA_BBND: a row is at
+    #                   block * block_size + offset, flat.
+    #   🔴 NOT established  whether golden's sa_in.kv rows are in this same
+    #                   [448|64] order and post-rope, or normalised some
+    #                   other way before it records them. A low cosine
+    #                   between the two is therefore not evidence about the
+    #                   values until that is settled.
+    "read.ori_kv": "rows of the original-stream KV cache: post-RoPE, bf16, "
+                   "[448 NoPE | 64 RoPE], addressed block*block_size+offset",
+    "read.cmp_kv": "rows of the compressed-stream KV cache; same layout as "
+                   "read.ori_kv",
     "read.sa_in.cmp_kv_rows.count":
         "how many rows the line above took, since 'the first "
         "seqused_cmp_kv of the first block' is an assumption about layout",

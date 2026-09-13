@@ -1099,7 +1099,9 @@ def test_attn_in_records_the_hidden_state_not_the_positions():
     entries = {key: parameter
                for _, key, side, parameter in align_taps._BOUNDARY_TAPS
                if side == "in"}
-    assert entries == {"attn.in": "hidden_states", "moe.in": "hidden_states"}
+    assert entries == {"attn.in": "hidden_states",
+                       "attn.positions": "positions",
+                       "moe.in": "hidden_states"}
 
 
 def test_a_module_without_that_parameter_fails_installation():
@@ -1144,3 +1146,35 @@ def test_every_recorded_key_has_a_declared_meaning():
     assert not missing, missing
     assert "⚠️" in align_taps.KEY_SEMANTICS["sa_in.kv"], (
         "the one key already known to differ in meaning must say so")
+
+
+def test_positions_are_recorded_under_their_own_key():
+    """🔵 In its own right, not for compatibility. positions reaches layer 0,
+    and the earliest divergence is at layer 0 -- "input_ids matched but
+    positions did not" produces exactly the symptom of "the embedding is
+    wrong", and only this key separates them."""
+    entries = {key: parameter
+               for _, key, side, parameter in align_taps._BOUNDARY_TAPS
+               if side == "in"}
+    assert entries["attn.positions"] == "positions"
+    assert entries["attn.in"] == "hidden_states"
+
+
+def test_the_kv_layout_is_declared_with_what_is_not_established():
+    """⚠️ A comparison against golden that does not know the layout produces
+    a number that looks like a finding -- a cosine of 0.15 between two
+    tensors that are not the same thing."""
+    text = align_taps.KEY_SEMANTICS["read.ori_kv"]
+    assert "post-RoPE" in text and "448 NoPE | 64 RoPE" in text
+    source = align_taps.KEY_SEMANTICS.__str__()
+    del source
+    import inspect
+    module = inspect.getsource(align_taps)
+    assert "NOT established" in module, (
+        "the layout block states only what is known; the half that is not "
+        "known is what stops a low cosine from being read as a finding")
+
+
+def test_the_renamed_key_says_dumps_across_it_are_not_comparable():
+    text = align_taps.KEY_SEMANTICS["attn.in"]
+    assert "must not be compared" in text
