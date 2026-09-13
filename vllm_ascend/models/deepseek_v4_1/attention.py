@@ -28,6 +28,8 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
+from vllm_ascend.models.deepseek_v4_1.indexer_select import \
+    compressed_lengths
 from vllm_ascend.models.deepseek_v4_1.o_proj import check_grouped_wo_a_layout
 from vllm_ascend.models.deepseek_v4_1.platform_patches import \
     assert_ready_for_ratio_two
@@ -658,6 +660,15 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             if attends_compressed and self.topk_indices_buffer is not None
             else None)
 
+        # Bound once for the same reason: the residual has to be computed
+        # against the ratio this call passes, not against a ratio computed
+        # separately a few lines later.
+        cmp_ratio = _dsa_swa_only_cmp_ratio(self.compress_ratio,
+                                            self.vllm_config)
+        cmp_residual_kv = (
+            compressed_lengths(cmp_req.seq_lens, cmp_ratio)[1]
+            if attends_compressed and cmp_req is not None else None)
+
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
             num_requests=req.query_start_loc.numel() - 1,
@@ -675,8 +686,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             # core at once, which is what this call has been doing.
             metadata=(cmp_req or req).sas_metadata,
             softmax_scale=self.softmax_scale,
-            cmp_ratio=_dsa_swa_only_cmp_ratio(self.compress_ratio,
-                                              self.vllm_config),
+            cmp_ratio=cmp_ratio,
             layout_kv=plan.layout_kv,
             attends_compressed=attends_compressed,
             ori_win_left=req.ori_win_left,
@@ -693,8 +703,27 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             # group that owns it -- not from the SWA group, whose ratio is 1.
             seqused_cmp_kv=(cmp_req.seqused_cmp_kv
                             if attends_compressed and cmp_req else None),
-            cmp_residual_kv=(cmp_req.qli_cmp_residual_k
-                             if attends_compressed and cmp_req else None),
+            # 🔴 Derived here, not read from req.qli_cmp_residual_k. The
+            # shared builder computes this correctly for any ratio and then
+            # publishes it behind ``if self.compressor_ratio == 4``
+            # (dsa_v1.py) -- V4.1 carries 1 and 2 and never 4, so the field
+            # arrives None on exactly the layers that need it, and the
+            # operator refuses the call:
+            #
+            #     "Cmp_residual_kv is required when cmp_mask_mode=3 and
+            #      cmp_ratio != 1"
+            #     "cmp_residual_k must be provided when mask_mode=3 and
+            #      cmp_ratio>1."
+            #
+            # The value existed one frame away and was not carried, again.
+            # ``compressed_lengths`` is the same function this line's own
+            # indexer already uses, so this is not a second implementation --
+            # it is the third consumer of the one we had to write. Returns
+            # None at ratio 1, which is what the operator requires there
+            # ("Cmp_ratio is 1 or sparse_mode is 0, cmp_residual_k must be
+            # null"), so the two opposite rules are both satisfied by one
+            # expression rather than by a branch here.
+            cmp_residual_kv=cmp_residual_kv,
             ori_sparse_indices=ori_sparse_indices,
             ori_topk_length=ori_topk_length,
             # The indexer's selection. Without it the compressed stream is

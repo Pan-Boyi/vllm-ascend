@@ -205,6 +205,19 @@ def compressed_lengths(seq_lens: torch.Tensor,
     TRIGGER to merge these into one: a usable V4.0 regression test, or a third
     consumer of the same computation. Whichever comes first.
 
+    ⚠️ 2026-09-13: the third consumer arrived -- the ``sparse_flash_mla`` call
+    needs the same residual, because the operator requires it ("Cmp_residual_kv
+    is required when cmp_mask_mode=3 and cmp_ratio != 1"). It was served by
+    calling *this* function rather than by widening the gate, so there is still
+    one implementation and ``dsa_v1.py`` was not touched.
+
+    That leaves the widening open, and the reason it was deferred has since
+    narrowed: ``qli_cu_seqlens_q`` and ``qli_seqused_k`` are read only by
+    ``models/deepseek_v4/indexer.py``, and V4.0 never runs ratio 2, so
+    ``== 4`` -> ``not in (0, 1)`` provably changes nothing at ratio 0, 1 or 4.
+    That is an argument, not a test, which is why it is written here instead
+    of acted on. TRIGGER unchanged: a usable V4.0 regression test.
+
     That ``== 4`` is itself the shape this codebase keeps producing -- a literal
     standing in for a value that is actually a function of the layer. It reads
     as a fact about the operator and it is a fact about DeepSeek-V4.

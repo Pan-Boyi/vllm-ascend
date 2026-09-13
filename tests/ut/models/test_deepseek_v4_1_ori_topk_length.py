@@ -661,9 +661,13 @@ def test_every_compressed_argument_comes_from_the_compressed_group():
         AscendDeepseekV41Attention
 
     source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    # cmp_residual_kv is derived rather than read: the shared builder
+    # publishes req.qli_cmp_residual_k only at compressor_ratio == 4, and V4.1
+    # carries 1 and 2. What this test is about is unchanged -- the value still
+    # comes from the compressed group, via that group's own seq_lens.
     for arg in ("cmp_block_table = cmp_req.block_table",
                 "cmp_req.seqused_cmp_kv",
-                "cmp_req.qli_cmp_residual_k"):
+                "compressed_lengths(cmp_req.seq_lens"):
         assert arg in source, arg
     for wrong in ("req.seqused_cmp_kv if attends",
                   "req.qli_cmp_residual_k if attends"):
