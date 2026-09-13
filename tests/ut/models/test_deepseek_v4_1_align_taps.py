@@ -1261,3 +1261,23 @@ def test_the_next_forward_records_its_own(monkeypatch, with_recorder):
     align_taps._ARMED = True
     align_taps._flush_and_rotate(None, (), None)
     assert "engram_hash_ids" not in align_taps._FORWARD_RECORDED
+
+
+def test_the_page_is_declared_as_taken_from_the_tensor_not_as_a_number():
+    """🔴 Four block sizes, each right in its own group. A number written
+    here would be wrong in three of them, and wrong silently -- a block id is
+    a block id."""
+    text = align_taps.KEY_SEMANTICS["read.ori_kv"]
+    assert "taken from THIS tensor's own shape" in text
+    assert "four different block sizes" in text
+
+
+def test_the_ratio_convention_is_named_as_this_ports_and_not_upstreams():
+    """⚠️ The hardest form of same-name-different-thing so far: not two
+    objects sharing a name, but one field meaning different things under two
+    conventions whose code looks identical. A `block_size // ratio` cannot be
+    judged without knowing which convention its dividend came from."""
+    text = align_taps.KEY_SEMANTICS["read.cmp_kv"]
+    assert "this port's convention" in text
+    assert "opposite of upstream" in text
+    assert "block_size // ratio" in text
