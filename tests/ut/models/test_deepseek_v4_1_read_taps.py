@@ -345,3 +345,55 @@ def test_the_pre_rope_latent_says_it_is_pre_rope():
         "the entry has to say why a content comparison survives the rotation "
         "and a positional one does not -- otherwise the next reader repeats "
         "the same wrong comparison")
+
+
+# ------------- the padding zero that read as a block of this request's
+
+def test_the_block_list_is_bounded_by_the_sequence_not_by_non_negative():
+    """🔴 Block tables are padded with **zero**, not -1 (dsa_v1.py:1570
+    fills unused rows with 0), so filtering on non-negative keeps the
+    padding -- and block 0 is a real block belonging to somebody else. That
+    is what produced ori=[5, 0] and cmp=[84, 85, 0] in the dumps: a trailing
+    zero that reads as "this request also touched block 0" and would have had
+    its contents digested and attributed here.
+    """
+    table = torch.tensor([[5, 0, 0, 0]], dtype=torch.int32)
+    ids = read_taps._block_ids(table, torch.tensor([5]), block_size=32)
+    assert ids.tolist() == [5]
+
+
+def test_a_long_sequence_keeps_every_block_it_needs():
+    """Two arms: the bound must not truncate a request that really spans
+    several blocks."""
+    table = torch.tensor([[5, 9, 11, 0]], dtype=torch.int32)
+    ids = read_taps._block_ids(table, torch.tensor([70]), block_size=32)
+    assert ids.tolist() == [5, 9, 11]
+
+
+def test_an_unbounded_list_says_it_is_unbounded(lines):
+    """⚠️ Better than no list, but the reader must know which of the two
+    they are holding."""
+    table = torch.tensor([[5, 0, 0]], dtype=torch.int32)
+    ids = read_taps._block_ids(table, None, None)
+    assert ids.tolist() == [5, 0]
+    assert any("upper bound, not as this request's blocks" in line
+               for line in lines), lines
+
+
+def test_the_page_size_comes_from_the_cache_not_the_config():
+    """The two have disagreed once on this line already, and the tensor is
+    the one being indexed."""
+    from vllm_ascend.models.deepseek_v4_1.attention import _cache_page_size
+
+    assert _cache_page_size(torch.zeros(64, 32, 1, 512)) == 32
+    assert _cache_page_size(None) is None
+    assert _cache_page_size(torch.zeros(8)) is None
+
+
+def test_zero_is_kept_when_it_is_genuinely_the_first_block():
+    """A request really allocated block 0 is not padding. The bound keeps it
+    because it falls inside the needed count, which is the difference the
+    non-negative filter could not express."""
+    table = torch.tensor([[0, 7, 0]], dtype=torch.int32)
+    ids = read_taps._block_ids(table, torch.tensor([40]), block_size=32)
+    assert ids.tolist() == [0, 7]

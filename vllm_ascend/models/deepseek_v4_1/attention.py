@@ -262,6 +262,19 @@ def _warn_unwritten_selection_on_dummy_run() -> None:
 
 
 
+
+def _cache_page_size(cache) -> "int | None":
+    """Tokens per block, from the cache's own shape.
+
+    ``[num_blocks, block_size, ...]`` under PA_BBND, so axis 1 is the page.
+    Taken from the tensor rather than from the config: the two have already
+    disagreed once on this line, and the tensor is the one being indexed.
+    """
+    if not isinstance(cache, torch.Tensor) or cache.ndim < 2:
+        return None
+    return int(cache.shape[1])
+
+
 def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
     """What the original-stream cache is about to be given, before it is.
 
@@ -333,10 +346,18 @@ def _tap_what_this_layer_read(attn, kwargs: dict, req, cmp_req) -> None:
             read_taps.tap_read(layer, key, torch.tensor([value]))
 
     # The two caches, gathered by the block tables this call passes.
+    # ⚠️ With the lengths, so the block list is bounded by what the request
+    # uses rather than by "non-negative" -- the table is padded with zero and
+    # block 0 is somebody else's.
+    page = _cache_page_size(kwargs.get("ori_kv"))
     read_taps.tap_cache_read(layer, "ori_kv", kwargs.get("ori_kv"),
-                             kwargs.get("ori_block_table"))
+                             kwargs.get("ori_block_table"),
+                             kwargs.get("seqused_ori_kv")
+                             or kwargs.get("seqused_kv"), page)
     read_taps.tap_cache_read(layer, "cmp_kv", kwargs.get("cmp_kv"),
-                             kwargs.get("cmp_block_table"))
+                             kwargs.get("cmp_block_table"),
+                             kwargs.get("seqused_cmp_kv"),
+                             _cache_page_size(kwargs.get("cmp_kv")))
     # 🔵 The half of golden's sa_in.kv this side keeps as a separate
     # argument. Recorded under its own key with the relation declared, not
     # concatenated into a tensor the operator never received as one.

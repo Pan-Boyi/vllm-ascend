@@ -149,7 +149,8 @@ def tap_read(layer_id: int, key: str, tensor) -> None:
 
 
 @_never_breaks_the_run
-def tap_cache_read(layer_id: int, key: str, cache, block_table) -> None:
+def tap_cache_read(layer_id: int, key: str, cache, block_table,
+                   seqused=None, block_size: "int | None" = None) -> None:
     """Record the cache blocks this request's block table points at.
 
     ⚠️ The blocks, not the cache. Two requests share one cache and differ in
@@ -161,7 +162,7 @@ def tap_cache_read(layer_id: int, key: str, cache, block_table) -> None:
     if not isinstance(cache, torch.Tensor) or \
             not isinstance(block_table, torch.Tensor):
         return
-    ids = _block_ids(block_table)
+    ids = _block_ids(block_table, seqused, block_size)
     if ids is None:
         return
     kept = ids[:MAX_BLOCKS]
@@ -328,10 +329,31 @@ def _describe_once(what: str, tensor, ids) -> None:
                     what, exc)
 
 
-def _block_ids(block_table: torch.Tensor):
-    """Valid block ids in this table, de-duplicated, in order."""
+def _block_ids(block_table: torch.Tensor, seqused=None,
+               block_size: "int | None" = None):
+    """The blocks this request actually uses, in order.
+
+    🔴 Bounded by the sequence length, not by ``>= 0``. Block tables are
+    padded with **zero**, not with -1 (``dsa_v1.py:1570`` fills unused rows
+    with 0), so filtering on non-negative keeps the padding -- and block 0 is
+    a real block belonging to somebody else. That is what produced
+    ``ori=[5, 0]`` and ``cmp=[84, 85, 0]`` in the dumps: a trailing 0 that
+    reads as "this request also touched block 0" and would have had its
+    contents digested and attributed here.
+
+    ⚠️ When the length or the page size is unavailable the old behaviour is
+    kept and said out loud, because an unbounded list is still better than no
+    list -- but a reader must know which of the two they are holding.
+    """
     flat = block_table.reshape(-1)
-    valid = flat[flat >= 0]
+    if flat.numel() == 0:
+        return None
+    needed = _blocks_needed(seqused, block_size)
+    if needed is None:
+        _report_unbounded()
+        valid = flat[flat >= 0]
+    else:
+        valid = flat[:needed]
     if valid.numel() == 0:
         return None
     seen = torch.zeros_like(valid, dtype=torch.bool)
@@ -339,6 +361,27 @@ def _block_ids(block_table: torch.Tensor):
     if valid.numel() > 1:
         seen[1:] = valid[1:] != valid[:-1]
     return valid[seen]
+
+
+def _blocks_needed(seqused, block_size: "int | None"):
+    """How many blocks a sequence of this length occupies, or ``None``."""
+    if not isinstance(seqused, torch.Tensor) or seqused.numel() == 0:
+        return None
+    if not block_size or block_size <= 0:
+        return None
+    longest = int(seqused.reshape(-1).max())
+    return max(1, -(-longest // block_size))
+
+
+def _report_unbounded() -> None:
+    from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+    announce_once(
+        "read_taps_unbounded_blocks",
+        "the block list could not be bounded by a sequence length, so it is "
+        "every non-negative entry in the table -- including the zero padding, "
+        "and block 0 belongs to somebody else. Treat the ids and any digest "
+        "of them as an upper bound, not as this request's blocks.")
 
 
 _DECLARED = False
