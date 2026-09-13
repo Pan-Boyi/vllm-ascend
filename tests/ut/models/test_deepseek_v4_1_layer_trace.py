@@ -331,3 +331,123 @@ def test_the_line_carries_both_digests(monkeypatch):
         logger.removeHandler(handler)
 
     assert lines and "out=0x" in lines[0] and "coarse=0x" in lines[0], lines
+
+
+# ----------------------------- one transfer per forward, not one per layer
+
+def test_the_layer_hooks_bring_nothing_back_to_the_host(monkeypatch):
+    """🔴 The property that killed the first launch with the trace on.
+
+    ``int(tensor)`` inside a layer hook is a host sync, and forty of them
+    inside a forward that other ranks are not waiting at ended in aicpu
+    507018 -- the same error code as the previous instrument that
+    synchronised inside the forward. So the layer hooks must only queue
+    device work; the single transfer happens after the forward.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import layer_trace
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "all")
+    model = _Model(n=3)
+    transfers = []
+
+    real_to = torch.Tensor.to
+    reads = []
+
+    def _counting_to(self, *args, **kwargs):
+        target = args[0] if args else kwargs.get("device")
+        if target in ("cpu", torch.device("cpu")):
+            transfers.append(tuple(self.shape))
+        return real_to(self, *args, **kwargs)
+
+    # ⚠️ The int-returning forms, watched by name. Counting .to("cpu") alone
+    # passes under test for the wrong reason: everything is already on the
+    # host here, so a per-layer int(tensor) moves nothing and the check stays
+    # green while the regression it exists to catch is present. Patching
+    # torch.Tensor.item does not help either -- int(t) reaches __int__, not
+    # the Python attribute. What is actually being asserted is "the layer
+    # hooks use the tensor form", so that is what is watched.
+    real_exact = layer_trace.fingerprint
+    real_coarse = layer_trace.coarse_fingerprint
+
+    def _watch(fn):
+        def _inner(*a, **k):
+            reads.append(1)
+            return fn(*a, **k)
+
+        return _inner
+
+    handles = install_layer_trace(model)
+    monkeypatch.setattr(torch.Tensor, "to", _counting_to)
+    monkeypatch.setattr(layer_trace, "fingerprint", _watch(real_exact))
+    monkeypatch.setattr(layer_trace, "coarse_fingerprint",
+                        _watch(real_coarse))
+    try:
+        model(torch.zeros(2, 4))
+    finally:
+        monkeypatch.undo()
+        for h in handles:
+            h.remove()
+
+    assert len(transfers) == 1, (
+        f"{len(transfers)} host transfers for 3 layers; the digests are "
+        "being read back per layer again")
+    assert transfers[0] == (3, 2), transfers
+    assert not reads, (
+        f"{len(reads)} host reads inside the forward; each one is a sync the "
+        "other ranks are not waiting at")
+
+
+def test_the_digest_tensors_stay_on_the_input_device():
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import (
+        coarse_fingerprint_tensor, fingerprint_tensor)
+
+    x = torch.arange(32, dtype=torch.bfloat16)
+    assert fingerprint_tensor(x).device == x.device
+    assert coarse_fingerprint_tensor(x).device == x.device
+    assert fingerprint_tensor(x).ndim == 0
+
+
+def test_the_tensor_and_int_forms_agree():
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import (
+        coarse_fingerprint, coarse_fingerprint_tensor, fingerprint,
+        fingerprint_tensor)
+
+    x = torch.linspace(-1, 1, 128, dtype=torch.float32)
+    assert int(fingerprint_tensor(x)) == fingerprint(x)
+    assert int(coarse_fingerprint_tensor(x)) == coarse_fingerprint(x)
+
+
+def test_the_coarse_form_branches_without_a_host_read():
+    """⚠️ ``if float(scale) == 0`` would itself be the sync this avoids, so
+    the zero and non-finite cases are handled by arithmetic."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import layer_trace
+
+    import ast
+    import textwrap
+
+    body = inspect.getsource(layer_trace.coarse_fingerprint_tensor)
+    # By AST, not by substring: the comment that explains why there is no
+    # host read contains the very text a substring check looks for, so that
+    # check went red on the thing it was documenting.
+    tree = ast.parse(textwrap.dedent(body))
+    calls = {node.func.id for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert not calls & {"float", "bool", "int"}, calls
+    assert "torch.where" in body
+
+
+def test_a_model_whose_layer_holder_is_missing_is_refused(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "all")
+
+    class _Bare(torch.nn.Module):
+        pass
+
+    bare = _Bare()
+    bare.layers = torch.nn.ModuleList([_Layer(0)])
+    # _find_inner_model finds it by `layers`, so this one is fine; the refusal
+    # is for the case where it cannot be found at all.
+    handles = install_layer_trace(bare)
+    for h in handles:
+        h.remove()

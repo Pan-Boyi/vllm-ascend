@@ -96,15 +96,32 @@ def fingerprint(tensor: torch.Tensor) -> int:
     silently becomes a constant is a check bit with no discriminating power,
     which reads as agreement everywhere.
     """
+    value = fingerprint_tensor(tensor)
+    return int(value)
+
+
+def fingerprint_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """:func:`fingerprint` without bringing the answer back to the host.
+
+    🔴 The int-returning form forces a device-to-host transfer, and the trace
+    calls it once per layer. Forty of those inside one forward is forty host
+    syncs that the other ranks are not waiting for, and the first launch with
+    the trace on died in ``aicpu`` 507018 -- the same error code as the last
+    instrument that synchronised inside the forward.
+
+    So the digest is computed and **kept on the device**; the trace stores it
+    in a preallocated slot and takes the whole buffer back once, after the
+    model forward, when there is nothing left to be out of step with.
+    """
     try:
         flat = tensor.detach().reshape(-1)
         if flat.numel() == 0:
-            return 0
+            return torch.zeros((), dtype=torch.int64, device=tensor.device)
         width = flat.element_size()
         as_int = {1: torch.int8, 2: torch.int16,
                   4: torch.int32, 8: torch.int64}.get(width)
         if as_int is None:
-            return -1
+            return torch.full((), -1, dtype=torch.int64, device=tensor.device)
         raw = flat.view(as_int).to(torch.int64)
         index = torch.arange(raw.numel(), device=raw.device,
                              dtype=torch.int64)
@@ -117,9 +134,9 @@ def fingerprint(tensor: torch.Tensor) -> int:
         # out. The test that caught it is the one that compares a tensor with
         # its own reverse.
         mixed = (raw ^ 0x9E3779B97F4A7C15) * (index * 2 + 1)
-        return int((mixed ^ (mixed >> 29)).sum())
+        return (mixed ^ (mixed >> 29)).sum()
     except Exception:                                        # noqa: BLE001
-        return -1
+        return torch.full((), -1, dtype=torch.int64)
 
 
 #: Quantisation levels for the coarse digest. 1/64 is about 1.6e-2 relative,
@@ -147,20 +164,31 @@ def coarse_fingerprint(tensor: torch.Tensor) -> int:
     Scaled by the tensor's own maximum before quantising, so the grid is
     relative and one outlier element does not decide the whole digest.
     """
+    return int(coarse_fingerprint_tensor(tensor))
+
+
+def coarse_fingerprint_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """:func:`coarse_fingerprint`, kept on the device. See
+    :func:`fingerprint_tensor` for why that matters."""
     try:
         flat = tensor.detach().reshape(-1).to(torch.float32)
+        zero = torch.zeros((), dtype=torch.int64, device=flat.device)
         if flat.numel() == 0:
-            return 0
+            return zero
         scale = flat.abs().max()
-        if not bool(torch.isfinite(scale)) or float(scale) == 0.0:
-            return 0
-        quantised = (flat / scale * COARSE_LEVELS).round().to(torch.int64)
+        # ⚠️ Branchless on purpose: ``if float(scale) == 0`` would be a host
+        # read, which is the thing this form exists to avoid. A zero or
+        # non-finite scale yields a zero digest through arithmetic instead.
+        safe = torch.where(torch.isfinite(scale) & (scale != 0), scale,
+                           torch.ones_like(scale))
+        quantised = (flat / safe * COARSE_LEVELS).round().to(torch.int64)
         index = torch.arange(quantised.numel(), device=quantised.device,
                              dtype=torch.int64)
         mixed = (quantised ^ 0x9E3779B97F4A7C15) * (index * 2 + 1)
-        return int((mixed ^ (mixed >> 29)).sum())
+        digest = (mixed ^ (mixed >> 29)).sum()
+        return torch.where(torch.isfinite(scale) & (scale != 0), digest, zero)
     except Exception:                                        # noqa: BLE001
-        return -1
+        return torch.full((), -1, dtype=torch.int64)
 
 
 def install_layer_trace(model: torch.nn.Module) -> list:
@@ -183,10 +211,19 @@ def install_layer_trace(model: torch.nn.Module) -> list:
             "where nothing diverged.")
     wanted = set(selected_layers(spec, tuple(sorted(layers))))
 
+    ordered = tuple(sorted(wanted))
+    _SLOTS.prepare(ordered)
+
     handles = []
     inner = _find_inner_model(model)
-    if inner is not None:
-        handles.append(inner.register_forward_pre_hook(_bump_step))
+    if inner is None:
+        raise RuntimeError(
+            f"{_ENV}={spec!r} but the module holding the decoder layers was "
+            "not found, so there is nowhere to drain the digests from. The "
+            "trace would collect forty values and print none of them, which "
+            "reads as a forward that never ran.")
+    handles.append(inner.register_forward_pre_hook(_bump_step))
+    handles.append(inner.register_forward_hook(_flush))
     for index, layer in layers.items():
         if index in wanted:
             handles.append(layer.register_forward_hook(_make_hook(index)))
@@ -201,23 +238,85 @@ def install_layer_trace(model: torch.nn.Module) -> list:
     return handles
 
 
+class _Slots:
+    """Where the per-layer digests wait until the forward is over.
+
+    🔴 One device buffer, one transfer. The first version read each digest
+    back with ``int(...)`` inside the layer hook -- forty host syncs inside a
+    forward that other ranks are not waiting at -- and the launch died in
+    aicpu 507018, the same error code as the previous instrument that
+    synchronised inside the forward. An instrument that stalls the thing it
+    measures is not measuring it.
+
+    Filled by index-assignment on the device, which queues like any other
+    kernel, and drained once from the model-level hook where the forward has
+    already finished.
+    """
+
+    def __init__(self):
+        self.layers: tuple[int, ...] = ()
+        self.buffer: torch.Tensor | None = None
+        self.rows = [0] * 0
+
+    def prepare(self, layers: tuple[int, ...]) -> None:
+        self.layers = layers
+        self.buffer = None
+        self.rows = [0] * len(layers)
+
+    def slot_of(self, layer: int) -> int:
+        return self.layers.index(layer)
+
+    def store(self, slot: int, exact: torch.Tensor, coarse: torch.Tensor,
+              rows: int) -> None:
+        if self.buffer is None:
+            self.buffer = torch.full((len(self.layers), 2), -1,
+                                     dtype=torch.int64, device=exact.device)
+        self.buffer[slot, 0] = exact
+        self.buffer[slot, 1] = coarse
+        self.rows[slot] = rows
+
+    def drain(self) -> list[tuple[int, int, int, int]]:
+        """``(layer, exact, coarse, rows)`` per slot, in one transfer."""
+        if self.buffer is None:
+            return []
+        values = self.buffer.to("cpu").tolist()
+        self.buffer = None
+        return [(layer, values[i][0], values[i][1], self.rows[i])
+                for i, layer in enumerate(self.layers)]
+
+
+_SLOTS = _Slots()
+
+
 def _bump_step(_module: torch.nn.Module, _args: tuple) -> None:
     global _STEP
     _STEP += 1
 
 
+def _flush(_module: torch.nn.Module, _args: tuple, _output) -> None:
+    """One transfer and all the lines, after the forward.
+
+    Here rather than per layer: at this point the forward is over, so a
+    transfer costs a wait that nothing else is racing.
+    """
+    from vllm.logger import logger
+
+    for layer, exact, coarse, rows in _SLOTS.drain():
+        logger.info(
+            "DSV4.1 trace step=%d layer=%02d out=0x%016x coarse=0x%016x "
+            "rows=%d", _STEP, layer, exact & 0xFFFFFFFFFFFFFFFF,
+            coarse & 0xFFFFFFFFFFFFFFFF, rows)
+
+
 def _make_hook(index: int):
+    slot = _SLOTS.slot_of(index)
+
     def _hook(_module: torch.nn.Module, _args: tuple, output) -> None:
         tensor = output[0] if isinstance(output, tuple) else output
         if not isinstance(tensor, torch.Tensor):
             return
-        from vllm.logger import logger
-
-        logger.info(
-            "DSV4.1 trace step=%d layer=%02d out=0x%016x coarse=0x%016x "
-            "rows=%d", _STEP, index,
-            fingerprint(tensor) & 0xFFFFFFFFFFFFFFFF,
-            coarse_fingerprint(tensor) & 0xFFFFFFFFFFFFFFFF,
-            tensor.shape[0] if tensor.ndim else 0)
+        _SLOTS.store(slot, fingerprint_tensor(tensor),
+                     coarse_fingerprint_tensor(tensor),
+                     tensor.shape[0] if tensor.ndim else 0)
 
     return _hook
