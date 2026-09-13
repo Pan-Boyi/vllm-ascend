@@ -48,6 +48,42 @@ _BOUNDARY_TAPS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+#: Protocol key -> the decoder layer's *argument* carrying it. These are the
+#: keys the injector replaces, so they have to be the tensors the layer was
+#: actually handed, not anything reconstructed from them.
+#:
+#: 🔴 Bound by parameter **name**, resolved once at install time. The call site
+#: passes all nine positionally (``model.py:626-636``), so ``args[6]`` would
+#: work today and would silently record the wrong tensor the day an argument
+#: is inserted ahead of it. Resolving the name and failing loudly if it is
+#: gone is the difference between a wrong dump and no dump.
+_ARG_TAPS: tuple[tuple[str, str], ...] = (
+    ("residual", "layer.in"),
+    ("pre_mix", "pre_mix.in"),
+)
+
+
+def _arg_positions(layer: torch.nn.Module) -> dict[str, int]:
+    """Where each tapped argument sits in this layer's positional signature."""
+    import inspect
+
+    parameters = list(
+        inspect.signature(type(layer).forward).parameters)
+    positions = {}
+    for name, key in _ARG_TAPS:
+        if name not in parameters:
+            raise RuntimeError(
+                f"{type(layer).__name__}.forward has no {name!r} parameter, so "
+                f"{key!r} cannot be recorded from the tensor the layer is "
+                "handed. Recording it from anywhere else would be recording a "
+                "reconstruction: the injector would then be replacing "
+                "something the layer never received. Its parameters are "
+                f"{parameters}.")
+        # -1 for self, which a hook's args tuple does not carry.
+        positions[key] = parameters.index(name) - 1
+    return positions
+
+
 def _first_tensor(value: Any) -> torch.Tensor | None:
     """The tensor a hook actually got, out of whatever shape it arrived in."""
     if isinstance(value, torch.Tensor):
@@ -71,7 +107,7 @@ def _record(tag_layer: int, key: str, tensor: torch.Tensor) -> None:
                                                               get_recorder)
 
     recorder = get_recorder()
-    if recorder is None:
+    if recorder is None or not _ARMED:
         return
     positions = _current_positions()
     if positions is None:
@@ -88,6 +124,80 @@ def _record(tag_layer: int, key: str, tensor: torch.Tensor) -> None:
 #: The positions argument of the decoder layer currently executing. Captured
 #: by a pre-hook on the layer itself rather than looked up elsewhere.
 _CURRENT_POSITIONS: torch.Tensor | None = None
+
+
+#: Whether this forward's recording is armed. False until the sequence length
+#: is known, because every ``record()`` scatters into a [seq_len, ...] buffer
+#: and raises without one.
+_ARMED = False
+
+
+def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
+    """Fix the sequence length for this forward, or disarm it and say so.
+
+    🔴 This used to live in the prologue hook and to ``return`` when the length
+    could not be determined. The result was recording left half-armed:
+    ``set_seq_len`` never ran, every later tap called ``record()``, and the run
+    died forty taps away with
+
+        RuntimeError: set_seq_len() must be called before record(),
+                      normally from the prologue hook
+
+    -- a message that names the hook which did *not* fail. It cost three
+    launches once, and another the first time a request arrived through
+    ``/v1/completions``, where the prologue's own precondition happened not to
+    hold. The fix is not a better message: "cannot size the buffer" has to
+    disable recording **here**, where it is discovered, instead of arming a
+    trap for the next forty taps.
+
+    Installed on the inner model, which always runs -- ``embed_tokens`` does
+    not exist on a non-first pipeline rank -- and which is strictly earlier
+    than every tap, the ordering the recorder needs.
+    """
+    global _ARMED
+
+    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
+
+    recorder = get_recorder()
+    if recorder is None:
+        _ARMED = False
+        return
+    try:
+        seq_len = _single_request_seq_len()
+    except ValueError as exc:
+        _ARMED = False
+        _report_disarmed(str(exc))
+        return
+    if seq_len is None:
+        # ⚠️ The precondition is "the recorder can size its buffer", not "the
+        # forward context told us the length". A recorder constructed with a
+        # seq_len already can, and disarming it would refuse to record a run
+        # that is perfectly recordable -- the opposite failure to the one
+        # this function exists for, and just as silent.
+        if getattr(recorder, "seq_len", None) is not None:
+            _ARMED = True
+            return
+        _ARMED = False
+        _report_disarmed(
+            "no single request's sequence length was available from the "
+            "forward context and the recorder has none of its own (profile "
+            "run, dummy run, or a batch this dump cannot be addressed "
+            "against)")
+        return
+    recorder.set_seq_len(seq_len)
+    _ARMED = True
+
+
+def _report_disarmed(reason: str) -> None:
+    from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+    announce_once(
+        "align_disarmed",
+        "alignment recording is disabled for this forward -- %s. Nothing will "
+        "be written, so the dump will be short rather than wrong. Said here, "
+        "where it is discovered: the previous behaviour left recording "
+        "half-armed and failed forty taps later with a message naming the "
+        "hook that did not fail.", reason)
 
 
 def _capture_positions(_module: torch.nn.Module, args: tuple) -> None:
@@ -136,6 +246,9 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     # either None or, worse, the previous step's, which is in range and wrong.
     # This also clears the value, so a forward that never reaches the capture
     # cannot leave the last one visible to the next.
+    # Before the positions capture and before every tap: nothing records
+    # until the buffer can be sized.
+    handles.append(inner.register_forward_pre_hook(_arm_recording))
     handles.append(inner.register_forward_pre_hook(_capture_positions))
     # Counted apart from the positions capture, which always registers. Using
     # len(handles) would have made the "nothing was tapped" branch below
@@ -160,6 +273,23 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
         # First, so the boundary hooks below it in the same layer see this
         # layer's positions rather than the previous layer's.
         handles.append(layer.register_forward_pre_hook(_capture_positions))
+        # The layer's own inputs, before its submodules see anything. These
+        # are what the injector replaces, so they are read from the argument
+        # the layer was handed.
+        #
+        # ⚠️ Layer 0 is a different shape of thing and is left to produce
+        # nothing here: it receives ``x`` as 2-D [T, 5120] and builds the
+        # 4-stream tensor itself (``model.py:303-305``), and its ``pre_mix``
+        # is None. The prologue's ``embed.out`` is what layer 0 was actually
+        # handed. Recording an expanded [T, 4, 5120] for it would be
+        # equivalent *today* -- expand loses nothing -- and that is exactly
+        # the trap: equivalence is a property of the current code, not of the
+        # interface, so the day that line stops being a broadcast nothing
+        # goes red and the injector quietly compares something else.
+        handles.append(
+            layer.register_forward_pre_hook(
+                _make_argument_tap(layer_id, _arg_positions(layer))))
+        taps_installed += 1
         for attribute, key, side in _BOUNDARY_TAPS:
             module = getattr(layer, attribute, None)
             if module is None:
@@ -188,6 +318,24 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     return handles
 
 
+def _make_argument_tap(layer_id: int, positions: dict[str, int]):
+    """Record the layer's own inputs, by name, from the args it was given."""
+
+    def _tap(_module: torch.nn.Module, args: tuple) -> None:
+        for key, index in positions.items():
+            if index >= len(args):
+                continue
+            value = args[index]
+            # None is the honest answer for layer 0's residual and pre_mix,
+            # and it is recorded as absence rather than as a fabricated
+            # identity: "layer 0 has no pre_mix" is a fact the dump has to be
+            # able to show, and an identity would erase it.
+            if isinstance(value, torch.Tensor):
+                _record(layer_id, key, value)
+
+    return _tap
+
+
 def _prologue_pre(_module: torch.nn.Module, args: tuple) -> None:
     """Fix the sequence length, then record input_ids.
 
@@ -197,17 +345,6 @@ def _prologue_pre(_module: torch.nn.Module, args: tuple) -> None:
     the number of rows in this chunk -- under chunked prefill those differ,
     and sizing the buffer by the chunk would drop every later row off the end.
     """
-    seq_len = _single_request_seq_len()
-    if seq_len is None:
-        return
-
-    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
-
-    recorder = get_recorder()
-    if recorder is None:
-        return
-    recorder.set_seq_len(seq_len)
-
     input_ids = _first_tensor(args)
     if input_ids is not None:
         _record_prologue("input_ids", input_ids)
@@ -231,7 +368,7 @@ def _record_prologue(key: str, tensor: torch.Tensor) -> None:
         current_row_to_pos, get_recorder)
 
     recorder = get_recorder()
-    if recorder is None:
+    if recorder is None or not _ARMED:
         return
     positions = _current_positions()
     if positions is None:

@@ -30,7 +30,14 @@ class _Layer(torch.nn.Module):
         self.attn = _Inner(record)
         self.ffn = _Inner(record)
 
-    def forward(self, x, positions, input_ids=None):
+    # ⚠️ The real signature, argument for argument
+    # (vllm/models/deepseek_v4_1/nvidia/model.py:285-296). The fixture used to
+    # stop at input_ids, which modelled a decoder layer that cannot exist --
+    # and a tap bound to `residual` by name could not be tested against it at
+    # all. A double that is missing the thing under test is not a double.
+    def forward(self, x, positions, input_ids=None, pre_mix=None,
+                post_mix=None, res_mix=None, residual=None,
+                engram_hashes=None, engram_mask=None):
         return self.ffn(self.attn(x))
 
 
@@ -41,9 +48,14 @@ class _Model(torch.nn.Module):
             [_Layer(record) for _ in range(num_layers)])
         self.start_layer = 0
 
-    def forward(self, x, positions):
+    def forward(self, x, positions, residual=None, pre_mix=None):
+        # Positionally, exactly as the real model calls it (model.py:626-636),
+        # because the taps resolve names to positions once and then index.
         for layer in self.layers:
-            x = layer(x, positions)
+            x = layer(x, positions, None, pre_mix, None, None, residual)
+            # After the first layer the streams exist, as upstream does.
+            residual = residual if residual is not None else x
+            pre_mix = pre_mix if pre_mix is not None else x[..., :1]
         return x
 
 
@@ -103,6 +115,15 @@ def with_recorder(monkeypatch):
     calls = []
 
     class _Recorder:
+        # ⚠️ Carries a seq_len like the real one. Recording is armed per
+        # forward on "can this recorder size its buffer", so a double without
+        # it disarms every tap and the test then asserts about a run in which
+        # nothing was ever going to be recorded.
+        seq_len = 1100
+
+        def set_seq_len(self, seq_len):
+            self.seq_len = seq_len
+
         def record_layer(self, layer_id, key, tensor, row_to_pos):
             calls.append((layer_id, key, tuple(tensor.shape),
                           row_to_pos.tolist()))
@@ -122,9 +143,17 @@ def test_on_records_both_edges_of_both_modules(with_recorder):
     model(torch.randn(3, 4), torch.arange(3))
 
     keys = {(layer_id, key) for layer_id, key, _, _ in with_recorder}
-    assert keys == {(0, "attn.in"), (0, "attn.out"), (0, "moe.in"),
-                    (0, "moe.out"), (1, "attn.in"), (1, "attn.out"),
-                    (1, "moe.in"), (1, "moe.out")}
+    # The module edges, on both layers...
+    assert {k for k in keys if k[1] in ("attn.in", "attn.out", "moe.in",
+                                       "moe.out")} == {
+        (0, "attn.in"), (0, "attn.out"), (0, "moe.in"), (0, "moe.out"),
+        (1, "attn.in"), (1, "attn.out"), (1, "moe.in"), (1, "moe.out")}
+    # ...and the layer's own inputs, which exist only once the streams do.
+    # Layer 0 receives residual=None and pre_mix=None and records neither:
+    # "layer 0 has no pre_mix" is a fact the dump has to be able to show, and
+    # a fabricated identity would erase it.
+    assert (1, "layer.in") in keys and (1, "pre_mix.in") in keys
+    assert (0, "layer.in") not in keys and (0, "pre_mix.in") not in keys
 
 
 def test_the_layer_index_is_global_not_local(with_recorder):
@@ -590,3 +619,109 @@ def test_a_layer_missing_in_its_entirety_is_still_reported(tmp_path):
     report = coverage_report({"layer_00/attn.out"}, d)
     assert report["state"] == "incomplete"
     assert report["missing"] == ["layer_02/attn.out"]
+
+
+# ------------------- recording is armed once per forward, or not at all
+
+def test_a_forward_that_cannot_be_sized_records_nothing(monkeypatch,
+                                                        with_recorder):
+    """🔴 The failure this replaced: recording left half-armed.
+
+    set_seq_len never ran, every later tap called record(), and the run died
+    forty taps away with "set_seq_len() must be called before record(),
+    normally from the prologue hook" -- a message naming the hook that did
+    *not* fail. It cost three launches once, and another the first time a
+    request came in through /v1/completions.
+    """
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    class _Unsized:
+        seq_len = None
+
+        def set_seq_len(self, seq_len):
+            raise AssertionError("must not be reached")
+
+        def record_layer(self, *a):
+            raise AssertionError("recording was left armed")
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Unsized())
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: None)
+
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))   # must not raise
+    finally:
+        for h in handles:
+            h.remove()
+    # The fixture's list also collects the model's own "inner-ran" markers,
+    # so what is asserted is that no *tap* wrote, not that nothing happened.
+    assert not [c for c in with_recorder if isinstance(c, tuple)]
+
+
+def test_the_disarming_says_so(monkeypatch, with_recorder):
+    """Said where it is discovered, not forty taps later."""
+    import logging
+
+    from vllm.logger import logger
+
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+    from vllm_ascend.models.deepseek_v4_1.switch_log import reset_for_test
+
+    class _Unsized:
+        seq_len = None
+
+        def record_layer(self, *a):
+            pass
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Unsized())
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: None)
+
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    reset_for_test()
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+        reset_for_test()
+
+    assert any("alignment recording is disabled for this forward" in line
+               for line in lines), lines
+
+
+def test_a_recorder_that_already_has_a_length_stays_armed(monkeypatch,
+                                                          with_recorder):
+    """⚠️ The opposite failure, and just as silent: refusing to record a run
+    that is perfectly recordable. The precondition is "can this recorder size
+    its buffer", not "did the forward context tell us"."""
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: None)
+
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert [c for c in with_recorder if isinstance(c, tuple)], \
+        "the fixture's recorder carries seq_len = 1100, so taps must record"
+
+
+def test_the_arming_hook_runs_before_every_tap():
+    """Ordering, stated as an observable: it is registered on the module that
+    always runs, and before the positions capture."""
+    import inspect
+
+    source = inspect.getsource(align_taps.install_alignment_taps)
+    assert source.index("_arm_recording") < source.index("_capture_positions")
