@@ -692,7 +692,7 @@ def _init() -> None:
 
     dump_dir = _env("VLLM_ASCEND_DSV41_DUMP_DIR")
     if dump_dir:
-        _recorder = AlignRecorder(_dump_dir_for(dump_dir, 0))
+        _recorder = _new_recorder(dump_dir, 0)
 
     mode = _env("VLLM_ASCEND_DSV41_FORCE_ROUTE") or "off"
     if mode != "off":
@@ -753,6 +753,25 @@ def _dump_dir_for(base: str, index: int) -> str:
     return os.path.join(base, f"req_{index:03d}")
 
 
+def _new_recorder(base: str, index: int) -> AlignRecorder:
+    """A recorder that says, in its own manifest, which dump it is.
+
+    🔴 The directory name is a *convention*, and conventions are lost in a
+    copy, an archive or a rename. A manifest is the artifact's own
+    declaration. A dump that does not say what it is can only be identified
+    by inference from outside, and inference from outside is what went wrong
+    the last three times something was read as the thing next to it.
+
+    ``dump_requests`` is here for the same reason: "I am dump 0 of 3" is a
+    complete statement, "I am req_000 of some run that recorded an unknown
+    number" is not.
+    """
+    recorder = AlignRecorder(_dump_dir_for(base, index))
+    recorder.add_manifest(request_index=index,
+                          dump_requests=_dump_request_limit())
+    return recorder
+
+
 #: How many prefills have been flushed so far this process.
 _DUMPS_DONE = 0
 
@@ -788,7 +807,7 @@ def rotate_recorder() -> bool:
             _DUMPS_DONE, limit)
         _recorder = None
         return False
-    _recorder = AlignRecorder(_dump_dir_for(base, _DUMPS_DONE))
+    _recorder = _new_recorder(base, _DUMPS_DONE)
     logger.info(
         "DSV4.1 alignment: dump %d of %d written; next request records into "
         "%s.", _DUMPS_DONE, limit, _recorder.dump_dir)

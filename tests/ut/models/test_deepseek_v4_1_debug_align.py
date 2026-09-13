@@ -418,3 +418,47 @@ def test_rotation_without_a_recorder_is_not_an_error(monkeypatch):
     monkeypatch.delenv("VLLM_ASCEND_DSV41_DUMP_DIR", raising=False)
     da.reset_for_test()
     assert da.rotate_recorder() is False
+
+
+def test_each_dump_declares_which_one_it_is(tmp_path, monkeypatch):
+    """🔴 The directory name is a convention, and conventions are lost in a
+    copy, an archive or a rename. "I am dump 0 of 3" is a complete statement;
+    "I am req_000 of a run that recorded an unknown number" is not."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "3")
+    da.reset_for_test()
+
+    first = da.get_recorder()
+    first.set_seq_len(SEQ_LEN)
+    first.record_whole("layer_00", "attn.out", torch.zeros(4))
+    da.rotate_recorder()
+    second = da.get_recorder()
+    second.set_seq_len(SEQ_LEN)
+    second.record_whole("layer_00", "attn.out", torch.ones(4))
+    da.rotate_recorder()
+
+    def _manifest(rec):
+        return json.load(open(os.path.join(rec.dump_dir, "manifest.json")))
+
+    assert _manifest(first)["request_index"] == 0
+    assert _manifest(first)["dump_requests"] == 3
+    assert _manifest(second)["request_index"] == 1
+    assert _manifest(second)["dump_requests"] == 3
+
+
+def test_the_single_dump_case_declares_itself_too(tmp_path, monkeypatch):
+    """Even where the directory carries no number, the artifact still says
+    what it is -- that is the whole point of not relying on the convention."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", raising=False)
+    da.reset_for_test()
+
+    rec = da.get_recorder()
+    rec.set_seq_len(SEQ_LEN)
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    da.rotate_recorder()
+
+    manifest = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))
+    assert manifest["request_index"] == 0
+    assert manifest["dump_requests"] == 1
