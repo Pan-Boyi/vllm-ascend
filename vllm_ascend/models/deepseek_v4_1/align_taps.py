@@ -177,9 +177,33 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
         return
     try:
         seq_len = _single_request_seq_len()
+        rows = _single_request_query_rows()
     except ValueError as exc:
         _ARMED = False
         _report_disarmed(str(exc))
+        return
+    if seq_len is not None and rows is not None and rows != seq_len:
+        # 🔴 This forward cannot fill the buffer, so it must not open one.
+        #
+        # Recording scatters rows into a [seq_len, ...] buffer and the flush
+        # requires every position written exactly once. A decode step has one
+        # row against a seq_len of prompt+N; a chunked prefill or a
+        # prefix-cache hit has some of them. All three are *normal* and all
+        # three produce an "incomplete coverage" dump, which is the artifact
+        # a broken row mapping produces -- so "nothing to contribute here"
+        # and "the mapping is wrong" were the same output again.
+        #
+        # Measured: a warm-up request recorded its prefill correctly and then
+        # its first decode armed at seq_len=202 (= 201 + 1, which only a
+        # decode can be), recorded one row, and the flush raised. The
+        # assertion was firing on an object its premise does not cover.
+        _ARMED = False
+        _report_disarmed(
+            f"this forward supplies {rows} query rows against a sequence "
+            f"length of {seq_len}, so it cannot write every position exactly "
+            "once. That is the normal shape of a decode step, a chunked "
+            "prefill or a prefix-cache hit -- not a defect. Only a forward "
+            "that covers the whole sequence is recorded.")
         return
     if seq_len is None:
         # ⚠️ The precondition is "the recorder can size its buffer", not "the
@@ -515,6 +539,31 @@ def _single_request_seq_len() -> int | None:
                 "scatter onto each other -- silently, since every value stays "
                 "in range.")
         return int(seq_lens[0])
+    return None
+
+
+def _single_request_query_rows() -> int | None:
+    """How many query rows this forward carries, or ``None`` if unavailable.
+
+    From ``query_start_loc[-1]``, which is the one place the count exists
+    without re-deriving it: it is the cumulative row boundary the whole
+    attention path already agrees on.
+    """
+    from vllm.forward_context import get_forward_context
+
+    try:
+        context = get_forward_context()
+    except Exception:                                        # noqa: BLE001
+        return None
+    metadata = getattr(context, "attn_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    for entry in metadata.values():
+        req = getattr(entry, "req_metadata", None)
+        starts = getattr(req, "query_start_loc", None)
+        if starts is None or starts.numel() == 0:
+            continue
+        return int(starts[-1])
     return None
 
 

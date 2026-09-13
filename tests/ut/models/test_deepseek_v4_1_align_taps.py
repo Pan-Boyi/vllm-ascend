@@ -905,3 +905,83 @@ def test_a_forward_with_some_real_rows_still_records(monkeypatch,
         for h in handles:
             h.remove()
     assert [c for c in with_recorder if isinstance(c, tuple)]
+
+
+# ------------- only a forward that can fill the buffer opens one
+
+def _armed_with(monkeypatch, with_recorder, seq_len, rows):
+    monkeypatch.setattr(align_taps, "_single_request_seq_len",
+                        lambda: seq_len)
+    monkeypatch.setattr(align_taps, "_single_request_query_rows",
+                        lambda: rows)
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    return [c for c in with_recorder if isinstance(c, tuple)]
+
+
+def test_a_decode_step_is_not_recorded(monkeypatch, with_recorder):
+    """🔴 What killed the dump flight.
+
+    A warm-up request recorded its prefill correctly and then its first
+    decode armed at seq_len=202 -- 201 + 1, which only a decode can be --
+    recorded one row, and the flush raised. The assertion was firing on an
+    object its premise does not cover: one row can never write 202 positions.
+    """
+    assert _armed_with(monkeypatch, with_recorder, seq_len=202, rows=1) == []
+
+
+def test_a_chunked_prefill_is_not_recorded(monkeypatch, with_recorder):
+    """Same shape, different cause: some of the positions, not one. Also
+    normal, also produces the artifact a broken mapping produces."""
+    with_recorder.clear()
+    assert _armed_with(monkeypatch, with_recorder, seq_len=201, rows=64) == []
+
+
+def test_a_full_prefill_is_recorded(monkeypatch, with_recorder):
+    """Two arms. The one forward that can write every position exactly once
+    is the one that opens a buffer."""
+    with_recorder.clear()
+    assert _armed_with(monkeypatch, with_recorder, seq_len=3, rows=3)
+
+
+def test_the_refusal_names_both_numbers(monkeypatch, with_recorder):
+    """⚠️ "cannot be recorded" without the pair cannot be acted on: 1 of 202
+    is a decode, 64 of 201 is a chunk, and they lead different places."""
+    import logging
+
+    from vllm.logger import logger
+
+    from vllm_ascend.models.deepseek_v4_1.switch_log import reset_for_test
+
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    reset_for_test()
+    try:
+        _armed_with(monkeypatch, with_recorder, seq_len=202, rows=1)
+    finally:
+        logger.removeHandler(handler)
+        reset_for_test()
+
+    assert any("1 query rows against a sequence length of 202" in line
+               for line in lines), lines
+    assert any("not a defect" in line for line in lines), lines
+
+
+def test_an_unknown_row_count_does_not_block_recording(monkeypatch,
+                                                       with_recorder):
+    """⚠️ Three states. "Cannot tell how many rows" must not silently refuse a
+    recordable forward -- that is the same wrong-direction failure as
+    demanding the length come from the forward context."""
+    with_recorder.clear()
+    assert _armed_with(monkeypatch, with_recorder, seq_len=3, rows=None)
