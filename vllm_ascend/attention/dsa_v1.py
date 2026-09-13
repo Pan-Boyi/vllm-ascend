@@ -1628,7 +1628,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         seqused_cmp_kv = None
         if is_deepseek_v41_text(self.model_config.hf_text_config):
             from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-                is_plain_sliding_window, select_ori_sparse_indices)
+                is_plain_sliding_window, ori_mask_mode_for,
+                select_ori_sparse_indices)
 
             attends_cmp = attends_compressed_stream(self.compressor_ratio,
                                                     self.vllm_config)
@@ -1636,12 +1637,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             # candidate tensors. Previously this recomputed the predicate from
             # its own expression; the two agreed, which hid that they were two
             # sources. They are one now, so a precedence change moves both.
-            plain_window = is_plain_sliding_window(
-                attends_cmp,
-                select_ori_sparse_indices(attends_cmp, vision_swa_indices,
-                                          dspark_swa_indices))
+            ori_indices = select_ori_sparse_indices(
+                attends_cmp, vision_swa_indices, dspark_swa_indices)
+            plain_window = is_plain_sliding_window(attends_cmp, ori_indices)
             sas_mask_kwargs = {
-                "ori_mask_mode": 4 if plain_window else 0,
+                # The mode, from the same function the call site uses. It was
+                # spelled here as "4 if plain_window else 0", which is the
+                # two-configuration reading -- and the third configuration,
+                # no indices with a compressed stream, silently took the 0.
+                "ori_mask_mode": ori_mask_mode_for(attends_cmp, ori_indices),
                 "ori_win_left": ori_win_left if plain_window else -1,
                 "ori_win_right": ori_win_right if plain_window else -1,
                 "has_cmp_kv": attends_cmp,

@@ -62,6 +62,10 @@ SLIDING_WINDOW_MASK_MODE = 4
 #: "Parameters ori_mask_mode and cmp_mask_mode ... have incorrect values 4, 0.
 #: Ori-only sparse mode requires both mask modes to be 0."
 NO_MASK_MODE = 0
+#: Causal. The operator lists {0, 3, 4} for ori_mask_mode; 3 is the only one
+#: of the three that masks anything without window bounds, which a layer
+#: attending a compressed stream at ratio != 1 is not allowed to have.
+CAUSAL_MASK_MODE = 3
 CMP_MASK_MODE = 3
 
 #: The operator's own mode rules, read out of its host library rather than
@@ -172,8 +176,68 @@ def is_plain_sliding_window(attends_compressed: bool,
 
     So indices present means the original stream is selected by that list, and
     the window bounds have nothing left to say.
+
+    ⚠️ This is the **mode-4 predicate**, and only that. What masks the
+    original stream on a layer that is *not* mode 4 is a separate question
+    with a separate answer -- see ``ori_mask_mode_for``. Folding the two
+    together is what left 38 layers with no masking at all.
     """
     return not attends_compressed and ori_sparse_indices is None
+
+
+def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices) -> int:
+    """What masks this layer's original stream.
+
+    Three configurations, and the third one had no answer:
+
+    ===============================  ==============================  =========
+    indices present                  the list masks it               0
+    no indices, no compressed stream the window masks it             4
+    no indices, compressed stream    **nothing masked it**           0 -> 3
+    ===============================  ==============================  =========
+
+    🔴 Mode 0 is NO_MASK in the operator's own words ("When mask_mode is 0
+    (NO_MASK), attn_mask should not be provided"). V4.1 puts 38 of its 40
+    layers in the third row -- layers 2..19 carry ratio 2 and 20..39 carry
+    ratio 1, and ``attends_compressed_stream`` is true for all of them -- so
+    almost the whole model has been attending its original stream with no
+    window, no causality and, since the mm-ranges switch, no index list
+    either. Nothing rejects that; it produces fluent text that means nothing.
+
+    That third row was self-consistent while the indices were always present,
+    because both SWA index builders write a causal window into the list.
+    Turning ``VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS`` on removed the list
+    -- correctly, it was the wrong path -- and left mode 0 supplying nothing.
+    ⇒ The switch fixed one defect and exposed another.
+
+    ⚠️ The answer is **3 (CAUSAL), not 4**. Mode 4 was the first guess and the
+    operator rules it out for these layers::
+
+        "SWA mode requires cmp_ratio=1"           (layers 2..19 carry 2)
+        "Non-sliding-window modes require ori_win_left=ori_win_right=-1"
+        "Ori_mask_mode should be {0, 3, 4} on ..."
+
+    so a ratio-2 layer cannot have window bounds at all, and 3 is the only
+    remaining mode that masks anything. It also needs no window bounds, which
+    is what the second rule requires of it. This line's own host check already
+    encoded the first rule and refused the mode-4 attempt -- the guard was
+    right and the hypothesis it refused was mine.
+
+    Behind ``VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES``, default off, so
+    the numerics change is one variable in one flight.
+    """
+    if is_plain_sliding_window(attends_compressed, ori_sparse_indices):
+        return SLIDING_WINDOW_MASK_MODE
+    if (ori_sparse_indices is None and attends_compressed
+            and _causal_without_indices()):
+        return CAUSAL_MASK_MODE
+    return NO_MASK_MODE
+
+
+def _causal_without_indices() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES == "1"
 
 
 def _check(condition: bool, operator_message: str, detail: str = "") -> None:
@@ -646,10 +710,8 @@ def build_sparse_flash_mla_kwargs(
         # is sliding-window mode. Window bounds go to -1 whenever the mode is
         # not 4, because "non-sliding-window modes require ori_win_left =
         # ori_win_right = -1".
-        ori_mask_mode=(SLIDING_WINDOW_MASK_MODE
-                       if is_plain_sliding_window(attends_compressed,
-                                                   ori_sparse_indices)
-                       else NO_MASK_MODE),
+        ori_mask_mode=ori_mask_mode_for(attends_compressed,
+                                        ori_sparse_indices),
         ori_win_left=(ori_win_left if is_plain_sliding_window(
             attends_compressed, ori_sparse_indices) else -1),
         ori_win_right=(ori_win_right if is_plain_sliding_window(

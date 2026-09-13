@@ -663,3 +663,90 @@ def test_the_builder_actually_runs_the_two_mode_check():
             ori_sparse_indices=indices,
             ori_topk_length=torch.ones(NUM_TOKENS, 1, dtype=torch.int32),
         ))
+
+
+# ------------------------------- what masks the original stream when nothing does
+
+def test_indices_present_is_never_sliding_window(monkeypatch):
+    """Both sides of the switch. An index list supplies the masking itself,
+    so the window bounds have nothing left to say either way."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        is_plain_sliding_window
+
+    for value in ("0", "1"):
+        monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES",
+                           value)
+        assert is_plain_sliding_window(True, object()) is False
+        assert is_plain_sliding_window(False, object()) is False
+
+
+def test_by_default_a_compressed_layer_still_sends_no_mask(monkeypatch):
+    """🔴 Today's behaviour, stated so the change is one variable.
+
+    38 of V4.1's 40 layers attend a compressed stream, so this is the default
+    on almost the whole model: ori_mask_mode 0 (NO_MASK) with the window
+    bounds at -1 and, since the mm-ranges switch, no index list either --
+    nothing masking the original stream at all.
+    """
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        is_plain_sliding_window
+
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        ori_mask_mode_for
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "0")
+    assert is_plain_sliding_window(True, None) is False
+    assert ori_mask_mode_for(True, None) == 0, "NO_MASK, on 38 of 40 layers"
+    assert is_plain_sliding_window(False, None) is True
+
+
+def test_with_the_switch_a_compressed_layer_becomes_causal(monkeypatch):
+    """⚠️ 3, not 4. Mode 4 was the first guess and the operator rules it out
+    for these layers -- "SWA mode requires cmp_ratio=1", and layers 2..19
+    carry 2. This line's own host check already encoded that rule and refused
+    the mode-4 attempt: the guard was right and the hypothesis was mine."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        is_plain_sliding_window, ori_mask_mode_for)
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
+    assert ori_mask_mode_for(True, None) == 3
+    # and still not sliding window, so no window bounds are sent -- which is
+    # what "Non-sliding-window modes require ori_win_left=ori_win_right=-1"
+    # demands of mode 3.
+    assert is_plain_sliding_window(True, None) is False
+    # A layer with no compressed stream is untouched: it was already masked.
+    assert ori_mask_mode_for(False, None) == 4
+
+
+def test_the_switch_reaches_the_mask_triple(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        build_sparse_flash_mla_kwargs
+
+    """Placement: the predicate is what the builder keys the whole triple on,
+    so the switch has to move mask mode and both window bounds together. A
+    mode-4 call with the bounds still at -1 is refused ("The value of
+    attn_mask cannot be nullptr when the mask_mode=4"), and a mode-0 call with
+    real bounds is refused too ("Non-sliding-window modes require
+    ori_win_left=ori_win_right=-1")."""
+    compressed = dict(
+        cmp_ratio=2,
+        attends_compressed=True,
+        cmp_kv=torch.zeros(4, 32, 1, HEAD_DIM),
+        cmp_block_table=torch.zeros(NUM_REQUESTS, 4, dtype=torch.int32),
+        seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32),
+        cmp_residual_kv=torch.zeros(NUM_REQUESTS, dtype=torch.int32),
+    )
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
+    built = build_sparse_flash_mla_kwargs(**_common(**compressed))
+    assert built["ori_mask_mode"] == 3
+    assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1), (
+        "mode 3 is a non-sliding-window mode, and the operator requires both "
+        "bounds at -1 there")
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "0")
+    built = build_sparse_flash_mla_kwargs(**_common(**compressed))
+    assert built["ori_mask_mode"] == 0, (
+        "today's default: NO_MASK on a layer whose original stream has "
+        "neither a window nor an index list")
+    assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1)
