@@ -343,15 +343,22 @@ def test_the_scope_says_isolation_is_partial(tmp_path):
 
 # ------------------------ two dumps in one process, for the strongest compare
 
-def test_one_request_keeps_the_old_layout(tmp_path, monkeypatch):
-    """Unchanged when only one dump is asked for, so every existing tool and
-    every earlier dump keeps its shape."""
+def test_even_a_single_dump_goes_under_its_writer(tmp_path, monkeypatch):
+    """🔴 The old layout put a single dump straight into the base directory,
+    and four data-parallel ranks then wrote the same path -- last writer
+    wins, artifacts well formed, attributed to whoever happened to finish
+    last. The writer is in the path for one dump as well, because that is
+    exactly where it collided silently."""
     monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
     monkeypatch.delenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", raising=False)
     da.reset_for_test()
 
     rec = da.get_recorder()
-    assert rec is not None and rec.dump_dir == str(tmp_path)
+    assert rec is not None
+    assert rec.dump_dir != str(tmp_path)
+    assert rec.dump_dir.endswith("req_000")
+    middle = os.path.basename(os.path.dirname(rec.dump_dir))
+    assert middle.startswith("rank_") or middle.startswith("pid_"), middle
 
 
 def test_two_requests_go_to_numbered_directories(tmp_path, monkeypatch):
@@ -459,9 +466,13 @@ def test_the_single_dump_case_declares_itself_too(tmp_path, monkeypatch):
     da.rotate_recorder()
 
     manifest = json.load(
-        open(os.path.join(str(tmp_path), "manifest.json")))
+        open(os.path.join(rec.dump_dir, "manifest.json")))
     assert manifest["request_index"] == 0
     assert manifest["dump_requests"] == 1
+    # ⚠️ And who wrote it. "I am dump 0 of 1" was a complete-sounding
+    # statement that four processes each made into the same file.
+    assert manifest["pid"] == os.getpid()
+    assert "dp_rank" in manifest and "dp_rank_source" in manifest
 
 
 # ------------------------- a bad dump is written, and says it is bad
@@ -512,3 +523,63 @@ def test_the_problem_line_names_the_sequence_length(tmp_path):
     coverage = json.load(
         open(os.path.join(str(tmp_path), "manifest.json")))["position_coverage"]
     assert any("seq_len=8" in p for p in coverage["problems"]), coverage
+
+
+def test_two_ranks_do_not_share_a_directory(tmp_path, monkeypatch):
+    """🔴 The defect, stated as an observable.
+
+    Four data-parallel ranks wrote base/req_000 in four processes. Each
+    manifest said "I am dump 0 of 3"; the last writer won; the survivors
+    belonged to two different ranks and nothing about them looked wrong.
+    """
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "2")
+
+    seen = []
+    for rank in (0, 3):
+        monkeypatch.setattr(da, "_writer_identity",
+                            lambda r=rank: {"pid": 100 + r, "dp_rank": r,
+                                            "dp_rank_source": "test"})
+        da.reset_for_test()
+        seen.append(da.get_recorder().dump_dir)
+
+    assert seen[0] != seen[1], seen
+    assert "rank_00" in seen[0] and "rank_03" in seen[1]
+
+
+def test_an_unknown_rank_still_gets_a_unique_path(tmp_path, monkeypatch):
+    """⚠️ "The rank could not be determined" must not reintroduce the
+    collision it exists to prevent. pid is always available."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr(da, "_writer_identity",
+                        lambda: {"pid": 4242, "dp_rank": None,
+                                 "dp_rank_source": None})
+    da.reset_for_test()
+    assert "pid_4242" in da.get_recorder().dump_dir
+
+
+def test_a_second_writer_for_one_directory_is_refused(tmp_path, monkeypatch):
+    """Silently overwriting produced artifacts that were well formed,
+    internally consistent and attributed to the wrong writer. Raising costs
+    a launch; the alternative has cost a day."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr(da, "_writer_identity",
+                        lambda: {"pid": 7, "dp_rank": 1,
+                                 "dp_rank_source": "test"})
+    da.reset_for_test()
+    rec = da.get_recorder()
+    rec.set_seq_len(SEQ_LEN)
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    rec.flush()
+
+    da.reset_for_test()
+    with pytest.raises(RuntimeError, match="already holds a dump"):
+        da.get_recorder()
+
+
+def test_the_writer_identity_prefers_the_rank_but_keeps_the_pid():
+    identity = da._writer_identity()
+    assert identity["pid"] == os.getpid()
+    # dp_rank may be None off the model path; what must always hold is that
+    # the pid is there, because it is what the path falls back to.
+    assert set(identity) == {"pid", "dp_rank", "dp_rank_source"}

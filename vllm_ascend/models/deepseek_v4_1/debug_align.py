@@ -761,19 +761,74 @@ def _dump_request_limit() -> int:
     return value
 
 
+def _writer_identity() -> dict:
+    """Who is writing this dump: rank first, pid always.
+
+    🔴 Four data-parallel ranks run this code in four processes and wrote to
+    the same ``base/req_000``. Each one made the same complete-sounding
+    statement -- "I am dump 0 of 3" -- into the same file, and the last
+    writer won. The artifacts that survived were well formed, internally
+    consistent and belonged to two different ranks, and that went unnoticed
+    for a day.
+
+    ⚠️ ``pid`` is recorded even when the rank is known, and the path falls
+    back to it when the rank is not. A path that can collide is the whole
+    defect; "the rank could not be determined" must not reintroduce it.
+    """
+    identity = {"pid": os.getpid(), "dp_rank": None, "dp_rank_source": None}
+    for source, getter in (
+            ("get_dp_group", _dp_rank_from_group),
+            ("parallel_config", _dp_rank_from_config),
+            ("VLLM_DP_RANK", lambda: _env_int("VLLM_DP_RANK"))):
+        try:
+            rank = getter()
+        except Exception:                                    # noqa: BLE001
+            rank = None
+        if rank is not None:
+            identity["dp_rank"] = int(rank)
+            identity["dp_rank_source"] = source
+            break
+    return identity
+
+
+def _dp_rank_from_group():
+    from vllm.distributed.parallel_state import get_dp_group
+
+    return get_dp_group().rank_in_group
+
+
+def _dp_rank_from_config():
+    from vllm.config import get_current_vllm_config
+
+    return get_current_vllm_config().parallel_config.data_parallel_rank
+
+
+def _env_int(name: str):
+    raw = os.environ.get(name)
+    return None if raw is None or not raw.strip() else int(raw)
+
+
+def _writer_tag(identity: dict) -> str:
+    rank = identity.get("dp_rank")
+    if rank is None:
+        return f"pid_{identity['pid']}"
+    return f"rank_{rank:02d}"
+
+
 def _dump_dir_for(base: str, index: int) -> str:
-    """One directory per recorded prefill, numbered in arrival order.
+    """One directory per recorded prefill, under the writer that wrote it.
 
     Numbered rather than named after the request id: the comparison is
     positional ("the first apple" against "the third"), and a directory named
     after an id that the log also has to be joined against is one more step
     between the reader and the answer.
+
+    🔴 But the number alone is not an address. Four ranks each produce a
+    "req_000", so the writer goes in the path -- and it goes in even for a
+    single dump, where the old layout collided just as silently.
     """
-    if _dump_request_limit() == 1:
-        # Unchanged layout when only one dump is asked for, so every existing
-        # tool and every earlier dump keeps its shape.
-        return base
-    return os.path.join(base, f"req_{index:03d}")
+    return os.path.join(base, _writer_tag(_writer_identity()),
+                        f"req_{index:03d}")
 
 
 def _new_recorder(base: str, index: int) -> AlignRecorder:
@@ -789,10 +844,33 @@ def _new_recorder(base: str, index: int) -> AlignRecorder:
     complete statement, "I am req_000 of some run that recorded an unknown
     number" is not.
     """
-    recorder = AlignRecorder(_dump_dir_for(base, index))
+    identity = _writer_identity()
+    directory = _dump_dir_for(base, index)
+    _refuse_to_overwrite(directory)
+    recorder = AlignRecorder(directory)
     recorder.add_manifest(request_index=index,
-                          dump_requests=_dump_request_limit())
+                          dump_requests=_dump_request_limit(),
+                          **identity)
     return recorder
+
+
+def _refuse_to_overwrite(directory: str) -> None:
+    """A second writer for one directory is a defect, not a retry.
+
+    🔴 Silently overwriting produced artifacts that were well formed,
+    internally consistent, and belonged to a different writer than the reader
+    believed -- and nothing about them looked wrong. Raising here costs a
+    launch; the alternative has already cost a day.
+    """
+    marker = os.path.join(directory, "manifest.json")
+    if not os.path.exists(marker):
+        return
+    raise RuntimeError(
+        f"{directory} already holds a dump. Something else has written it -- "
+        "another data-parallel rank sharing this path, or a re-run into the "
+        "same directory. Refusing rather than overwriting: the result would "
+        "be well formed, internally consistent, and attributed to the wrong "
+        "writer, which is exactly what went unnoticed for a day.")
 
 
 #: How many prefills have been flushed so far this process.
