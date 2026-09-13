@@ -83,6 +83,11 @@ KEY_SEMANTICS: dict = {
     "pre_mix.in": "the decoder layer's `pre_mix` argument [T, 4] fp32; "
                   "absent on layer 0, where it is None",
     "input_ids": "the token ids the model was handed this forward",
+    "engram_hash_ids":
+        "the engram n-gram hash ids, computed once per forward and handed to "
+        "every engram layer. 🔵 The tables are gathered *by these*: a wrong "
+        "id returns a different row of a 189 GiB table and the layer then "
+        "computes correctly on the wrong weights",
     "positions": "the position of each row in its own request",
     "embed.out": "the embedding output, i.e. what the first decoder layer "
                  "receives",
@@ -153,6 +158,21 @@ KEY_SEMANTICS: dict = {
 _ARG_TAPS: tuple[tuple[str, str], ...] = (
     ("residual", "layer.in"),
     ("pre_mix", "pre_mix.in"),
+)
+
+#: Arguments that belong to the forward rather than to a layer: the model
+#: computes them once and hands the same tensor to every layer. Recorded
+#: under the ``prologue`` tag, once, from whichever layer sees them first.
+#:
+#: 🔵 ``engram_hashes`` is here because of what it decides. The engram tables
+#: are gathered **by these ids**: a wrong id returns a different row of a
+#: 189 GiB table, and the layer then computes correctly on the wrong weights.
+#: The symptom of that is structural, present from the first layer, identical
+#: on every request and independent of cross-request state -- which is the
+#: complete description of the defect currently being hunted. It has never
+#: been recorded.
+_FORWARD_ARG_TAPS: tuple[tuple[str, str], ...] = (
+    ("engram_hashes", "engram_hash_ids"),
 )
 
 
@@ -294,6 +314,15 @@ def _record(tag_layer: int, key: str, tensor: torch.Tensor) -> None:
 _CURRENT_POSITIONS: torch.Tensor | None = None
 
 
+#: Protocol key -> the parameter it comes from, for the keyword lookup.
+_ARG_NAME_BY_KEY: dict = {key: name for name, key in _ARG_TAPS}
+
+
+#: Which forward-level arguments have been recorded this forward. Cleared at
+#: the flush, so each forward records its own rather than the first one's.
+_FORWARD_RECORDED: set = set()
+
+
 #: Whether this forward's recording is armed. False until the sequence length
 #: is known, because every ``record()`` scatters into a [seq_len, ...] buffer
 #: and raises without one.
@@ -400,6 +429,8 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
     if not _ARMED:
         return
     _ARMED = False
+    # Per forward, so the next one records its own.
+    _FORWARD_RECORDED.clear()
     from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
 
     rotate_recorder()
@@ -601,7 +632,8 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
         # goes red and the injector quietly compares something else.
         handles.append(
             layer.register_forward_pre_hook(
-                _make_argument_tap(layer_id, _arg_positions(layer))))
+                _make_argument_tap(layer_id, _arg_positions(layer)),
+                with_kwargs=True))
         taps_installed += 1
         for attribute, key, side, parameter in _BOUNDARY_TAPS:
             module = getattr(layer, attribute, None)
@@ -634,11 +666,28 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
 def _make_argument_tap(layer_id: int, positions: dict[str, int]):
     """Record the layer's own inputs, by name, from the args it was given."""
 
-    def _tap(_module: torch.nn.Module, args: tuple) -> None:
-        for key, index in positions.items():
-            if index >= len(args):
+    # ⚠️ with_kwargs. The caller passes some of these by keyword, and a hook
+    # that only sees positional arguments finds nothing and records nothing
+    # -- silently, which is the same failure that left the prologue empty all
+    # day. Caught here by a test whose double passes engram_hashes by
+    # keyword, which is how the real model passes it.
+    def _tap(_module: torch.nn.Module, args: tuple,
+             kwargs: dict | None = None) -> None:
+        for name, key in _FORWARD_ARG_TAPS:
+            if key in _FORWARD_RECORDED:
                 continue
-            value = args[index]
+            value = _named_argument(_module, name, args, kwargs)
+            if isinstance(value, torch.Tensor):
+                _FORWARD_RECORDED.add(key)
+                # Under the prologue tag: the model computes it once for the
+                # whole forward, so tagging it to whichever layer happened to
+                # be first would make it look layer-specific and would put it
+                # somewhere golden does not compare.
+                _record_prologue(key, value)
+        for key, index in positions.items():
+            value = (args[index] if index < len(args) else None)
+            if value is None and kwargs:
+                value = kwargs.get(_ARG_NAME_BY_KEY.get(key, ""))
             # None is the honest answer for layer 0's residual and pre_mix,
             # and it is recorded as absence rather than as a fabricated
             # identity: "layer 0 has no pre_mix" is a fact the dump has to be

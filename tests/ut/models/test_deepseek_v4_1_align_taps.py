@@ -1178,3 +1178,86 @@ def test_the_kv_layout_is_declared_with_what_is_not_established():
 def test_the_renamed_key_says_dumps_across_it_are_not_comparable():
     text = align_taps.KEY_SEMANTICS["attn.in"]
     assert "must not be compared" in text
+
+
+# ------------------------- the forward-level arguments
+
+class _EngramLayer(_Layer):
+    def forward(self, x, positions, input_ids=None, pre_mix=None,
+                post_mix=None, res_mix=None, residual=None,
+                engram_hashes=None, engram_mask=None):
+        return self.ffn(positions, self.attn(positions, x))
+
+
+class _EngramModel(torch.nn.Module):
+    def __init__(self, record, n=3):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(_EngramLayer(record)
+                                          for _ in range(n))
+        self.start_layer = 0
+
+    def forward(self, x, positions, engram_hashes=None):
+        for layer in self.layers:
+            x = layer(x, positions, engram_hashes=engram_hashes)
+        return x
+
+
+def test_engram_hash_ids_are_recorded_once_under_prologue(monkeypatch,
+                                                          with_recorder):
+    """🔵 The engram tables are gathered *by these ids*: a wrong id returns a
+    different row of a 189 GiB table and the layer then computes correctly on
+    the wrong weights -- structural, present from the first layer, identical
+    on every request, independent of cross-request state. That is the whole
+    description of the defect being hunted, and it has never been recorded.
+    """
+    recorded = []
+    monkeypatch.setattr(align_taps, "_record_prologue",
+                        lambda key, tensor: recorded.append(key))
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 3)
+    monkeypatch.setattr(align_taps, "_single_request_query_rows", lambda: 3)
+    align_taps._FORWARD_RECORDED.clear()
+
+    model = _EngramModel(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3),
+              engram_hashes=torch.arange(6).reshape(3, 2))
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Once, not once per layer: the model computes it for the whole forward,
+    # and three copies under three layer tags would make it look
+    # layer-specific and put it where golden does not compare.
+    assert recorded == ["engram_hash_ids"], recorded
+
+
+def test_a_forward_without_engram_hashes_records_nothing(monkeypatch,
+                                                         with_recorder):
+    """Two arms. Absent is absent -- a model with no engram layers has no
+    hashes, and that is not a defect."""
+    recorded = []
+    monkeypatch.setattr(align_taps, "_record_prologue",
+                        lambda key, tensor: recorded.append(key))
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 3)
+    monkeypatch.setattr(align_taps, "_single_request_query_rows", lambda: 3)
+    align_taps._FORWARD_RECORDED.clear()
+
+    model = _EngramModel(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert recorded == []
+
+
+def test_the_next_forward_records_its_own(monkeypatch, with_recorder):
+    """⚠️ Cleared at the flush. Otherwise the second forward keeps the
+    first's ids, and a stale tensor is in range and wrong -- the failure this
+    module has already had once with positions."""
+    align_taps._FORWARD_RECORDED.add("engram_hash_ids")
+    align_taps._ARMED = True
+    align_taps._flush_and_rotate(None, (), None)
+    assert "engram_hash_ids" not in align_taps._FORWARD_RECORDED
