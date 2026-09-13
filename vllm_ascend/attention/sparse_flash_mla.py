@@ -99,7 +99,21 @@ def _match_topk_length_rank(kwargs: dict) -> None:
     **derived from the table**, so it cannot drift from it the way a second
     ``unsqueeze`` at each builder could. And those builders are shared with
     V4.0 (see ``_add_ori_topk_length``'s note), whose call this must not
-    change -- this wrapper is the V4.1-only adapter.
+    change.
+
+    ⚠️ Scope, corrected: this wrapper is **not** V4.1-only. It is the adapter
+    the **A5 bf16 KV plan** selects (``dsa_attn_kv_plan.py:255``, under
+    ``is_a5_bf16_kv_enabled``), and V4.0 on that plan reaches it too. The
+    reshape is right for V4.0 as well, precisely because it is derived from
+    the table rather than assumed -- but a rule that is genuinely V4.1-only
+    does not belong in this file, and "the V4.1 adapter" is how one would end
+    up here.
+
+    ⚠️ A length with no table is skipped rather than refused. Both
+    ``_add_ori_topk_length`` call sites set the table on the adjacent line, so
+    no input reaches that branch today; a guard there would be one that cannot
+    go red. It becomes reachable the moment a call site publishes a count
+    without the indices it counts, and the symptom is the EZ0011 above.
 
     ⚠️ Three states, not two: shapes already agree / the count can be reshaped
     onto the table / it cannot. The third raises. Reshaping a count whose
