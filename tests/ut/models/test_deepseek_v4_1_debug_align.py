@@ -339,3 +339,82 @@ def test_the_scope_says_isolation_is_partial(tmp_path):
     assert "PARTIAL isolation" in scope["note"]
     assert any("KV cache" in item
                for item in scope["per_layer"]["3"]["not_isolated"])
+
+
+# ------------------------ two dumps in one process, for the strongest compare
+
+def test_one_request_keeps_the_old_layout(tmp_path, monkeypatch):
+    """Unchanged when only one dump is asked for, so every existing tool and
+    every earlier dump keeps its shape."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", raising=False)
+    da.reset_for_test()
+
+    rec = da.get_recorder()
+    assert rec is not None and rec.dump_dir == str(tmp_path)
+
+
+def test_two_requests_go_to_numbered_directories(tmp_path, monkeypatch):
+    """🔴 The comparison this exists for: same server, same weights, same
+    prompt, one request before a different one has run and one after. A
+    correct forward makes those byte-identical."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "2")
+    da.reset_for_test()
+
+    first = da.get_recorder()
+    assert first.dump_dir.endswith("req_000")
+    first.set_seq_len(SEQ_LEN)
+    first.record_whole("layer_00", "attn.out", torch.zeros(4))
+
+    assert da.rotate_recorder() is True
+    second = da.get_recorder()
+    assert second is not first and second.dump_dir.endswith("req_001")
+    second.set_seq_len(SEQ_LEN)
+    second.record_whole("layer_00", "attn.out", torch.ones(4))
+
+    assert da.rotate_recorder() is False
+    assert os.path.exists(os.path.join(first.dump_dir, "layer_00.safetensors"))
+    assert os.path.exists(os.path.join(second.dump_dir,
+                                       "layer_00.safetensors"))
+
+
+def test_a_later_request_does_not_overwrite_the_dumps(tmp_path, monkeypatch):
+    """⚠️ Recording stops once the requested dumps are written. A third
+    request quietly replacing the second would destroy half the comparison
+    and leave two well-formed directories behind."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "1")
+    da.reset_for_test()
+
+    rec = da.get_recorder()
+    rec.set_seq_len(SEQ_LEN)
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    assert da.rotate_recorder() is False
+    assert da.get_recorder() is None
+
+
+def test_a_typo_in_the_count_is_refused(tmp_path, monkeypatch):
+    """A silent fallback to 1 makes the two-dump comparison read as 'the
+    second request was never served'."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "two")
+    da.reset_for_test()
+
+    with pytest.raises(ValueError, match="is not a number"):
+        da.get_recorder()
+
+
+def test_zero_dumps_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "0")
+    da.reset_for_test()
+
+    with pytest.raises(ValueError, match="would record nothing"):
+        da.get_recorder()
+
+
+def test_rotation_without_a_recorder_is_not_an_error(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_DUMP_DIR", raising=False)
+    da.reset_for_test()
+    assert da.rotate_recorder() is False

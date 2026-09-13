@@ -130,6 +130,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Per-layer output fingerprints in the log: "all", or a comma list of
     # layer indices. Empty (the default) registers no hooks at all.
     "VLLM_ASCEND_DSV41_TRACE_LAYERS": lambda: os.getenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", ""),
+    # How many prefills to record, each into its own req_NNN directory.
+    # 1 (the default) keeps the single-directory layout every existing tool
+    # reads.
+    "VLLM_ASCEND_DSV41_DUMP_REQUESTS": lambda: os.getenv("VLLM_ASCEND_DSV41_DUMP_REQUESTS", "1"),
     # DeepSeek-V4.1 kv-cache spec: "1" makes the layer's configured
     # compress_ratios entry -- 0 included -- reach the metadata builder as its
     # own spec field. Default "0" keeps today's behaviour, where ratio 0 is

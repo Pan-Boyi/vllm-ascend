@@ -80,7 +80,12 @@ def _metadata(num_tokens=4, num_reqs=2, max_seq_len=64):
                               dtype=torch.int32)[:num_reqs],
         query_start_loc=torch.tensor([0, num_tokens // 2, num_tokens],
                                      dtype=torch.int32),
-        block_table=torch.zeros((num_reqs, 4), dtype=torch.int32))
+        block_table=torch.zeros((num_reqs, 4), dtype=torch.int32),
+        # ⚠️ Carried because AscendDSAReqMetadata carries it. A double that
+        # stops one field short of the real thing makes anything reading that
+        # field untestable, which is how this fixture had to be repaired
+        # twice in one day.
+        storage_block_size=128)
     return SimpleNamespace(req_metadata=req, max_seq_len=max_seq_len)
 
 

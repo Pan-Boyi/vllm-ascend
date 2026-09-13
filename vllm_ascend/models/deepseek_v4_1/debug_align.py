@@ -692,7 +692,7 @@ def _init() -> None:
 
     dump_dir = _env("VLLM_ASCEND_DSV41_DUMP_DIR")
     if dump_dir:
-        _recorder = AlignRecorder(dump_dir)
+        _recorder = AlignRecorder(_dump_dir_for(dump_dir, 0))
 
     mode = _env("VLLM_ASCEND_DSV41_FORCE_ROUTE") or "off"
     if mode != "off":
@@ -709,6 +709,98 @@ def _init() -> None:
             routing_plan_accum_dtype=(_injector.accum_dtype()
                                       if _injector else None),
         )
+
+
+#: How many prefills to record, each into its own directory. Default 1 keeps
+#: today's single dump.
+#:
+#: 🔴 Two is the number this exists for. The strongest available comparison
+#: is not "our dump against golden" -- it is **our dump against our own**:
+#: the same server, the same weights, the same prompt, one request before a
+#: different one has run and one after. A correct forward makes those two
+#: byte-identical, and they are already known to produce different text, so
+#: the first tensor that differs is the entry point for cross-request state,
+#: located to a layer and a key. That comparison needs no reference, no
+#: tolerance and no discussion of precision, and it cannot come back empty.
+def _dump_request_limit() -> int:
+    raw = _env("VLLM_ASCEND_DSV41_DUMP_REQUESTS") or "1"
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"VLLM_ASCEND_DSV41_DUMP_REQUESTS={raw!r} is not a number. "
+            "Refusing rather than falling back to 1: a typo that silently "
+            "records one dump makes the two-dump comparison read as 'the "
+            "second request was never served'.") from None
+    if value < 1:
+        raise ValueError(
+            f"VLLM_ASCEND_DSV41_DUMP_REQUESTS={value} would record nothing.")
+    return value
+
+
+def _dump_dir_for(base: str, index: int) -> str:
+    """One directory per recorded prefill, numbered in arrival order.
+
+    Numbered rather than named after the request id: the comparison is
+    positional ("the first apple" against "the third"), and a directory named
+    after an id that the log also has to be joined against is one more step
+    between the reader and the answer.
+    """
+    if _dump_request_limit() == 1:
+        # Unchanged layout when only one dump is asked for, so every existing
+        # tool and every earlier dump keeps its shape.
+        return base
+    return os.path.join(base, f"req_{index:03d}")
+
+
+#: How many prefills have been flushed so far this process.
+_DUMPS_DONE = 0
+
+
+def rotate_recorder() -> bool:
+    """Flush the current dump and open the next one, if any are left.
+
+    Returns whether recording continues. Called at the end of a prefill
+    forward, which is where "this request's tensors are all in" is true and
+    nothing later can still scatter into the buffers.
+
+    ⚠️ One dump per *prefill forward*, not per request. Under chunked prefill
+    a single request spans several forwards and would be split across
+    directories. That is stated rather than guarded against: at the lengths
+    this is used for there is one chunk, and a guard that cannot be exercised
+    is worse than a sentence that can be read.
+    """
+    global _recorder, _DUMPS_DONE
+
+    if _recorder is None:
+        return False
+    base = _env("VLLM_ASCEND_DSV41_DUMP_DIR")
+    limit = _dump_request_limit()
+    _recorder.flush()
+    _DUMPS_DONE += 1
+
+    from vllm.logger import logger
+
+    if _DUMPS_DONE >= limit:
+        logger.info(
+            "DSV4.1 alignment: %d of %d requested dumps written; recording "
+            "stops here. A later request will NOT overwrite them.",
+            _DUMPS_DONE, limit)
+        _recorder = None
+        return False
+    _recorder = AlignRecorder(_dump_dir_for(base, _DUMPS_DONE))
+    logger.info(
+        "DSV4.1 alignment: dump %d of %d written; next request records into "
+        "%s.", _DUMPS_DONE, limit, _recorder.dump_dir)
+    return True
+
+
+def reset_for_test() -> None:
+    global _recorder, _injector, _initialised, _DUMPS_DONE
+    _recorder = None
+    _injector = None
+    _initialised = False
+    _DUMPS_DONE = 0
 
 
 def get_recorder() -> Optional[AlignRecorder]:

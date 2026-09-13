@@ -762,3 +762,99 @@ def test_arming_is_reported_too(monkeypatch, with_recorder):
         reset_for_test()
 
     assert any("recording armed at seq_len=77" in line for line in lines), lines
+
+
+def test_a_recorded_prefill_flushes_and_rotates(monkeypatch, with_recorder):
+    """Flushed at the end of the forward, which is what makes two dumps in
+    one server possible."""
+    rotations = []
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    monkeypatch.setattr(debug_align, "rotate_recorder",
+                        lambda: rotations.append(1) or True)
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 5)
+
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert rotations == [1]
+
+
+def test_a_disarmed_forward_does_not_flush(monkeypatch, with_recorder):
+    """⚠️ A decode step disarms, and flushing there would write an empty dump
+    over a real one -- a well-formed artifact that says nothing and reads as
+    if it did, which is the trace-sentinel failure again."""
+    rotations = []
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    class _Unsized:
+        seq_len = None
+
+        def record_layer(self, *a):
+            pass
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Unsized())
+    monkeypatch.setattr(debug_align, "rotate_recorder",
+                        lambda: rotations.append(1) or True)
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: None)
+
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    assert rotations == []
+
+
+def test_the_disarm_line_says_which_step_came_up_empty(monkeypatch,
+                                                       with_recorder):
+    """🔴 "No sequence length" has four causes needing four different next
+    actions. Reporting only the conclusion makes a flight that disarms cost a
+    second flight to find out why -- and this path has already been debugged
+    twice from the outside."""
+    import logging
+
+    from vllm.logger import logger
+
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+    from vllm_ascend.models.deepseek_v4_1.switch_log import reset_for_test
+
+    class _Unsized:
+        seq_len = None
+
+        def record_layer(self, *a):
+            pass
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Unsized())
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: None)
+
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    reset_for_test()
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        model(torch.randn(3, 4), torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+        reset_for_test()
+
+    disarm = [line for line in lines if "recording is disabled" in line]
+    assert disarm, lines
+    # Off the model path there is no forward context, which is one of the
+    # four and must be named as that one rather than as "not available".
+    assert "no forward context here at all" in disarm[0], disarm

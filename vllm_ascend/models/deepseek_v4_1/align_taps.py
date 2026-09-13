@@ -180,13 +180,37 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
         _ARMED = False
         _report_disarmed(
             "no single request's sequence length was available from the "
-            "forward context and the recorder has none of its own (profile "
-            "run, dummy run, or a batch this dump cannot be addressed "
-            "against)")
+            "forward context and the recorder has none of its own. "
+            + _why_no_seq_len())
         return
     recorder.set_seq_len(seq_len)
     _ARMED = True
     _report_armed(seq_len)
+
+
+def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
+                      _output) -> None:
+    """Write this prefill's dump and open the next one.
+
+    🔴 Flushing here rather than at process exit is what makes two dumps in
+    one server possible, and two dumps in one server is the comparison that
+    needs no reference: same weights, same prompt, one request before a
+    different one has run and one after. A correct forward makes those
+    byte-identical, and they are already known to produce different text.
+
+    Only when this forward actually recorded something. A decode step
+    disarms, and flushing there would write an empty dump over a real one --
+    the same failure as the trace's sentinel, where a well-formed artifact
+    says nothing and reads as if it did.
+    """
+    global _ARMED
+
+    if not _ARMED:
+        return
+    _ARMED = False
+    from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
+
+    rotate_recorder()
 
 
 def _report_armed(seq_len: int) -> None:
@@ -205,6 +229,45 @@ def _report_armed(seq_len: int) -> None:
         "alignment recording armed at seq_len=%d. If a 'recording is "
         "disabled' line appeared before this one it was a profile or dummy "
         "forward, not this run's request.", seq_len)
+
+
+def _why_no_seq_len() -> str:
+    """Which step of the lookup came up empty.
+
+    🔴 "No sequence length" has four different causes needing four different
+    next actions: no forward context at all (profile run), metadata that is
+    not the per-layer dict this reads, a dict whose entries carry no
+    req_metadata, or entries whose seq_lens is empty. Reporting only the
+    conclusion makes a flight that disarms cost a second flight to find out
+    why -- and this path has already been debugged twice from the outside.
+    """
+    from vllm.forward_context import get_forward_context
+
+    try:
+        context = get_forward_context()
+    except Exception:                                        # noqa: BLE001
+        return "There is no forward context here at all (profile run)."
+    metadata = getattr(context, "attn_metadata", None)
+    if metadata is None:
+        return "The forward context carries attn_metadata=None."
+    if not isinstance(metadata, dict):
+        return (f"attn_metadata is {type(metadata).__name__}, not the "
+                "per-layer dict this reads; on this path the length lives "
+                "somewhere else.")
+    if not metadata:
+        return "attn_metadata is an empty dict."
+    with_req = [k for k, v in metadata.items()
+                if getattr(v, "req_metadata", None) is not None]
+    if not with_req:
+        return (f"none of the {len(metadata)} attn_metadata entries carries "
+                f"req_metadata (keys: {sorted(metadata)[:4]}).")
+    shapes = []
+    for key in with_req[:4]:
+        lens = getattr(getattr(metadata[key], "req_metadata", None),
+                       "seq_lens", None)
+        shapes.append((key, None if lens is None else tuple(lens.shape)))
+    return ("attn_metadata entries carry req_metadata but no usable "
+            f"seq_lens: {shapes}.")
 
 
 def _report_disarmed(reason: str) -> None:
@@ -269,6 +332,8 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     # until the buffer can be sized.
     handles.append(inner.register_forward_pre_hook(_arm_recording))
     handles.append(inner.register_forward_pre_hook(_capture_positions))
+    # And after everything, where "this request's tensors are all in" is true.
+    handles.append(inner.register_forward_hook(_flush_and_rotate))
     # Counted apart from the positions capture, which always registers. Using
     # len(handles) would have made the "nothing was tapped" branch below
     # unreachable -- a guard that cannot fire, which is worse than none
