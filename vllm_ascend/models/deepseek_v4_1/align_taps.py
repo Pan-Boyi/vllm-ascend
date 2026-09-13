@@ -96,6 +96,35 @@ def _first_tensor(value: Any) -> torch.Tensor | None:
     return None
 
 
+def _armed_recorder():
+    """The recorder, or ``None`` when this forward must not be recorded.
+
+    🔴 The single door. Every path that writes a tensor goes through this one
+    call, because the previous arrangement -- each writer fetching the
+    recorder and checking ``_ARMED`` itself -- had exactly the failure this
+    project keeps producing: a new writer that does not know about the check.
+
+    Measured twice. First ``_record_prologue`` was a second writer of the same
+    shape and was caught by a text match. Then ``_record_with`` -- the inline
+    ``tap`` API -- had a *different* shape, so the same text match did not
+    reach it, and a decode step's tap called ``record()`` against a recorder
+    that had no sequence length yet:
+
+        RuntimeError: set_seq_len() must be called before record(),
+                      normally from the prologue hook
+
+    Enumerating writers by pattern finds the writers that look like the ones
+    you already know about. One door, plus a test that walks this module's
+    AST for ``recorder.record*`` calls and fails on any that did not come
+    through it, finds the ones that do not.
+    """
+    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
+
+    if not _ARMED:
+        return None
+    return get_recorder()
+
+
 def _record(tag_layer: int, key: str, tensor: torch.Tensor) -> None:
     """One tensor into the recorder, addressed by global sequence position.
 
@@ -103,11 +132,10 @@ def _record(tag_layer: int, key: str, tensor: torch.Tensor) -> None:
     the forward, not to the tap: a cached one would survive into the next
     step and scatter this step's rows onto last step's positions.
     """
-    from vllm_ascend.models.deepseek_v4_1.debug_align import (current_row_to_pos,
-                                                              get_recorder)
+    from vllm_ascend.models.deepseek_v4_1.debug_align import current_row_to_pos
 
-    recorder = get_recorder()
-    if recorder is None or not _ARMED:
+    recorder = _armed_recorder()
+    if recorder is None:
         return
     positions = _current_positions()
     if positions is None:
@@ -496,11 +524,10 @@ def _record_prologue(key: str, tensor: torch.Tensor) -> None:
     tensors in their own file, and a per-layer tag here would put them in
     layer_00 where nothing compares them.
     """
-    from vllm_ascend.models.deepseek_v4_1.debug_align import (
-        current_row_to_pos, get_recorder)
+    from vllm_ascend.models.deepseek_v4_1.debug_align import current_row_to_pos
 
-    recorder = get_recorder()
-    if recorder is None or not _ARMED:
+    recorder = _armed_recorder()
+    if recorder is None:
         return
     positions = _current_positions()
     if positions is None:
@@ -833,9 +860,7 @@ def tap_whole(layer_id: int, key: str, tensor: torch.Tensor) -> None:
     neither has a token axis, so scattering them by row would be meaningless
     and the coverage assertion would never be satisfied.
     """
-    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
-
-    recorder = get_recorder()
+    recorder = _armed_recorder()
     if recorder is None:
         return
     recorder.record_whole(f"layer_{layer_id:02d}", key, tensor)
@@ -843,10 +868,9 @@ def tap_whole(layer_id: int, key: str, tensor: torch.Tensor) -> None:
 
 def _record_with(layer_id: int, key: str, tensor: torch.Tensor,
                  positions: torch.Tensor) -> None:
-    from vllm_ascend.models.deepseek_v4_1.debug_align import (
-        current_row_to_pos, get_recorder)
+    from vllm_ascend.models.deepseek_v4_1.debug_align import current_row_to_pos
 
-    recorder = get_recorder()
+    recorder = _armed_recorder()
     if recorder is None:
         return
     row_to_pos = current_row_to_pos(positions)

@@ -399,8 +399,16 @@ def test_a_tap_before_set_seq_len_says_what_is_missing(prologue_recorder,
     import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
 
     monkeypatch.setattr(align_taps, "_CURRENT_POSITIONS", torch.arange(3))
+    # ⚠️ Armed on purpose. An *unarmed* tap is now silent -- that is the fix
+    # for the forwards that must not be recorded at all. What is still a
+    # programming error, and still has to raise, is reaching a tap while
+    # armed against a recorder that was never given a length: the two cases
+    # were one before, and only one of them was a defect.
+    monkeypatch.setattr(align_taps, "_ARMED", True)
 
     class _Unprepared:
+        seq_len = None
+
         def record_layer(self, *a, **k):
             raise RuntimeError(
                 "set_seq_len() must be called before record()")
@@ -985,3 +993,88 @@ def test_an_unknown_row_count_does_not_block_recording(monkeypatch,
     demanding the length come from the forward context."""
     with_recorder.clear()
     assert _armed_with(monkeypatch, with_recorder, seq_len=3, rows=None)
+
+
+# ------------------------------- every writer goes through the same door
+
+def test_every_recording_call_comes_through_the_armed_door():
+    """🔴 Enumerating writers by pattern finds the ones that look like the
+    writers you already know about.
+
+    _record_prologue was a second writer of the same shape and a text match
+    caught it. _record_with -- the inline tap API -- had a different shape,
+    the same text match did not reach it, and a decode step's tap called
+    record() against a recorder with no sequence length. This walks the AST
+    instead, so a writer that looks like nothing already here still has to
+    come through _armed_recorder.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(align_taps)))
+    writers = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        records = [n for n in ast.walk(func)
+                   if isinstance(n, ast.Call)
+                   and isinstance(n.func, ast.Attribute)
+                   and n.func.attr in ("record", "record_layer",
+                                       "record_whole")]
+        if records:
+            writers.append(func)
+
+    assert writers, "no recording calls found; this check is not checking"
+    for func in writers:
+        names = {n.func.id for n in ast.walk(func)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "_armed_recorder" in names, (
+            f"{func.name} writes to the recorder without going through "
+            "_armed_recorder; a forward that must not be recorded will reach "
+            "it, and record() raises when the buffer has no sequence length")
+
+
+def test_the_inline_tap_is_silent_when_not_armed(monkeypatch, with_recorder):
+    """The specific path that raised: tap() during a decode step."""
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    class _Explodes:
+        seq_len = None
+
+        def record_layer(self, *a):
+            raise AssertionError("recorded while disarmed")
+
+        def record_whole(self, *a):
+            raise AssertionError("recorded while disarmed")
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Explodes())
+    monkeypatch.setattr(align_taps, "_ARMED", False)
+
+    align_taps.tap(0, "sa_in.q", torch.zeros(1, 4), torch.tensor([0]))
+    align_taps.tap_whole(0, "sa_in.attn_sink", torch.zeros(4))
+
+
+def test_the_inline_tap_records_when_armed(monkeypatch, with_recorder):
+    """Two arms: the door must open."""
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+
+    written = []
+
+    class _Recorder:
+        seq_len = 4
+
+        def record_layer(self, *a):
+            written.append("layer")
+
+        def record_whole(self, *a):
+            written.append("whole")
+
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Recorder())
+    monkeypatch.setattr(debug_align, "current_row_to_pos",
+                        lambda positions: positions.to(torch.int64))
+    monkeypatch.setattr(align_taps, "_ARMED", True)
+
+    align_taps.tap(0, "sa_in.q", torch.zeros(1, 4), torch.tensor([0]))
+    align_taps.tap_whole(0, "sa_in.attn_sink", torch.zeros(4))
+    assert written == ["layer", "whole"]
