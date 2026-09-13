@@ -382,11 +382,21 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
     # because it reads as coverage. So the rule is gone and the two conditions
     # it would have depended on are pinned by tests instead, where removing
     # one of them turns red rather than quietly re-opening this.
-        if cmp_ratio == 1:
-            residual = kwargs.get("cmp_residual_kv")
-            _check(residual is not None,
-                   "cmp_ratio=1 with a compressed stream additionally requires "
-                   "cmp_residual_kv")
+        residual = kwargs.get("cmp_residual_kv")
+        # 🔴 Not "cmp_ratio == 1 requires it". The operator does require it
+        # there, but these kwargs are pre-adapter and the adapter fills it in
+        # (`seqused_ori_kv % cmp_ratio`, zeros at ratio 1) exactly when a
+        # compressed stream is present. Demanding it here refuses a call that
+        # would have completed -- which is what stopped the first launch to
+        # reach layer 20, the first ratio-1 layer.
+        #
+        # Fourth time a rule in this function has been the operator's rather
+        # than the caller's. The function speaks the caller's vocabulary
+        # throughout (seqused_kv, not seqused_ori_kv); a rule about what the
+        # operator receives cannot be evaluated one step before the step that
+        # produces it. What is still checked is the shape of a residual that
+        # *was* supplied -- that part is about this caller's own value.
+        if residual is not None:
             # Despite the name it is not KV data: the operator rejects anything
             # but a 1-D tensor ("incorrect shape dim 3. It should be 1").
             _check(residual.ndim == 1,

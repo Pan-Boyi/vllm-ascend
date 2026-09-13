@@ -94,14 +94,33 @@ def test_the_compressed_configuration_is_accepted(q):
     assert _validate(_with_compressed(), q) is not None
 
 
-def test_ratio_one_with_a_compressed_stream_needs_a_residual(q):
-    """Layers 20..39: ratio 1 meaning 'compressed, pooling disabled'."""
+def test_ratio_one_with_a_compressed_stream_may_leave_the_residual_to_the_adapter(q):
+    """Layers 20..39: ratio 1 meaning 'compressed, pooling disabled'.
+
+    The operator does require cmp_residual_kv there. This function used to
+    demand it, and that refused a call that would have completed: these kwargs
+    are pre-adapter, and the adapter fills the residual in
+    (seqused_ori_kv % cmp_ratio, zeros at ratio 1) whenever a compressed
+    stream is present. The rule stopped the first launch to reach layer 20 --
+    the first ratio-1 layer -- and it is the fourth time a rule here has been
+    the operator's rather than the caller's.
+    """
     ok = _with_compressed(cmp_ratio=1,
                           cmp_residual_kv=torch.zeros(NUM_REQUESTS, dtype=torch.int32))
     assert _validate(ok, q) is not None
 
-    with pytest.raises(ValueError, match="additionally requires"):
-        _validate(_with_compressed(cmp_ratio=1), q)
+    # Absent is fine; the adapter derives it.
+    assert _validate(_with_compressed(cmp_ratio=1), q) is not None
+
+
+def test_a_supplied_residual_is_still_held_to_its_shape(q):
+    """What remains checkable here: the caller's own value. Despite the name
+    it is one number per request, not KV data -- the operator's words are
+    "incorrect shape dim 3. It should be 1"."""
+    with pytest.raises(ValueError, match="It should be 1"):
+        _validate(_with_compressed(
+            cmp_ratio=1,
+            cmp_residual_kv=torch.zeros(NUM_REQUESTS, 8, 512)), q)
 
 
 # -- one test per stated constraint ------------------------------------------
