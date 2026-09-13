@@ -153,6 +153,23 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         self.topk_indices_buffer[:num_tokens] = NO_TOKEN
         flat = topk_idxs.squeeze(1) if topk_idxs.ndim == 3 else topk_idxs
         self.topk_indices_buffer[:num_tokens, :self.topk_tokens] = flat
+
+        # 🔴 The per-row count of real entries, published beside the buffer.
+        #
+        # Without it the attention call supplies cmp_sparse_indices and no
+        # cmp_topk_length, and the operator then treats the whole row as
+        # valid -- padding included -- and gathers at the -1 slots. That is
+        # the same mechanism kernel proved single-variable on the *ori* side:
+        # the identical table crashes when the declared length is the full
+        # width and passes at its true length.
+        #
+        # Counted here rather than at the consumer because this is where the
+        # rows are written and where -1 means what it means. A count taken
+        # downstream would be a second source, free to disagree with the table
+        # it describes.
+        self.topk_lengths_buffer = (flat >= 0).sum(
+            dim=-1, dtype=torch.int32) if flat.numel() else torch.zeros(
+                num_tokens, dtype=torch.int32, device=flat.device)
         return self.topk_indices_buffer
 
     def _qli_metadata(self, req, seqused_k, cmp_residual_k, max_seq_len: int,

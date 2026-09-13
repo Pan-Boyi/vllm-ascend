@@ -427,8 +427,38 @@ def test_the_three_dimensional_form_is_accepted():
         **_common(attends_compressed=True, cmp_ratio=2,
                   cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
                   seqused_cmp_kv=torch.ones(NUM_REQUESTS, dtype=torch.int32),
-                  cmp_sparse_indices=three_d))
+                  cmp_sparse_indices=three_d,
+                  cmp_topk_length=torch.full((NUM_TOKENS,), 512,
+                                             dtype=torch.int32)))
     assert built["cmp_sparse_indices"].shape == (NUM_TOKENS, 1, 512)
+    assert built["cmp_topk_length"].numel() == NUM_TOKENS
+
+
+def test_compressed_indices_without_their_length_are_refused():
+    """The same pairing the ori side enforces, and the same mechanism: the
+    selection buffer is -1 padded, so declaring the whole row valid sends the
+    kernel to gather at the padding. Measured single-variable on the ori
+    side -- identical table, crashes at the full width, passes at its true
+    length."""
+    with pytest.raises(ValueError, match="without cmp_topk_length"):
+        build_sparse_flash_mla_kwargs(
+            **_common(attends_compressed=True, cmp_ratio=2,
+                      cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+                      seqused_cmp_kv=torch.ones(NUM_REQUESTS, dtype=torch.int32),
+                      cmp_sparse_indices=torch.zeros(NUM_TOKENS, 1, 512,
+                                                     dtype=torch.int32)))
+
+
+def test_the_indexer_publishes_the_count_rather_than_the_consumer_deriving_it():
+    """A count taken at the consumer is a second source, free to disagree with
+    the table it describes. It is computed where the rows are written."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import sparse_indexer
+
+    source = inspect.getsource(sparse_indexer.AscendSparseAttnIndexer.forward_oot)
+    assert "self.topk_lengths_buffer" in source
+    assert "(flat >= 0).sum(" in source
 
 
 def test_a_row_count_that_is_not_the_token_count_is_refused():
@@ -511,21 +541,21 @@ class _Layer:
         self.is_kv_source = is_kv_source
         self.compressed_cache_prefix = compressed_prefix
 
-    _compressed_block_table = None  # bound below
+    _compressed_group_metadata = None  # bound below
 
 
 def _bind():
     from vllm_ascend.models.deepseek_v4_1.attention import \
         AscendDeepseekV41Attention
 
-    _Layer._compressed_block_table = \
-        AscendDeepseekV41Attention._compressed_block_table
+    _Layer._compressed_group_metadata = \
+        AscendDeepseekV41Attention._compressed_group_metadata
     return _Layer
 
 
-def _meta(block_table):
+def _meta(block_table, descriptor=None):
     return type("M", (), {"req_metadata": type("R", (), {
-        "block_table": block_table})()})()
+        "block_table": block_table, "sas_metadata": descriptor})()})()
 
 
 def test_a_consumer_layer_uses_its_sources_block_table():
@@ -535,29 +565,31 @@ def test_a_consumer_layer_uses_its_sources_block_table():
     layer = _bind()(is_kv_source=False, compressed_prefix="layers.0.attn")
     mine = torch.zeros(3, 4, dtype=torch.int32)
     theirs = torch.ones(3, 4, dtype=torch.int32)
-    table = layer._compressed_block_table(
+    got = layer._compressed_group_metadata(
         {"layers.2.attn": _meta(mine), "layers.0.attn": _meta(theirs)})
-    assert table is theirs
+    assert got.block_table is theirs
 
 
 def test_a_kv_source_layer_uses_its_own():
     layer = _bind()(is_kv_source=True)
     mine = torch.zeros(3, 4, dtype=torch.int32)
-    assert layer._compressed_block_table({"layers.2.attn": _meta(mine)}) is mine
+    got = layer._compressed_group_metadata({"layers.2.attn": _meta(mine)})
+    assert got.block_table is mine
 
 
 def test_a_missing_group_is_refused_rather_than_falling_back():
     """The fallback is the defect: this layer's own table is always available
     and always wrong for that cache."""
     layer = _bind()(is_kv_source=False, compressed_prefix="layers.0.attn")
-    with pytest.raises(ValueError, match="in\n?\\s*range, wrong blocks"):
-        layer._compressed_block_table({"layers.2.attn": _meta(torch.zeros(1))})
+    with pytest.raises(ValueError, match="both well-formed, both wrong"):
+        layer._compressed_group_metadata(
+            {"layers.2.attn": _meta(torch.zeros(1))})
 
 
 def test_a_consumer_with_no_source_prefix_is_refused():
     layer = _bind()(is_kv_source=False, compressed_prefix=None)
     with pytest.raises(ValueError, match="no compressed_cache_prefix"):
-        layer._compressed_block_table({})
+        layer._compressed_group_metadata({})
 
 
 def test_the_call_site_does_not_reuse_the_swa_table():
@@ -570,4 +602,39 @@ def test_the_call_site_does_not_reuse_the_swa_table():
 
     source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
     assert "cmp_block_table = req.block_table" not in source
-    assert "cmp_block_table = self._compressed_block_table(" in source
+    assert "cmp_req = self._compressed_group_metadata(" in source
+
+
+def test_the_descriptor_comes_from_the_compressed_group_when_there_is_one():
+    """The kernel takes its tiling from this. The SWA group's spec reports no
+    compression, so its descriptor is built at ratio 1 -- well-formed, and the
+    wrong tiling for a ratio-2 layer. V4.0 makes the same distinction
+    (dsa_v1.py:2574-2580, common_attn_metadata vs swa_metadata)."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    assert "metadata=(cmp_req or req).sas_metadata," in source, (
+        "the descriptor is being taken from the SWA group unconditionally")
+    assert "metadata=req.sas_metadata," not in source
+
+
+def test_every_compressed_argument_comes_from_the_compressed_group():
+    """Four arguments describe the compressed stream; all four must come from
+    the group that owns it. Sourcing any of them from the SWA group is not a
+    shape error and nothing downstream can see it."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    for arg in ("cmp_block_table = cmp_req.block_table",
+                "cmp_req.seqused_cmp_kv",
+                "cmp_req.qli_cmp_residual_k"):
+        assert arg in source, arg
+    for wrong in ("req.seqused_cmp_kv if attends",
+                  "req.qli_cmp_residual_k if attends"):
+        assert wrong not in source, wrong

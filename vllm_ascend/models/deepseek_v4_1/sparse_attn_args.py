@@ -517,6 +517,9 @@ def build_sparse_flash_mla_kwargs(
     #: are supplied; see ori_sparse_selection for why the default is unsafe.
     ori_topk_length: torch.Tensor | None = None,
     cmp_sparse_indices: torch.Tensor | None = None,
+    #: Valid entries per row of cmp_sparse_indices. Required whenever the
+    #: compressed indices are supplied, for the reason ori_topk_length is.
+    cmp_topk_length: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Assemble one call, mirroring ``DSAImpl._forward_attention``.
 
@@ -604,6 +607,19 @@ def build_sparse_flash_mla_kwargs(
                    "cmp_sparse_indices must have one row per query token",
                    f"got {cmp_sparse_indices.shape[0]} rows for "
                    f"{q.shape[0]} query tokens")
+            # The same pairing the ori side enforces. The selection buffer is
+            # -1 padded, and omitting the length declares the padding valid --
+            # the kernel then gathers at those slots. Measured single-variable
+            # on the ori side: identical table, crashes at the full width,
+            # passes at its true length.
+            if cmp_topk_length is None:
+                raise ValueError(
+                    "cmp_sparse_indices was supplied without cmp_topk_length. "
+                    "The operator then takes the whole row as valid -- "
+                    f"{tuple(cmp_sparse_indices.shape)} here -- and gathers "
+                    "at the -1 padding the indexer wrote. Omitting the length "
+                    "is not a safe default; it is the most dangerous one.")
             kwargs["cmp_sparse_indices"] = cmp_sparse_indices
+            kwargs["cmp_topk_length"] = cmp_topk_length
 
     return validate_sparse_flash_mla_args(kwargs, q, num_requests)

@@ -513,6 +513,11 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         plan = get_dsa_attn_kv_plan(self.vllm_config)
 
         cmp_kv = cmp_block_table = None
+        # The group whose descriptor the kernel takes its tiling from. V4.0:
+        # `common_attn_metadata = layer_metadata.attention or layer_metadata.swa`
+        # -- the compressed group when there is one, the SWA group otherwise.
+        # A ratio-0 layer has no compressed group and correctly falls back.
+        cmp_req = None
         if attends_compressed:
             # Through the same rank helper ori_kv uses. It was written for
             # ori_kv and only ori_kv was routed through it, so cmp_kv reached
@@ -540,7 +545,8 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             #
             # Resolved through the same prefix the cache came from, so the
             # table and the cache cannot come from different groups.
-            cmp_block_table = self._compressed_block_table(attn_metadata)
+            cmp_req = self._compressed_group_metadata(attn_metadata)
+            cmp_block_table = cmp_req.block_table
 
         # Explicit original-KV indices, following dsa_v1's precedence: a vision
         # prefill supplies them so tokens inside an image span see the whole
@@ -613,7 +619,12 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             cu_seqlens_q=req.query_start_loc,
             seqused_kv=req.seq_lens,
             sinks=self.attn_sink,
-            metadata=req.sas_metadata,
+            # 🔴 The compressed group's descriptor when there is one. The SWA
+            # group's spec reports no compression, so its descriptor is built
+            # at ratio 1 -- well-formed, and the wrong tiling for a ratio-2
+            # layer. That disagreement does not get rejected; it faults every
+            # core at once, which is what this call has been doing.
+            metadata=(cmp_req or req).sas_metadata,
             softmax_scale=self.softmax_scale,
             cmp_ratio=_dsa_swa_only_cmp_ratio(self.compress_ratio,
                                               self.vllm_config),
@@ -629,8 +640,12 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             # value per request. Sending the cumulative one would have been
             # accepted -- same dtype, same device, plausible values, one
             # element longer -- and read as lengths.
-            seqused_cmp_kv=req.seqused_cmp_kv if attends_compressed else None,
-            cmp_residual_kv=req.qli_cmp_residual_k if attends_compressed else None,
+            # Both describe the compressed stream, so both come from the
+            # group that owns it -- not from the SWA group, whose ratio is 1.
+            seqused_cmp_kv=(cmp_req.seqused_cmp_kv
+                            if attends_compressed and cmp_req else None),
+            cmp_residual_kv=(cmp_req.qli_cmp_residual_k
+                             if attends_compressed and cmp_req else None),
             ori_sparse_indices=ori_sparse_indices,
             ori_topk_length=ori_topk_length,
             # The indexer's selection. Without it the compressed stream is
@@ -656,17 +671,62 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)
                 if attends_compressed and self.topk_indices_buffer is not None
                 else None),
+            # 🔴 Travels with the indices, same rule as ori_topk_length. The
+            # selection buffer is -1 padded; declaring the whole row valid
+            # sends the kernel to gather at those slots, which is the
+            # mechanism kernel proved single-variable on the ori side. Taken
+            # from the indexer that wrote the rows, never recounted here.
+            cmp_topk_length=(self._compressed_topk_length(q.shape[0])
+                             if attends_compressed else None),
         )
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
 
-    def _compressed_block_table(self, attn_metadata: dict):
-        """The block table of the cache ``_compressed_kv_cache`` returns.
+    def _compressed_topk_length(self, num_tokens: int):
+        """Valid entries per row of the indexer's selection, or ``None``.
 
-        Keyed by the same prefix that selects the cache, so the two cannot
-        drift apart. Passing the SWA group's table instead is not a shape
-        error and no check downstream can see it: the ids are in range for
-        both pools and simply address the wrong blocks.
+        ``None`` when the indexer has not published one -- a layer whose
+        source has not run this step. The operator then falls back to the full
+        width, which is the unsafe default, so this returning ``None`` is a
+        state worth being able to see rather than a quiet omission; the
+        argument builder refuses indices without a length on the ori side and
+        the same rule is what makes this visible on the cmp side.
+        """
+        indexer = getattr(self, "indexer", None)
+        lengths = getattr(indexer, "topk_lengths_buffer", None)
+        if lengths is None:
+            return None
+        return lengths[:num_tokens]
+
+    def _compressed_group_metadata(self, attn_metadata: dict):
+        """The metadata of the group that owns this layer's compressed cache.
+
+        🔴 Not the SWA group's. Three of this call's arguments describe the
+        compressed stream -- the block table that addresses it, the lengths
+        that bound it, and the descriptor the kernel takes its tiling from --
+        and all three belong to whichever group holds that cache, which for a
+        consumer layer is another layer entirely (``_compressed_kv_cache``
+        follows ``compressed_cache_prefix``).
+
+        V4.0 keeps the two apart and this is the shape to copy
+        (``dsa_v1.py:2574-2580``)::
+
+            common_attn_metadata = layer_metadata.attention or layer_metadata.swa
+            swa_metadata         = layer_metadata.swa
+            ...
+            ori_block_table = swa_req_metadata.block_table
+            metadata        = common_metadata.sas_metadata
+
+        Taking everything from the SWA group is not a shape error and nothing
+        downstream can see it: the block ids are in range for both pools, and
+        the descriptor is a well-formed descriptor -- for the wrong tiling.
+        The SWA group's spec reports no compression, so its descriptor is
+        built at ratio 1; handing that to a ratio-2 layer is the
+        descriptor/call disagreement that opened this port, and it surfaces
+        as an aicore exception with no frame naming the operator.
+
+        Resolved through the same prefix that selects the cache, so cache,
+        table, lengths and descriptor cannot come from different groups.
         """
         prefix = (self.prefix if self.is_kv_source
                   else self.compressed_cache_prefix)
@@ -674,21 +734,22 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             raise ValueError(
                 f"{self.prefix}: this layer attends a compressed stream but "
                 "has no compressed_cache_prefix, so there is no way to say "
-                "which cache group's block table addresses it.")
+                "which cache group describes it.")
         metadata = attn_metadata.get(prefix)
         if metadata is None:
             raise ValueError(
                 f"{self.prefix}: no attention metadata for the compressed "
-                f"cache at {prefix!r}. Falling back to this layer's own table "
-                "would index that cache with another group's block ids -- in "
-                f"range, wrong blocks. Groups present: {sorted(attn_metadata)[:4]}")
+                f"cache at {prefix!r}. Falling back to this layer's own group "
+                "would describe that cache with another group's block ids and "
+                "another ratio's descriptor -- both well-formed, both wrong. "
+                f"Groups present: {sorted(attn_metadata)[:4]}")
         req = getattr(metadata, "req_metadata", None)
-        block_table = getattr(req, "block_table", None)
-        if block_table is None:
+        if req is None or getattr(req, "block_table", None) is None:
             raise ValueError(
                 f"{self.prefix}: the metadata for {prefix!r} carries no "
-                "block table, so the compressed cache cannot be addressed.")
-        return block_table
+                "req_metadata with a block table, so the compressed cache "
+                "cannot be addressed.")
+        return req
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Inverse RoPE, then the block-diagonal wo_a, then wo_b.
