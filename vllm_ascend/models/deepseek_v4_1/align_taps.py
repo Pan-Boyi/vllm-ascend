@@ -1028,6 +1028,78 @@ def golden_layers(golden_dir: str) -> tuple[int, ...]:
                         if _LAYER_TAG.fullmatch(tag)))
 
 
+#: The prologue keys the hooks declare they will write, each with the one
+#: reason it may legitimately be absent. A key with no such reason that is
+#: missing is a defect, and the two must not share an artifact.
+PROLOGUE_KEYS: tuple[tuple[str, str], ...] = (
+    ("input_ids", "only a pipeline rank that does not hold the embedding"),
+    ("positions", "only a pipeline rank that does not hold the embedding"),
+    ("embed.out", "only a pipeline rank that does not hold the embedding"),
+    ("engram_hash_ids", "only a model with no engram layers"),
+)
+
+
+def declared_coverage(recorded: set[str]) -> dict:
+    """Per key: declared and recorded, declared and missing, or exempt.
+
+    🔴 The gap this closes. ``coverage_report`` answers "does this dump hold
+    what golden compares", and it answers "not_checked" whenever no golden
+    directory is set -- which is most runs. Between those two there was a
+    fourth state nobody reported: the section exists, the keys are missing,
+    and nothing says so. That is how ``input_ids`` / ``positions`` /
+    ``embed.out`` stayed absent for a day while every flight looked fine.
+
+    So this asks a question that needs no golden at all: **for every key the
+    hooks in this module declare they will write, was it written?** One line
+    per key, three states, and the exemptions named rather than assumed --
+    ``layer.in`` and ``pre_mix.in`` are genuinely absent on the first layer
+    (it receives a 2-D embedding and builds the streams itself), and saying
+    "missing" there would train the reader to skip the report.
+
+    Scope is stated, not implied: only the hook-declared keys. The inline
+    taps (``sa_in.*``, ``read.*``) fire on selected layers by design, so
+    "absent" carries no information about them and listing them would drown
+    the keys where it does.
+    """
+    layer_tags = sorted(
+        {entry.split("/", 1)[0]
+         for entry in recorded if entry.split("/", 1)[0].startswith("layer_")})
+    first_layer = layer_tags[0] if layer_tags else None
+
+    prologue = {}
+    for key, exemption in PROLOGUE_KEYS:
+        prologue[key] = ("recorded" if f"prologue/{key}" in recorded else
+                         f"MISSING -- expected unless {exemption}")
+
+    per_layer = {}
+    for key in [k for _, k, _, _ in _BOUNDARY_TAPS] + [k for _, k in _ARG_TAPS]:
+        exempt = ([first_layer] if key in {k for _, k in _ARG_TAPS}
+                  and first_layer is not None else [])
+        wanted = [tag for tag in layer_tags if tag not in exempt]
+        missing = [tag for tag in wanted if f"{tag}/{key}" not in recorded]
+        per_layer[key] = {
+            "recorded_in": len(wanted) - len(missing),
+            "of": len(wanted),
+            "missing": missing,
+            "exempt": exempt,
+        }
+
+    problems = [f"prologue/{key}" for key, state in prologue.items()
+                if state != "recorded"]
+    problems += [f"{tag}/{key}" for key, row in per_layer.items()
+                 for tag in row["missing"]]
+    return {
+        "state": "ok" if not problems else "incomplete",
+        "scope": ("the keys the hooks in align_taps declare they will write. "
+                  "Inline taps (sa_in.*, read.*) fire on selected layers by "
+                  "design and are not judged here."),
+        "layers_seen": len(layer_tags),
+        "prologue": prologue,
+        "per_layer": per_layer,
+        "problems": problems,
+    }
+
+
 def coverage_report(recorded: set[str], golden_dir: str | None) -> dict:
     """Did this run record everything golden will compare, and nothing else.
 

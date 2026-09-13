@@ -250,6 +250,7 @@ class AlignRecorder:
         manifest["tensors"] = {tag: sorted(keys)
                                for tag, keys in self._bufs.items()}
         manifest["golden_coverage"] = self._golden_coverage()
+        manifest["declared_coverage"] = self._declared_coverage()
         manifest["injection_scope"] = self._injection_scope()
         self._report_missing_prologue()
         problems = self._coverage_problems()
@@ -376,6 +377,39 @@ class AlignRecorder:
         report = coverage_report(recorded, _env("VLLM_ASCEND_DSV41_GOLDEN_DIR")
                                  or None)
         _log_coverage(report, self.dump_dir)
+        return report
+
+    def _declared_coverage(self) -> dict:
+        """Per key: was the thing we said we would record, recorded.
+
+        🔴 The state nobody reported. ``golden_coverage`` answers "does this
+        hold what golden compares" and answers ``not_checked`` whenever no
+        golden directory is set, which is most runs. Between "ok" and
+        "not_checked" sat a fourth state -- section present, keys missing,
+        nothing said -- and it is how input_ids / positions / embed.out
+        stayed absent for a day while every flight reported success.
+
+        Needs no golden: the declaration is this line's own tap tables.
+        Written into the manifest and logged; never raises, for the same
+        reason ``_golden_coverage`` does not -- a dump costs a launch.
+        """
+        from vllm_ascend.models.deepseek_v4_1.align_taps import \
+            declared_coverage
+
+        recorded = {f"{tag}/{key}"
+                    for tag, keys in self._bufs.items() for key in keys}
+        report = declared_coverage(recorded)
+        if report["problems"]:
+            from vllm.logger import logger
+
+            logger.error(
+                "DSV4.1 alignment: %d declared key(s) were not recorded in "
+                "%s: %s. Each of these was declared by a tap in align_taps, "
+                "so its absence is a defect in the tap and not 'there was "
+                "nothing to record'; the exemptions that do exist are named "
+                "in the manifest's declared_coverage.",
+                len(report["problems"]), self.dump_dir,
+                ", ".join(report["problems"][:20]))
         return report
 
     def _report_missing_prologue(self) -> None:

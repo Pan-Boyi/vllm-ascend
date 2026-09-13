@@ -1294,3 +1294,60 @@ def test_the_ratio_convention_is_named_as_this_ports_and_not_upstreams():
     assert "this port's convention" in text
     assert "opposite of upstream" in text
     assert "block_size // ratio" in text
+
+
+# ------------------------------- per key: declared, recorded, or exempt
+
+def test_a_declared_key_that_was_not_recorded_is_named():
+    """🔴 The fourth state.
+
+    "Section absent" and "section present but empty" already had reports.
+    "Section present, keys missing, nothing said" did not -- and that is the
+    state input_ids / positions / embed.out sat in for a day while every
+    flight looked fine.
+    """
+    from vllm_ascend.models.deepseek_v4_1.align_taps import declared_coverage
+
+    report = declared_coverage({
+        "prologue/input_ids", "prologue/engram_hash_ids",
+        "layer_00/attn.in", "layer_00/attn.positions", "layer_00/attn.out",
+        "layer_00/moe.in", "layer_00/moe.out",
+    })
+    assert report["state"] == "incomplete"
+    assert "prologue/positions" in report["problems"]
+    assert "prologue/embed.out" in report["problems"]
+    assert report["prologue"]["input_ids"] == "recorded"
+    assert "MISSING" in report["prologue"]["positions"]
+
+
+def test_the_first_layers_missing_residual_is_exempt_not_missing():
+    """layer.in and pre_mix.in are genuinely absent on the first layer -- it
+    receives a 2-D embedding and builds the streams itself. Calling that
+    "missing" would train the reader to skip the report."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import (
+        PROLOGUE_KEYS, declared_coverage)
+
+    recorded = {f"prologue/{key}" for key, _ in PROLOGUE_KEYS}
+    for tag in ("layer_00", "layer_01"):
+        for key in ("attn.in", "attn.positions", "attn.out", "moe.in",
+                    "moe.out"):
+            recorded.add(f"{tag}/{key}")
+    for key in ("layer.in", "pre_mix.in"):
+        recorded.add(f"layer_01/{key}")
+
+    report = declared_coverage(recorded)
+    assert report["state"] == "ok", report["problems"]
+    assert report["per_layer"]["layer.in"]["exempt"] == ["layer_00"]
+    assert report["per_layer"]["layer.in"]["recorded_in"] == 1
+    assert report["per_layer"]["attn.in"]["of"] == 2
+
+
+def test_the_report_says_what_it_does_not_judge():
+    """Scope stated, not implied: the inline taps fire on selected layers by
+    design, so "absent" carries no information about them."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import declared_coverage
+
+    report = declared_coverage(set())
+    assert "sa_in" in report["scope"] and "read." in report["scope"]
+    assert not any(key.startswith("sa_in") or key.startswith("read.")
+                   for key in report["per_layer"])
