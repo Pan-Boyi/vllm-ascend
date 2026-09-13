@@ -414,6 +414,7 @@ def check_ring_mapping(
     consumer: str,
     layer_names: tuple,
     query_start_loc: torch.Tensor | None = None,
+    compress_ratio: int = 2,
 ) -> None:
     """The ring mapping's own criterion -- which is *not* the per-token one.
 
@@ -439,6 +440,10 @@ def check_ring_mapping(
     mappings was held by a paragraph of prose until now, and prose does not
     go red.
     """
+    # First, and not skipped by the capture guard or the budget: it is
+    # integer arithmetic over two configuration numbers, and what it protects
+    # against is silent.
+    require_ring_capacity_divides(capacity, compress_ratio)
     if _stream_is_capturing():
         return
     key = ("ring:" + consumer, tuple(layer_names), int(capacity))
@@ -542,3 +547,76 @@ def ring_readers_this_forward(query_start_loc, positions) -> tuple:
         return 0, 0
     first = positions[starts]
     return int((((first + 1) % 2) == 0).sum()), int(starts.numel())
+
+
+_RING_SHAPES_CHECKED: set = set()
+
+
+def positions_that_read_across_a_block(capacity: int, ratio: int,
+                                       span: int) -> list:
+    """Positions where the ring reader would read the wrong block.
+
+    The reader takes its block from ``position // capacity`` and its row from
+    ``(position - 1) % capacity`` (``fused_compress_quant_cache.py:151-152``),
+    so the two agree only while ``position`` and ``position - 1`` sit in the
+    same block. They do not when ``capacity`` divides ``position``. And the
+    read happens only when the position closes a group,
+    ``(position + 1) % ratio == 0``.
+
+    Searched rather than reasoned, so the closed form below is *checked*
+    against it instead of trusted.
+    """
+    if capacity < 1 or ratio < 1:
+        return []
+    return [p for p in range(1, span)
+            if (p + 1) % ratio == 0 and p % capacity == 0]
+
+
+def require_ring_capacity_divides(capacity: int, ratio: int) -> None:
+    """The ring's unwritten precondition, written down and made executable.
+
+    🔴 The reader never reads a stale row **today**, and the reason is not in
+    the source anywhere. A read happens at ``position ≡ -1 (mod ratio)`` and a
+    block change at ``position ≡ 0 (mod capacity)``; a position satisfying
+    both exists exactly when ``gcd(capacity, ratio) == 1``. The attainable
+    residues of ``k * capacity`` mod ratio are the multiples of
+    ``g = gcd(capacity, ratio)``, and ``ratio - 1`` is a multiple of ``g``
+    only when ``g == 1`` -- so ``g > 1`` is what makes it impossible, and
+    ``gcd(8, 2) = 2`` is the whole reason this is safe.
+
+    ⚠️ Not ``capacity % ratio == 0``. That was the first form written here and
+    it is sufficient but not necessary: ``(capacity, ratio) = (6, 4)`` is safe
+    and fails it. The test that compares the closed form against the search is
+    what found that, which is the reason the guard searches.
+
+    Change either number so that it does not, and the reader crosses into the
+    next block and pools a row belonging to a different position. Nothing
+    raises: the row is in range and the arithmetic is valid.
+
+    ⚠️ A property that merely *happens to hold* looks exactly like a designed
+    guarantee once it is only a comment, and comments do not go red. Raising
+    rather than reporting, unlike the congruence criterion above: this one is
+    integer arithmetic over configuration, it cannot be tripped by an
+    instrument, and if it does fire the run is genuinely unsafe.
+    """
+    key = (int(capacity), int(ratio))
+    if key in _RING_SHAPES_CHECKED:
+        return
+    _RING_SHAPES_CHECKED.add(key)
+    if ratio <= 1:
+        return
+    bad = positions_that_read_across_a_block(capacity, ratio,
+                                             max(capacity, ratio) * 4)
+    if not bad:
+        return
+    raise ValueError(
+        f"the compressor state ring has capacity {capacity} with "
+        f"compress_ratio {ratio}, and gcd({capacity}, {ratio}) == 1. The "
+        f"reader takes its block from (position // {capacity}) and its row "
+        f"from "
+        f"((position - 1) % {capacity}), so at positions {bad[:8]} it would "
+        "read the previous position's row from the *next* block -- a row in "
+        "range, belonging to another position, with nothing raised. This "
+        "held only because capacity and ratio shared a factor; that is a "
+        "property nothing in the source states, which is why it is stated "
+        "here.")

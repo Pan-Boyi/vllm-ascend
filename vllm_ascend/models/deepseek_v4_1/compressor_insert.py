@@ -202,7 +202,8 @@ def fused_save_compress_norm_ascend(
         check_ring_mapping(flat, positions, int(state_cache.shape[1]),
                            "fused_save_compress_norm",
                            layer_owning(slot_mapping),
-                           query_start_loc=query_start_loc)
+                           query_start_loc=query_start_loc,
+                           compress_ratio=compress_ratio)
     _tap_write_side("fused_save_compress_norm", flat, latent_out, state_cache)
     fused_save_compress_norm(
         kv_score, positions, state_cache, flat,

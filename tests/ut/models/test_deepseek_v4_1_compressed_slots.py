@@ -385,3 +385,93 @@ def test_a_bare_string_is_one_layer_not_eight(ctx, monkeypatch):
         torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2, "w",
         "layer_02")
     assert "layers=1:[layer_02]" in lines[0]
+
+
+# ------------------------- the ring's precondition, made executable
+
+def test_the_shipped_ring_shape_never_reads_across_a_block():
+    """🔴 The property nothing in the source states.
+
+    The reader takes its block from (position // capacity) and its row from
+    ((position - 1) % capacity), so those agree only while position and
+    position-1 share a block. Today they always do -- but only because
+    capacity 8 is a multiple of ratio 2. That is a coincidence of two
+    configuration numbers, and in the code it looks exactly like a designed
+    guarantee.
+    """
+    assert compressed_slots.positions_that_read_across_a_block(8, 2, 4096) == []
+    compressed_slots._RING_SHAPES_CHECKED.clear()
+    compressed_slots.require_ring_capacity_divides(8, 2)
+
+
+@pytest.mark.parametrize("capacity,ratio", [(3, 2), (5, 2), (9, 2), (4, 3),
+                                            (8, 3), (3, 4)])
+def test_a_shape_that_does_read_across_a_block_is_refused(capacity, ratio):
+    """The mutation. Change either number so the divisibility breaks and the
+    reader crosses into the next block -- a row in range, belonging to
+    another position, with nothing raised."""
+    bad = compressed_slots.positions_that_read_across_a_block(
+        capacity, ratio, max(capacity, ratio) * 4)
+    assert bad, "this pair was meant to be a violating one"
+    compressed_slots._RING_SHAPES_CHECKED.clear()
+    with pytest.raises(ValueError, match="read the previous position's row"):
+        compressed_slots.require_ring_capacity_divides(capacity, ratio)
+
+
+@pytest.mark.parametrize("capacity", [2, 4, 6, 8, 16, 32, 128])
+@pytest.mark.parametrize("ratio", [2, 4])
+def test_the_closed_form_agrees_with_the_search(capacity, ratio):
+    """🔴 This is what found the closed form wrong.
+
+    The first version of the guard's docstring said the invariant was
+    `capacity % ratio == 0`. It is sufficient but not necessary -- (6, 4) is
+    safe and fails it -- and the real condition is gcd(capacity, ratio) > 1:
+    the attainable residues of k*capacity mod ratio are the multiples of the
+    gcd, and ratio-1 is one of those only when the gcd is 1.
+
+    The guard searches positions rather than evaluating either form, so the
+    shortcut is checked against it instead of standing in for it.
+    """
+    import math
+
+    searched = compressed_slots.positions_that_read_across_a_block(
+        capacity, ratio, max(capacity, ratio) * 8)
+    assert bool(searched) == (math.gcd(capacity, ratio) == 1), (
+        capacity, ratio, searched[:4])
+
+
+@pytest.mark.parametrize("capacity,ratio", [(6, 4), (2, 4), (10, 4)])
+def test_the_first_closed_form_would_have_refused_a_safe_shape(capacity,
+                                                               ratio):
+    """The other direction of the same mistake: shapes that are safe and
+    that `capacity % ratio == 0` calls unsafe. A guard written from the wrong
+    shortcut would refuse these runs for nothing."""
+    import math
+
+    assert capacity % ratio != 0
+    assert math.gcd(capacity, ratio) > 1
+    assert compressed_slots.positions_that_read_across_a_block(
+        capacity, ratio, max(capacity, ratio) * 8) == []
+    compressed_slots._RING_SHAPES_CHECKED.clear()
+    compressed_slots.require_ring_capacity_divides(capacity, ratio)
+
+
+def test_ratio_one_has_no_reader_to_protect():
+    """At ratio 1 there is no ring: the kernel's ring branch is a constexpr
+    branch on COMPRESS_RATIO == 2, so no divisibility is required."""
+    compressed_slots._RING_SHAPES_CHECKED.clear()
+    compressed_slots.require_ring_capacity_divides(7, 1)
+
+
+def test_the_precondition_is_checked_before_the_capture_guard(ctx,
+                                                              monkeypatch):
+    """It is integer arithmetic over two configuration numbers, so neither a
+    graph capture nor a spent budget is a reason to skip it -- and what it
+    protects against is silent."""
+    compressed_slots.reset_for_test()
+    compressed_slots._RING_SHAPES_CHECKED.clear()
+    monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: True)
+    with pytest.raises(ValueError, match="read the previous position's row"):
+        compressed_slots.check_ring_mapping(
+            torch.tensor([0, 1, 2], dtype=torch.int32), torch.arange(3), 3,
+            "w", ("l", ), compress_ratio=2)
