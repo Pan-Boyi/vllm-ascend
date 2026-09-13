@@ -218,24 +218,44 @@ class AlignRecorder:
         self._meta.update(kw)
 
     def flush(self, strict: bool = True) -> None:
-        """Write every tag, then judge what was written.
+        """Write every key whose positions are sound, and say what was not.
 
-        🔴 The order used to be the other way round, and it cost a flight. The
-        coverage assertion ran first and raised, so **nothing reached disk** --
-        a dump that says "I am incomplete, here is how" is far more useful
-        than no dump, and the run that would have produced it is a server
-        start and a warm-up away.
+        🔴 Two revisions, each paid for by a flight.
 
-        Same shape as the trace's sentinel refusal and the golden-coverage
-        report: the artifact is written, and then the artifact declares what
-        is wrong with it. A report must not destroy the thing it reports on.
+        First: the coverage assertion ran *before* the tensors were written,
+        so a failure left nothing on disk. A dump that says "I am incomplete,
+        here is how" is worth far more than no dump, and the run that would
+        have produced it is a server start and a warm-up away.
+
+        Second (flight-23): writing everything and then raising still lost the
+        whole flight -- one bad key, and the request that would have produced
+        the other forty aborted. The refusal is now **per key**. A key whose
+        positions were not written exactly once does not reach disk, and the
+        manifest names it, its missing and duplicated positions, and why it
+        was refused; every other key flushes normally. The dump ends up
+        *short one key* rather than absent, which is the same shape as
+        "cannot size the buffer, so record nothing here and say so".
+
+        What is deliberately unchanged: a key with a wrong row->position
+        mapping is still never written. That failure is worse than a missing
+        key -- it produces a tensor that looks right and compares wrong, and
+        downstream it reads as a routing mismatch rather than as a mapping
+        bug.
+
+        ⚠️ A refused key counts as NOT MEASURED, never as exempt. It is a
+        fault, and the two must not share an artifact.
         """
         from safetensors.torch import save_file
+
+        problems = self._coverage_problems()
+        refused = {f"{tag}/{key}" for tag, key, _ in self._bad_coverage()}
 
         for tag, keys in self._bufs.items():
             scattered = self._coverage.get(tag, {})
             out = {}
             for key, t in keys.items():
+                if f"{tag}/{key}" in refused:
+                    continue
                 # Protocol shapes carry a batch axis; golden is always B=1.
                 # moe_gate.* and moe_routing_margin are the exceptions -- they
                 # are stored without it, so only re-add it where we scattered
@@ -244,19 +264,28 @@ class AlignRecorder:
                                               and not _is_flat_key(key)) else t
             save_file(out, os.path.join(self.dump_dir, f"{tag}.safetensors"))
 
+        written = {tag: sorted(k for k in keys
+                               if f"{tag}/{k}" not in refused)
+                   for tag, keys in self._bufs.items()}
         manifest = dict(self._meta)
         manifest.setdefault("seq_len", self.seq_len)
         manifest.setdefault("tags", sorted(self._bufs))
-        manifest["tensors"] = {tag: sorted(keys)
-                               for tag, keys in self._bufs.items()}
-        manifest["golden_coverage"] = self._golden_coverage()
-        manifest["declared_coverage"] = self._declared_coverage()
+        manifest["tensors"] = written
+        manifest["golden_coverage"] = self._golden_coverage(refused)
+        manifest["declared_coverage"] = self._declared_coverage(refused)
         manifest["injection_scope"] = self._injection_scope()
         self._report_missing_prologue()
-        problems = self._coverage_problems()
         manifest["position_coverage"] = {
             "state": "ok" if not problems else "incomplete",
             "problems": problems,
+            "refused": sorted(refused),
+            "refused_note": ("These keys were NOT written. Their rows did not "
+                             "map one-to-one onto positions, and a tensor "
+                             "built from such a mapping looks right and "
+                             "compares wrong -- downstream that reads as a "
+                             "routing mismatch rather than as a mapping bug. "
+                             "They are NOT MEASURED, not exempt: this is a "
+                             "fault, and the dump is short by exactly these."),
             "note": ("Every position of every recorded key must be written "
                      "exactly once. Anything else means the row->position "
                      "mapping is wrong, and the symptom downstream looks like "
@@ -265,14 +294,15 @@ class AlignRecorder:
         with open(os.path.join(self.dump_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
 
-        if problems and strict:
-            raise AssertionError(
-                "position coverage is not exactly 1 for every token -- the "
-                "row->position mapping is wrong, and the symptom would "
-                "otherwise look like a routing mismatch. The tensors and a "
-                f"manifest saying so were written to {self.dump_dir} first, "
-                "so this dump is readable and self-describing rather than "
-                "absent:\n" + "\n".join(problems))
+        if problems:
+            from vllm.logger import logger
+
+            logger.error(
+                "DSV4.1 alignment: %d key(s) refused by position coverage and "
+                "NOT written to %s -- the dump is short by exactly these, and "
+                "every other key is intact. Each row below is a key whose rows "
+                "did not map one-to-one onto positions:\n%s",
+                len(refused), self.dump_dir, "\n".join(problems))
 
     #: Keys an injector can replace, in the order it should prefer them. Layer
     #: 0 is the exception the whole structure exists for: it receives a 2-D
@@ -356,7 +386,7 @@ class AlignRecorder:
             items.append("this layer's candidate blocks")
         return items
 
-    def _golden_coverage(self) -> dict:
+    def _golden_coverage(self, refused: set | None = None) -> dict:
         """Say whether this dump holds everything golden will compare.
 
         🔴 Runs **after** the tensors are on disk and never raises. A dump run
@@ -373,13 +403,14 @@ class AlignRecorder:
         from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
 
         recorded = {f"{tag}/{key}"
-                    for tag, keys in self._bufs.items() for key in keys}
+                    for tag, keys in self._bufs.items()
+                    for key in keys} - (refused or set())
         report = coverage_report(recorded, _env("VLLM_ASCEND_DSV41_GOLDEN_DIR")
                                  or None)
         _log_coverage(report, self.dump_dir)
         return report
 
-    def _declared_coverage(self) -> dict:
+    def _declared_coverage(self, refused: set | None = None) -> dict:
         """Per key: was the thing we said we would record, recorded.
 
         🔴 The state nobody reported. ``golden_coverage`` answers "does this
@@ -396,9 +427,14 @@ class AlignRecorder:
         from vllm_ascend.models.deepseek_v4_1.align_taps import \
             declared_coverage
 
+        # 🔴 Minus the refused ones. A key that was recorded and then
+        # withheld must read as NOT MEASURED here, not as present: it is a
+        # fault, and counting it as recorded would let the one report that
+        # exists to catch silence report silence as coverage.
         recorded = {f"{tag}/{key}"
-                    for tag, keys in self._bufs.items() for key in keys}
-        report = declared_coverage(recorded)
+                    for tag, keys in self._bufs.items()
+                    for key in keys} - (refused or set())
+        report = declared_coverage(recorded, layer_tags=list(self._bufs))
         if report["problems"]:
             from vllm.logger import logger
 
@@ -438,17 +474,31 @@ class AlignRecorder:
             "either way it is not 'there was nothing to record'.",
             self.dump_dir)
 
-    def _coverage_problems(self) -> list:
-        """Keys whose positions were not written exactly once."""
-        problems = []
+    def _bad_coverage(self) -> list:
+        """``(tag, key, cov)`` for every key not written exactly once.
+
+        One enumeration, used both to refuse the keys and to describe them,
+        so the set that is withheld and the set that is reported cannot drift
+        apart -- a dump missing a key the manifest does not mention is the
+        worst of the three outcomes.
+        """
+        bad = []
         for tag, keys in sorted(self._coverage.items()):
             for key, cov in sorted(keys.items()):
                 if not torch.all(cov == 1):
-                    missing = (cov == 0).nonzero().flatten().tolist()
-                    dupes = (cov > 1).nonzero().flatten().tolist()
-                    problems.append(
-                        f"  {tag}/{key}: seq_len={cov.numel()} "
-                        f"missing={missing[:8]} duplicated={dupes[:8]}")
+                    bad.append((tag, key, cov))
+        return bad
+
+    def _coverage_problems(self) -> list:
+        """Keys whose positions were not written exactly once, described."""
+        problems = []
+        for tag, key, cov in self._bad_coverage():
+            missing = (cov == 0).nonzero().flatten().tolist()
+            dupes = (cov > 1).nonzero().flatten().tolist()
+            problems.append(
+                f"  {tag}/{key}: seq_len={cov.numel()} "
+                f"missing={missing[:8]} duplicated={dupes[:8]} "
+                f"-- REFUSED, not written")
         return problems
 
 

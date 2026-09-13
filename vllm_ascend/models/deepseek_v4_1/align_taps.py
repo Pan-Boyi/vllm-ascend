@@ -1150,7 +1150,8 @@ PROLOGUE_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
-def declared_coverage(recorded: set[str]) -> dict:
+def declared_coverage(recorded: set[str],
+                      layer_tags: "list | None" = None) -> dict:
     """Per key: declared and recorded, declared and missing, or exempt.
 
     🔴 The gap this closes. ``coverage_report`` answers "does this dump hold
@@ -1171,10 +1172,20 @@ def declared_coverage(recorded: set[str]) -> dict:
     taps (``sa_in.*``, ``read.*``) fire on selected layers by design, so
     "absent" carries no information about them and listing them would drown
     the keys where it does.
+
+    ``layer_tags`` is the set of layers this forward actually had, supplied by
+    the caller. Without it the layers are inferred from ``recorded``, and a
+    layer whose every key was refused would then not appear at all.
     """
-    layer_tags = sorted(
-        {entry.split("/", 1)[0]
-         for entry in recorded if entry.split("/", 1)[0].startswith("layer_")})
+    # 🔴 The universe of layers comes from the caller when it can say, not
+    # from the recorded set. Deriving it from what survived means a layer all
+    # of whose keys were refused disappears from the report entirely -- the
+    # report's own subject list taken from the thing it is judging, which is
+    # how "nothing was recorded" ends up reading as "nothing was missing".
+    if layer_tags is None:
+        layer_tags = [entry.split("/", 1)[0] for entry in recorded]
+    layer_tags = sorted({tag for tag in layer_tags
+                         if str(tag).startswith("layer_")})
     first_layer = layer_tags[0] if layer_tags else None
 
     prologue = {}

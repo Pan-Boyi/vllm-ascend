@@ -1471,3 +1471,23 @@ def test_a_key_that_could_not_be_recorded_does_not_consume_its_turn():
         align_taps._current_positions = original_positions
         debug_align.current_row_to_pos = original_row_to_pos
         align_taps._FORWARD_RECORDED.clear()
+
+
+def test_a_layer_whose_every_key_was_refused_still_appears(tmp_path):
+    """🔴 The report's subject list must not come from the thing it judges.
+
+    Deriving the layer set from what was recorded means a layer all of whose
+    keys were withheld disappears from the report -- "nothing was recorded"
+    then reads as "nothing was missing", which is the strongest possible
+    wrong conclusion and the exact failure this report exists to end.
+    """
+    from vllm_ascend.models.deepseek_v4_1.align_taps import declared_coverage
+
+    silent = declared_coverage(set())
+    assert silent["layers_seen"] == 0
+    assert silent["per_layer"]["attn.in"]["of"] == 0
+
+    told = declared_coverage(set(), layer_tags=["layer_00", "layer_01"])
+    assert told["layers_seen"] == 2
+    assert told["per_layer"]["attn.in"]["missing"] == ["layer_00", "layer_01"]
+    assert told["state"] == "incomplete"

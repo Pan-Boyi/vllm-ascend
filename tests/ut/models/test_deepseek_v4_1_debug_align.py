@@ -162,11 +162,45 @@ def test_recorder_reassembles_out_of_order_chunks(tmp_path):
     assert out["moe_gate.out.1"].shape == gold["moe_gate.out.1"].shape
 
 
-def test_coverage_assertion_catches_bad_mapping(tmp_path):
+def test_coverage_catches_bad_mapping_and_withholds_that_key(tmp_path):
+    """The mapping check is unchanged; what changed is its blast radius.
+
+    A key whose rows do not map one-to-one onto positions is still never
+    written -- that tensor would look right and compare wrong. It just no
+    longer takes the rest of the dump with it.
+    """
     rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
     rec.record_layer(0, "x", torch.zeros(5, 4), torch.tensor([0, 1, 2, 3, 3]))
-    with pytest.raises(AssertionError, match="duplicated"):
-        rec.flush()
+    rec.record_layer(0, "y", torch.zeros(SEQ_LEN, 4), torch.arange(SEQ_LEN))
+    rec.flush()
+
+    from safetensors.torch import load_file
+    written = load_file(os.path.join(str(tmp_path), "layer_00.safetensors"))
+    assert "x" not in written, "a key with a broken mapping must not be written"
+    assert "y" in written, "and it must not take the sound keys with it"
+
+    coverage = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["position_coverage"]
+    assert coverage["refused"] == ["layer_00/x"]
+    assert any("duplicated=[3]" in p for p in coverage["problems"])
+    assert "NOT MEASURED" in coverage["refused_note"]
+
+
+def test_a_refused_key_reads_as_not_measured_not_as_recorded(tmp_path):
+    """⚠️ A fault and an exemption must not share an artifact.
+
+    The one report that exists to catch silence would otherwise report this
+    silence as coverage.
+    """
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_layer(0, "attn.in", torch.zeros(2, 4), torch.tensor([0, 0]))
+    rec.flush()
+
+    manifest = json.load(open(os.path.join(str(tmp_path), "manifest.json")))
+    assert manifest["tensors"]["layer_00"] == []
+    per_layer = manifest["declared_coverage"]["per_layer"]["attn.in"]
+    assert per_layer["missing"] == ["layer_00"]
+    assert per_layer["exempt"] == []
 
 
 def test_manifest_records_injection_state(tmp_path, injector):
@@ -489,14 +523,18 @@ def test_an_incomplete_dump_is_written_before_it_is_judged(tmp_path):
     rec.record_layer(0, "attn.out", torch.zeros(2, 4),
                      torch.tensor([0, 0]))          # position 0 written twice
 
-    with pytest.raises(AssertionError, match="self-describing rather than"):
-        rec.flush()
+    # Flight-23 paid for the second half of this: writing everything and then
+    # raising still lost the whole flight, because one bad key aborted the
+    # request that would have produced the other forty. The refusal is per
+    # key now, so the dump is short one key rather than absent.
+    rec.flush()
 
     assert os.path.exists(os.path.join(str(tmp_path), "layer_00.safetensors"))
     coverage = json.load(
         open(os.path.join(str(tmp_path), "manifest.json")))["position_coverage"]
     assert coverage["state"] == "incomplete"
     assert any("duplicated=[0]" in p for p in coverage["problems"]), coverage
+    assert coverage["refused"] == ["layer_00/attn.out"]
 
 
 def test_a_complete_dump_says_so(tmp_path):
