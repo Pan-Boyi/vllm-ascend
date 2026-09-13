@@ -328,6 +328,8 @@ class AscendStagedEngramEmbedding:
         if not rows:
             return
 
+        _refuse_under_capture(num_tokens)
+
         layout = getattr(self, "_layout", None)
         if layout is None:
             raise RuntimeError(
@@ -382,6 +384,74 @@ class AscendStagedEngramEmbedding:
         launch = _staged_dequant_launcher()
         launch(self._dev_weight[:rows], self._dev_scale[:rows], flat,
                dim=self._layout.dim, quant_block=self._layout.quant_block)
+
+
+def _refuse_under_capture(num_tokens: int) -> None:
+    """Say who is incompatible with graph capture, in this frame.
+
+    🔴 This path cannot be captured, and not for one removable reason. A
+    captured graph replays **device** operations; this lookup does three
+    things none of which are device operations:
+
+        1. D2H of the hash ids (the one synchronising transfer here)
+        2. ``gather_into_staging`` -- a numpy gather over host-resident tables
+        3. H2D of the staged rows
+
+    Upstream's ``EngramEmbedding.lookup`` is a single triton kernel over
+    device-resident tables (``common/engram.py:716``) and captures fine. The
+    host gather is this line's own adaptation, forced by the tables not being
+    device-addressable on A5, so the incompatibility is ours to own and ours
+    to state.
+
+    ⚠️ Without this, the failure arrives as ``rtMemcpy: operation not
+    permitted when a stream is capturing`` from inside
+    ``copy_between_host_and_device_opapi`` -- a message that names the copy
+    and says nothing about which design decision made the copy unreplayable.
+    It reads as a driver or a torch_npu problem, which is the wrong team.
+
+    What to do about it is a configuration choice, not a fix here: run with
+    ``--enforce-eager`` (how every token this line has produced so far was
+    produced), or put this lookup in an eager segment -- upstream's
+    ``staged_rows`` exists to "keep lookup results alive across breakable
+    graph segments" (``common/engram.py:936``), which is that shape.
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` is the switch; ⚠️ unverified on
+    Ascend, where vllm_ascend keeps it opt-in on purpose, and
+    ``DeepseekV41ForCausalLM`` is **not** in upstream's auto-enable set
+    (``config/vllm.py:77``), so it is never turned on for us by default.
+    """
+    if not _stream_is_capturing():
+        return
+    raise RuntimeError(
+        f"engram lookup was reached for {num_tokens} tokens while the stream "
+        "is capturing, and it cannot be captured: it copies hash ids to the "
+        "host, gathers from host-resident tables with numpy, and copies the "
+        "staged rows back. None of the three is a device operation, so there "
+        "is nothing for a graph to replay -- this is a property of the host "
+        "gather, not a call that needs fixing. Upstream's lookup is one "
+        "triton kernel over device-resident tables; ours is not, because the "
+        "tables are not device-addressable on A5. Run with --enforce-eager, "
+        "or arrange for this lookup to fall in an eager segment "
+        "(VLLM_USE_BREAKABLE_CUDAGRAPH=1 -- unverified on Ascend).")
+
+
+def _stream_is_capturing() -> bool:
+    """Whether a graph capture is in progress, or ``False`` if unaskable.
+
+    ⚠️ Deliberately permissive on the third state. A predicate that is not
+    available must not turn into a refusal of a path that works today: every
+    token this line has produced came through here with capture off. The cost
+    of answering "no" wrongly is the CANN error we already get; the cost of
+    answering "yes" wrongly is a server that will not start.
+    """
+    for module in (getattr(torch, "npu", None), getattr(torch, "cuda", None)):
+        predicate = getattr(module, "is_current_stream_capturing", None)
+        if predicate is None:
+            continue
+        try:
+            return bool(predicate())
+        except Exception:
+            return False
+    return False
 
 
 def _flatten_out_rows(out: torch.Tensor, rows: int) -> torch.Tensor:

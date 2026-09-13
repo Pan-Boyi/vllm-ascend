@@ -561,3 +561,100 @@ def test_a_flat_buffer_of_the_wrong_length_is_refused():
 
     with pytest.raises(ValueError, match="already in"):
         _flatten_out_rows(torch.zeros(8, 256), 192)
+
+
+# ------------------------------------------------ the wall, named in its frame
+
+def test_lookup_under_capture_says_who_is_incompatible():
+    """🔴 The error that arrives without this names the wrong layer.
+
+    ``rtMemcpy: operation not permitted when a stream is capturing``, raised
+    from ``copy_between_host_and_device_opapi``, reads as a driver or
+    torch_npu problem. The actual subject is this line's host gather, which
+    replaced a device-resident triton lookup because the tables do not fit in
+    HBM on A5.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    import unittest.mock as mock
+
+    with mock.patch.object(engram_embedding, "_stream_is_capturing",
+                           return_value=True):
+        with pytest.raises(RuntimeError) as excinfo:
+            engram_embedding._refuse_under_capture(7)
+    message = str(excinfo.value)
+    assert "host gather" in message
+    assert "enforce-eager" in message, (
+        "the message says what is wrong and not what to do about it; the "
+        "reader is mid-launch")
+    assert "7 tokens" in message
+
+
+def test_no_capture_is_not_refused():
+    """Two arms. The guard has to be able to stay quiet -- every token this
+    line has produced came through here with capture off."""
+    import unittest.mock as mock
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    with mock.patch.object(engram_embedding, "_stream_is_capturing",
+                           return_value=False):
+        engram_embedding._refuse_under_capture(7)
+
+
+def test_an_unavailable_predicate_does_not_refuse():
+    """⚠️ The third state is permissive on purpose. A predicate that cannot
+    be asked must not stop a server that works today; the cost of a wrong
+    "no" is the CANN error we already get, the cost of a wrong "yes" is a
+    server that will not start."""
+    import unittest.mock as mock
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    class _NoPredicate:
+        pass
+
+    with mock.patch.object(engram_embedding.torch, "npu", _NoPredicate()), \
+            mock.patch.object(engram_embedding.torch, "cuda", _NoPredicate()):
+        assert engram_embedding._stream_is_capturing() is False
+
+
+def test_a_raising_predicate_does_not_refuse():
+    import unittest.mock as mock
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    class _Raises:
+        @staticmethod
+        def is_current_stream_capturing():
+            raise RuntimeError("no graph subsystem here")
+
+    with mock.patch.object(engram_embedding.torch, "npu", _Raises()):
+        assert engram_embedding._stream_is_capturing() is False
+
+
+def test_the_predicate_exists_on_this_platform():
+    """The guard is worth nothing if nothing can ever answer it. Evaluated
+    here rather than written down, because which module carries it has moved
+    before."""
+    import torch
+
+    assert any(
+        hasattr(getattr(torch, name, None), "is_current_stream_capturing")
+        for name in ("npu", "cuda"))
+
+
+def test_lookup_asks_before_it_copies():
+    """Placement, not presence: the refusal has to come before the D2H, or
+    the CANN error wins the race and the attribution never prints."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        AscendStagedEngramEmbedding
+
+    body = inspect.getsource(AscendStagedEngramEmbedding.lookup)
+    guard_at = body.index("_refuse_under_capture")
+    copy_at = body.index('.to("cpu"')
+    assert guard_at < copy_at, (
+        "the capture check sits after the synchronising copy, so the copy "
+        "raises first and the message that explains it never runs")
