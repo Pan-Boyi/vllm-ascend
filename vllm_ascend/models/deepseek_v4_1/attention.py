@@ -387,7 +387,34 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
 
     @staticmethod
     def _configured_ratio(vllm_config, prefix: str) -> int | None:
-        """This layer's compress_ratios entry, read before super() sets it."""
+        """This layer's compress_ratios entry, read before super() sets it.
+
+        ⚠️ Reads ``hf_config``, not ``hf_text_config``, and that is currently
+        correct but not obviously so: V4.1-Flash is a multimodal checkpoint,
+        and the same wrapper has broken three other assumptions written for a
+        text-only shape (the ``use_compress`` config read, the ``{0: []}``
+        multimodal ranges, the module tree under ``language_model``). This one
+        survives because ``DeepseekV41Config`` flattens ``text_config`` to the
+        top level -- measured, not assumed: ``hasattr(hf_config,
+        "compress_ratios")`` is True and the first entries are [0, 0, 2, 2, 2].
+
+        🔴 The ``except Exception`` is a known silent failure point, tolerated
+        for now and not safe. It cannot tell "this model has no ratios" from
+        "the read path moved", and both come back as ``None`` -- which every
+        caller downstream reads as "no ratio configured", i.e. as a ratio-0
+        layer. A ratio-2 layer silently demoted to 0 is the shape of defect
+        this port has already spent a night on.
+
+        Tolerated rather than tightened because it sits on the bring-up path
+        and tightening it means first establishing what ``None`` should mean
+        to each caller. ⇒ Must be narrowed when either of these happens:
+
+          * the read path for ``compress_ratios`` changes at all, or
+          * ``DeepseekV41Config`` stops flattening ``text_config``.
+
+        Both are changes someone would make deliberately, so the trigger is
+        checkable rather than a reminder to be vigilant.
+        """
         try:
             from vllm.model_executor.models.utils import extract_layer_index
 
