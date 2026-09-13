@@ -385,6 +385,15 @@ class AscendStagedEngramEmbedding:
         # token ids the runner already holds, rather than to make it faster.
         row_ids = indices.reshape(-1).to("cpu", torch.int64).numpy()
 
+        from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+        # 🔴 Here, at the copy, not at the parse. The launch that set this
+        # variable and learned nothing had only vLLM's "Unknown environment
+        # variable" warning to go on, which proves it was set and not that
+        # this line ran.
+        announce_once("engram_h2d",
+                      "engram staging H2D mode %r reached the copy "
+                      "(rows=%d).", _h2d_mode(), rows)
         host_weight, host_scale = self._staging_host_views(rows)
         gather_into_staging(weight_table, scale_table, row_ids,
                             host_weight, host_scale)

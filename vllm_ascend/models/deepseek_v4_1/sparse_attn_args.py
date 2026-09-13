@@ -230,6 +230,13 @@ def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices) -> int:
         return SLIDING_WINDOW_MASK_MODE
     if (ori_sparse_indices is None and attends_compressed
             and _causal_without_indices()):
+        from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+        announce_once(
+            "ori_window_without_indices",
+            "ORI_WINDOW_WITHOUT_INDICES=1 sent ori_mask_mode=%d on a layer "
+            "attending a compressed stream; without it this call would be "
+            "NO_MASK.", CAUSAL_MASK_MODE)
         return CAUSAL_MASK_MODE
     return NO_MASK_MODE
 

@@ -869,7 +869,17 @@ def mm_ranges_have_spans(mm_ranges) -> bool:
         # Not a mapping. Fall back to the container's own truthiness rather
         # than guessing at a shape; the switch is about empty *span lists*.
         return True
-    return any(bool(ranges) for ranges in values())
+    has_spans = any(bool(ranges) for ranges in values())
+    if not has_spans:
+        from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+        # Announced from where the branch is taken, not from where the value
+        # is parsed: parsing happens whether or not this is ever reached.
+        announce_once(
+            "mm_ranges_require_spans",
+            "MM_RANGES_REQUIRE_SPANS=1 excluded a request whose multimodal "
+            "ranges hold no span, so it takes no vision index path.")
+    return has_spans
 
 
 def build_vision_bidirectional_swa_indices(
