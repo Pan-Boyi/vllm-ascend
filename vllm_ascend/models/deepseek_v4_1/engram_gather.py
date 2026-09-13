@@ -161,11 +161,15 @@ class HostTable:
 
 def _acl():
     lib = ctypes.CDLL("libascendcl.so")
-    lib.aclrtHostRegisterV2.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
-                                        ctypes.c_uint32]
-    lib.aclrtHostRegisterV2.restype = ctypes.c_int
-    # Three parameters. The trailing flag is not optional: calling it with two
-    # leaves whatever is in the register as the flag and it returns
+    # 🔴 aclrtHostRegisterV2's prototype is deliberately NOT declared here.
+    # Nothing may call it (card 3 died on the first 1 GiB registration against
+    # a real table), and a declared prototype is the last line of setup before
+    # a call -- keeping it leaves a ready-made path and adds nothing, since
+    # register_host_table refuses before reaching this.
+    #
+    # Kept as prose because it cost a debugging round and is not obvious: it
+    # takes three parameters, and the trailing flag is not optional. Called
+    # with two, whatever is in the register becomes the flag and it returns
     # ACL_ERROR_INVALID_PARAM, which reads as "this memory cannot be mapped".
     lib.aclrtHostGetDevicePointer.argtypes = [ctypes.c_void_p,
                                               ctypes.POINTER(ctypes.c_void_p),
@@ -212,23 +216,6 @@ def register_host_table(host_addr: int, num_bytes: int) -> HostTable:
         f"on a card. (Asked for {num_bytes} bytes at 0x{host_addr:x}.) The "
         "engram path uses a host gather plus small H2D copies instead; see "
         "engram_staging.")
-
-
-def _register_host_table_unreachable(host_addr: int, num_bytes: int) -> HostTable:
-    """The body that used to run, kept only so the ban has something to point
-    at. Nothing calls this and nothing should."""
-    lib = _acl()
-    rc = lib.aclrtHostRegisterV2(ctypes.c_void_p(host_addr), num_bytes,
-                                 ACL_HOST_REG_MAPPED)
-    if rc != 0:
-        raise RuntimeError(f"aclrtHostRegisterV2 failed: rc={rc}")
-    dev = ctypes.c_void_p()
-    rc = lib.aclrtHostGetDevicePointer(ctypes.c_void_p(host_addr),
-                                       ctypes.byref(dev), 0)
-    if rc != 0:
-        lib.aclrtHostUnregister(ctypes.c_void_p(host_addr))
-        raise RuntimeError(f"aclrtHostGetDevicePointer failed: rc={rc}")
-    return HostTable(host_addr, dev.value or 0, num_bytes)
 
 
 def unregister_host_table(table: HostTable) -> None:
