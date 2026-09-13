@@ -38,14 +38,61 @@ import torch
 #: what counts as a tag.
 _LAYER_TAG = re.compile(r"layer_\d+")
 
-#: Protocol key -> what to read at that module edge. "in" takes the module's
-#: first positional input, "out" its output.
-_BOUNDARY_TAPS: tuple[tuple[str, str, str], ...] = (
-    ("attn", "attn.in", "in"),
-    ("attn", "attn.out", "out"),
-    ("ffn", "moe.in", "in"),
-    ("ffn", "moe.out", "out"),
+#: Protocol key -> which module edge, and for an input, **which parameter**.
+#:
+#: 🔴 "the module's first positional input" was wrong and shipped wrong.
+#: ``DeepseekV4Attention.forward(self, positions, hidden_states, ...)`` takes
+#: positions first, so ``attn.in`` recorded an int64 [T] position vector
+#: under a key golden uses for a bf16 [T, 5120] hidden state. Both sides had
+#: a tensor called ``attn.in``; they were different tensors; nothing said so,
+#: because a key name is not a contract.
+#:
+#: Bound by parameter name and resolved once at install, so a signature that
+#: moves fails loudly instead of recording the neighbour.
+_BOUNDARY_TAPS: tuple[tuple[str, str, str, "str | None"], ...] = (
+    ("attn", "attn.in", "in", "hidden_states"),
+    ("attn", "attn.out", "out", None),
+    ("ffn", "moe.in", "in", "hidden_states"),
+    ("ffn", "moe.out", "out", None),
 )
+
+#: What each key **is**, declared here so a dump can say it rather than
+#: leaving the reader to infer it from a name two teams chose separately.
+#: Two keys have already turned out to mean different things on the two
+#: sides; once that happens to one key, every other key is unverified too.
+KEY_SEMANTICS: dict = {
+    "attn.in": "the attention module's input hidden state (not positions)",
+    "attn.out": "the attention module's output, before the residual add",
+    "moe.in": "the FFN/MoE module's input hidden state",
+    "moe.out": "the FFN/MoE module's output",
+    "layer.in": "the decoder layer's `residual` argument: the hc_mult-way "
+                "residual streams [T, 4, 5120]. Absent on layer 0, which "
+                "receives a 2-D embedding and builds the streams itself",
+    "pre_mix.in": "the decoder layer's `pre_mix` argument [T, 4] fp32; "
+                  "absent on layer 0, where it is None",
+    "input_ids": "the token ids the model was handed this forward",
+    "positions": "the position of each row in its own request",
+    "embed.out": "the embedding output, i.e. what the first decoder layer "
+                 "receives",
+    "sa_in.q": "the query handed to the sparse-attention operator, after "
+               "rope and quantisation, sliced to n_local_heads",
+    "sa_in.kv": "the KV handed to the sparse-attention operator for this "
+                "layer's own stream -- ⚠️ golden's has the compressed "
+                "stream concatenated and this one does not",
+    "sa_in.attn_sink": "the per-head attention sink (no token axis)",
+    "sa_in.softmax_scale": "the softmax scale (scalar)",
+    "attn.o_raw": "the operator's output before inverse rope",
+    "attn.o_unroped": "the operator's output after inverse rope",
+    "read.sa_in.cmp_kv_rows":
+        "the compressed entries this request hands the operator, read from "
+        "the block its table names. 🔵 golden's sa_in.kv is [original rows] "
+        "++ [these]; on this side they are two separate arguments, so the "
+        "relation is: golden sa_in.kv == ours sa_in.kv ++ ours "
+        "read.sa_in.cmp_kv_rows",
+    "read.sa_in.cmp_kv_rows.count":
+        "how many rows the line above took, since 'the first "
+        "seqused_cmp_kv of the first block' is an assumption about layout",
+}
 
 
 #: Protocol key -> the decoder layer's *argument* carrying it. These are the
@@ -82,6 +129,40 @@ def _arg_positions(layer: torch.nn.Module) -> dict[str, int]:
         # -1 for self, which a hook's args tuple does not carry.
         positions[key] = parameters.index(name) - 1
     return positions
+
+
+def _named_argument(module: torch.nn.Module, parameter: str, args: tuple,
+                    kwargs: "dict | None"):
+    """One argument of this call, found by name in args or kwargs.
+
+    ⚠️ Returns ``None`` when it is not there, which is a real answer: a
+    pipeline rank or a code path that does not pass it has none. What it
+    must never do is return the *neighbouring* argument, which is what a
+    fixed index does the day the signature or the call style changes.
+    """
+    if kwargs and parameter in kwargs:
+        return kwargs[parameter]
+    try:
+        index = _parameter_index(module, parameter, parameter)
+    except Exception:                                        # noqa: BLE001
+        return None
+    return args[index] if 0 <= index < len(args) else None
+
+
+def _parameter_index(module: torch.nn.Module, parameter: str,
+                     key: str) -> int:
+    """Where ``parameter`` sits in this module's positional signature."""
+    import inspect
+
+    names = list(inspect.signature(type(module).forward).parameters)
+    if parameter not in names:
+        raise RuntimeError(
+            f"{type(module).__name__}.forward has no {parameter!r} parameter, "
+            f"so {key!r} cannot be recorded from the tensor it names. Its "
+            f"parameters are {names}. Recording a neighbour instead is how "
+            "this key came to hold an int64 position vector on one side and "
+            "a bf16 hidden state on the other.")
+    return names.index(parameter) - 1          # -1 for self
 
 
 def _first_tensor(value: Any) -> torch.Tensor | None:
@@ -358,7 +439,8 @@ def _report_disarmed(reason: str) -> None:
         "hook that did not fail.", reason)
 
 
-def _capture_positions(_module: torch.nn.Module, args: tuple) -> None:
+def _capture_positions(_module: torch.nn.Module, args: tuple,
+                       kwargs: dict | None = None) -> None:
     """Remember this layer's ``positions`` for the boundary hooks below.
 
     The attention metadata does **not** carry positions -- checked, not
@@ -373,7 +455,14 @@ def _capture_positions(_module: torch.nn.Module, args: tuple) -> None:
     # forward's positions in place is the failure mode this guards. A stale
     # position vector is in range and wrong, so every row lands somewhere
     # real and the coverage assertion may not even fire.
-    _CURRENT_POSITIONS = args[1] if len(args) > 1 else None
+    #
+    # 🔴 By name, and accepting keyword arguments. ``args[1]`` was the whole
+    # of this, and it is None the moment a caller passes positions by
+    # keyword -- which silently disables every position-sharded tap,
+    # including the prologue's. The dump then simply has no prologue file,
+    # and "the embedding was never recorded" reads the same as "there was
+    # nothing to record".
+    _CURRENT_POSITIONS = _named_argument(_module, "positions", args, kwargs)
 
 
 def _current_positions() -> torch.Tensor | None:
@@ -407,7 +496,8 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     # Before the positions capture and before every tap: nothing records
     # until the buffer can be sized.
     handles.append(inner.register_forward_pre_hook(_arm_recording))
-    handles.append(inner.register_forward_pre_hook(_capture_positions))
+    handles.append(inner.register_forward_pre_hook(_capture_positions,
+                                                   with_kwargs=True))
     # And after everything, where "this request's tensors are all in" is true.
     handles.append(inner.register_forward_hook(_flush_and_rotate))
     # Counted apart from the positions capture, which always registers. Using
@@ -432,7 +522,8 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     for layer_id, layer in _decoder_layers(model):
         # First, so the boundary hooks below it in the same layer see this
         # layer's positions rather than the previous layer's.
-        handles.append(layer.register_forward_pre_hook(_capture_positions))
+        handles.append(layer.register_forward_pre_hook(_capture_positions,
+                                                       with_kwargs=True))
         # The layer's own inputs, before its submodules see anything. These
         # are what the injector replaces, so they are read from the argument
         # the layer was handed.
@@ -450,11 +541,11 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
             layer.register_forward_pre_hook(
                 _make_argument_tap(layer_id, _arg_positions(layer))))
         taps_installed += 1
-        for attribute, key, side in _BOUNDARY_TAPS:
+        for attribute, key, side, parameter in _BOUNDARY_TAPS:
             module = getattr(layer, attribute, None)
             if module is None:
                 continue
-            handles.append(_attach(module, layer_id, key, side))
+            handles.append(_attach(module, layer_id, key, side, parameter))
             taps_installed += 1
 
     # Said out loud, because the two failures so far were both diagnosed by
@@ -595,10 +686,19 @@ def _single_request_query_rows() -> int | None:
 
 
 def _attach(module: torch.nn.Module, layer_id: int, key: str,
-            side: str) -> Any:
+            side: str, parameter: "str | None" = None) -> Any:
+    index = None if parameter is None else _parameter_index(module, parameter,
+                                                            key)
+
     def _pre(_mod: torch.nn.Module, args: tuple) -> None:
-        tensor = _first_tensor(args)
-        if tensor is not None:
+        # By position resolved from the name, never "the first one". The
+        # first positional argument of this module is `positions`, and
+        # recording it under `attn.in` is how two sides ended up with the
+        # same key holding different tensors.
+        if index is None or index >= len(args):
+            return
+        tensor = args[index]
+        if isinstance(tensor, torch.Tensor):
             _record(layer_id, key, tensor)
 
     def _post(_mod: torch.nn.Module, _args: tuple, output: Any) -> None:

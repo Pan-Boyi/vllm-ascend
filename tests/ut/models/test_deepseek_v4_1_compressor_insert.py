@@ -300,3 +300,105 @@ def test_a_missing_state_cache_reports_that_the_page_was_not_cross_checked(
         vllm_logger.removeHandler(handler)
 
     assert any("NOT" in m and "cross-checked" in m for m in records), records
+
+
+# ---------------------------- the write side, for the read side to pair with
+
+def test_the_write_side_is_recorded_before_the_operator_runs(monkeypatch):
+    """🔴 The read side says the compressed stream's entry #0 comes back all
+    zeros on every even-numbered prefill while entry #1 is correct. That is
+    consistent with "never written" and with "written elsewhere", and only
+    the write side separates them -- taken before the call, because after it
+    the question has changed."""
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    order = []
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        lambda: True)
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
+        lambda: (2, ))
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole",
+        lambda layer, key, tensor: order.append(key))
+    ci.reset_write_taps_for_test()
+
+    ci._tap_write_side("rope_quant_insert", torch.tensor([5, 6]),
+                       torch.zeros(2, 4), torch.zeros(4, 4))
+    assert order == ["compressor.rope_quant_insert.00.slots",
+                     "compressor.rope_quant_insert.00.latent",
+                     "compressor.rope_quant_insert.00.cache_ptr"]
+
+
+def test_calls_are_numbered_so_a_forward_can_be_ordered(monkeypatch):
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    keys = []
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        lambda: True)
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
+        lambda: (2, ))
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole",
+        lambda layer, key, tensor: keys.append(key))
+    ci.reset_write_taps_for_test()
+
+    for _ in range(2):
+        ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                           torch.zeros(1, 4), torch.zeros(4, 4))
+    assert any(".01.slots" in k for k in keys), keys
+
+
+def test_it_is_silent_when_nothing_is_being_recorded(monkeypatch):
+    """Two arms: an instrument that runs when nobody asked is a cost with no
+    reader."""
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    keys = []
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        lambda: False)
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole",
+        lambda layer, key, tensor: keys.append(key))
+    ci.reset_write_taps_for_test()
+    ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                       torch.zeros(1, 4), torch.zeros(4, 4))
+    assert keys == []
+
+
+def test_a_failing_write_tap_does_not_reach_the_operator(monkeypatch):
+    """⚠️ It has already cost one flight to let an instrument propagate."""
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    def _explode(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        lambda: True)
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
+        lambda: (2, ))
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole", _explode)
+    ci.reset_write_taps_for_test()
+    ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                       torch.zeros(1, 4), torch.zeros(4, 4))
+
+
+def test_the_slots_recorded_are_the_flattened_ones(monkeypatch):
+    """The slots the operator is handed, not the (block, offset) pairs the
+    caller had -- those are two different values and only one of them is
+    what the write lands on."""
+    import inspect
+
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    body = inspect.getsource(ci.rope_quant_insert_ascend)
+    assert body.index("flat = flatten_slot_mapping") < \
+        body.index("_tap_write_side")
+    assert "_tap_write_side(\"rope_quant_insert\", flat" in body

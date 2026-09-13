@@ -19,9 +19,14 @@ class _Inner(torch.nn.Module):
         super().__init__()
         self.record = record
 
-    def forward(self, x):
+    # ⚠️ `positions` first, `hidden_states` second -- the real attention
+    # module's order (attention.py:545). A double taking one tensor made
+    # "which parameter" untestable, and "the first positional argument" is
+    # exactly the assumption that put an int64 position vector into the key
+    # golden uses for a bf16 hidden state.
+    def forward(self, positions, hidden_states):
         self.record.append("inner-ran")
-        return x * 2
+        return hidden_states * 2
 
 
 class _Layer(torch.nn.Module):
@@ -38,7 +43,7 @@ class _Layer(torch.nn.Module):
     def forward(self, x, positions, input_ids=None, pre_mix=None,
                 post_mix=None, res_mix=None, residual=None,
                 engram_hashes=None, engram_mask=None):
-        return self.ffn(self.attn(x))
+        return self.ffn(positions, self.attn(positions, x))
 
 
 class _Model(torch.nn.Module):
@@ -271,7 +276,7 @@ def test_the_norm_modules_are_not_tapped_as_boundaries():
     """attn_norm / ffn_norm are real submodules whose norm is computed inside
     mhc_pre_delayed_tilelang -- it only borrows their weights. A hook on
     either would never fire, and "no rows" reads as "the layer did not run"."""
-    tapped = {attribute for attribute, _, _ in align_taps._BOUNDARY_TAPS}
+    tapped = {entry[0] for entry in align_taps._BOUNDARY_TAPS}
     assert "attn_norm" not in tapped and "ffn_norm" not in tapped
 
 
@@ -1078,3 +1083,64 @@ def test_the_inline_tap_records_when_armed(monkeypatch, with_recorder):
     align_taps.tap(0, "sa_in.q", torch.zeros(1, 4), torch.tensor([0]))
     align_taps.tap_whole(0, "sa_in.attn_sink", torch.zeros(4))
     assert written == ["layer", "whole"]
+
+
+# ------------------------------- a key name is not a contract
+
+def test_attn_in_records_the_hidden_state_not_the_positions():
+    """🔴 It shipped wrong.
+
+    DeepseekV4Attention.forward(self, positions, hidden_states, ...) takes
+    positions first, and "the module's first positional input" put an int64
+    [T] position vector into the key golden uses for a bf16 [T, 5120] hidden
+    state. Both sides had a tensor called attn.in; they were different
+    tensors; nothing said so, because a key name is not a contract.
+    """
+    entries = {key: parameter
+               for _, key, side, parameter in align_taps._BOUNDARY_TAPS
+               if side == "in"}
+    assert entries == {"attn.in": "hidden_states", "moe.in": "hidden_states"}
+
+
+def test_a_module_without_that_parameter_fails_installation():
+    """Loudly, rather than recording the neighbour."""
+    class _Wrong(torch.nn.Module):
+        def forward(self, positions):
+            return positions
+
+    with pytest.raises(RuntimeError, match="has no 'hidden_states'"):
+        align_taps._parameter_index(_Wrong(), "hidden_states", "attn.in")
+
+
+def test_the_tapped_tensor_is_the_named_one(with_recorder):
+    """Two arms, on a double whose two arguments are distinguishable."""
+    model = _Model(with_recorder)
+    handles = align_taps.install_alignment_taps(model)
+    try:
+        hidden = torch.randn(3, 4)
+        model(hidden, torch.arange(3))
+    finally:
+        for h in handles:
+            h.remove()
+    shapes = {entry[1]: entry[2] for entry in with_recorder
+              if isinstance(entry, tuple)}
+    # The two candidates are distinguishable by shape alone: the hidden state
+    # is [T, H] and positions is [T]. That is the whole difference the bug
+    # turned on, and it is what the dump showed -- I64 (1,5) against BF16
+    # (1,5,5120).
+    assert shapes["attn.in"] == tuple(hidden.shape), shapes
+    assert shapes["attn.in"] != tuple(torch.arange(3).shape)
+
+
+def test_every_recorded_key_has_a_declared_meaning():
+    """⚠️ Two keys have already turned out to mean different things on the
+    two sides. Once that happens to one key, every other key is unverified
+    too -- so each one says what it is rather than leaving a reader to infer
+    it from a name two teams chose separately."""
+    declared = set(align_taps.KEY_SEMANTICS)
+    tapped = {key for _, key, _, _ in align_taps._BOUNDARY_TAPS}
+    tapped |= {key for _, key in align_taps._ARG_TAPS}
+    missing = tapped - declared
+    assert not missing, missing
+    assert "⚠️" in align_taps.KEY_SEMANTICS["sa_in.kv"], (
+        "the one key already known to differ in meaning must say so")

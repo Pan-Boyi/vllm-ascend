@@ -54,8 +54,9 @@ def rope_quant_insert_ascend(
     from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import \
         rope_quant_insert
 
-    rope_quant_insert(latent, positions, cos_sin_cache, kv_cache,
-                      flatten_slot_mapping(slot_mapping, kv_cache),
+    flat = flatten_slot_mapping(slot_mapping, kv_cache)
+    _tap_write_side("rope_quant_insert", flat, latent, kv_cache)
+    rope_quant_insert(latent, positions, cos_sin_cache, kv_cache, flat,
                       compress_ratio, fp8_scale)
 
 
@@ -155,11 +156,55 @@ def fused_save_compress_norm_ascend(
     from vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache import \
         fused_save_compress_norm
 
+    flat = flatten_slot_mapping(slot_mapping, state_cache)
+    _tap_write_side("fused_save_compress_norm", flat, latent_out, state_cache)
     fused_save_compress_norm(
-        kv_score, positions, state_cache,
-        flatten_slot_mapping(slot_mapping, state_cache),
+        kv_score, positions, state_cache, flat,
         query_start_loc, token_to_req_indices, rms_norm_weight, rms_norm_eps,
         compress_ratio, latent_out)
+
+
+_WRITE_CALLS: dict = {}
+
+
+def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
+    """Where this call is about to write, recorded before it writes.
+
+    🔴 The read side says the compressed stream's entry #0 comes back all
+    zeros on every even-numbered prefill while entry #1 is correct. That is
+    consistent with two different things -- it was never written, or it was
+    written somewhere else -- and only the write side can tell them apart.
+    So: the flat slots this call is handed, and the latent it is handed,
+    taken **before** the operator runs.
+
+    ⚠️ Tagged ``compressor`` with a call index and the cache's data pointer
+    rather than a layer number, because this function does not know its
+    layer: it is a free function rebound over the compressor's own import.
+    The pointer is what lets a reader attribute a call to a cache; the index
+    is what orders calls within a forward. Neither is guessed at.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
+
+    if not align_taps.alignment_active() or not read_taps.read_tap_layers():
+        return
+    try:
+        index = _WRITE_CALLS.get(who, 0)
+        _WRITE_CALLS[who] = index + 1
+        prefix = f"compressor.{who}.{index:02d}"
+        align_taps.tap_whole(0, f"{prefix}.slots", flat_slots)
+        align_taps.tap_whole(0, f"{prefix}.latent", latent)
+        align_taps.tap_whole(
+            0, f"{prefix}.cache_ptr",
+            torch.tensor([cache.data_ptr() if hasattr(cache, "data_ptr")
+                          else 0], dtype=torch.int64))
+    except Exception:                                        # noqa: BLE001
+        # Instrument. It has already cost one flight to let one of these
+        # propagate; it will not cost a second.
+        pass
+
+
+def reset_write_taps_for_test() -> None:
+    _WRITE_CALLS.clear()
 
 
 #: The compressor imports these names into its own module at import time and

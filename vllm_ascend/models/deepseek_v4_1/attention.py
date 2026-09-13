@@ -303,6 +303,13 @@ def _tap_what_this_layer_read(attn, kwargs: dict, req, cmp_req) -> None:
                              kwargs.get("ori_block_table"))
     read_taps.tap_cache_read(layer, "cmp_kv", kwargs.get("cmp_kv"),
                              kwargs.get("cmp_block_table"))
+    # 🔵 The half of golden's sa_in.kv this side keeps as a separate
+    # argument. Recorded under its own key with the relation declared, not
+    # concatenated into a tensor the operator never received as one.
+    read_taps.tap_operator_rows(layer, kwargs.get("cmp_kv"),
+                                kwargs.get("cmp_block_table"),
+                                kwargs.get("seqused_cmp_kv"))
+
     # candidate blocks, which only some layers carry; absent is absent, not
     # an empty tensor.
     for source in (cmp_req, req):

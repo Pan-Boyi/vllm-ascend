@@ -209,6 +209,48 @@ def _tap_block_contents(layer_id: int, key: str, cache, kept) -> None:
     tap_read(layer_id, f"{key}.block_digest_coarse", torch.cat(coarse))
 
 
+@_never_breaks_the_run
+def tap_operator_rows(layer_id: int, cache, block_table, seqused) -> None:
+    """The compressed entries this request hands the operator, as rows.
+
+    🔵 golden's ``sa_in.kv`` is ``[original rows] ++ [compressed entries]`` --
+    one tensor of width ``T + seqused_cmp_kv`` (measured: 5+2=7 at ratio 2,
+    5+5=10 at ratio 1). On this side the two halves are **two arguments**:
+    the SWA cache and the compressed cache, passed separately. So the
+    concatenation golden records does not exist here as a tensor.
+
+    ⚠️ Which is why this records the missing half under **its own key** and
+    the manifest declares the relation, rather than building golden's tensor.
+    Fabricating it would put a constructed object under a name the operator
+    never saw as one block -- the same move already refused for
+    ``sa_in.topk_idxs`` and for layer 0's ``layer.in``. The relation is
+    stated so the comparison can still be made:
+
+        golden sa_in.kv  ==  ours sa_in.kv  ++  ours sa_in.cmp_kv_rows
+
+    Read by **basic indexing** into the block the table names, which is the
+    access that works: two gather kernels have failed on this tensor.
+    """
+    if not records_reads(layer_id):
+        return
+    if not isinstance(cache, torch.Tensor) or \
+            not isinstance(block_table, torch.Tensor):
+        return
+    ids = _block_ids(block_table)
+    if ids is None:
+        return
+    rows = None if not isinstance(seqused, torch.Tensor) or \
+        seqused.numel() == 0 else int(seqused.reshape(-1)[0])
+    block = cache[int(ids.reshape(-1)[0])]
+    tap_read(layer_id, "sa_in.cmp_kv_rows",
+             block if rows is None else block[:rows])
+    # How many rows were taken, because "the first seqused_cmp_kv of the
+    # first block" is an assumption about layout, and a reader comparing
+    # widths needs to know which assumption produced this one.
+    tap_read(layer_id, "sa_in.cmp_kv_rows.count",
+             torch.tensor([-1 if rows is None else rows]))
+
+
 def _block_ids(block_table: torch.Tensor):
     """Valid block ids in this table, de-duplicated, in order."""
     flat = block_table.reshape(-1)
