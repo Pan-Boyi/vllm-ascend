@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Dict, Optional, Set, Tuple
 
 import torch
@@ -99,6 +100,11 @@ def _to_storable(t: torch.Tensor) -> torch.Tensor:
     if t.dtype in _WIDEN_TO_FP32:
         t = t.to(torch.float32)
     return t.cpu().contiguous()
+
+
+#: Matches the tags _layer_tag produces, so the scan below cannot be fooled
+#: by a non-layer tag that happens to start with "layer".
+_LAYER_TAG_RE = re.compile(r"layer_\d+")
 
 
 def _layer_tag(layer_id: int) -> str:
@@ -236,8 +242,91 @@ class AlignRecorder:
         manifest["tensors"] = {tag: sorted(keys)
                                for tag, keys in self._bufs.items()}
         manifest["golden_coverage"] = self._golden_coverage()
+        manifest["injection_scope"] = self._injection_scope()
         with open(os.path.join(self.dump_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
+
+    #: Keys an injector can replace, in the order it should prefer them. Layer
+    #: 0 is the exception the whole structure exists for: it receives a 2-D
+    #: embedding and builds the 4-stream tensor itself, so ``layer.in`` is not
+    #: a tensor it was handed and ``embed.out`` is.
+    INJECTABLE_KEYS = ("layer.in", "pre_mix.in", "embed.out")
+
+    def _injection_scope(self) -> dict:
+        """Per layer: what an injector can replace here, and what it cannot.
+
+        🔴 Per layer, not one shared statement. What is injectable differs by
+        layer -- layer 0 has no ``layer.in`` and no ``pre_mix`` at all -- so
+        any single sentence about "the injected keys" is already false on
+        layer 0. That is also why this is written by the side that produced
+        the tensors: a reader that composes the sentence itself has to guess,
+        and its guess is wrong on the layer that differs.
+
+        Derived from what was actually recorded, never from a list of what
+        was meant to be. A key that failed to record would otherwise still be
+        claimed as covered, which is the failure this file already had once.
+
+        ⚠️ ``not_isolated`` is the load-bearing half. Injection replaces a
+        layer's inputs and nothing else; the KV cache, the compressor latents
+        and the candidate blocks still come from this run. An error that
+        travels through those is invisible to injection, and the report for
+        that layer reads "input the same, output the same" -- which is what
+        "no defect here" looks like.
+        """
+        per_layer: dict[str, dict] = {}
+        for tag, keys in sorted(self._bufs.items()):
+            if not _LAYER_TAG_RE.fullmatch(tag):
+                continue
+            index = int(tag.split("_")[1])
+            injectable = [k for k in self.INJECTABLE_KEYS if k in keys]
+            if index == 0 and "embed.out" not in injectable:
+                # Recorded in the prologue tag, not in layer_00's.
+                if "embed.out" in self._bufs.get("prologue", {}):
+                    injectable = ["embed.out (prologue tag)"] + injectable
+            per_layer[str(index)] = {
+                "injectable_keys": injectable,
+                "absent_here": [k for k in self.INJECTABLE_KEYS
+                                if k not in keys and not (
+                                    index == 0 and k == "embed.out")],
+                "not_isolated": self._not_isolated(index),
+            }
+        return {
+            "per_layer": per_layer,
+            "source": "vllm_ascend AlignRecorder.flush",
+            "note": ("PARTIAL isolation. Injection replaces the keys listed "
+                     "per layer and nothing else; everything under "
+                     "not_isolated still comes from this run, so an error "
+                     "travelling through it is invisible here and the layer "
+                     "reads as clean."),
+        }
+
+    def _not_isolated(self, index: int) -> list:
+        """What still comes from this run at this layer.
+
+        ⚠️ Three states on the compressor layers. Which layers produce the
+        compressed latents is a property of the checkpoint, so it is reported
+        only when the caller supplied it through ``add_manifest``; otherwise
+        this says it does not know rather than naming a set from memory. A
+        frozen 2/8/14/20 would be right for today's config and silently wrong
+        for the next one.
+        """
+        items = ["KV cache (this run's own)"]
+        sources = self._meta.get("compressor_source_layers")
+        if sources is None:
+            items.append(
+                "compressor latents (which layers produce them was not "
+                "recorded in this dump -- pass compressor_source_layers to "
+                "add_manifest; NOT a claim that there are none)")
+        else:
+            items.append(
+                "compressor latents produced by layers "
+                + ", ".join(str(x) for x in sources))
+        candidates = self._meta.get("candidate_block_layers")
+        if candidates is None:
+            items.append("candidate blocks (producing layers not recorded)")
+        elif index in set(candidates):
+            items.append("this layer's candidate blocks")
+        return items
 
     def _golden_coverage(self) -> dict:
         """Say whether this dump holds everything golden will compare.

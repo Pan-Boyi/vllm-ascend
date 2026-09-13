@@ -255,3 +255,87 @@ def test_without_a_golden_dir_the_manifest_says_not_checked(tmp_path,
         open(os.path.join(str(tmp_path), "manifest.json")))["golden_coverage"]
     assert coverage["state"] == "not_checked"
     assert "missing" not in coverage
+
+
+# ------------------------------ the injection scope, written per layer
+
+def test_the_injection_scope_is_per_layer_not_one_sentence(tmp_path):
+    """🔴 Layer 0 is the exception the whole structure exists for.
+
+    It receives a 2-D embedding and builds the 4-stream tensor itself, so it
+    has no layer.in and no pre_mix at all. Any single sentence about "the
+    injected keys" is already false on layer 0 -- which is also why the side
+    that produced the tensors writes it: a reader composing it has to guess,
+    and its guess is wrong on exactly the layer that differs.
+    """
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("prologue", "embed.out", torch.zeros(4))
+    rec.record_whole("layer_00", "attn.out", torch.zeros(4))
+    rec.record_whole("layer_01", "layer.in", torch.zeros(4))
+    rec.record_whole("layer_01", "pre_mix.in", torch.zeros(4))
+    rec.flush()
+
+    scope = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["injection_scope"]
+    assert scope["per_layer"]["1"]["injectable_keys"] == ["layer.in",
+                                                         "pre_mix.in"]
+    assert "layer.in" in scope["per_layer"]["0"]["absent_here"]
+    assert "pre_mix.in" in scope["per_layer"]["0"]["absent_here"]
+    assert any("embed.out" in k
+               for k in scope["per_layer"]["0"]["injectable_keys"])
+
+
+def test_a_key_that_failed_to_record_is_not_claimed(tmp_path):
+    """Derived from what was recorded, never from what was meant to be."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("layer_02", "layer.in", torch.zeros(4))
+    rec.flush()
+
+    scope = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["injection_scope"]
+    assert scope["per_layer"]["2"]["injectable_keys"] == ["layer.in"]
+    assert "pre_mix.in" in scope["per_layer"]["2"]["absent_here"]
+
+
+def test_the_compressor_layers_are_reported_as_unknown_when_unknown(tmp_path):
+    """⚠️ Three states. A frozen 2/8/14/20 would be right for today's config
+    and silently wrong for the next one, and 'no compressor latents' is a very
+    different claim from 'nobody wrote down which layers produce them'."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("layer_01", "layer.in", torch.zeros(4))
+    rec.flush()
+
+    scope = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["injection_scope"]
+    text = " ".join(scope["per_layer"]["1"]["not_isolated"])
+    assert "was not recorded" in text
+    assert "NOT a claim that there are none" in text
+
+
+def test_the_compressor_layers_are_named_when_supplied(tmp_path):
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.add_manifest(compressor_source_layers=[2, 8, 14, 20],
+                     candidate_block_layers=[20])
+    rec.record_whole("layer_20", "layer.in", torch.zeros(4))
+    rec.flush()
+
+    scope = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["injection_scope"]
+    text = " ".join(scope["per_layer"]["20"]["not_isolated"])
+    assert "2, 8, 14, 20" in text
+    assert "this layer's candidate blocks" in text
+
+
+def test_the_scope_says_isolation_is_partial(tmp_path):
+    """The load-bearing half: an error travelling through the KV cache is
+    invisible to injection, and that layer reads 'input the same, output the
+    same' -- which is what 'no defect here' looks like."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("layer_03", "layer.in", torch.zeros(4))
+    rec.flush()
+
+    scope = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["injection_scope"]
+    assert "PARTIAL isolation" in scope["note"]
+    assert any("KV cache" in item
+               for item in scope["per_layer"]["3"]["not_isolated"])
