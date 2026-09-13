@@ -101,6 +101,10 @@ def _capture_positions(_module: torch.nn.Module, args: tuple) -> None:
     second time from query_start_loc and seq_lens.
     """
     global _CURRENT_POSITIONS
+    # Assigned unconditionally, including to None: leaving the previous
+    # forward's positions in place is the failure mode this guards. A stale
+    # position vector is in range and wrong, so every row lands somewhere
+    # real and the coverage assertion may not even fire.
     _CURRENT_POSITIONS = args[1] if len(args) > 1 else None
 
 
@@ -122,6 +126,27 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
         return []
 
     handles: list = []
+    inner = getattr(model, "model", model)
+    # 🔴 First, and on the model rather than on a layer. The layer-level
+    # capture below runs only once the first decoder layer starts, which is
+    # *after* embed_tokens -- so a prologue tap reading positions would get
+    # either None or, worse, the previous step's, which is in range and wrong.
+    # This also clears the value, so a forward that never reaches the capture
+    # cannot leave the last one visible to the next.
+    handles.append(inner.register_forward_pre_hook(_capture_positions))
+    embed = getattr(inner, "embed_tokens", None)
+    if embed is not None and type(embed).__name__ != "PPMissingLayer":
+        # 🔴 The prologue is not optional plumbing. AlignRecorder.record()
+        # raises until set_seq_len() has been called, so without this hook the
+        # very first tap -- sa_in.q -- fails and the whole dump is empty. That
+        # is what happened on the first real run: six taps were entered, none
+        # recorded, and the error correctly said so.
+        #
+        # It lives on embed_tokens because that is the one module that runs
+        # once per forward, before any layer, and whose output *is* a protocol
+        # key. A separate "prologue" module does not exist to hook.
+        handles.append(embed.register_forward_pre_hook(_prologue_pre))
+        handles.append(embed.register_forward_hook(_prologue_post))
     for layer_id, layer in _decoder_layers(model):
         # First, so the boundary hooks below it in the same layer see this
         # layer's positions rather than the previous layer's.
@@ -132,6 +157,91 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
                 continue
             handles.append(_attach(module, layer_id, key, side))
     return handles
+
+
+def _prologue_pre(_module: torch.nn.Module, args: tuple) -> None:
+    """Fix the sequence length, then record input_ids.
+
+    The order matters and is the whole point of this hook: every record()
+    scatters into a [seq_len, ...] buffer, so seq_len has to be known before
+    the first one. Set from the request's own total length rather than from
+    the number of rows in this chunk -- under chunked prefill those differ,
+    and sizing the buffer by the chunk would drop every later row off the end.
+    """
+    seq_len = _single_request_seq_len()
+    if seq_len is None:
+        return
+
+    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
+
+    recorder = get_recorder()
+    if recorder is None:
+        return
+    recorder.set_seq_len(seq_len)
+
+    input_ids = _first_tensor(args)
+    if input_ids is not None:
+        _record_prologue("input_ids", input_ids)
+
+
+def _prologue_post(_module: torch.nn.Module, _args: tuple,
+                   output: Any) -> None:
+    tensor = _first_tensor(output)
+    if tensor is not None:
+        _record_prologue("embed.out", tensor)
+
+
+def _record_prologue(key: str, tensor: torch.Tensor) -> None:
+    """One prologue tensor, scattered by position like any other.
+
+    Tagged "prologue" rather than by layer: golden keeps the model-level
+    tensors in their own file, and a per-layer tag here would put them in
+    layer_00 where nothing compares them.
+    """
+    from vllm_ascend.models.deepseek_v4_1.debug_align import (
+        current_row_to_pos, get_recorder)
+
+    recorder = get_recorder()
+    if recorder is None:
+        return
+    positions = _current_positions()
+    if positions is None:
+        return
+    row_to_pos = current_row_to_pos(positions)
+    if row_to_pos is None:
+        return
+    recorder.record("prologue", key, tensor, row_to_pos)
+
+
+def _single_request_seq_len() -> int | None:
+    """The one request's total sequence length, or None if there is no batch.
+
+    None on a profile or dummy run -- there is nothing to size a buffer with,
+    and guessing would produce a dump shaped like a real one.
+    """
+    from vllm.forward_context import get_forward_context
+
+    try:
+        context = get_forward_context()
+    except AssertionError:
+        return None
+    metadata = getattr(context, "attn_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    for entry in metadata.values():
+        req = getattr(entry, "req_metadata", None)
+        seq_lens = getattr(req, "seq_lens", None)
+        if seq_lens is None or seq_lens.numel() == 0:
+            continue
+        if seq_lens.numel() != 1:
+            raise ValueError(
+                f"alignment recording needs a single request, got "
+                f"{seq_lens.numel()} sequence lengths. positions are "
+                "per-request, so two requests both start at 0 and their rows "
+                "scatter onto each other -- silently, since every value stays "
+                "in range.")
+        return int(seq_lens[0])
+    return None
 
 
 def _attach(module: torch.nn.Module, layer_id: int, key: str,

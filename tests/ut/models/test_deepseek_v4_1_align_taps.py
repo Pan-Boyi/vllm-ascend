@@ -244,3 +244,92 @@ def test_the_norm_modules_are_not_tapped_as_boundaries():
     either would never fire, and "no rows" reads as "the layer did not run"."""
     tapped = {attribute for attribute, _, _ in align_taps._BOUNDARY_TAPS}
     assert "attn_norm" not in tapped and "ffn_norm" not in tapped
+
+
+# ------------------------------------------------------------- the prologue
+
+class _Embed(torch.nn.Module):
+    def forward(self, input_ids):
+        return input_ids.unsqueeze(-1).float().expand(-1, 4)
+
+
+class _ModelWithEmbed(torch.nn.Module):
+    def __init__(self, record, num_layers=1):
+        super().__init__()
+        self.embed_tokens = _Embed()
+        self.layers = torch.nn.ModuleList(
+            [_Layer(record) for _ in range(num_layers)])
+        self.start_layer = 0
+
+    def forward(self, input_ids, positions):
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = layer(x, positions)
+        return x
+
+
+@pytest.fixture
+def prologue_recorder(monkeypatch):
+    """A recorder that refuses record() before set_seq_len(), like the real one."""
+    state = {"seq_len": None, "calls": [], "order": []}
+
+    class _Recorder:
+        def set_seq_len(self, seq_len):
+            state["seq_len"] = seq_len
+            state["order"].append("set_seq_len")
+
+        def record(self, tag, key, tensor, row_to_pos):
+            if state["seq_len"] is None:
+                raise RuntimeError("set_seq_len() must be called before record()")
+            state["order"].append(f"{tag}/{key}")
+            state["calls"].append((tag, key))
+
+        def record_layer(self, layer_id, key, tensor, row_to_pos):
+            self.record(f"layer_{layer_id:02d}", key, tensor, row_to_pos)
+
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+    monkeypatch.setattr(debug_align, "get_recorder", lambda: _Recorder())
+    monkeypatch.setattr(debug_align, "current_row_to_pos",
+                        lambda positions: positions.to(torch.int64))
+    monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 1100)
+    monkeypatch.setattr(align_taps, "_CURRENT_POSITIONS", None)
+    return state
+
+
+def test_seq_len_is_set_before_the_first_record(prologue_recorder):
+    """The failure this hook exists for.
+
+    Without it the first tap reached -- sa_in.q on the first layer -- raises
+    "set_seq_len() must be called before record()", six taps are entered, none
+    record, and the dump is empty. Measured on the first real run.
+    """
+    model = _ModelWithEmbed([])
+    align_taps.install_alignment_taps(model)
+    model(torch.arange(3), torch.arange(3))
+    assert prologue_recorder["order"][0] == "set_seq_len"
+
+
+def test_the_prologue_keys_are_tagged_prologue_not_layer_00(prologue_recorder):
+    model = _ModelWithEmbed([])
+    align_taps.install_alignment_taps(model)
+    model(torch.arange(3), torch.arange(3))
+    assert ("prologue", "input_ids") in prologue_recorder["calls"]
+    assert ("prologue", "embed.out") in prologue_recorder["calls"]
+
+
+def test_positions_are_available_before_the_embedding_runs(prologue_recorder):
+    """The prologue runs before any decoder layer, so a positions capture
+    attached only to the layers would give None here -- or, worse, the
+    previous step's, which is in range and wrong."""
+    model = _ModelWithEmbed([])
+    align_taps.install_alignment_taps(model)
+    model(torch.arange(3), torch.tensor([7, 8, 9]))
+    assert ("prologue", "embed.out") in prologue_recorder["calls"]
+
+
+def test_a_forward_without_positions_clears_the_previous_ones(no_recorder):
+    """Assigned unconditionally, including to None: a leftover position
+    vector from the last step is in range and wrong."""
+    align_taps._CURRENT_POSITIONS = torch.tensor([1, 2, 3])
+    align_taps._capture_positions(torch.nn.Identity(), (torch.zeros(3),))
+    assert align_taps._current_positions() is None
