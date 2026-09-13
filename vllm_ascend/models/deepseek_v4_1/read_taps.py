@@ -37,6 +37,11 @@ _ENV = "VLLM_ASCEND_DSV41_TAP_READ_LAYERS"
 #: the comparison unusable. Overflow is reported, never silently dropped.
 MAX_BLOCKS = 8
 
+#: How many blocks are kept as **rows** rather than only as a digest. One
+#: is enough for the comparisons being run (a five-token request lives in
+#: one block) and keeps the dump small; the digests still cover the rest.
+ROW_BLOCKS = 1
+
 #: Declared in the manifest so the dump says what its "read.*" keys are.
 MOMENT = ("immediately before the operator call: what this layer read, not "
           "what the cache held after the forward")
@@ -200,7 +205,7 @@ def _tap_block_contents(layer_id: int, key: str, cache, kept) -> None:
         coarse_fingerprint_tensor, fingerprint_tensor)
 
     _describe_once("cmp/ori cache", cache, kept)
-    exact, coarse = [], []
+    exact, coarse, landed = [], [], []
     for index in kept.reshape(-1).tolist():
         # 🔴 The view is free; consuming it is not. The failure that killed
         # two flights was not the index operator -- the traceback's third
@@ -215,9 +220,18 @@ def _tap_block_contents(layer_id: int, key: str, cache, kept) -> None:
             return
         exact.append(fingerprint_tensor(block).reshape(1))
         coarse.append(coarse_fingerprint_tensor(block).reshape(1))
+        if len(landed) < ROW_BLOCKS:
+            landed.append(block.reshape(1, *block.shape))
     if not exact:
         return
     tap_read(layer_id, f"{key}.block_digest", torch.cat(exact))
+    # 🔵 And the rows themselves. A digest answers "same or not"; the
+    # comparison that is actually wanted is "different where" -- the NoPE
+    # 448 dims and the RoPE 64 have to be read apart, and a digest folds
+    # them together. 5 rows x 512 bf16 is 5 KB, which is not a reason to
+    # keep the question unanswerable.
+    if landed:
+        tap_read(layer_id, f"{key}.rows", torch.cat(landed))
     tap_read(layer_id, f"{key}.block_digest_coarse", torch.cat(coarse))
 
 

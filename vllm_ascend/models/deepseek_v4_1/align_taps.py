@@ -461,6 +461,30 @@ def _report_all_padding(layer: int, key: str, rows: int) -> None:
         "broken row mapping on the rows that do exist.", rows, layer, key)
 
 
+def _record_model_inputs(module: torch.nn.Module, args: tuple,
+                         kwargs: "dict | None") -> None:
+    """input_ids and positions, from the model's own arguments.
+
+    🔴 They used to be taken from hooks on ``embed_tokens``, and flight-22
+    came back with a prologue section holding only ``engram_hash_ids``: the
+    section existed, three of its four keys did not, and nothing said so.
+
+    ``embed_tokens`` is not on the path when the caller supplies
+    ``inputs_embeds`` -- ``model.py:541-545`` takes it in preference and never
+    calls the embedding -- which is exactly what a multimodal wrapper does.
+    The hooks were installed and simply never fired, so neither the install
+    report nor the flush report had anything to say.
+
+    ⚠️ So these are read where they are **arguments**, not where some module
+    happens to consume them. An argument is present whatever the path taken
+    with it; a module's being called is a property of the path.
+    """
+    for name in ("input_ids", "positions"):
+        value = _named_argument(module, name, args, kwargs)
+        if isinstance(value, torch.Tensor):
+            _record_prologue(name, value)
+
+
 def _report_armed(seq_len: int) -> None:
     """Say, once, that recording did arm.
 
@@ -554,6 +578,7 @@ def _capture_positions(_module: torch.nn.Module, args: tuple,
     # and "the embedding was never recorded" reads the same as "there was
     # nothing to record".
     _CURRENT_POSITIONS = _named_argument(_module, "positions", args, kwargs)
+    _record_model_inputs(_module, args, kwargs)
 
 
 def _current_positions() -> torch.Tensor | None:
@@ -687,6 +712,15 @@ def _make_argument_tap(layer_id: int, positions: dict[str, int]):
     # keyword, which is how the real model passes it.
     def _tap(_module: torch.nn.Module, args: tuple,
              kwargs: dict | None = None) -> None:
+        if layer_id == 0:
+            # 🔵 What layer 0 was handed *is* the embedding output, whichever
+            # path produced it -- the embedding module, a multimodal wrapper's
+            # inputs_embeds, or anything else. Recorded here rather than at
+            # embed_tokens for that reason: the argument exists on every path,
+            # the module call does not.
+            x = _named_argument(_module, "x", args, kwargs)
+            if isinstance(x, torch.Tensor):
+                _record_prologue("embed.out", x)
         for name, key in _FORWARD_ARG_TAPS:
             if key in _FORWARD_RECORDED:
                 continue
@@ -750,6 +784,14 @@ def _record_prologue(key: str, tensor: torch.Tensor) -> None:
         return
     row_to_pos = current_row_to_pos(positions)
     if row_to_pos is None:
+        return
+    if not bool((row_to_pos >= 0).any()):
+        # Same reason as the layer path: an all-padding forward would create
+        # a buffer nothing scatters into, and the flush then reports the key
+        # as missing everywhere -- which is the artifact a broken mapping
+        # produces. The prologue had this guard missing while the layer path
+        # had it.
+        _report_all_padding(-1, key, row_to_pos.numel())
         return
     recorder.record("prologue", key, tensor, row_to_pos)
 

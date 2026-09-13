@@ -133,6 +133,13 @@ def with_recorder(monkeypatch):
             calls.append((layer_id, key, tuple(tensor.shape),
                           row_to_pos.tolist()))
 
+        # ⚠️ The prologue path writes through `record`, not `record_layer`.
+        # A double carrying only one of the recorder's two write methods
+        # makes the other path untestable -- which is how the prologue went
+        # a day with three of its four keys missing and no test noticing.
+        def record(self, tag, key, tensor, row_to_pos):
+            calls.append((tag, key, tuple(tensor.shape), row_to_pos.tolist()))
+
     import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
     monkeypatch.setattr(debug_align, "get_recorder", lambda: _Recorder())
     monkeypatch.setattr(debug_align, "current_row_to_pos",
@@ -168,7 +175,10 @@ def test_the_layer_index_is_global_not_local(with_recorder):
     model.start_layer = 20
     align_taps.install_alignment_taps(model)
     model(torch.randn(2, 4), torch.arange(2))
-    assert {layer_id for layer_id, _, _, _ in with_recorder} == {20, 21}
+    # Only the layer-tagged entries: the prologue now records input_ids and
+    # positions from the model's own arguments, under a string tag.
+    assert {entry[0] for entry in with_recorder
+            if isinstance(entry[0], int)} == {20, 21}
 
 
 def test_positions_come_from_the_layer_being_tapped(with_recorder):
@@ -1229,7 +1239,10 @@ def test_engram_hash_ids_are_recorded_once_under_prologue(monkeypatch,
     # Once, not once per layer: the model computes it for the whole forward,
     # and three copies under three layer tags would make it look
     # layer-specific and put it where golden does not compare.
-    assert recorded == ["engram_hash_ids"], recorded
+    # Only the engram key: input_ids/positions also go to the prologue now,
+    # from the model's own arguments, and they are a different question.
+    assert [k for k in recorded if k == "engram_hash_ids"] == \
+        ["engram_hash_ids"], recorded
 
 
 def test_a_forward_without_engram_hashes_records_nothing(monkeypatch,
@@ -1250,7 +1263,7 @@ def test_a_forward_without_engram_hashes_records_nothing(monkeypatch,
     finally:
         for h in handles:
             h.remove()
-    assert recorded == []
+    assert "engram_hash_ids" not in recorded, recorded
 
 
 def test_the_next_forward_records_its_own(monkeypatch, with_recorder):

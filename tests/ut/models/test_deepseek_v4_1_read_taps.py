@@ -96,7 +96,7 @@ def test_only_the_selected_blocks_are_taken():
         read_taps.tap_read = read_taps.tap_read.__wrapped_original__
     keys = {k for _, k, _ in recorded}
     assert keys == {"ori_kv.block_ids", "ori_kv.block_digest",
-                    "ori_kv.block_digest_coarse"}
+                    "ori_kv.block_digest_coarse", "ori_kv.rows"}
     ids = [t for _, k, t in recorded if k == "ori_kv.block_ids"][0]
     assert ids.numel() == 2, "de-duplicated: 4 appears twice"
     digest = [t for _, k, t in recorded if k == "ori_kv.block_digest"][0]
