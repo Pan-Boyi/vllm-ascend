@@ -11,8 +11,8 @@ starts. That distance is the problem: a cause at layer 2 and a cause at layer
 This turns that into a bisection. One fingerprint per decoder layer per
 forward, in the log, comparable across requests:
 
-    DSV4.1 trace step=3 layer=00 out=0x9f3a...  n=519
-    DSV4.1 trace step=3 layer=02 out=0x11be...  n=519
+    DSV4.1 trace step=3 layer=00 out=0x9f3a... coarse=0x71c2... rows=519
+    DSV4.1 trace step=3 layer=02 out=0x11be... coarse=0x71c2... rows=519
 
 Two requests with the same prompt should produce identical lines. The first
 layer where they differ is the first layer that read something this request
@@ -122,6 +122,47 @@ def fingerprint(tensor: torch.Tensor) -> int:
         return -1
 
 
+#: Quantisation levels for the coarse digest. 1/64 is about 1.6e-2 relative,
+#: which is comfortably above bf16's ULP of 3.9e-3 -- a threshold at or below
+#: the representation floor cannot separate "the same computation, reassociated"
+#: from "a different computation".
+COARSE_LEVELS = 64
+
+
+def coarse_fingerprint(tensor: torch.Tensor) -> int:
+    """A digest that survives reassociation but not a real difference.
+
+    🔴 The exact fingerprint answers "are these the same bits", which is the
+    right question for a stale buffer and the wrong one for a sum added up in
+    a different order. Both print as "different", and the two have opposite
+    remedies: one is a memory bug, the other is a non-deterministic reduction
+    whose 1-ULP wobble is flipping an argmax between near-tied tokens.
+
+    So the trace carries both. Read together:
+
+        exact differs, coarse same   the computation is the same and the
+                                     arithmetic was reassociated
+        both differ                  something structural changed
+
+    Scaled by the tensor's own maximum before quantising, so the grid is
+    relative and one outlier element does not decide the whole digest.
+    """
+    try:
+        flat = tensor.detach().reshape(-1).to(torch.float32)
+        if flat.numel() == 0:
+            return 0
+        scale = flat.abs().max()
+        if not bool(torch.isfinite(scale)) or float(scale) == 0.0:
+            return 0
+        quantised = (flat / scale * COARSE_LEVELS).round().to(torch.int64)
+        index = torch.arange(quantised.numel(), device=quantised.device,
+                             dtype=torch.int64)
+        mixed = (quantised ^ 0x9E3779B97F4A7C15) * (index * 2 + 1)
+        return int((mixed ^ (mixed >> 29)).sum())
+    except Exception:                                        # noqa: BLE001
+        return -1
+
+
 def install_layer_trace(model: torch.nn.Module) -> list:
     """Register the per-layer fingerprint hooks, or none at all.
 
@@ -172,8 +213,11 @@ def _make_hook(index: int):
             return
         from vllm.logger import logger
 
-        logger.info("DSV4.1 trace step=%d layer=%02d out=0x%016x rows=%d",
-                    _STEP, index, fingerprint(tensor) & 0xFFFFFFFFFFFFFFFF,
-                    tensor.shape[0] if tensor.ndim else 0)
+        logger.info(
+            "DSV4.1 trace step=%d layer=%02d out=0x%016x coarse=0x%016x "
+            "rows=%d", _STEP, index,
+            fingerprint(tensor) & 0xFFFFFFFFFFFFFFFF,
+            coarse_fingerprint(tensor) & 0xFFFFFFFFFFFFFFFF,
+            tensor.shape[0] if tensor.ndim else 0)
 
     return _hook

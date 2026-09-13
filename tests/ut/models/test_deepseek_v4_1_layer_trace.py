@@ -247,3 +247,87 @@ def test_the_model_installs_it(monkeypatch):
 
     source = inspect.getsource(model_module)
     assert "install_layer_trace(self)" in source
+
+
+# ------------------------- telling reassociation apart from a real difference
+
+def test_a_one_ulp_wobble_keeps_the_coarse_digest(monkeypatch):
+    """🔴 The distinction the exact digest cannot make.
+
+    A sum added up in a different order and a stale buffer both print as
+    "different bits", and their remedies are opposite: one is a
+    non-deterministic reduction whose wobble is flipping an argmax between
+    near-tied tokens, the other is a memory bug.
+    """
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import (
+        coarse_fingerprint, fingerprint)
+
+    a = torch.linspace(-1, 1, 512, dtype=torch.float32)
+    b = a + a.abs() * 1e-4          # well under bf16's 3.9e-3 ULP
+    assert fingerprint(a) != fingerprint(b)
+    assert coarse_fingerprint(a) == coarse_fingerprint(b)
+
+
+def test_a_real_difference_changes_the_coarse_digest_too():
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import coarse_fingerprint
+
+    a = torch.linspace(-1, 1, 512, dtype=torch.float32)
+    b = a.clone()
+    b[100] = -b[100]
+    assert coarse_fingerprint(a) != coarse_fingerprint(b)
+
+
+def test_the_coarse_grid_is_above_the_bf16_floor():
+    """⚠️ A threshold at or below the representation floor cannot separate
+    "the same computation, reassociated" from "a different computation"."""
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import COARSE_LEVELS
+
+    bf16_ulp = 2 ** -8              # 3.9e-3
+    assert 1.0 / COARSE_LEVELS > bf16_ulp
+
+
+def test_a_permutation_changes_the_coarse_digest_as_well():
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import coarse_fingerprint
+
+    a = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    assert coarse_fingerprint(a) != coarse_fingerprint(a.flip(0))
+
+
+def test_an_all_zero_tensor_is_not_an_error():
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import coarse_fingerprint
+
+    assert coarse_fingerprint(torch.zeros(16)) == 0
+
+
+def test_a_non_finite_tensor_reports_zero_rather_than_garbage():
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import coarse_fingerprint
+
+    assert coarse_fingerprint(torch.full((8,), float("nan"))) == 0
+
+
+def test_the_line_carries_both_digests(monkeypatch):
+    import logging
+
+    from vllm.logger import logger
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "0")
+    model = _Model(n=2)
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            message = record.getMessage()
+            if "DSV4.1 trace step=" in message:
+                lines.append(message)
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    handles = install_layer_trace(model)
+    try:
+        model(torch.zeros(2, 4))
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+
+    assert lines and "out=0x" in lines[0] and "coarse=0x" in lines[0], lines
