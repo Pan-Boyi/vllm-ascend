@@ -179,38 +179,13 @@ def test_a_wrong_page_size_would_have_stayed_in_range(ctx):
 
 # ----------------------------------------------------------------- the rebind
 
-def test_the_patch_points_the_compressors_own_name(monkeypatch):
-    """The compressor imports the name into its module and calls it there, so
-    the module attribute is what has to move."""
-    import importlib
-
-    module = importlib.import_module(compressor_insert._TARGET_MODULE)
-    original = getattr(module, compressor_insert._TARGET_NAME)
-    try:
-        # The plugin may already have applied it during import, so start from
-        # a known-unpatched state rather than assuming one. Asserting True on
-        # the first call otherwise tests the import order, not the patch.
-        from vllm.models.deepseek_v4_1.common.ops import \
-            fused_compress_quant_cache as ops
-        setattr(module, compressor_insert._TARGET_NAME,
-                ops.rope_quant_insert)
-        assert not compressor_insert.compressor_insert_patched()
-
-        assert compressor_insert.apply_compressor_insert_patch() is True
-        assert compressor_insert.compressor_insert_patched()
-        # Idempotent: a second apply is a no-op, not a double wrap.
-        assert compressor_insert.apply_compressor_insert_patch() is False
-    finally:
-        setattr(module, compressor_insert._TARGET_NAME, original)
-
-
 def test_a_missing_upstream_name_is_refused_loudly(monkeypatch):
-    """If upstream stops importing it, the patch must fail rather than
-    silently leave the compressor on the paired mapping."""
+    """If upstream stops importing one of them, the patch must fail rather
+    than silently leave that consumer on the paired mapping."""
     import importlib
 
     module = importlib.import_module(compressor_insert._TARGET_MODULE)
-    monkeypatch.delattr(module, compressor_insert._TARGET_NAME)
+    monkeypatch.delattr(module, compressor_insert._REBINDS[0][0])
     with pytest.raises(AttributeError, match="no longer imports"):
         compressor_insert.apply_compressor_insert_patch()
 
@@ -223,3 +198,105 @@ def test_apply_all_includes_it():
 
     source = inspect.getsource(platform_patches.apply_all)
     assert "apply_compressor_insert_patch" in source
+
+
+# ------------------------------- every consumer, enumerated from upstream
+
+def test_every_upstream_function_taking_a_slot_mapping_is_rebound():
+    """Enumerated from upstream's source, not from the list in our module.
+
+    The list is what was incomplete last time: rope_quant_insert was fixed and
+    fused_save_compress_norm was not, so the paired mapping reached it and its
+    own assert fired -- one launch later, at layer 19 instead of layer 2.
+
+    A third function growing a slot_mapping parameter turns this red instead of
+    costing a flight.
+    """
+    import inspect
+
+    from vllm.models.deepseek_v4_1.common.ops import fused_compress_quant_cache
+
+    takes_mapping = {
+        name for name, fn in vars(fused_compress_quant_cache).items()
+        if not name.startswith("_") and inspect.isfunction(fn)
+        and "slot_mapping" in inspect.signature(fn).parameters
+    }
+    assert takes_mapping, (
+        "no upstream function takes a slot_mapping any more; this check just "
+        "became vacuous")
+
+    rebound = {upstream for upstream, _ in compressor_insert._REBINDS}
+    assert takes_mapping <= rebound, (
+        f"these upstream functions take a slot mapping and nothing converts "
+        f"it for them: {sorted(takes_mapping - rebound)}")
+
+
+def test_both_rebinds_apply_together():
+    import importlib
+
+    module = importlib.import_module(compressor_insert._TARGET_MODULE)
+    originals = {name: getattr(module, name)
+                 for name, _ in compressor_insert._REBINDS}
+    try:
+        from vllm.models.deepseek_v4_1.common.ops import \
+            fused_compress_quant_cache as ops
+        for name, _ in compressor_insert._REBINDS:
+            setattr(module, name, getattr(ops, name))
+        assert not compressor_insert.compressor_insert_patched()
+
+        assert compressor_insert.apply_compressor_insert_patch() is True
+        assert compressor_insert.compressor_insert_patched()
+        assert compressor_insert.apply_compressor_insert_patch() is False
+    finally:
+        for name, original in originals.items():
+            setattr(module, name, original)
+
+
+def test_the_pooling_half_gets_a_flat_mapping(ctx, monkeypatch):
+    seen = {}
+
+    def _fake(kv_score, positions, state_cache, slot_mapping, *rest):
+        seen["slot_mapping"] = slot_mapping.clone()
+
+    import vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache as m
+    monkeypatch.setattr(m, "fused_save_compress_norm", _fake)
+
+    flat = torch.tensor([0, 31, 32], dtype=torch.int32)
+    pairs = _split(flat)
+    ctx({"compressor": _Meta(_Req(pairs))})
+    compressor_insert.fused_save_compress_norm_ascend(
+        torch.zeros(3), torch.arange(3), _cache(), pairs,
+        None, None, torch.ones(4), 1e-6, 2, torch.zeros(3, 4))
+    torch.testing.assert_close(seen["slot_mapping"], flat)
+
+
+def test_a_missing_state_cache_reports_that_the_page_was_not_cross_checked(
+        ctx, monkeypatch):
+    """state_cache may be None, and then only one source for the page size
+    exists. Reported, not passed off as checked."""
+    import logging
+
+    from vllm.logger import logger as vllm_logger
+
+    import vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache as m
+    monkeypatch.setattr(m, "fused_save_compress_norm", lambda *a: None)
+    compressor_insert._LOGGED_UNCHECKED_PAGES.clear()
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    pairs = _split(torch.tensor([64], dtype=torch.int32))
+    ctx({"compressor": _Meta(_Req(pairs))})
+    handler = Capture()
+    vllm_logger.addHandler(handler)
+    try:
+        compressor_insert.fused_save_compress_norm_ascend(
+            torch.zeros(1), torch.arange(1), None, pairs,
+            None, None, torch.ones(4), 1e-6, 2, torch.zeros(1, 4))
+    finally:
+        vllm_logger.removeHandler(handler)
+
+    assert any("NOT" in m and "cross-checked" in m for m in records), records
