@@ -590,7 +590,17 @@ def _stream_is_capturing() -> bool:
         if predicate is None:
             continue
         try:
-            return bool(predicate())
+            # 🔴 ``is True``, not ``bool(...)``. A test double left on
+            # torch.npu makes the predicate return a Mock, and ``bool(Mock)``
+            # is True -- so the probe reports "capturing" and every caller
+            # stands down, silently. Measured: eight engram tests and ten
+            # slot-mapping tests failed only inside the full suite, for that
+            # reason, and had been on the books as unexplained "existing
+            # failures". Anything that is not the literal True reads as not
+            # capturing, which is the safe direction: saying "yes" wrongly
+            # silences a check, saying "no" wrongly costs at worst the CANN
+            # error we would have got anyway.
+            return predicate() is True
         except Exception:
             return False
     return False

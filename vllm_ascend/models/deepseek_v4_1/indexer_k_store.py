@@ -425,7 +425,7 @@ def indexer_k_norm_rope_store_ascend(
         # carries its fp8 scales alongside the values, so ``shape[1]`` is not
         # a second source for the page until that layout is read rather than
         # assumed. One source, said out loud, beats a check on a guess.
-        kv_slot_mapping, layer_name = per_token_compressed_slots(
+        kv_slot_mapping, layers = per_token_compressed_slots(
             handed, positions, compress_ratio)
         num_tokens = kv_slot_mapping.shape[0]
     else:
@@ -435,12 +435,12 @@ def indexer_k_norm_rope_store_ascend(
         if handed.ndim == 2:
             kv_slot_mapping = flatten_block_offset_slots(handed)
             num_tokens = kv_slot_mapping.shape[0]
-        layer_name = layer_owning(handed)
+        layers = layer_owning(handed)
 
     slots = group_boundary_slots(kv_slot_mapping, positions[:num_tokens],
                                  compress_ratio)
     check_per_token(slots, positions, compress_ratio, "indexer_k_store",
-                    layer_name, handed=handed)
+                    layers, handed=handed)
     k = _rms_norm(k_pre[:num_tokens], rms_norm_weight, rms_norm_eps)
     # A latent stands for the first token of its group.
     compressed_pos = torch.div(positions[:num_tokens], compress_ratio,

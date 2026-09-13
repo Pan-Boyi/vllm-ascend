@@ -276,7 +276,13 @@ def test_the_pooling_half_gets_a_flat_mapping(ctx, monkeypatch):
     import vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache as m
     monkeypatch.setattr(m, "fused_save_compress_norm", _fake)
 
-    flat = torch.tensor([0, 31, 32], dtype=torch.int32)
+    # A ring mapping the reader could actually use: row == position % 32,
+    # here block 3. The arbitrary [0, 31, 32] this used to carry is refused
+    # now, and rightly -- the reader takes the row for a position as
+    # (position % capacity), so consecutive-but-incongruent offsets land
+    # where nothing will look. The subject here is the flattening, so the
+    # data has to be valid in every other respect.
+    flat = torch.tensor([96, 97, 98], dtype=torch.int32)
     pairs = _split(flat)
     ctx({"compressor": _Meta(_Req(pairs))})
     compressor_insert.fused_save_compress_norm_ascend(
@@ -343,7 +349,7 @@ def test_the_write_side_is_recorded_before_the_operator_runs(monkeypatch):
                        torch.zeros(2, 4), torch.zeros(4, 4))
     assert order == ["compressor.rope_quant_insert.00.slots",
                      "compressor.rope_quant_insert.00.latent",
-                     "compressor.rope_quant_insert.00.cache_id"]
+                     "compressor.rope_quant_insert.00.cache_id.process_local"]
 
 
 def test_calls_are_numbered_so_a_forward_can_be_ordered(monkeypatch):
@@ -474,3 +480,97 @@ def test_a_compressing_ratio_hands_upstream_a_per_token_mapping(ctx, upstream):
         2,
     )
     assert upstream["slot_mapping"].tolist() == [-1, 10752, -1, 10753, -1]
+
+
+# ---------------------------------- process-local keys leave the comparison
+
+def test_a_process_local_key_says_so_in_its_own_name():
+    """🔴 Corrected, not tidied.
+
+    These were hashed, with a comment claiming the hash let the four-rank
+    same-state comparison report a clean zero. Hashing a pointer that differs
+    per process gives a value that differs per process, so the comparison
+    carried ten known differences every run and relied on the reader
+    remembering to subtract them.
+
+    A process-local identifier cannot be made comparable; it can only leave
+    the comparison. The suffix says that in the key, so a comparator filters
+    it mechanically -- an exceptions list is the other form of remembering,
+    and it is the one that gets forgotten.
+    """
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import attention, compressor_insert
+
+    assert compressor_insert.PROCESS_LOCAL == ".process_local"
+    for source in (inspect.getsource(compressor_insert._tap_write_side),
+                   inspect.getsource(attention._tap_write_side_kv)):
+        for line in source.splitlines():
+            if "data_ptr()" in line or "cache_id" in line or "cache_ptr" in line:
+                continue
+        assert "PROCESS_LOCAL" in source, source
+
+    # And nothing may publish a raw pointer under an unsuffixed key.
+    for module in (compressor_insert, attention):
+        text = inspect.getsource(module)
+        assert '"write.ori_kv.cache_ptr"' not in text
+        assert '.cache_id"' not in text
+
+
+def test_the_ring_mapping_has_its_own_criterion(ctx, monkeypatch):
+    """🔴 Not the per-token one, and the difference matters in both
+    directions.
+
+    The ring is written at every token, so `valid ⊆ boundary` would refuse a
+    correct ring mapping. What it must satisfy is the addressing its reader
+    assumes: the row for a position is (position % capacity) and nothing
+    else, so an offset that is merely consecutive lands in a real row the
+    reader will never look at.
+    """
+    import vllm.models.deepseek_v4_1.common.ops.fused_compress_quant_cache as m
+    monkeypatch.setattr(m, "fused_save_compress_norm", lambda *a: None)
+
+    from vllm_ascend.models.deepseek_v4_1 import compressed_slots
+    compressed_slots.reset_for_test()
+    monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: False)
+
+    # Congruent: accepted, and every token valid -- which the per-token
+    # criterion would have rejected as three non-boundary rows.
+    pairs = _split(torch.tensor([96, 97, 98], dtype=torch.int32))
+    ctx({"compressor": _Meta(_Req(pairs))})
+    compressor_insert.fused_save_compress_norm_ascend(
+        torch.zeros(3), torch.arange(3), _cache(), pairs,
+        None, None, torch.ones(4), 1e-6, 2, torch.zeros(3, 4))
+
+    # Shifted by one: still in range, still a real row, and refused.
+    compressed_slots.reset_for_test()
+    shifted = _split(torch.tensor([97, 98, 99], dtype=torch.int32))
+    ctx({"compressor": _Meta(_Req(shifted))})
+    with pytest.raises(ValueError, match="not congruent to their positions"):
+        compressor_insert.fused_save_compress_norm_ascend(
+            torch.zeros(3), torch.arange(3), _cache(), shifted,
+            None, None, torch.ones(4), 1e-6, 2, torch.zeros(3, 4))
+
+
+def test_the_ring_reader_count_is_reported(ctx, monkeypatch):
+    """🔴 "How far does the reader read" presumes the reader runs.
+
+    Upstream reads the ring only when a chunk's first token closes a group
+    (fused_compress_quant_cache.py:148), so a request's first chunk -- which
+    starts at position 0 -- never reads it. Counted rather than argued: 0
+    readers means a forward carries zero evidence about the reader, which is
+    not the same as evidence that it is fine.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import compressed_slots
+
+    positions = torch.tensor([0, 1, 2, 3, 4, 7, 8], dtype=torch.int64)
+    qsl = torch.tensor([0, 5, 7], dtype=torch.int32)
+    readers, requests = compressed_slots.ring_readers_this_forward(qsl,
+                                                                   positions)
+    # Request 0 starts at position 0 (even -> no read); request 1 starts at
+    # position 7 (odd -> reads row 6).
+    assert (readers, requests) == (1, 2)
+
+    only_first_chunks = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
+    assert compressed_slots.ring_readers_this_forward(
+        torch.tensor([0, 5], dtype=torch.int32), only_first_chunks) == (0, 1)

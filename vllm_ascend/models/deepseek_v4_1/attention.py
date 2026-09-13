@@ -300,8 +300,15 @@ def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
         read_taps.tap_read(layer, "write.ori_kv.latent_pre_rope", kv)
         read_taps.tap_read(layer, "write.ori_kv.positions", positions)
         read_taps.tap_read(layer, "write.ori_kv.slots", slot_mapping)
+        # 🔴 Suffixed, not hashed. A raw pointer and a hash of it are both
+        # process-local, so neither can be equal across ranks; the only fix
+        # is to take the key out of the bit-exact comparison, and the suffix
+        # says so in the key itself so a comparator needs no exception list.
+        from vllm_ascend.models.deepseek_v4_1.compressor_insert import \
+            PROCESS_LOCAL
+
         read_taps.tap_read(
-            layer, "write.ori_kv.cache_ptr",
+            layer, f"write.ori_kv.cache_ptr{PROCESS_LOCAL}",
             torch.tensor([cache.data_ptr()], dtype=torch.int64))
     except Exception:                                        # noqa: BLE001
         # Instrument. One of these has already cost a flight.

@@ -99,7 +99,7 @@ def test_the_rebuild_reproduces_the_measured_mapping(ctx):
     slots, layer = compressed_slots.per_token_compressed_slots(
         handed, torch.arange(5), 2)
     assert slots.tolist() == [-1, 10752, -1, 10753, -1]
-    assert layer == "c2"
+    assert layer == ("c2", )
 
 
 def test_a_second_page_of_states_walks_the_block_table(ctx):
@@ -146,7 +146,7 @@ def test_the_dense_mapping_is_refused_and_named(ctx):
     assert dense.tolist() == [10752, 10753, -1, 0, 0]
     with pytest.raises(ValueError) as excinfo:
         compressed_slots.check_per_token(dense, torch.arange(5), 2,
-                                         "rope_quant_insert", "c2")
+                                         "rope_quant_insert", ("c2", ))
     message = str(excinfo.value)
     assert "DENSE (V4.0) convention" in message
     # Which rows are the problem, not just that something is. Row 0 holds
@@ -204,12 +204,12 @@ def test_containment_not_equality_so_padding_is_not_an_error(ctx):
     """A boundary row may legitimately be -1; a non-boundary row may not be
     valid. Equality would turn ordinary padding into a refused flight."""
     slots = torch.tensor([-1, 10752, -1, -1, -1], dtype=torch.int32)
-    compressed_slots.check_per_token(slots, torch.arange(5), 2, "w", "c2")
+    compressed_slots.check_per_token(slots, torch.arange(5), 2, "w", ("c2", ))
 
 
 def test_ratio_one_has_no_boundary_to_violate(ctx):
     slots = torch.tensor([0, -1, 2, 3], dtype=torch.int32)
-    compressed_slots.check_per_token(slots, torch.arange(4), 1, "w", "c1")
+    compressed_slots.check_per_token(slots, torch.arange(4), 1, "w", ("c1", ))
 
 
 # ------------------------------------- the criterion is also the instrument
@@ -240,14 +240,14 @@ def test_passing_is_announced_once_per_site(ctx, monkeypatch):
     slots = torch.tensor([-1, 10752, -1, 10753, -1], dtype=torch.int32)
     for _ in range(3):
         compressed_slots.check_per_token(slots, torch.arange(5), 2,
-                                         "rope_quant_insert", "layer_02")
+                                         "rope_quant_insert", ("layer_02", ))
     assert len(lines) == 1
     assert "consumer=rope_quant_insert" in lines[0]
-    assert "layer=layer_02" in lines[0]
+    assert "layers=1:[layer_02]" in lines[0]
     assert "ratio=2" in lines[0]
 
     compressed_slots.check_per_token(slots, torch.arange(5), 2,
-                                     "indexer_k_store", "layer_02")
+                                     "indexer_k_store", ("indexer_layer", ))
     assert len(lines) == 2, "a second consumer is a second site"
     assert "consumer=indexer_k_store" in lines[1]
 
@@ -257,7 +257,7 @@ def test_a_writer_that_never_runs_announces_nothing(ctx, monkeypatch):
     lines = _announcements(monkeypatch)
     compressed_slots.check_per_token(
         torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2,
-        "rope_quant_insert", "layer_02")
+        "rope_quant_insert", ("layer_02", ))
     assert len(lines) == 1
     assert not [line for line in lines if "indexer_k_store" in line]
 
@@ -268,11 +268,11 @@ def test_the_budget_is_per_site_not_global(ctx, monkeypatch):
     slots = torch.tensor([-1, 0], dtype=torch.int32)
     for _ in range(compressed_slots.CHECK_LIMIT + 4):
         compressed_slots.check_per_token(slots, torch.arange(2), 2, "busy",
-                                         "layer_02")
+                                         ("layer_02", ))
     dense = torch.tensor([0, -1], dtype=torch.int32)
     with pytest.raises(ValueError):
         compressed_slots.check_per_token(dense, torch.arange(2), 2, "quiet",
-                                         "layer_02")
+                                         ("layer_02", ))
 
 
 def test_a_spent_budget_stops_checking(ctx, monkeypatch):
@@ -284,8 +284,8 @@ def test_a_spent_budget_stops_checking(ctx, monkeypatch):
     for _ in range(compressed_slots.CHECK_LIMIT):
         with pytest.raises(ValueError):
             compressed_slots.check_per_token(dense, torch.arange(2), 2, "w",
-                                             "layer_02")
-    compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", "layer_02")
+                                             ("layer_02", ))
+    compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", ("layer_02", ))
 
 
 # ------------------------------------------------------------- the identity
@@ -312,7 +312,8 @@ def test_the_label_lookup_answers_rather_than_raises(ctx):
     into a failed one."""
     ctx(None)
     assert compressed_slots.layer_owning(
-        torch.zeros(2, dtype=torch.int32)) == "unattributed"
+        torch.zeros(2, dtype=torch.int32)) == ()
+    assert compressed_slots.label(()) == "0:[unattributed]"
 
 
 # ------------------------------------------------------- under graph capture
@@ -329,9 +330,58 @@ def test_the_check_stands_down_under_capture_without_spending_its_budget(
     dense = torch.tensor([0, -1], dtype=torch.int32)
     monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: True)
     for _ in range(compressed_slots.CHECK_LIMIT + 2):
-        compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", "l")
+        compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", ("l", ))
     assert lines == []
 
     monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: False)
     with pytest.raises(ValueError, match="not group boundaries"):
-        compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", "l")
+        compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", ("l", ))
+
+
+# --------------------------------- the label names every sharing layer
+
+def test_every_layer_sharing_one_mapping_is_named(ctx):
+    """🔴 What flight-23 could not answer.
+
+    Four "convention OK" lines named layers 2 and 20, and there was no way
+    to tell whether layers 8 and 14 were covered by those lines -- their
+    caches sharing one group, one builder and therefore one mapping -- or
+    had simply never run. Those are opposite conclusions about whether the
+    fix has runtime coverage there, and the first match in a dict was
+    deciding which one the reader saw.
+    """
+    shared = torch.zeros(5, dtype=torch.int32)
+    req = _Req(shared, 128, ((84, ), ), [0, 5])
+    other = _Req(torch.zeros(5, dtype=torch.int32), 32, ((1, ), ), [0, 5])
+    ctx({"layers.2.attn": _Meta(req),
+         "layers.8.attn": _Meta(req),
+         "elsewhere": _Meta(other),
+         "layers.14.attn": _Meta(req)})
+
+    names, owner = compressed_slots.owning_req_metadata(shared)
+    assert names == ("layers.2.attn", "layers.8.attn", "layers.14.attn")
+    assert owner is req
+    assert compressed_slots.label(names) == (
+        "3:[layers.2.attn, layers.8.attn, layers.14.attn]")
+
+
+def test_the_count_is_printed_even_for_one_layer(ctx, monkeypatch):
+    """So "one layer" and "a group's first member" stop reading the same."""
+    lines = _announcements(monkeypatch)
+    compressed_slots.check_per_token(
+        torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2, "w",
+        ("layers.20.attn", ))
+    assert "layers=1:[layers.20.attn]" in lines[0]
+    assert "a layer absent from every line did not run" in lines[0]
+
+
+def test_a_bare_string_is_one_layer_not_eight(ctx, monkeypatch):
+    """tuple("layer_02") splits into characters, and the log then reports a
+    plausible count of layers that do not exist. Found by a test that passed
+    a string; normalised rather than refused, because refusing would turn a
+    label mistake into a failed write."""
+    lines = _announcements(monkeypatch)
+    compressed_slots.check_per_token(
+        torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2, "w",
+        "layer_02")
+    assert "layers=1:[layer_02]" in lines[0]

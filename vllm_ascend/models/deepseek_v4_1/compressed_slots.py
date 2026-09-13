@@ -91,13 +91,24 @@ def reset_for_test() -> None:
     _ANNOUNCED.clear()
 
 
-def owning_req_metadata(slot_mapping: torch.Tensor) -> tuple[str, Any]:
-    """The layer name and ``req_metadata`` carrying *this exact tensor*.
+def owning_req_metadata(slot_mapping: torch.Tensor) -> tuple[tuple, Any]:
+    """**Every** layer name sharing this exact tensor, and its ``req_metadata``.
 
     Matched by object identity, never by layer name or shape. A name match
     would accept a sibling group's metadata, and every group has its own
     storage page and its own block table -- taking either from the wrong group
     produces in-range slots belonging to other tokens, with nothing raised.
+
+    🔴 All the names, not the first one. Layers whose caches share a KV cache
+    group share one metadata object, so the first match is the group's
+    lowest-numbered member and the rest are invisible. Flight-23 showed
+    exactly that: four "convention OK" lines naming layers 2 and 20, and no
+    way to tell whether layers 8 and 14 were covered by those lines or had
+    never run. A label that reads like a layer and means "first member of a
+    set" is the same-name-different-thing failure, in this module's own log.
+
+    Returning the whole tuple costs nothing -- the walk already visits every
+    entry -- and turns that question into a reading instead of a guess.
 
     No match is a refusal, never a default.
     """
@@ -118,6 +129,8 @@ def owning_req_metadata(slot_mapping: torch.Tensor) -> tuple[str, Any]:
             "dict to take its group's block table and storage page from.")
 
     seen = []
+    names: list = []
+    owner = None
     for layer_name, metadata in attn_metadata.items():
         req = getattr(metadata, "req_metadata", None)
         if req is None:
@@ -128,8 +141,12 @@ def owning_req_metadata(slot_mapping: torch.Tensor) -> tuple[str, Any]:
         candidates = (getattr(req, "slot_mapping", None),
                       getattr(req, "token_slot_mapping", None))
         if any(c is slot_mapping for c in candidates):
-            return layer_name, req
+            names.append(layer_name)
+            owner = req
+            continue
         seen.append((layer_name, page))
+    if owner is not None:
+        return tuple(names), owner
 
     raise ValueError(
         "this slot mapping is not the slot mapping of any attention metadata "
@@ -138,8 +155,8 @@ def owning_req_metadata(slot_mapping: torch.Tensor) -> tuple[str, Any]:
         f"unknown. Groups seen: {seen}")
 
 
-def layer_owning(slot_mapping: torch.Tensor) -> str:
-    """The layer name for a mapping, or a word saying it could not be found.
+def layer_owning(slot_mapping: torch.Tensor) -> tuple:
+    """Every layer sharing this mapping, or an empty tuple if none is found.
 
     Used only to label the coverage report. A missing name must not turn a
     working write into a failure, so this one answers instead of raising --
@@ -148,7 +165,19 @@ def layer_owning(slot_mapping: torch.Tensor) -> str:
     try:
         return owning_req_metadata(slot_mapping)[0]
     except ValueError:
-        return "unattributed"
+        return ()
+
+
+def label(names: tuple) -> str:
+    """The log's name for a set of layers that share one mapping.
+
+    Says how many, and says so even when there is one -- "layers=1:[x]" and
+    "layers=3:[x, y, z]" are then the same kind of reading, and nobody has to
+    know whether a bare name meant one layer or a group's first member.
+    """
+    if not names:
+        return "0:[unattributed]"
+    return f"{len(names)}:[{', '.join(str(n) for n in names)}]"
 
 
 def per_token_compressed_slots(
@@ -185,7 +214,7 @@ def per_token_compressed_slots(
             "with no compressed stream never reaches a compressed-stream "
             "writer, so reaching here means a layer was routed wrongly.")
 
-    layer_name, req = owning_req_metadata(slot_mapping)
+    layer_names, req = owning_req_metadata(slot_mapping)
     page = int(req.storage_block_size)
     if cache is not None:
         from_cache = int(cache.shape[1])
@@ -226,7 +255,7 @@ def per_token_compressed_slots(
     flat = blocks * page + (state % page)
     keep = publishes & addressable & (blocks >= 0)
     slots = torch.where(keep, flat, torch.full_like(flat, SKIP_SLOT))
-    return slots.to(slot_mapping.dtype), layer_name
+    return slots.to(slot_mapping.dtype), layer_names
 
 
 def _index_set(mask: torch.Tensor) -> list:
@@ -257,7 +286,7 @@ def check_per_token(
     positions: torch.Tensor,
     compress_ratio: int,
     consumer: str,
-    layer_name: str,
+    layer_names: tuple,
     handed: torch.Tensor | None = None,
 ) -> None:
     """Assert the mapping is per-token, and say so when it is.
@@ -286,7 +315,14 @@ def check_per_token(
         # deployment that captures everything therefore announces nothing,
         # which is the honest reading: this check did not run.
         return
-    key = (consumer, layer_name, int(compress_ratio))
+    # ⚠️ A bare string is one name, not eight. ``tuple("layer_02")`` splits
+    # into characters and the log then reads "layers=8:[l, a, y, e, r, ...]"
+    # -- a plausible-looking count of layers that do not exist. Caught by a
+    # test that passed a string; normalised rather than refused, because
+    # refusing would turn a label mistake into a failed write.
+    if isinstance(layer_names, str):
+        layer_names = (layer_names, )
+    key = (consumer, tuple(layer_names), int(compress_ratio))
     seen = _CHECKS.get(key, 0)
     if seen >= CHECK_LIMIT:
         return
@@ -304,10 +340,12 @@ def check_per_token(
         if key not in _ANNOUNCED:
             _ANNOUNCED.add(key)
             logger.info(
-                "DSV4.1 slot-mapping convention OK: consumer=%s layer=%s "
-                "ratio=%d T=%d valid=%d/%d boundary rows %s", consumer,
-                layer_name, compress_ratio, num_tokens, len(valid),
-                len(boundary), _short(boundary))
+                "DSV4.1 slot-mapping convention OK: consumer=%s layers=%s "
+                "ratio=%d T=%d valid=%d/%d boundary rows %s. Every layer "
+                "listed shares this one mapping, so one line covers all of "
+                "them; a layer absent from every line did not run.",
+                consumer, label(layer_names), compress_ratio, num_tokens,
+                len(valid), len(boundary), _short(boundary))
         return
 
     num_reqs = 0
@@ -318,7 +356,8 @@ def check_per_token(
         except ValueError:
             num_reqs = 0
     raise ValueError(
-        f"DSV4.1 {consumer} on {layer_name} has a slot mapping with valid "
+        f"DSV4.1 {consumer} on layers {label(layer_names)} has a slot "
+        f"mapping with valid "
         f"rows at {_short(outside)} that are not group boundaries. This "
         f"writer indexes the mapping per token and publishes only where "
         f"(position + 1) % {compress_ratio} == 0, which for these "
@@ -352,7 +391,125 @@ def _stream_is_capturing() -> bool:
         if predicate is None:
             continue
         try:
-            return bool(predicate())
+            # 🔴 ``is True``, not ``bool(...)``. A test double left on
+            # torch.npu makes the predicate return a Mock, and ``bool(Mock)``
+            # is True -- so the probe reports "capturing" and every caller
+            # stands down, silently. Measured: eight engram tests and ten
+            # slot-mapping tests failed only inside the full suite, for that
+            # reason, and had been on the books as unexplained "existing
+            # failures". Anything that is not the literal True reads as not
+            # capturing, which is the safe direction: saying "yes" wrongly
+            # silences a check, saying "no" wrongly costs at worst the CANN
+            # error we would have got anyway.
+            return predicate() is True
         except Exception:                                    # noqa: BLE001
             return False
     return False
+
+
+def check_ring_mapping(
+    slots: torch.Tensor,
+    positions: torch.Tensor,
+    capacity: int,
+    consumer: str,
+    layer_names: tuple,
+    query_start_loc: torch.Tensor | None = None,
+) -> None:
+    """The ring mapping's own criterion -- which is *not* the per-token one.
+
+    🔴 Applying :func:`check_per_token` here would refuse a correct mapping.
+    The compressor's state ring is written at **every** token, not only at
+    group boundaries: measured, ``[344, 345, 346, 347, 348]`` for a five-token
+    chunk, five valid rows for five tokens. ``valid ⊆ boundary`` would leave
+    three of those five outside and go red on the healthy case.
+
+    What the ring must satisfy instead is the addressing its reader assumes.
+    Upstream's kernel reads exactly one row per request program::
+
+        prev = ring + ((position - 1) % STATE_BLOCK) * STATE_ROW_STRIDE
+
+    (``fused_compress_quant_cache.py:152``) and its tail store writes
+    ``slot % STATE_BLOCK`` (:184). So the row a position occupies is
+    ``position % capacity`` and nothing else: a mapping whose offsets are
+    merely *consecutive* rather than *congruent* would put every row in a real
+    place the reader will not look at.
+
+    Two criteria, two paths, and neither substitutes for the other -- which is
+    the point of writing this one down. The distinction between these
+    mappings was held by a paragraph of prose until now, and prose does not
+    go red.
+    """
+    if _stream_is_capturing():
+        return
+    key = ("ring:" + consumer, tuple(layer_names), int(capacity))
+    seen = _CHECKS.get(key, 0)
+    if seen >= CHECK_LIMIT:
+        return
+    _CHECKS[key] = seen + 1
+
+    from vllm.logger import logger
+
+    num_tokens = int(slots.shape[0])
+    pos = positions[:num_tokens].to(device=slots.device, dtype=torch.int64)
+    flat = slots.reshape(num_tokens, -1)[:, 0] if slots.ndim > 1 else slots
+    valid = flat >= 0
+    congruent = (flat % capacity) == (pos % capacity)
+    wrong = _index_set(valid & ~congruent)
+
+    if not wrong:
+        if key not in _ANNOUNCED:
+            _ANNOUNCED.add(key)
+            readers, requests = ring_readers_this_forward(
+                query_start_loc, pos)
+            logger.info(
+                "DSV4.1 ring-mapping addressing OK: consumer=%s layers=%s "
+                "capacity=%d T=%d valid=%d/%d, ring READ by %d of %d "
+                "requests this forward. Written at every token, not only at "
+                "group boundaries -- the per-token criterion does not apply "
+                "here and would refuse this. A read count of 0 means the "
+                "ring was written and never read, so this forward carries no "
+                "evidence about the reader either way.", consumer,
+                label(layer_names), capacity, num_tokens,
+                int(valid.sum()), num_tokens, readers, requests)
+        return
+
+    raise ValueError(
+        f"DSV4.1 {consumer} on layers {label(layer_names)} has a state-ring "
+        f"mapping whose rows {_short(wrong)} are not congruent to their "
+        f"positions modulo the ring capacity {capacity}. The reader takes "
+        f"the row for a position as (position % {capacity}) and nothing "
+        "else, so an offset that is merely consecutive lands in a real row "
+        "the reader will never look at, and the pooled group then carries "
+        "whatever that row held.")
+
+
+def ring_readers_this_forward(query_start_loc, positions) -> tuple:
+    """How many of this forward's requests actually read the state ring.
+
+    🔴 "How far does the reader read" presumes the reader runs, and twice
+    today that presumption was wrong: at T=5 the indexer's operator is
+    short-circuited before it is called, and the ring's reader is likewise
+    gated. Upstream's request program reads the ring only under::
+
+        position = tl.load(positions + start)
+        if (position + 1) % 2 == 0:        # the chunk's first token closes a group
+
+    (``fused_compress_quant_cache.py:148-149``) -- so a chunk that starts at
+    an even absolute position never touches the ring, and a request's *first*
+    chunk starts at position 0 and therefore never does.
+
+    Counted here rather than argued, because the two answers lead to
+    different next steps: 0 readers means this forward's evidence about the
+    reader is **zero, not negative**, and the way to get evidence is a second
+    chunk (chunked prefill, or any decode step at an odd position) -- not a
+    longer prompt.
+    """
+    if query_start_loc is None:
+        return -1, -1
+    starts = query_start_loc[:-1].to(device=positions.device,
+                                     dtype=torch.int64)
+    starts = starts[starts < positions.numel()]
+    if starts.numel() == 0:
+        return 0, 0
+    first = positions[starts]
+    return int((((first + 1) % 2) == 0).sum()), int(starts.numel())

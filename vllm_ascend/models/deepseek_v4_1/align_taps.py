@@ -722,11 +722,12 @@ def _make_argument_tap(layer_id: int, positions: dict[str, int]):
             if isinstance(x, torch.Tensor):
                 _record_prologue("embed.out", x)
         for name, key in _FORWARD_ARG_TAPS:
-            if key in _FORWARD_RECORDED:
-                continue
+            # No skip and no marking here any more: _record_prologue is the
+            # door and owns the once-per-forward guard for every prologue
+            # key. Two places deciding "already recorded" is how the other
+            # three keys ended up with no such decision at all.
             value = _named_argument(_module, name, args, kwargs)
             if isinstance(value, torch.Tensor):
-                _FORWARD_RECORDED.add(key)
                 # Under the prologue tag: the model computes it once for the
                 # whole forward, so tagging it to whichever layer happened to
                 # be first would make it look layer-specific and would put it
@@ -768,14 +769,41 @@ def _prologue_post(_module: torch.nn.Module, _args: tuple,
 
 
 def _record_prologue(key: str, tensor: torch.Tensor) -> None:
-    """One prologue tensor, scattered by position like any other.
+    """One prologue tensor, once per forward, scattered by position.
 
     Tagged "prologue" rather than by layer: golden keeps the model-level
     tensors in their own file, and a per-layer tag here would put them in
     layer_00 where nothing compares them.
+
+    🔴 **Once per forward, and the guard lives here** -- not at the call
+    sites, because counting the call sites is what failed. Every prologue key
+    is a property of the forward, not of whoever noticed it, and each one had
+    more writers than anybody had counted:
+
+        input_ids   the embed_tokens pre-hook, and the model's own arguments
+        embed.out   the embed_tokens post-hook, and layer 0's ``x``
+        positions   the model's arguments -- and ``_capture_positions`` is
+                    registered on the inner model **and on every layer**
+                    (install_alignment_taps :615 and :657), so 40 layers each
+                    recorded it again: 41 writers for one key
+
+    Flight-23 died on it: ``position coverage is not exactly 1``, with
+    ``duplicated`` listing *every* position of ``input_ids`` and
+    ``positions``. The second writer of each was added for a real reason (the
+    embedding is bypassed when a caller supplies ``inputs_embeds``, so an
+    argument-side reader is needed) -- the mistake was adding it without
+    asking how many writers the key already had.
+
+    ⚠️ ``embed.out`` has two writers as well and did *not* appear in that
+    report. That is luck about ordering, not a difference in kind.
+
+    The guard is here rather than at each site so that a fourth writer needs
+    no change: this is the only door into the prologue section.
     """
     from vllm_ascend.models.deepseek_v4_1.debug_align import current_row_to_pos
 
+    if key in _FORWARD_RECORDED:
+        return
     recorder = _armed_recorder()
     if recorder is None:
         return
@@ -793,6 +821,11 @@ def _record_prologue(key: str, tensor: torch.Tensor) -> None:
         # had it.
         _report_all_padding(-1, key, row_to_pos.numel())
         return
+    # Marked only after the write actually happened. Marking on entry would
+    # let an early return -- not armed yet, no positions yet -- consume the
+    # key and lock out the writer that could have recorded it, which is the
+    # same "absent and silent" state this whole section exists to end.
+    _FORWARD_RECORDED.add(key)
     recorder.record("prologue", key, tensor, row_to_pos)
 
 

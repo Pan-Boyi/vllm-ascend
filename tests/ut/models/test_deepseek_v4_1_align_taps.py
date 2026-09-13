@@ -1220,9 +1220,9 @@ def test_engram_hash_ids_are_recorded_once_under_prologue(monkeypatch,
     on every request, independent of cross-request state. That is the whole
     description of the defect being hunted, and it has never been recorded.
     """
-    recorded = []
-    monkeypatch.setattr(align_taps, "_record_prologue",
-                        lambda key, tensor: recorded.append(key))
+    # ⚠️ Observed at the recorder, not at _record_prologue. That function is
+    # now the door that enforces once-per-forward, so a double standing in
+    # for it would test a path the production code no longer has.
     monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 3)
     monkeypatch.setattr(align_taps, "_single_request_query_rows", lambda: 3)
     align_taps._FORWARD_RECORDED.clear()
@@ -1241,6 +1241,7 @@ def test_engram_hash_ids_are_recorded_once_under_prologue(monkeypatch,
     # layer-specific and put it where golden does not compare.
     # Only the engram key: input_ids/positions also go to the prologue now,
     # from the model's own arguments, and they are a different question.
+    recorded = [key for tag, key, *_ in with_recorder if tag == "prologue"]
     assert [k for k in recorded if k == "engram_hash_ids"] == \
         ["engram_hash_ids"], recorded
 
@@ -1249,9 +1250,9 @@ def test_a_forward_without_engram_hashes_records_nothing(monkeypatch,
                                                          with_recorder):
     """Two arms. Absent is absent -- a model with no engram layers has no
     hashes, and that is not a defect."""
-    recorded = []
-    monkeypatch.setattr(align_taps, "_record_prologue",
-                        lambda key, tensor: recorded.append(key))
+    # ⚠️ Observed at the recorder, not at _record_prologue. That function is
+    # now the door that enforces once-per-forward, so a double standing in
+    # for it would test a path the production code no longer has.
     monkeypatch.setattr(align_taps, "_single_request_seq_len", lambda: 3)
     monkeypatch.setattr(align_taps, "_single_request_query_rows", lambda: 3)
     align_taps._FORWARD_RECORDED.clear()
@@ -1263,6 +1264,7 @@ def test_a_forward_without_engram_hashes_records_nothing(monkeypatch,
     finally:
         for h in handles:
             h.remove()
+    recorded = [key for tag, key, *_ in with_recorder if tag == "prologue"]
     assert "engram_hash_ids" not in recorded, recorded
 
 
@@ -1351,3 +1353,95 @@ def test_the_report_says_what_it_does_not_judge():
     assert "sa_in" in report["scope"] and "read." in report["scope"]
     assert not any(key.startswith("sa_in") or key.startswith("read.")
                    for key in report["per_layer"])
+
+
+# ------------------------------ one prologue key, however many writers
+
+def test_a_prologue_key_is_recorded_once_however_many_writers_there_are():
+    """🔴 Flight-23 died here.
+
+    input_ids has two writers (the embed_tokens pre-hook and the model's own
+    arguments), embed.out has two (the embed_tokens post-hook and layer 0's
+    x), and positions has forty-one -- _capture_positions is registered on
+    the inner model AND on every layer. Every one of them was added for a
+    real reason; nobody counted them. The flush then refused the dump with
+    "position coverage is not exactly 1", `duplicated` listing every
+    position.
+
+    Written against the door rather than against the writers, so a fourth
+    writer needs no change to this test either.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    recorded = []
+
+    class _Recorder:
+        seq_len = 3
+
+        def record(self, tag, key, tensor, row_to_pos):
+            recorded.append((tag, key))
+
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+    original_row_to_pos = debug_align.current_row_to_pos
+    debug_align.current_row_to_pos = lambda positions: positions.to(torch.int64)
+    original_recorder = align_taps._armed_recorder
+    original_positions = align_taps._current_positions
+    align_taps._armed_recorder = lambda: _Recorder()
+    align_taps._current_positions = lambda: torch.arange(3)
+    align_taps._FORWARD_RECORDED.clear()
+    try:
+        for _ in range(41):
+            align_taps._record_prologue("positions", torch.arange(3))
+        align_taps._record_prologue("input_ids", torch.arange(3))
+        align_taps._record_prologue("input_ids", torch.arange(3))
+        assert recorded == [("prologue", "positions"),
+                            ("prologue", "input_ids")]
+
+        # And the next forward records them again -- the guard is per
+        # forward, not per process, or the second request would have none.
+        align_taps._FORWARD_RECORDED.clear()
+        align_taps._record_prologue("input_ids", torch.arange(3))
+        assert recorded[-1] == ("prologue", "input_ids")
+        assert len(recorded) == 3
+    finally:
+        align_taps._armed_recorder = original_recorder
+        align_taps._current_positions = original_positions
+        debug_align.current_row_to_pos = original_row_to_pos
+        align_taps._FORWARD_RECORDED.clear()
+
+
+def test_a_key_that_could_not_be_recorded_does_not_consume_its_turn():
+    """Marking on entry would let an early return -- not armed yet, no
+    positions yet -- lock out the writer that could have recorded it, which
+    is exactly the "absent and silent" state this section exists to end."""
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    recorded = []
+
+    class _Recorder:
+        seq_len = 3
+
+        def record(self, tag, key, tensor, row_to_pos):
+            recorded.append(key)
+
+    import vllm_ascend.models.deepseek_v4_1.debug_align as debug_align
+    original_row_to_pos = debug_align.current_row_to_pos
+    debug_align.current_row_to_pos = lambda positions: positions.to(torch.int64)
+    original_recorder = align_taps._armed_recorder
+    original_positions = align_taps._current_positions
+    align_taps._FORWARD_RECORDED.clear()
+    try:
+        align_taps._armed_recorder = lambda: None
+        align_taps._current_positions = lambda: torch.arange(3)
+        align_taps._record_prologue("input_ids", torch.arange(3))
+        assert recorded == []
+        assert "input_ids" not in align_taps._FORWARD_RECORDED
+
+        align_taps._armed_recorder = lambda: _Recorder()
+        align_taps._record_prologue("input_ids", torch.arange(3))
+        assert recorded == ["input_ids"]
+    finally:
+        align_taps._armed_recorder = original_recorder
+        align_taps._current_positions = original_positions
+        debug_align.current_row_to_pos = original_row_to_pos
+        align_taps._FORWARD_RECORDED.clear()

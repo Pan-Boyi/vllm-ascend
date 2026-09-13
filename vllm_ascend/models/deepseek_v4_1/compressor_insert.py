@@ -34,6 +34,14 @@ from __future__ import annotations
 
 import torch
 
+#: Suffix marking a key whose value is a process-local identifier -- a
+#: pointer, a handle, an address-derived id. Such a key can never be equal
+#: across ranks or across runs, so a bit-exact comparator must skip it. Said
+#: in the key rather than in a list of exceptions: the list is the form of
+#: "remembering" that gets forgotten, and a baseline that always carries a
+#: few known differences stops being usable as a baseline.
+PROCESS_LOCAL = ".process_local"
+
 
 def rope_quant_insert_ascend(
     latent: torch.Tensor,
@@ -69,16 +77,16 @@ def rope_quant_insert_ascend(
         # token skips entry #0 entirely and sends a later token to flat slot
         # 0, another request's row. See compressed_slots for the derivation
         # and the measurements.
-        flat, layer_name = per_token_compressed_slots(slot_mapping, positions,
-                                                      compress_ratio, kv_cache)
+        flat, layers = per_token_compressed_slots(slot_mapping, positions,
+                                                  compress_ratio, kv_cache)
     else:
         # Ratio 1 has no group boundaries, so the builder's per-token mapping
         # (dsa_v1.py:1298, the branch that does run) is already the right
         # convention; only the (block, offset) form has to come off.
         flat = flatten_slot_mapping(slot_mapping, kv_cache)
-        layer_name = layer_owning(slot_mapping)
+        layers = layer_owning(slot_mapping)
     check_per_token(flat, positions, compress_ratio, "rope_quant_insert",
-                    layer_name, handed=slot_mapping)
+                    layers, handed=slot_mapping)
     _tap_write_side("rope_quant_insert", flat, latent, kv_cache)
     rope_quant_insert(latent, positions, cos_sin_cache, kv_cache, flat,
                       compress_ratio, fp8_scale)
@@ -181,6 +189,20 @@ def fused_save_compress_norm_ascend(
         fused_save_compress_norm
 
     flat = flatten_slot_mapping(slot_mapping, state_cache)
+    if state_cache is not None and compress_ratio > 1:
+        from vllm_ascend.models.deepseek_v4_1.compressed_slots import (
+            check_ring_mapping, layer_owning)
+
+        # ⚠️ A different criterion from the compressed stream's, deliberately.
+        # The ring is written at every token, so `valid ⊆ boundary` would
+        # refuse a correct mapping; what it must satisfy is the addressing
+        # its reader assumes, `slot % capacity == position % capacity`.
+        # Until now that distinction was held by a paragraph of prose, and
+        # prose does not go red.
+        check_ring_mapping(flat, positions, int(state_cache.shape[1]),
+                           "fused_save_compress_norm",
+                           layer_owning(slot_mapping),
+                           query_start_loc=query_start_loc)
     _tap_write_side("fused_save_compress_norm", flat, latent_out, state_cache)
     fused_save_compress_norm(
         kv_score, positions, state_cache, flat,
@@ -217,15 +239,22 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
         prefix = f"compressor.{who}.{index:02d}"
         align_taps.tap_whole(0, f"{prefix}.slots", flat_slots)
         align_taps.tap_whole(0, f"{prefix}.latent", latent)
-        # 🔴 Hashed, not raw. A process-local address differs between ranks
-        # by construction, so a raw one makes the same-state comparison --
-        # four ranks' dumps expected to be byte-identical -- report ten
-        # differences every time. A baseline criterion that always carries
-        # noise stops being a baseline. The hash still identifies *which*
-        # cache within one process, which is all this key is for.
+        # 🔴 Correction. This used to be hashed, with a comment saying the
+        # hash let the four-rank same-state comparison report a clean zero.
+        # That was wrong: hashing a pointer that differs per process gives a
+        # value that differs per process. The measured values (2937847808 vs
+        # 2440991232 on two ranks) were the hashed ones.
+        #
+        # A process-local identifier cannot be made comparable; it can only
+        # be taken out of the comparison. Hence the suffix, which says so in
+        # the key itself: a comparator filters `.process_local` mechanically
+        # and needs no maintained list of exceptions -- a list being the
+        # other form of "remembering", which is the thing that gets
+        # forgotten. The value still identifies *which* cache within one
+        # process, which is all this key was ever for.
         raw = cache.data_ptr() if hasattr(cache, "data_ptr") else 0
         align_taps.tap_whole(
-            0, f"{prefix}.cache_id",
+            0, f"{prefix}.cache_id{PROCESS_LOCAL}",
             torch.tensor([(raw * 0x9E3779B1) & 0xFFFFFFFF], dtype=torch.int64))
     except Exception:                                        # noqa: BLE001
         # Instrument. It has already cost one flight to let one of these
