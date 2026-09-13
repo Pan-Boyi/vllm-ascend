@@ -94,32 +94,42 @@ def _never_breaks_the_run(fn):
 
     @functools.wraps(fn)
     def _guarded(*args, **kwargs):
-        global _DISABLED
-        if _DISABLED:
+        if _DISABLED.get(fn.__name__):
             return None
         try:
             return fn(*args, **kwargs)
         except Exception as exc:                             # noqa: BLE001
-            _DISABLED = True
+            _DISABLED[fn.__name__] = True
             from vllm_ascend.models.deepseek_v4_1.switch_log import \
                 announce_once
 
             announce_once(
-                "read_taps_disabled",
-                "the read-side taps failed (%s: %r) and have disabled "
-                "themselves for the rest of this process. The run continues; "
-                "every read.* key is absent from this dump, and that is why "
-                "-- not because the layer had nothing to read.",
-                fn.__name__, exc)
+                "read_taps_disabled_" + fn.__name__,
+                "%s failed (%r) and has disabled itself for the rest of "
+                "this process. The run continues and the other read taps are "
+                "unaffected; the keys this one writes are absent from the "
+                "dump, and that is why -- not because the layer had nothing "
+                "to read.", fn.__name__, exc)
             return None
 
     return _guarded
 
 
-#: Set once a tap has failed. Module-level so both entry points share it: a
-#: failure in one is a reason to stop trusting the other, and two independent
-#: flags would leave half the keys appearing for no stated reason.
-_DISABLED = False
+#: Disabled per entry point, not for the module.
+#:
+#: 🔴 This was one shared flag, and that was wrong in the direction that
+#: cost a flight. ``tap_cache_read`` failed -- it gathers from a cache the
+#: device may hold in an internal format -- and took ``tap_read`` down with
+#: it. But ``tap_read`` only records small tensors that were already passed
+#: as arguments: the selections, the lengths, the indexer's topk_idxs. Those
+#: are exactly the keys the investigation needs, they never touch the
+#: gather, and they were lost to a failure in a part they do not depend on.
+#:
+#: ⚠️ The earlier reasoning -- "a failure in one is a reason to stop trusting
+#: the other" -- is right about *trust* and wrong about *coupling*. The two
+#: read different things through different operations; only the shared
+#: conclusion ("the cache contents are unavailable") is shared.
+_DISABLED: dict = {}
 
 
 @_never_breaks_the_run
@@ -155,19 +165,48 @@ def tap_cache_read(layer_id: int, key: str, cache, block_table) -> None:
     if ids is None:
         return
     kept = ids[:MAX_BLOCKS]
-    # 🔴 index_select, not ``cache[kept]``. Advanced indexing on a 4-D NPU
-    # tensor goes through aclnnIndex, which failed with 561103 and took the
-    # whole run down -- the instrument crashed before the thing it was
-    # measuring had run. index_select is the dedicated dim-0 gather, it is
-    # exactly equivalent here (one 1-D index on the first axis), and it does
-    # not go near the high-dimensional index kernel.
-    tap_read(layer_id, key, torch.index_select(cache, 0, kept.to(torch.int32)))
-    # The ids themselves, because "which blocks" is half the question: two
-    # requests reading identical bytes out of different blocks and two
-    # reading different bytes out of the same block are different findings.
+    # The ids themselves first, and through their own tap, because "which
+    # blocks" is half the question -- two requests reading identical bytes
+    # out of different blocks and two reading different bytes out of the same
+    # block are different findings -- and because this part cannot fail the
+    # way the contents can.
     tap_read(layer_id, f"{key}.block_ids", kept)
+    _tap_block_contents(layer_id, key, cache, kept)
     if ids.numel() > MAX_BLOCKS:
         _report_truncated(layer_id, key, int(ids.numel()))
+
+
+@_never_breaks_the_run
+def _tap_block_contents(layer_id: int, key: str, cache, kept) -> None:
+    """A digest of each block, taken one block at a time.
+
+    🔴 Two gather operators have now failed on this tensor with the same
+    error: ``aclnnIndex`` (from ``cache[ids]``) and ``aclnnIndexSelect``
+    (from ``index_select``). The same code from two different kernels points
+    away from "which gather" and at the tensor -- a KV cache the device may
+    be holding in an internal format, which neither gather accepts.
+
+    So this takes ``cache[int(i)]``, which is **basic** indexing: a view, not
+    a kernel, and the most primitive access there is. And it records a
+    **digest** rather than the bytes, because the question is "did the two
+    requests read the same thing", and a digest answers it without moving
+    megabytes per layer per request off the device.
+
+    ⚠️ The digest is the trace's, so a difference here and a difference in
+    the layer trace mean the same thing and can be compared directly.
+    """
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import (
+        coarse_fingerprint_tensor, fingerprint_tensor)
+
+    exact, coarse = [], []
+    for index in kept.reshape(-1).tolist():
+        block = cache[int(index)]
+        exact.append(fingerprint_tensor(block).reshape(1))
+        coarse.append(coarse_fingerprint_tensor(block).reshape(1))
+    if not exact:
+        return
+    tap_read(layer_id, f"{key}.block_digest", torch.cat(exact))
+    tap_read(layer_id, f"{key}.block_digest_coarse", torch.cat(coarse))
 
 
 def _block_ids(block_table: torch.Tensor):
@@ -202,9 +241,9 @@ def _declare_moment() -> None:
 
 
 def reset_for_test() -> None:
-    global _DECLARED, _DISABLED
+    global _DECLARED
     _DECLARED = False
-    _DISABLED = False
+    _DISABLED.clear()
 
 
 def _report_truncated(layer_id: int, key: str, total: int) -> None:
