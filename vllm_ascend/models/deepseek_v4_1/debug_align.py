@@ -105,6 +105,39 @@ def _layer_tag(layer_id: int) -> str:
     return f"layer_{layer_id:02d}"
 
 
+def _log_coverage(report: dict, dump_dir: str) -> None:
+    """Put the verdict in the log, in the words the reader needs.
+
+    ⚠️ "not checked" is logged at warning level and says so in those words.
+    The failure this prevents is the cheapest one in this whole area: a dump
+    produced with no golden directory, a manifest whose differences are both
+    empty, and a reader concluding the run recorded everything.
+    """
+    from vllm.logger import logger
+
+    state = report.get("state")
+    if state == "not_checked":
+        logger.warning(
+            "DSV4.1 alignment: dump written to %s with %d tensors, and "
+            "whether that is everything golden compares was NOT CHECKED -- %s",
+            dump_dir, report.get("recorded_count", 0), report.get("reason"))
+        return
+    if state == "ok":
+        logger.info(
+            "DSV4.1 alignment: dump written to %s -- all %d keys golden "
+            "declares are present (%d extra recorded).", dump_dir,
+            report.get("expected_count", 0), len(report.get("extra", ())))
+        return
+    missing = report.get("missing", [])
+    logger.error(
+        "DSV4.1 alignment: dump written to %s is INCOMPLETE -- %d of the %d "
+        "keys golden declares were never recorded, so those comparisons "
+        "cannot run and their absence looks exactly like a comparison that "
+        "passed. Missing: %s%s", dump_dir, len(missing),
+        report.get("expected_count", 0), ", ".join(missing[:12]),
+        " ..." if len(missing) > 12 else "")
+
+
 class AlignRecorder:
     """Collects per-layer tensors and writes protocol-shaped safetensors.
 
@@ -200,8 +233,34 @@ class AlignRecorder:
         manifest = dict(self._meta)
         manifest.setdefault("seq_len", self.seq_len)
         manifest.setdefault("tags", sorted(self._bufs))
+        manifest["tensors"] = {tag: sorted(keys)
+                               for tag, keys in self._bufs.items()}
+        manifest["golden_coverage"] = self._golden_coverage()
         with open(os.path.join(self.dump_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
+
+    def _golden_coverage(self) -> dict:
+        """Say whether this dump holds everything golden will compare.
+
+        🔴 Runs **after** the tensors are on disk and never raises. A dump run
+        costs a launch; throwing it away at the last step because the report
+        is bad would destroy the only copy of the thing the report is about.
+        So the verdict is written into the manifest and logged, and the bytes
+        are kept whatever it says.
+
+        The coverage assertion above it is about *positions within a key*.
+        This is about *which keys exist at all*, and the two cannot substitute
+        for each other: a key that was never recorded has no coverage vector,
+        so it passes the first check by not being looked at.
+        """
+        from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+        recorded = {f"{tag}/{key}"
+                    for tag, keys in self._bufs.items() for key in keys}
+        report = coverage_report(recorded, _env("VLLM_ASCEND_DSV41_GOLDEN_DIR")
+                                 or None)
+        _log_coverage(report, self.dump_dir)
+        return report
 
     def _assert_full_coverage(self) -> None:
         problems = []

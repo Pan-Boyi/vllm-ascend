@@ -418,6 +418,82 @@ def expected_keys(dump_dir: str, layers: tuple[int, ...]) -> set[str]:
 
 
 
+def golden_layers(golden_dir: str) -> tuple[int, ...]:
+    """Which layers golden actually declares, from its own manifest.
+
+    Not a configured range and not a scan of our own output. A layer that we
+    failed to record entirely has no tag of ours to be discovered from, so
+    deriving the layer list from what we produced would make exactly the
+    omission we are looking for invisible -- the missing row cannot show
+    itself in a hand-built enumeration of the rows that are present.
+    """
+    import json
+    import os
+
+    path = os.path.join(golden_dir, "manifest.json")
+    declared = json.loads(open(path).read()).get("tensors")
+    if not isinstance(declared, dict):
+        raise ValueError(
+            f"{path} declares no 'tensors', so there is no list of layers to "
+            "compare against.")
+    return tuple(sorted(int(tag.split("_")[1]) for tag in declared
+                        if _LAYER_TAG.fullmatch(tag)))
+
+
+def coverage_report(recorded: set[str], golden_dir: str | None) -> dict:
+    """Did this run record everything golden will compare, and nothing else.
+
+    🔴 ``AlignRecorder``'s flush already asserts position coverage -- every
+    token of every recorded key written exactly once. What it cannot see is a
+    key that was **never recorded at all**: there is no buffer, so there is
+    no coverage vector, so there is nothing for that assertion to look at.
+    A whole tensor silently absent and a whole tensor perfectly recorded
+    produce the same green flush.
+
+    Both directions are reported because they mean different things and only
+    one of them is obvious:
+
+        missing   golden compares it, we never wrote it
+                  -> that comparison cannot run, and its absence looks
+                     exactly like a comparison that passed
+        extra     we wrote it, golden does not compare it
+                  -> bytes and seconds for nothing, and it moves the tensor
+                     count, which is the number everyone reads first
+
+    ⚠️ Three states. Without a golden directory this is **not checked**, and
+    that is returned as its own state rather than as two empty differences --
+    empty differences read as full agreement, which is the one reading that
+    must not be available to something that did not run.
+    """
+    if not golden_dir:
+        return {
+            "state": "not_checked",
+            "reason": ("VLLM_ASCEND_DSV41_GOLDEN_DIR is not set, so there is "
+                       "no declaration of what this dump should contain. "
+                       "This is not a pass."),
+            "recorded_count": len(recorded),
+        }
+    try:
+        wanted = expected_keys(golden_dir, golden_layers(golden_dir))
+    except Exception as exc:                       # noqa: BLE001
+        return {
+            "state": "not_checked",
+            "reason": (f"golden's manifest could not be read ({exc!r}), so "
+                       "the expected set is unknown. This is not a pass."),
+            "recorded_count": len(recorded),
+        }
+
+    missing = sorted(wanted - recorded)
+    extra = sorted(recorded - wanted)
+    return {
+        "state": "ok" if not missing else "incomplete",
+        "missing": missing,
+        "extra": extra,
+        "expected_count": len(wanted),
+        "recorded_count": len(recorded),
+    }
+
+
 def alignment_active() -> bool:
     """Whether anything should be recorded at all.
 

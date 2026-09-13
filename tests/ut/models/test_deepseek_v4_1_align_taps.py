@@ -484,3 +484,109 @@ def test_an_unrecognisable_model_reports_what_it_looked_at(with_recorder):
         vllm_logger.removeHandler(handler)
 
     assert any("something_else" in m for m in records), records
+
+
+# ------------------------------------ did we record everything golden compares
+
+def test_golden_layers_come_from_goldens_own_manifest(tmp_path):
+    """Not from what we produced. A layer we failed to record entirely has no
+    tag of ours to be discovered from, so deriving the list from our own
+    output would make the omission we are looking for invisible."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import golden_layers
+
+    d = _manifest(tmp_path, {
+        "prologue": ["input_ids"],
+        "layer_00": ["attn.out"],
+        "layer_02": ["attn.out"],
+        "layer_20": ["attn.out"],
+        "epilogue": ["logits"],
+    })
+    assert golden_layers(d) == (0, 2, 20)
+
+
+def test_a_complete_dump_reports_ok(tmp_path):
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    d = _manifest(tmp_path, {"prologue": ["input_ids"],
+                             "layer_00": ["attn.out", "sa_in.q"]})
+    recorded = {"prologue/input_ids", "layer_00/attn.out", "layer_00/sa_in.q"}
+    report = coverage_report(recorded, d)
+    assert report["state"] == "ok"
+    assert report["missing"] == []
+    assert report["expected_count"] == 3
+
+
+def test_a_key_never_recorded_is_reported_as_missing(tmp_path):
+    """🔴 The case the position-coverage assertion structurally cannot see.
+
+    That assertion walks ``self._coverage``, which only has an entry for a key
+    some call recorded. A key nothing ever wrote has no buffer, no coverage
+    vector, and therefore nothing to be checked -- it passes by not being
+    looked at. A whole tensor silently absent and a whole tensor perfectly
+    recorded produce the same green flush.
+    """
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    d = _manifest(tmp_path, {"layer_00": ["attn.out", "moe_gate.out.1"]})
+    report = coverage_report({"layer_00/attn.out"}, d)
+    assert report["state"] == "incomplete"
+    assert report["missing"] == ["layer_00/moe_gate.out.1"]
+
+
+def test_keys_golden_does_not_compare_are_reported_too(tmp_path):
+    """The other direction. Not a failure -- bytes and seconds for nothing,
+    and it moves the tensor count, which is the number everyone reads first."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    d = _manifest(tmp_path, {"layer_00": ["attn.out"]})
+    report = coverage_report({"layer_00/attn.out", "layer_00/scratch"}, d)
+    assert report["state"] == "ok"
+    assert report["extra"] == ["layer_00/scratch"]
+
+
+def test_no_golden_directory_is_not_checked_rather_than_agreement():
+    """⚠️ The three-state. Two empty differences read as full agreement, and
+    that reading must not be available to something that did not run."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    report = coverage_report({"layer_00/attn.out"}, None)
+    assert report["state"] == "not_checked"
+    assert "not a pass" in report["reason"].lower()
+    assert "missing" not in report and "extra" not in report, (
+        "an unchecked run published differences, and empty differences are "
+        "what agreement looks like")
+
+
+def test_an_unreadable_golden_manifest_is_not_checked_either(tmp_path):
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    report = coverage_report({"layer_00/attn.out"}, str(tmp_path))
+    assert report["state"] == "not_checked"
+    assert "not a pass" in report["reason"].lower()
+
+
+def test_the_report_never_raises_on_a_bad_golden_dir(tmp_path):
+    """The dump costs a launch. Nothing in this path may throw it away."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    (tmp_path / "manifest.json").write_text("{not json")
+    assert coverage_report(set(), str(tmp_path))["state"] == "not_checked"
+
+
+def test_a_layer_missing_in_its_entirety_is_still_reported(tmp_path):
+    """🔴 The case that says why the layer list comes from golden.
+
+    Mutation-tested: deriving the layers from our own recorded keys passes
+    every other test in this file and turns this one green-by-omission --
+    layer_02 is filtered out of the expected set by the very fact that we
+    recorded nothing for it, so "we recorded nothing for layer 2" and "layer 2
+    is complete" become the same answer. The missing row cannot show itself in
+    an enumeration built from the rows that are present.
+    """
+    from vllm_ascend.models.deepseek_v4_1.align_taps import coverage_report
+
+    d = _manifest(tmp_path, {"layer_00": ["attn.out"],
+                             "layer_02": ["attn.out"]})
+    report = coverage_report({"layer_00/attn.out"}, d)
+    assert report["state"] == "incomplete"
+    assert report["missing"] == ["layer_02/attn.out"]

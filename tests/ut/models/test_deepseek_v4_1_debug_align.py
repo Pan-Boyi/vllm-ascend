@@ -181,3 +181,77 @@ def test_manifest_records_injection_state(tmp_path, injector):
     # bug: both show up as strict tolerance failing on every layer.
     assert manifest["force_route"] == "moe+layer_in"
     assert manifest["routing_plan_accum_dtype"] == "torch.float32"
+
+
+# ------------------------------------- the dump says whether it is complete
+
+def _golden(tmp_path, tensors):
+    d = tmp_path / "golden"
+    d.mkdir()
+    (d / "manifest.json").write_text(json.dumps({"tensors": tensors}))
+    return str(d)
+
+
+def test_flush_records_what_it_wrote_in_its_own_manifest(tmp_path):
+    """Symmetric with golden's, so our dump can be read by the same code that
+    reads golden's -- including as the next run's expected set."""
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("layer_00", "attn.sink", torch.zeros(4))
+    rec.flush()
+
+    manifest = json.load(open(os.path.join(str(tmp_path), "manifest.json")))
+    assert manifest["tensors"] == {"layer_00": ["attn.sink"]}
+
+
+def test_an_incomplete_dump_says_so_and_keeps_its_bytes(tmp_path, monkeypatch):
+    """🔴 The report runs after the tensors are on disk and never raises.
+
+    A dump run costs a launch; throwing it away at the last step because the
+    report is bad would destroy the only copy of the thing the report is
+    about.
+    """
+    golden = _golden(tmp_path, {"layer_00": ["attn.sink", "attn.out"]})
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_GOLDEN_DIR", golden)
+
+    out = tmp_path / "ours"
+    rec = da.AlignRecorder(str(out), seq_len=SEQ_LEN)
+    rec.record_whole("layer_00", "attn.sink", torch.zeros(4))
+    rec.flush()
+
+    assert os.path.exists(os.path.join(str(out), "layer_00.safetensors")), (
+        "the tensors were discarded because the coverage report was bad, "
+        "which destroys the only copy of what the report is about")
+    coverage = json.load(
+        open(os.path.join(str(out), "manifest.json")))["golden_coverage"]
+    assert coverage["state"] == "incomplete"
+    assert coverage["missing"] == ["layer_00/attn.out"]
+
+
+def test_a_complete_dump_says_ok(tmp_path, monkeypatch):
+    golden = _golden(tmp_path, {"layer_00": ["attn.sink"]})
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_GOLDEN_DIR", golden)
+
+    out = tmp_path / "ours"
+    rec = da.AlignRecorder(str(out), seq_len=SEQ_LEN)
+    rec.record_whole("layer_00", "attn.sink", torch.zeros(4))
+    rec.flush()
+
+    coverage = json.load(
+        open(os.path.join(str(out), "manifest.json")))["golden_coverage"]
+    assert coverage["state"] == "ok"
+
+
+def test_without_a_golden_dir_the_manifest_says_not_checked(tmp_path,
+                                                            monkeypatch):
+    """⚠️ Not two empty differences. The reader of this manifest has to be
+    able to tell "recorded everything" from "nobody looked"."""
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_GOLDEN_DIR", raising=False)
+
+    rec = da.AlignRecorder(str(tmp_path), seq_len=SEQ_LEN)
+    rec.record_whole("layer_00", "attn.sink", torch.zeros(4))
+    rec.flush()
+
+    coverage = json.load(
+        open(os.path.join(str(tmp_path), "manifest.json")))["golden_coverage"]
+    assert coverage["state"] == "not_checked"
+    assert "missing" not in coverage
