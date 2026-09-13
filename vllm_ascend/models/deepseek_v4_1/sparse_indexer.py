@@ -335,8 +335,18 @@ def _tap_indexer_reads(indexer, req, topk_idxs, seqused_k, cmp_residual_k,
     read_taps.tap_read(layer, "indexer.topk_idxs", topk_idxs)
     read_taps.tap_read(layer, "indexer.seqused_k", seqused_k)
     read_taps.tap_read(layer, "indexer.cmp_residual_k", cmp_residual_k)
+    # 🔴 With this cache's own page and this call's own length. The page is
+    # not one number: the serve log's group table shows four
+    # (SWA 32, two compressed groups at 128 and 256, the compressor ring at
+    # 8), and every one of them is correct in its own group. Reusing another
+    # cache's page here would take the wrong number of blocks -- silently,
+    # since a block id is a block id.
+    page = (int(key_values.shape[1])
+            if isinstance(key_values, torch.Tensor) and key_values.ndim >= 2
+            else None)
     read_taps.tap_cache_read(layer, "indexer.k_cache", key_values,
-                             getattr(req, "block_table", None))
+                             getattr(req, "block_table", None),
+                             seqused_k, page)
 
 def register(ops: dict) -> None:
     """Add the Ascend indexer to the OOT registry table.

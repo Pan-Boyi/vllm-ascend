@@ -397,3 +397,47 @@ def test_zero_is_kept_when_it_is_genuinely_the_first_block():
     table = torch.tensor([[0, 7, 0]], dtype=torch.int32)
     ids = read_taps._block_ids(table, torch.tensor([40]), block_size=32)
     assert ids.tolist() == [0, 7]
+
+
+def test_two_caches_with_different_pages_are_bounded_by_their_own(lines):
+    """🔴 There is no such thing as "the" block size.
+
+    The serve log's group table has four: SWA 32, two compressed groups at
+    128 and 256, the compressor ring at 8 -- and each is correct in its own
+    group. A fixture with one cache cannot express the difference, which is
+    exactly the shape of bench that cannot show the failure it is meant to
+    guard: reusing one page for another cache takes the wrong number of
+    blocks, silently, because a block id is a block id.
+    """
+    recorded = {}
+    import vllm_ascend.models.deepseek_v4_1.align_taps as at
+
+    original = at.tap_whole
+    at.tap_whole = lambda layer, key, tensor: recorded.__setitem__(key, tensor)
+    try:
+        # 70 tokens at page 32 needs 3 blocks; at page 128 it needs 1.
+        table = torch.tensor([[5, 9, 11, 0, 0]], dtype=torch.int32)
+        read_taps.tap_cache_read(2, "ori_kv", torch.zeros(64, 32, 1, 8),
+                                 table, torch.tensor([70]), 32)
+        read_taps.tap_cache_read(2, "cmp_kv", torch.zeros(64, 128, 1, 8),
+                                 table, torch.tensor([70]), 128)
+    finally:
+        at.tap_whole = original
+
+    assert recorded["read.ori_kv.block_ids"].tolist() == [5, 9, 11]
+    assert recorded["read.cmp_kv.block_ids"].tolist() == [5], (
+        "the compressed cache's 128-token page needs one block for 70 "
+        "tokens; taking three is what reusing the SWA page does")
+
+
+def test_the_indexer_tap_passes_its_own_page_and_length():
+    """Pinned as source: the indexer call had neither, so it fell into the
+    unbounded branch and its block list included the padding zeros."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import \
+        _tap_indexer_reads
+
+    body = inspect.getsource(_tap_indexer_reads)
+    assert "key_values.shape[1]" in body
+    assert "seqused_k, page" in body
