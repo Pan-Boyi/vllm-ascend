@@ -177,6 +177,7 @@ def tap_cache_read(layer_id: int, key: str, cache, block_table,
     # block are different findings -- and because this part cannot fail the
     # way the contents can.
     tap_read(layer_id, f"{key}.block_ids", kept)
+    _tap_stray_write_canary(layer_id, key, cache)
     _tap_block_contents(layer_id, key, cache, kept)
     if ids.numel() > MAX_BLOCKS:
         _report_truncated(layer_id, key, int(ids.numel()))
@@ -233,6 +234,40 @@ def _tap_block_contents(layer_id: int, key: str, cache, kept) -> None:
     if landed:
         tap_read(layer_id, f"{key}.rows", torch.cat(landed))
     tap_read(layer_id, f"{key}.block_digest_coarse", torch.cat(coarse))
+
+
+@_never_breaks_the_run
+def _tap_stray_write_canary(layer_id: int, key: str, cache) -> None:
+    """Block 0, row 0 -- recorded whether or not this request owns it.
+
+    🔴 The one row in the cache that is not about this request. Read per
+    token, the dense slot mapping sends every token whose index falls past
+    ``num_compressed_tokens`` to flat slot 0 -- block 0, offset 0 -- because
+    the part of the buffer nobody wrote is ``torch.zeros`` and 0 is a real
+    slot. Measured on flight-21: block 0 held exactly one non-zero row, row
+    0, bit-identical to that forward's ``latent[3]`` on NoPE[0:448].
+
+    It is taken deliberately **outside** the block-table bound. Every other
+    key here is bounded by ``ceil(seqused / page)`` precisely so a request
+    does not record other requests' rows; this one exists because the write
+    being watched is a write into another request's row, and the bound that
+    makes the rest correct is exactly what hides it. Before that bound was
+    added, an unbounded read happened to include block 0 -- which is the only
+    reason anyone ever saw this. That window is closed now, so it is reopened
+    here on purpose, one row wide.
+
+    ⚠️ The row, not a verdict. "Is it zero" is the wrong question: what
+    settles it is whether it still equals ``latent[3]``, and that comparison
+    belongs on the read side with both tensors in hand.
+    """
+    if not isinstance(cache, torch.Tensor):
+        return
+    if cache.ndim < 2 or cache.shape[0] < 1 or cache.shape[1] < 1:
+        return
+    row = _landed(cache[0][0], 0)
+    if row is None:
+        return
+    tap_read(layer_id, f"{key}.block0_row0", row.reshape(1, *row.shape))
 
 
 @_never_breaks_the_run

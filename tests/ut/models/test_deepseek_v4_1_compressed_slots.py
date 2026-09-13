@@ -46,6 +46,13 @@ class _Ctx:
 @pytest.fixture
 def ctx(monkeypatch):
     compressed_slots.reset_for_test()
+    # 🔴 Pinned, not assumed. The check stands down under graph capture, and
+    # torch.npu.is_current_stream_capturing is a module attribute another
+    # test can leave patched -- which it does: these tests passed alone and
+    # ten of them silently stopped raising in the full run, because the
+    # criterion had quietly stood down. An instrument that can be switched
+    # off by something outside the test has to be switched on by the test.
+    monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: False)
     holder = {"ctx": _Ctx()}
 
     def _install(attn_metadata):

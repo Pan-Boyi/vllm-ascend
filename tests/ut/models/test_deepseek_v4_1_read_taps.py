@@ -96,11 +96,53 @@ def test_only_the_selected_blocks_are_taken():
         read_taps.tap_read = read_taps.tap_read.__wrapped_original__
     keys = {k for _, k, _ in recorded}
     assert keys == {"ori_kv.block_ids", "ori_kv.block_digest",
-                    "ori_kv.block_digest_coarse", "ori_kv.rows"}
+                    "ori_kv.block_digest_coarse", "ori_kv.rows",
+                    "ori_kv.block0_row0"}
     ids = [t for _, k, t in recorded if k == "ori_kv.block_ids"][0]
     assert ids.numel() == 2, "de-duplicated: 4 appears twice"
     digest = [t for _, k, t in recorded if k == "ori_kv.block_digest"][0]
     assert digest.numel() == 2, "one digest per block kept"
+    # The one deliberate exception, and it must stay under its own key: the
+    # bounded keys above must not grow a block 0 the request does not own,
+    # because "which blocks this request read" is what they answer.
+    assert 0 not in ids.reshape(-1).tolist()
+
+
+def test_block_zero_row_zero_is_recorded_whoever_owns_it():
+    """🔴 Deliberately outside the block-table bound.
+
+    The write being watched is a write into somebody else's row -- read per
+    token, the dense slot mapping sends tokens past num_compressed_tokens to
+    flat slot 0 -- so the bound that makes every other key correct is exactly
+    what hides it. It was visible once, by accident, while the bound was
+    missing; this reopens that window on purpose, one row wide.
+    """
+    recorded = []
+    read_taps.tap_read = _capture(read_taps.tap_read, recorded)
+    try:
+        cache = torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4)
+        table = torch.tensor([[4, 5]], dtype=torch.int32)
+        read_taps.tap_cache_read(2, "cmp_kv", cache, table)
+    finally:
+        read_taps.tap_read = read_taps.tap_read.__wrapped_original__
+    row = [t for _, k, t in recorded if k == "cmp_kv.block0_row0"][0]
+    assert row.shape == (1, 4)
+    torch.testing.assert_close(row[0], cache[0][0])
+
+
+def test_the_canary_is_the_row_not_a_verdict():
+    """"Is it zero" is the wrong question -- what settles it is whether the
+    row still equals latent[3], and that comparison needs both tensors."""
+    recorded = []
+    read_taps.tap_read = _capture(read_taps.tap_read, recorded)
+    try:
+        cache = torch.zeros(3, 2, 4)
+        read_taps.tap_cache_read(2, "cmp_kv", cache,
+                                 torch.tensor([[1]], dtype=torch.int32))
+    finally:
+        read_taps.tap_read = read_taps.tap_read.__wrapped_original__
+    rows = [t for _, k, t in recorded if k == "cmp_kv.block0_row0"]
+    assert len(rows) == 1, "an all-zero row is still recorded, not skipped"
 
 
 def _capture(original, sink):
