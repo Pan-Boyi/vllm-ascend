@@ -498,3 +498,76 @@ def test_the_helper_is_no_longer_documented_as_being_for_one_parameter():
 
     doc = " ".join(kv_with_layout_rank.__doc__.split())
     assert "a helper that one of two callers uses" in doc
+
+
+# --------------------------------- the compressed cache's own block table
+
+class _Layer:
+    """Just enough of the attention layer to exercise the lookup."""
+
+    prefix = "layers.2.attn"
+
+    def __init__(self, is_kv_source, compressed_prefix=None):
+        self.is_kv_source = is_kv_source
+        self.compressed_cache_prefix = compressed_prefix
+
+    _compressed_block_table = None  # bound below
+
+
+def _bind():
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    _Layer._compressed_block_table = \
+        AscendDeepseekV41Attention._compressed_block_table
+    return _Layer
+
+
+def _meta(block_table):
+    return type("M", (), {"req_metadata": type("R", (), {
+        "block_table": block_table})()})()
+
+
+def test_a_consumer_layer_uses_its_sources_block_table():
+    """Not its own. The compressed cache belongs to another layer's group, and
+    the two tables differ -- addressing one cache with the other's ids gives
+    blocks that are in range and wrong."""
+    layer = _bind()(is_kv_source=False, compressed_prefix="layers.0.attn")
+    mine = torch.zeros(3, 4, dtype=torch.int32)
+    theirs = torch.ones(3, 4, dtype=torch.int32)
+    table = layer._compressed_block_table(
+        {"layers.2.attn": _meta(mine), "layers.0.attn": _meta(theirs)})
+    assert table is theirs
+
+
+def test_a_kv_source_layer_uses_its_own():
+    layer = _bind()(is_kv_source=True)
+    mine = torch.zeros(3, 4, dtype=torch.int32)
+    assert layer._compressed_block_table({"layers.2.attn": _meta(mine)}) is mine
+
+
+def test_a_missing_group_is_refused_rather_than_falling_back():
+    """The fallback is the defect: this layer's own table is always available
+    and always wrong for that cache."""
+    layer = _bind()(is_kv_source=False, compressed_prefix="layers.0.attn")
+    with pytest.raises(ValueError, match="in\n?\\s*range, wrong blocks"):
+        layer._compressed_block_table({"layers.2.attn": _meta(torch.zeros(1))})
+
+
+def test_a_consumer_with_no_source_prefix_is_refused():
+    layer = _bind()(is_kv_source=False, compressed_prefix=None)
+    with pytest.raises(ValueError, match="no compressed_cache_prefix"):
+        layer._compressed_block_table({})
+
+
+def test_the_call_site_does_not_reuse_the_swa_table():
+    """Derived from the source: `cmp_block_table = req.block_table` is the
+    defect, and `req` is the SWA group's metadata."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    assert "cmp_block_table = req.block_table" not in source
+    assert "cmp_block_table = self._compressed_block_table(" in source

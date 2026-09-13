@@ -523,7 +523,24 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             cmp_kv = kv_with_layout_rank(
                 self._unwrap_cache(self._compressed_kv_cache()),
                 plan.layout_kv)
-            cmp_block_table = req.block_table
+            # 🔴 NOT req.block_table. `req` is the SWA cache group's metadata,
+            # and the compressed cache is a different group -- for a consumer
+            # layer it is another layer's cache entirely
+            # (_compressed_kv_cache follows compressed_cache_prefix). Indexing
+            # one cache with the other's block table gives block ids that are
+            # in range and point at the wrong blocks: nothing raises, the
+            # gather lands on real memory, and it surfaces as an aicore
+            # exception with no frame naming the operator.
+            #
+            # Both the other implementations of this call keep them apart:
+            #   dsa_v1:2657/2695   swa_req_metadata.block_table
+            #                      vs common_metadata.block_table
+            #   flashinfer_sparse:408/364  swa_metadata.block_table
+            #                      vs attn_metadata.block_table
+            #
+            # Resolved through the same prefix the cache came from, so the
+            # table and the cache cannot come from different groups.
+            cmp_block_table = self._compressed_block_table(attn_metadata)
 
         # Explicit original-KV indices, following dsa_v1's precedence: a vision
         # prefill supplies them so tokens inside an image span see the whole
@@ -642,6 +659,36 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         )
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
+
+    def _compressed_block_table(self, attn_metadata: dict):
+        """The block table of the cache ``_compressed_kv_cache`` returns.
+
+        Keyed by the same prefix that selects the cache, so the two cannot
+        drift apart. Passing the SWA group's table instead is not a shape
+        error and no check downstream can see it: the ids are in range for
+        both pools and simply address the wrong blocks.
+        """
+        prefix = (self.prefix if self.is_kv_source
+                  else self.compressed_cache_prefix)
+        if prefix is None:
+            raise ValueError(
+                f"{self.prefix}: this layer attends a compressed stream but "
+                "has no compressed_cache_prefix, so there is no way to say "
+                "which cache group's block table addresses it.")
+        metadata = attn_metadata.get(prefix)
+        if metadata is None:
+            raise ValueError(
+                f"{self.prefix}: no attention metadata for the compressed "
+                f"cache at {prefix!r}. Falling back to this layer's own table "
+                "would index that cache with another group's block ids -- in "
+                f"range, wrong blocks. Groups present: {sorted(attn_metadata)[:4]}")
+        req = getattr(metadata, "req_metadata", None)
+        block_table = getattr(req, "block_table", None)
+        if block_table is None:
+            raise ValueError(
+                f"{self.prefix}: the metadata for {prefix!r} carries no "
+                "block table, so the compressed cache cannot be addressed.")
+        return block_table
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Inverse RoPE, then the block-diagonal wo_a, then wo_b.
