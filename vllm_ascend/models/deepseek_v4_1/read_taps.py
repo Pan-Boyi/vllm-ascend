@@ -76,6 +76,53 @@ def records_reads(layer_id: int) -> bool:
     return layer_id in read_tap_layers()
 
 
+def _never_breaks_the_run(fn):
+    """An instrument that can kill the run is not an instrument.
+
+    🔴 ``tap_cache_read`` raised ``aclnnIndex`` 561103 and the flight came
+    back 0/4 with an empty dump -- the cost of a server start and a warm-up,
+    spent on the observer rather than on the thing observed. Everything in
+    this module is read-only and optional by construction, so nothing here
+    has any business propagating.
+
+    Disables itself after the first failure and says so once. Continuing to
+    throw every call would fill the log with the same line and keep paying
+    the cost; going quiet without a word would leave a dump that is missing
+    keys for no stated reason, which reads as "this layer had nothing".
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def _guarded(*args, **kwargs):
+        global _DISABLED
+        if _DISABLED:
+            return None
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:                             # noqa: BLE001
+            _DISABLED = True
+            from vllm_ascend.models.deepseek_v4_1.switch_log import \
+                announce_once
+
+            announce_once(
+                "read_taps_disabled",
+                "the read-side taps failed (%s: %r) and have disabled "
+                "themselves for the rest of this process. The run continues; "
+                "every read.* key is absent from this dump, and that is why "
+                "-- not because the layer had nothing to read.",
+                fn.__name__, exc)
+            return None
+
+    return _guarded
+
+
+#: Set once a tap has failed. Module-level so both entry points share it: a
+#: failure in one is a reason to stop trusting the other, and two independent
+#: flags would leave half the keys appearing for no stated reason.
+_DISABLED = False
+
+
+@_never_breaks_the_run
 def tap_read(layer_id: int, key: str, tensor) -> None:
     """Record one thing this layer read, under a ``read.`` key.
 
@@ -91,6 +138,7 @@ def tap_read(layer_id: int, key: str, tensor) -> None:
     tap_whole(layer_id, f"read.{key}", tensor)
 
 
+@_never_breaks_the_run
 def tap_cache_read(layer_id: int, key: str, cache, block_table) -> None:
     """Record the cache blocks this request's block table points at.
 
@@ -107,7 +155,13 @@ def tap_cache_read(layer_id: int, key: str, cache, block_table) -> None:
     if ids is None:
         return
     kept = ids[:MAX_BLOCKS]
-    tap_read(layer_id, key, cache[kept])
+    # 🔴 index_select, not ``cache[kept]``. Advanced indexing on a 4-D NPU
+    # tensor goes through aclnnIndex, which failed with 561103 and took the
+    # whole run down -- the instrument crashed before the thing it was
+    # measuring had run. index_select is the dedicated dim-0 gather, it is
+    # exactly equivalent here (one 1-D index on the first axis), and it does
+    # not go near the high-dimensional index kernel.
+    tap_read(layer_id, key, torch.index_select(cache, 0, kept.to(torch.int32)))
     # The ids themselves, because "which blocks" is half the question: two
     # requests reading identical bytes out of different blocks and two
     # reading different bytes out of the same block are different findings.
@@ -148,8 +202,9 @@ def _declare_moment() -> None:
 
 
 def reset_for_test() -> None:
-    global _DECLARED
+    global _DECLARED, _DISABLED
     _DECLARED = False
+    _DISABLED = False
 
 
 def _report_truncated(layer_id: int, key: str, total: int) -> None:
