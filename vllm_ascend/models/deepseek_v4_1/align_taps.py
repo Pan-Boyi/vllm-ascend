@@ -91,11 +91,41 @@ KEY_SEMANTICS: dict = {
     "positions": "the position of each row in its own request",
     "embed.out": "the embedding output, i.e. what the first decoder layer "
                  "receives",
+    "qkv_a.out": "the fused q-lora/KV projection's output, [T, q_lora_rank + "
+                 "head_dim], before either RMSNorm. The first point after "
+                 "attn.in on this path",
+    "split.qr": "the q-lora activation after q_norm, i.e. wq_b's input. The "
+                "kv half of the same split is sa_in.kv. ⚠️ Absent when the "
+                "fused query-quant path is taken, because qr is then a "
+                "QuantizedActivation and not a tensor",
+    "q.wq_b_out": "q after the wq_b projection, [T, heads, head_dim], before "
+                  "the weight-free per-head RMSNorm. ⚠️ That norm is NOT "
+                  "q_norm: q_norm is an RMSNorm(q_lora_rank) applied earlier "
+                  "to qr, and this one takes no learned weight at all",
+    "rope.q.in": "the rotation's input on the q side: the trailing "
+                 "rope_head_dim of the normed q, [T, heads, rope_head_dim]. "
+                 "🔵 Only the slice the rotation touches -- the leading dims "
+                 "pass through unchanged and are already in sa_in.q, so "
+                 "recording them again would be the same numbers at eight "
+                 "times the size. Named to match golden's rope.kv.in",
     "sa_in.q": "the query handed to the sparse-attention operator, after "
                "rope and quantisation, sliced to n_local_heads",
-    "sa_in.kv": "the KV handed to the sparse-attention operator for this "
-                "layer's own stream -- ⚠️ golden's has the compressed "
-                "stream concatenated and this one does not",
+    "sa_in.kv": "🔴 the **pre-RoPE**, post-kv_norm kv: the argument this "
+                "layer was handed, not what the operator reads. Upstream's "
+                "contract is 'kv is unchanged; attention reads kv solely via "
+                "swa_kv_cache' (qkv_prolog.py:80-83), so the rotation is "
+                "applied to a separate kv_out that goes to the cache and the "
+                "argument stays pre-rope. ⚠️ Two consequences: golden's key "
+                "of "
+                "the same name has the compressed stream concatenated and "
+                "this one does not, AND if golden records the value the "
+                "operator reads then golden's is post-rope while this one is "
+                "not -- a difference whose angle grows exactly with position "
+                "and which inverse-rotation cancels. That signature is what "
+                "a stage mismatch looks like; it is also what a missing "
+                "rotation looks like, and only the write side tells them "
+                "apart (compare read.ori_kv.rows against "
+                "read.write.ori_kv.latent_pre_rope)",
     "sa_in.attn_sink": "the per-head attention sink (no token axis)",
     "sa_in.softmax_scale": "the softmax scale (scalar)",
     "attn.o_raw": "the operator's output before inverse rope",
@@ -111,10 +141,18 @@ KEY_SEMANTICS: dict = {
     # like a finding. Measured against upstream's own docstring
     # (fused_compress_quant_cache.py:231-238) plus this line's plan:
     #
-    #   ✅ established  RoPE is **already applied**: rope_quant_insert takes
-    #                   positions and cos_sin_cache and writes the roped
-    #                   latent. Reading a cache row and comparing it with a
-    #                   pre-rope tensor compares two different things.
+    #   📖 read, not measured  RoPE is already applied **to the rows in the
+    #                   cache**: rope_quant_insert takes positions and
+    #                   cos_sin_cache and writes the roped latent. The grade
+    #                   is the operator's signature, not a comparison -- it
+    #                   was carrying a ✅ that read as measured, and a whole
+    #                   day passed without anyone re-examining rope because
+    #                   of it.
+    #   🔴 SCOPE  the line above is about **cache rows**, and it does not
+    #                   transfer to ``sa_in.kv``. That key is the pre-rope
+    #                   argument (see its own entry), and reading this line
+    #                   as covering it is how a stage mismatch between the
+    #                   two dumps can look like a rope defect.
     #   ✅ established  On the A5 bf16 plan nothing is quantised: the cache
     #                   dtype is bfloat16 and fp8_scale is None. The uint8
     #                   fp8_ds_mla layout is a different plan.
@@ -579,6 +617,17 @@ def _capture_positions(_module: torch.nn.Module, args: tuple,
     # nothing to record".
     _CURRENT_POSITIONS = _named_argument(_module, "positions", args, kwargs)
     _record_model_inputs(_module, args, kwargs)
+
+
+def current_positions() -> torch.Tensor | None:
+    """The positions of the layer currently being tapped, for inline taps.
+
+    A public name for what the hooks use, so a tap site in another module
+    does not reach into a private one -- the private name is free to change
+    with the hook, and a cross-module use of it would not be found when it
+    does.
+    """
+    return _CURRENT_POSITIONS
 
 
 def _current_positions() -> torch.Tensor | None:

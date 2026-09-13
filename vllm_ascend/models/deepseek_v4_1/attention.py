@@ -275,6 +275,29 @@ def _cache_page_size(cache) -> "int | None":
     return int(cache.shape[1])
 
 
+def _tap_chain_point(attn, key: str, tensor) -> None:
+    """One intermediate of the attn input chain, under its own key.
+
+    Position-sharded like the boundary taps, so it lands in the same
+    ``layer_NN`` file golden compares against. Never propagates: these are
+    observations of a value that is about to be used either way.
+    """
+    try:
+        from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+        if not align_taps.alignment_active():
+            return
+        layer = align_taps.layer_index(
+            attn.prefix, attn.vllm_config.model_config.hf_text_config)
+        positions = align_taps.current_positions()
+        if positions is None:
+            return
+        align_taps.tap(layer, key, tensor, positions)
+    except Exception:                                        # noqa: BLE001
+        # Instrument. One of these has already cost a flight.
+        pass
+
+
 def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
     """What the original-stream cache is about to be given, before it is.
 
@@ -499,6 +522,38 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             stream_compress_ratio=stated_stream_ratio(self),
         )
 
+    def _fused_wqa_wkv_gemm(self, hidden_states):
+        """Upstream's fused q-lora/KV projection, with its output recorded.
+
+        🔵 The first thing after ``attn.in`` on this path, and the point that
+        splits the projection from the two RMSNorms that follow it
+        (``_split_qkv_and_norm``, upstream attention.py:601-620). Recorded
+        because ``sa_in.kv`` -- which is the *post*-norm kv -- already differs
+        from golden, so the divergence is at or before that split, and only
+        this key says which side of it.
+
+        Tapped, not reimplemented: the call goes straight to the base class.
+        """
+        out = super()._fused_wqa_wkv_gemm(hidden_states)
+        _tap_chain_point(self, "qkv_a.out", out)
+        return out
+
+    def _split_qkv_and_norm(self, qr_kv):
+        """Upstream's split and the two RMSNorms, with the q half recorded.
+
+        The kv half of this split is already ``sa_in.kv``; the q half had no
+        key, and it is the first point on the q path after the projection.
+
+        ⚠️ ``qr`` is a ``QuantizedActivation`` rather than a tensor when the
+        fused query-quant path is taken. Recorded only when it is a tensor:
+        a key that is sometimes one thing and sometimes another is worse than
+        an absent key, and the absence is visible in the declared coverage.
+        """
+        qr, qr_scale, kv = super()._split_qkv_and_norm(qr_kv)
+        if isinstance(qr, torch.Tensor):
+            _tap_chain_point(self, "split.qr", qr)
+        return qr, qr_scale, kv
+
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         """Upstream's fused prolog, decomposed. See deepseek_v4_1.qkv_prolog.
 
@@ -551,12 +606,27 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # has the answer: `kv` here is the tensor that becomes those dims.
         _tap_write_side_kv(self, kv, positions, swa_metadata.slot_mapping,
                            swa_kv_cache)
+        # 🔴 The q side, one key per step. Measured: the kv side's error is
+        # 99.82% concentrated in its rope slice, while q's is spread evenly
+        # over both halves -- so q carries a second defect somewhere in
+        # wq_a / q_norm / wq_b, and that stretch had no observation at all.
+        #
+        #   qkv_a.out    wq_a + wkv, before either norm
+        #   split.qr     after q_norm (the kv half of that split is sa_in.kv)
+        #   q.wq_b_out   this argument -- after wq_b, before the per-head norm
+        #   rope.q.in    after the weight-free per-head RMSNorm, rope slice
+        #   sa_in.q      after the rotation (already recorded)
+        #
+        # One operation per gap. Without them, "sa_in.q differs" names a
+        # four-operation segment and costs a bisection per flight.
+        _tap_chain_point(self, "q.wq_b_out", q)
         return qnorm_rope_kv_insert(
             q=q, kv=kv, positions=positions,
             cos_sin_cache=self.rotary_emb.cos_sin_cache,
             swa_kv_cache=swa_kv_cache,
             slot_mapping=swa_metadata.slot_mapping,
-            eps=self.eps, rope_head_dim=self.rope_head_dim)
+            eps=self.eps, rope_head_dim=self.rope_head_dim,
+            tap=lambda key, tensor: _tap_chain_point(self, key, tensor))
 
     def __init__(
         self,

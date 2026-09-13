@@ -183,15 +183,29 @@ def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
                          positions: torch.Tensor, cos_sin_cache: torch.Tensor,
                          swa_kv_cache: torch.Tensor,
                          slot_mapping: torch.Tensor, eps: float,
-                         rope_head_dim: int) -> torch.Tensor:
+                         rope_head_dim: int,
+                         tap=None) -> torch.Tensor:
     """The bf16 branch, decomposed. Returns the rotated, normed ``q``.
 
     ``q`` is ``[tokens, heads, head_dim]`` and ``kv`` is ``[tokens, head_dim]``;
     both are rotated over the same trailing slice at the same positions, so the
     cos/sin pair is built once.
+
+    ``tap`` -- optional ``(key, tensor) -> None`` -- is offered the rotation's
+    input, the trailing ``rope_head_dim`` of the normed q. Passed in rather
+    than imported here because this module has no layer identity and the
+    caller does.
     """
     cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
-    q_out = rope_tail(rms_norm_weightless(q, eps), cos, sin, rope_head_dim)
+    q_normed = rms_norm_weightless(q, eps)
+    if tap is not None:
+        # 🔵 Only the slice the rotation touches. The leading
+        # ``head_dim - rope_head_dim`` dims pass through unchanged, so they
+        # are already in ``sa_in.q`` and recording them again would be the
+        # same numbers at eight times the size (measured on this model:
+        # [T, 64, 512] against [T, 64, 64]).
+        tap("rope.q.in", q_normed[..., q_normed.shape[-1] - rope_head_dim:])
+    q_out = rope_tail(q_normed, cos, sin, rope_head_dim)
     # kv arrives normed; the op's name says kv_rope, not kv_norm_rope.
     kv_out = rope_tail(kv, cos, sin, rope_head_dim)
     scatter_rows(swa_kv_cache, kv_out, slot_mapping, swa_kv_cache.shape[1])

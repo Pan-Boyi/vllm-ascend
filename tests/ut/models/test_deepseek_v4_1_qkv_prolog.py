@@ -10,6 +10,8 @@ one the operator's name would have got wrong, so each has a test.
 import pytest
 import torch
 
+from vllm_ascend.models.deepseek_v4_1.qkv_prolog import \
+    rms_norm_weightless as qkv_prolog_rms
 from vllm_ascend.models.deepseek_v4_1.qkv_prolog import (qnorm_rope_kv_insert,
                                                           rms_norm_weightless,
                                                           rope_tail,
@@ -293,3 +295,82 @@ def test_the_prolog_does_not_mutate_kv():
         swa_kv_cache=torch.zeros(2, 4, HEAD_DIM, dtype=torch.bfloat16),
         slot_mapping=torch.tensor([0, 1]), eps=EPS, rope_head_dim=ROPE_DIM)
     torch.testing.assert_close(kv, before)
+
+
+# ------------------------------- the chain points between attn.in and sa_in.q
+
+def test_the_pre_rope_value_is_offered_to_the_caller():
+    """🔴 Three operations sit between q's projection and sa_in.q, and any of
+    them can be the wrong one.
+
+        q.wq_b_out   after wq_b, before any norm
+        q.pre_rope   after the weight-free per-head RMSNorm   <- this one
+        sa_in.q      after the GPT-J rotation
+
+    Without the middle value, "sa_in.q differs" names a three-operation
+    segment and costs a bisection per flight. The tap is a caller-supplied
+    callable because this module has no layer identity and the caller does.
+    """
+    seen = {}
+    q = torch.randn(3, 2, 8, dtype=torch.bfloat16)
+    kv = torch.randn(3, 8, dtype=torch.bfloat16)
+    cos_sin = torch.zeros(16, 4, dtype=torch.float32)
+    cos_sin[:, :2] = 1.0
+
+    out = qnorm_rope_kv_insert(
+        q=q, kv=kv, positions=torch.arange(3),
+        cos_sin_cache=cos_sin, swa_kv_cache=torch.zeros(2, 4, 8),
+        slot_mapping=torch.tensor([0, 1, 2], dtype=torch.int32),
+        eps=1e-6, rope_head_dim=4,
+        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
+
+    assert set(seen) == {"rope.q.in"}
+    # The normed q before the rotation, and only the slice the rotation
+    # touches: the leading dims pass through and are already in sa_in.q.
+    normed = rms_norm_weightless(q, 1e-6)
+    torch.testing.assert_close(seen["rope.q.in"], normed[..., -4:])
+    assert seen["rope.q.in"].shape == (3, 2, 4)
+    assert out.shape == (3, 2, 8)
+
+
+def test_the_rotation_still_happens_on_the_tapped_value():
+    """The tap must observe the value the next step consumes, not a copy that
+    the next step then ignores -- an instrument that reads a dead branch is
+    the failure this module has already had once."""
+    q = torch.randn(2, 1, 8, dtype=torch.bfloat16)
+    cos_sin = torch.zeros(8, 4, dtype=torch.float32)
+    cos_sin[:, :2] = 0.5
+    cos_sin[:, 2:] = 0.25
+    seen = {}
+    out = qnorm_rope_kv_insert(
+        q=q, kv=torch.randn(2, 8, dtype=torch.bfloat16),
+        positions=torch.arange(2), cos_sin_cache=cos_sin,
+        swa_kv_cache=torch.zeros(2, 4, 8),
+        slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
+        eps=1e-6, rope_head_dim=4,
+        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
+    nope = 8 - 4
+    # The tapped slice is the rotation's input; the rotation changed it.
+    assert not torch.allclose(out[..., nope:].to(torch.float32),
+                              seen["rope.q.in"])
+    # And the leading dims the tap deliberately omits did pass through, which
+    # is the reason omitting them loses nothing.
+    normed = qkv_prolog_rms(q, 1e-6)
+    torch.testing.assert_close(out[..., :nope].to(torch.float32),
+                               normed[..., :nope], rtol=2e-2, atol=2e-2)
+
+
+def test_no_tap_is_the_default_and_changes_nothing():
+    q = torch.randn(2, 1, 8, dtype=torch.bfloat16)
+    kv = torch.randn(2, 8, dtype=torch.bfloat16)
+    cos_sin = torch.zeros(8, 4, dtype=torch.float32)
+    cos_sin[:, :2] = 1.0
+    args = dict(positions=torch.arange(2), cos_sin_cache=cos_sin,
+                slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
+                eps=1e-6, rope_head_dim=4)
+    a = qnorm_rope_kv_insert(
+        q=q, kv=kv, swa_kv_cache=torch.zeros(2, 4, 8), **args)
+    b = qnorm_rope_kv_insert(
+        q=q, kv=kv, swa_kv_cache=torch.zeros(2, 4, 8),
+        tap=lambda key, tensor: None, **args)
+    assert torch.equal(a, b)
