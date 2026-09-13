@@ -261,6 +261,40 @@ def _warn_unwritten_selection_on_dummy_run() -> None:
 
 
 
+
+def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
+    """What the original-stream cache is about to be given, before it is.
+
+    ⚠️ Pre-rope. ``qnorm_rope_kv_insert`` applies the rope inside, so this
+    tensor is the input to that and the cache row is the output -- comparing
+    the two directly is comparing across a rotation, which is exactly the
+    mistake that made a cosine of 0.15 look like a finding. The rope is an
+    orthogonal transform, so a *content* comparison at equal positions is
+    still valid; a positional one is not.
+
+    Recorded whole, because there is no token-position scatter to do here
+    that the reader could not do better with the slot mapping alongside.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
+
+    if not align_taps.alignment_active():
+        return
+    try:
+        layer = align_taps.layer_index(
+            attn.prefix, attn.vllm_config.model_config.hf_text_config)
+        if not read_taps.records_reads(layer):
+            return
+        read_taps.tap_read(layer, "write.ori_kv.latent_pre_rope", kv)
+        read_taps.tap_read(layer, "write.ori_kv.positions", positions)
+        read_taps.tap_read(layer, "write.ori_kv.slots", slot_mapping)
+        read_taps.tap_read(
+            layer, "write.ori_kv.cache_ptr",
+            torch.tensor([cache.data_ptr()], dtype=torch.int64))
+    except Exception:                                        # noqa: BLE001
+        # Instrument. One of these has already cost a flight.
+        pass
+
+
 def _tap_what_this_layer_read(attn, kwargs: dict, req, cmp_req) -> None:
     """Everything the operator is about to be handed, plus the blocks behind
     the two block tables.
@@ -480,6 +514,15 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 f"metadata says block_size {block_size}, head_dim "
                 f"{self.head_dim}. These index each other, so a mismatch "
                 "writes rows at the wrong offset rather than failing.")
+        # 🔴 The write side of the original stream. golden searched all 40
+        # layers of its own dump -- 275,691 slices -- for anything matching
+        # the NoPE 448 dims of our cached rows and found max |cos| = 0.106,
+        # while the values are plainly activations (std 0.339 against its
+        # 0.306, no zeros, mutually near-orthogonal). So the question is not
+        # "where was it written" but "what was written", and only this side
+        # has the answer: `kv` here is the tensor that becomes those dims.
+        _tap_write_side_kv(self, kv, positions, swa_metadata.slot_mapping,
+                           swa_kv_cache)
         return qnorm_rope_kv_insert(
             q=q, kv=kv, positions=positions,
             cos_sin_cache=self.rotary_emb.cos_sin_cache,

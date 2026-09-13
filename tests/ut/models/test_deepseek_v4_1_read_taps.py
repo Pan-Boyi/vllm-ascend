@@ -310,3 +310,38 @@ def test_the_block_ids_survive_a_landing_failure(lines, monkeypatch):
                              torch.tensor([[0, 1]], dtype=torch.int32))
     assert "read.ori_kv.block_ids" in recorded
     assert not any("block_digest" in key for key in recorded)
+
+
+# ------------------- the write side of the original stream
+
+def test_the_original_stream_write_is_tapped_before_the_insert():
+    """🔴 golden searched all 40 layers of its own dump -- 275,691 slices --
+    for anything matching the NoPE 448 dims of our cached rows and found max
+    |cos| = 0.106, while the values are plainly activations. So the question
+    is not "where was it written" but "what was written", and only the write
+    side answers it."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    body = inspect.getsource(
+        AscendDeepseekV41Attention._fused_qnorm_rope_kv_insert)
+    assert body.index("_tap_write_side_kv") < body.index(
+        "return qnorm_rope_kv_insert"), (
+        "the tap must run before the insert; afterwards the question has "
+        "changed from 'what was handed over' to 'what is in the cache now'")
+
+
+def test_the_pre_rope_latent_says_it_is_pre_rope():
+    """⚠️ The cached row is this after rope. Comparing the two directly
+    compares across a rotation -- the mistake that made a cosine of 0.15
+    look like a finding."""
+    from vllm_ascend.models.deepseek_v4_1.align_taps import KEY_SEMANTICS
+
+    text = KEY_SEMANTICS["read.write.ori_kv.latent_pre_rope"]
+    assert "before** rope" in text or "before rope" in text
+    assert "orthogonal" in text, (
+        "the entry has to say why a content comparison survives the rotation "
+        "and a positional one does not -- otherwise the next reader repeats "
+        "the same wrong comparison")

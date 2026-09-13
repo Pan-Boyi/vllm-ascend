@@ -126,6 +126,15 @@ KEY_SEMANTICS: dict = {
                    "[448 NoPE | 64 RoPE], addressed block*block_size+offset",
     "read.cmp_kv": "rows of the compressed-stream KV cache; same layout as "
                    "read.ori_kv",
+    "read.write.ori_kv.latent_pre_rope":
+        "⚠️ the KV latent handed to the original-stream cache insert, "
+        "**before** rope. The cached row is this after rope, so comparing "
+        "the two directly compares across a rotation. Rope is orthogonal, so "
+        "a content comparison at equal positions survives it; a positional "
+        "one does not",
+    "read.write.ori_kv.slots":
+        "the slot mapping that insert was given, in the form it was given "
+        "(the caller's, before any flattening this line does elsewhere)",
     "read.sa_in.cmp_kv_rows.count":
         "how many rows the line above took, since 'the first "
         "seqused_cmp_kv of the first block' is an assumption about layout",
