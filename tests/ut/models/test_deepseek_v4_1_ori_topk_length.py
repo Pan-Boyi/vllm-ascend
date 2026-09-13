@@ -399,3 +399,57 @@ def test_the_builder_publishes_the_length_the_descriptor_computed():
     source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder.build_req_metadata)
     assert 'sas_mask_kwargs["seqused_cmp_kv"] = seqused_cmp_kv' in source
     assert "seqused_cmp_kv=seqused_cmp_kv," in source
+
+
+# ------------------------------------------------- cmp_sparse_indices' rank
+
+def test_the_compressed_index_list_must_carry_the_kv_head_axis():
+    """[T, KV_N, K2] under layout_q=TND.
+
+    Upstream keeps topk_indices_buffer as [tokens, index_topk] because its own
+    consumer reads it that way. The operator's rank is not a property of that
+    buffer, and sending it unchanged is what #65 did: the refusal came back
+    truncated -- "has inc[orrect shape" -- with no expected shape in it, so
+    the launch cost a round trip and yielded no number.
+    """
+    two_d = torch.zeros(NUM_TOKENS, 512, dtype=torch.int32)
+    with pytest.raises(ValueError, match="KV-head axis"):
+        build_sparse_flash_mla_kwargs(
+            **_common(attends_compressed=True, cmp_ratio=2,
+                      cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+                      seqused_cmp_kv=torch.ones(NUM_REQUESTS, dtype=torch.int32),
+                      cmp_sparse_indices=two_d))
+
+
+def test_the_three_dimensional_form_is_accepted():
+    three_d = torch.zeros(NUM_TOKENS, 1, 512, dtype=torch.int32)
+    built = build_sparse_flash_mla_kwargs(
+        **_common(attends_compressed=True, cmp_ratio=2,
+                  cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+                  seqused_cmp_kv=torch.ones(NUM_REQUESTS, dtype=torch.int32),
+                  cmp_sparse_indices=three_d))
+    assert built["cmp_sparse_indices"].shape == (NUM_TOKENS, 1, 512)
+
+
+def test_a_row_count_that_is_not_the_token_count_is_refused():
+    """Right rank, wrong length: the slice bound is the other thing that goes
+    wrong here, and rank alone would not see it."""
+    with pytest.raises(ValueError, match="one row per query token"):
+        build_sparse_flash_mla_kwargs(
+            **_common(attends_compressed=True, cmp_ratio=2,
+                      cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+                      seqused_cmp_kv=torch.ones(NUM_REQUESTS, dtype=torch.int32),
+                      cmp_sparse_indices=torch.zeros(NUM_TOKENS + 3, 1, 512,
+                                                     dtype=torch.int32)))
+
+
+def test_the_call_site_adds_the_axis_rather_than_reshaping_the_buffer():
+    """Derived from the source: the buffer is shared with upstream's own
+    consumer, so the axis belongs at the call, not in the buffer."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
+
+    source = inspect.getsource(AscendDeepseekV41Attention.forward_mqa)
+    assert "self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)" in source

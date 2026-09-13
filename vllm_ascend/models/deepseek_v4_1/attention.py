@@ -614,8 +614,21 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             # is set from the same config value, in the builder, because a
             # top-k promised there and not supplied here is the same
             # disagreement that produced the aicore exception.
+            # unsqueeze(1): the buffer is [tokens, index_topk] and the
+            # operator takes [T, KV_N, K2] under layout_q=TND -- the KV-head
+            # axis is missing, and V4.1 has num_key_value_heads = 1 so it is
+            # a unit axis. Three sources agree on the rank: the sibling
+            # operators' own docs (sparse_attn_sharedkv/README.md:65,
+            # kv_quant_sparse_attn_sharedkv/README.md:35), the QLI operator's
+            # measured output (T, num_heads_k, topk), and this same call's
+            # ori_sparse_indices, which is already 3-D and is accepted.
+            #
+            # Upstream stores it 2-D because its own consumer reads it that
+            # way; the shape the operator wants is not a property of the
+            # buffer, so the axis is added here rather than by changing the
+            # buffer everyone else reads.
             cmp_sparse_indices=(
-                self.topk_indices_buffer[:q.shape[0]]
+                self.topk_indices_buffer[:q.shape[0]].unsqueeze(1)
                 if attends_compressed and self.topk_indices_buffer is not None
                 else None),
         )

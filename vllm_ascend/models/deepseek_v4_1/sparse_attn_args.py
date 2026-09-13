@@ -566,6 +566,21 @@ def build_sparse_flash_mla_kwargs(
         if cmp_residual_kv is not None:
             kwargs["cmp_residual_kv"] = cmp_residual_kv
         if cmp_sparse_indices is not None:
+            # [T, KV_N, K2] under layout_q=TND. Checked here because the
+            # operator's own refusal is truncated -- "has inc[orrect shape"
+            # and nothing about what it wanted -- so a rank mistake costs a
+            # launch and yields no number. The sibling operators' docs state
+            # the rank and K2 = 512 (sparse_attn_sharedkv/README.md:65).
+            _check(cmp_sparse_indices.ndim == 3,
+                   "cmp_sparse_indices must be [T, KV_N, K2] under layout_q=TND",
+                   f"got {cmp_sparse_indices.ndim} dims "
+                   f"{tuple(cmp_sparse_indices.shape)}; the KV-head axis is "
+                   "the one usually missing, since the buffer upstream keeps "
+                   "is [tokens, index_topk]")
+            _check(cmp_sparse_indices.shape[0] == q.shape[0],
+                   "cmp_sparse_indices must have one row per query token",
+                   f"got {cmp_sparse_indices.shape[0]} rows for "
+                   f"{q.shape[0]} query tokens")
             kwargs["cmp_sparse_indices"] = cmp_sparse_indices
 
     return validate_sparse_flash_mla_args(kwargs, q, num_requests)
