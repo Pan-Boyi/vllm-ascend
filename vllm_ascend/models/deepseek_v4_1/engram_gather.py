@@ -177,7 +177,46 @@ def _acl():
 
 
 def register_host_table(host_addr: int, num_bytes: int) -> HostTable:
-    """Map an already-locked host range into the device address space."""
+    """🔴 Refuses. Host registration is banned on this project, at any size.
+
+    Raising rather than deleting, on purpose. Deleting the function would take
+    the reason with it, and the next person needing a device pointer for a
+    host table would write it again and rediscover why -- on a card. A raise
+    puts the reason at the moment someone tries to use it.
+
+    The ban, verbatim: **never initiate aclrtHostRegisterV2 -- any size, any
+    card, any form.** Its basis is that card 3 died on the *first* 1 GiB
+    registration against a real table.
+
+    Two things that make it easy to talk yourself past this:
+
+    * It is not a performance question. Pinning 1 GiB of the real table took
+      over 12 minutes against 6.4 seconds for the scratch buffer, but the ban
+      exists because a card died, not because it was slow.
+    * "We were careful" is not what stopped it last time. On the second launch
+      this path was stopped by the host running out of memory, not by any rule
+      of ours -- a larger machine would have let it through. That is why this
+      is a raise and not a comment.
+
+    ⚠️ ``unregister_host_table`` below deliberately still works. It calls
+    ``aclrtHostUnregister``, which is not the banned API, and it is the only
+    way to release a mapping made before the ban. An asymmetric pair is a
+    signal in itself, so the asymmetry is stated here rather than left to be
+    inferred.
+    """
+    raise RuntimeError(
+        "aclrtHostRegisterV2 is banned on this project -- any size, any card, "
+        "any form. Card 3 died on the first 1 GiB registration against a real "
+        "table. This function is kept, and refuses, so that the reason "
+        "arrives where someone tries to use it rather than being rediscovered "
+        f"on a card. (Asked for {num_bytes} bytes at 0x{host_addr:x}.) The "
+        "engram path uses a host gather plus small H2D copies instead; see "
+        "engram_staging.")
+
+
+def _register_host_table_unreachable(host_addr: int, num_bytes: int) -> HostTable:
+    """The body that used to run, kept only so the ban has something to point
+    at. Nothing calls this and nothing should."""
     lib = _acl()
     rc = lib.aclrtHostRegisterV2(ctypes.c_void_p(host_addr), num_bytes,
                                  ACL_HOST_REG_MAPPED)
