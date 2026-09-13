@@ -119,6 +119,19 @@ def _check_block_table_fits(kwargs: dict[str, Any]) -> None:
     )
     # descriptor 与调用的三件并排：descriptor 承诺的 vs 调用实际供的。
     # 算子不校验这一对；不一致不报错，表现为 aicore 异常 + tilingKey 0。
+    # ① 键名无条件打一次：「某参数在不在」不该需要再等一轮起飞。
+    #    上一轮 cmp_kv 就是因为没打而只能报「没测到」。
+    # ② cmp_kv / cmp_block_table 的在与形状 —— 它是判「走的哪条 impl」的一项。
+    def _t(x):
+        return f"有{tuple(x.shape)}" if isinstance(x, torch.Tensor) else (
+            "无" if x is None else f"非张量({type(x).__name__})")
+    logger.error(
+        "【SFM-KEYS #%d】键=%s | cmp_kv=%s cmp_block_table=%s "
+        "ori_kv=%s ori_block_table=%s",
+        n, sorted(kwargs.keys()), _t(kwargs.get("cmp_kv")),
+        _t(kwargs.get("cmp_block_table")), _t(kwargs.get("ori_kv")),
+        _t(kwargs.get("ori_block_table")))
+
     md = kwargs.get("metadata")
     if isinstance(md, torch.Tensor):
         h = md.detach().to("cpu", torch.int32).contiguous()
@@ -126,11 +139,16 @@ def _check_block_table_fits(kwargs: dict[str, Any]) -> None:
         logger.error(
             "【SFM-META #%d】metadata: numel=%d 非零=%d data_ptr=0x%x dtype=%s | "
             "调用侧 has_cmp_kv=%s cmp_topk=%s cmp_ratio=%s ori_mask_mode=%s "
-            "cmp_mask_mode=%s cmp_sparse_indices=%s seqused_cmp_kv=%s",
+            "cmp_mask_mode=%s ori_win=(%s,%s) ori_sparse_indices=%s "
+            "cmp_sparse_indices=%s seqused_cmp_kv=%s",
             n, md.numel(), nz, md.data_ptr(), md.dtype,
             kwargs.get("has_cmp_kv"), kwargs.get("cmp_topk"),
             kwargs.get("cmp_ratio"), kwargs.get("ori_mask_mode"),
             kwargs.get("cmp_mask_mode"),
+            kwargs.get("ori_win_left"), kwargs.get("ori_win_right"),
+            # mask mode 0 要的是 ori 这张表，不是 cmp 那张。两张表不同名不同物，
+            # 混了就会得出一个"独立成立"的假违规。
+            "有" if kwargs.get("ori_sparse_indices") is not None else "无",
             "有" if kwargs.get("cmp_sparse_indices") is not None else "无",
             "有" if kwargs.get("seqused_cmp_kv") is not None else "无",
         )
