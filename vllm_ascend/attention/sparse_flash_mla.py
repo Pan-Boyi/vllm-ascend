@@ -80,6 +80,56 @@ def sparse_flash_mla_metadata(**kwargs):
     return metadata_op(**kwargs)
 
 
+def _match_topk_length_rank(kwargs: dict) -> None:
+    """Give each ``*_topk_length`` the leading shape of the table it describes.
+
+    🔴 Both SWA builders return the table with a head axis and the length on
+    the very next line without one::
+
+        per_token_slots = repeat_interleave(slot_ids, ...).unsqueeze(1)  # [T,1,W]
+        per_token_lens  = repeat_interleave(visible_lens, ...)           # [T]
+
+    Nothing between the two lines checks that the companion still matches the
+    table it counts. The operator reports it as, measured 2026-09-13::
+
+        EZ0011: Parameter ori_topk_length of SparseFlashMla has incorrect
+                shape dim 1. It should be 2.
+
+    ⚪ Fixed here rather than at the two builders for two reasons. The count is
+    **derived from the table**, so it cannot drift from it the way a second
+    ``unsqueeze`` at each builder could. And those builders are shared with
+    V4.0 (see ``_add_ori_topk_length``'s note), whose call this must not
+    change -- this wrapper is the V4.1-only adapter.
+
+    ⚠️ Three states, not two: shapes already agree / the count can be reshaped
+    onto the table / it cannot. The third raises. Reshaping a count whose
+    element total does not match the table would produce a *plausible* tensor
+    of the right rank describing the wrong rows, which is the failure this
+    parameter exists to prevent.
+    """
+    import math
+
+    for length_key, table_key in (("ori_topk_length", "ori_sparse_indices"),
+                                  ("cmp_topk_length", "cmp_sparse_indices")):
+        length = kwargs.get(length_key)
+        table = kwargs.get(table_key)
+        if length is None or table is None:
+            continue
+        want = tuple(table.shape[:-1])
+        if tuple(length.shape) == want:
+            continue
+        if length.numel() != math.prod(want):
+            raise ValueError(
+                f"{length_key} has {length.numel()} entries but the table it "
+                f"describes ({table_key}, shape {tuple(table.shape)}) has "
+                f"{math.prod(want)} rows. The count and the table disagree "
+                "about how many rows there are, so neither one can be trusted "
+                "to describe the other -- reshaping here would hand the "
+                "operator a plausible tensor of the right rank pointing at the "
+                "wrong rows.")
+        kwargs[length_key] = length.reshape(want)
+
+
 def sparse_flash_mla(q: torch.Tensor, **kwargs):
     """Adapt existing DSA attention kwargs to SparseFlashMla BF16 KV."""
     kwargs.pop("kv_quant_mode", None)
@@ -89,5 +139,6 @@ def sparse_flash_mla(q: torch.Tensor, **kwargs):
     if "seqused_kv" in kwargs:
         kwargs["seqused_ori_kv"] = kwargs.pop("seqused_kv")
     _add_compressed_kv_lengths(kwargs)
+    _match_topk_length_rank(kwargs)
     attention_op, _ = _get_sparse_flash_mla_ops()
     return attention_op(q, **kwargs)
