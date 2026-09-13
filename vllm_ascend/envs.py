@@ -123,6 +123,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # even on a layer that also attends a compressed stream. Default "0" keeps
     # today's behaviour, which sends ori_mask_mode=0 (NO_MASK) there.
     "VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES": lambda: os.getenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "0"),
+    # Whether the engram staging H2D waits before its host source may be
+    # reused. Default "0" keeps today's non_blocking=True.
+    "VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "0"),
     # DeepSeek-V4.1 kv-cache spec: "1" makes the layer's configured
     # compress_ratios entry -- 0 included -- reach the metadata builder as its
     # own spec field. Default "0" keeps today's behaviour, where ratio 0 is

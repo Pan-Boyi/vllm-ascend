@@ -658,3 +658,70 @@ def test_lookup_asks_before_it_copies():
     assert guard_at < copy_at, (
         "the capture check sits after the synchronising copy, so the copy "
         "raises first and the message that explains it never runs")
+
+
+# ------------------------------ the host staging buffer is reused every forward
+
+def test_the_host_staging_buffer_is_one_buffer_reused(monkeypatch):
+    """🔴 The property that makes the copy's timing matter.
+
+    ``_host_weight`` is allocated once at construction and rewritten by every
+    forward. If the H2D issued from it can still be in flight when the next
+    forward's gather overwrites those bytes, the device sees a mix of two
+    requests -- and deterministically so, because the request sequence fixes
+    the overwrite sequence.
+    """
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    first = layer._host_weight
+    layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
+    assert layer._host_weight is first, (
+        "a fresh buffer per forward would remove the hazard entirely; this "
+        "test exists to say that is not what happens")
+
+
+def test_the_copy_is_non_blocking_by_default(monkeypatch):
+    """Today's behaviour, pinned so the change is one variable."""
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", raising=False)
+    assert engram_embedding._blocking_h2d() is False
+
+
+def test_the_switch_makes_it_wait(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "1")
+    assert engram_embedding._blocking_h2d() is True
+
+
+def test_waiting_actually_synchronises(monkeypatch):
+    """⚠️ non_blocking=False orders the copy on the stream; what this needs is
+    for it to have drained before the host bytes are rewritten. The
+    synchronise is the part that establishes that, so it is asserted rather
+    than left implied by the flag."""
+    import unittest.mock as mock
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "1")
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    with mock.patch.object(engram_embedding, "_synchronize_current_stream") \
+            as sync:
+        layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
+    assert sync.called
+
+
+def test_no_synchronise_when_the_switch_is_off(monkeypatch):
+    import unittest.mock as mock
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", raising=False)
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+    with mock.patch.object(engram_embedding, "_synchronize_current_stream") \
+            as sync:
+        layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
+    assert not sync.called

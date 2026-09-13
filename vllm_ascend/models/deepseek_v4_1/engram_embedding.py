@@ -357,10 +357,39 @@ class AscendStagedEngramEmbedding:
         gather_into_staging(weight_table, scale_table, row_ids,
                             self._host_weight[:rows], self._host_scale[:rows])
 
+        # ⚠️ The host source is **one buffer, reused every forward**, and the
+        # next forward's gather_into_staging overwrites it. Whether that is
+        # safe depends entirely on whether this H2D may still be in flight
+        # when that happens:
+        #
+        #   CUDA, pageable source   safe -- the runtime stages the copy, so
+        #                           the source may be touched immediately
+        #   CUDA, pinned source     UNSAFE -- and this buffer would be pinned
+        #                           the day someone takes the speed
+        #   torch_npu              not established. The transfer goes through
+        #                           copy_between_host_and_device_opapi and
+        #                           nothing read here says which of the two it
+        #                           behaves like.
+        #
+        # 🔴 If it is the unsafe one, the device gets a mix of this forward's
+        # rows and the previous forward's, which is a forward whose result
+        # depends on how many requests came before it -- and deterministically
+        # so, since the sequence of requests fixes the sequence of overwrites.
+        # That is the shape of the trajectory integration measured: the Nth
+        # request reproducibly differs from the first, across independent runs.
+        #
+        # Not asserted, and not fixed by default: the switch is the one-
+        # variable test. If waiting removes the trajectory, this was it, and
+        # the default flips on that measurement rather than on this comment.
+        non_blocking = not _blocking_h2d()
         self._dev_weight[:rows].copy_(
-            torch.from_numpy(self._host_weight[:rows]), non_blocking=True)
+            torch.from_numpy(self._host_weight[:rows]),
+            non_blocking=non_blocking)
         self._dev_scale[:rows].copy_(
-            torch.from_numpy(self._host_scale[:rows]), non_blocking=True)
+            torch.from_numpy(self._host_scale[:rows]),
+            non_blocking=non_blocking)
+        if not non_blocking:
+            _synchronize_current_stream()
 
         self._dequantize_staged(rows, out)
 
@@ -384,6 +413,32 @@ class AscendStagedEngramEmbedding:
         launch = _staged_dequant_launcher()
         launch(self._dev_weight[:rows], self._dev_scale[:rows], flat,
                dim=self._layout.dim, quant_block=self._layout.quant_block)
+
+
+def _blocking_h2d() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D == "1"
+
+
+def _synchronize_current_stream() -> None:
+    """Wait for the staging copy before its host source can be rewritten.
+
+    ⚠️ ``non_blocking=False`` alone is not obviously enough: it orders the
+    copy on the stream, and what this needs is for the copy to have *drained*
+    before the next forward's numpy gather writes the same host bytes. The
+    synchronise is the part that actually establishes that, so it is here
+    rather than left implied by the flag.
+    """
+    for module in (getattr(torch, "npu", None), getattr(torch, "cuda", None)):
+        sync = getattr(module, "synchronize", None)
+        if sync is None:
+            continue
+        try:
+            sync()
+        except Exception:                                   # noqa: BLE001
+            pass
+        return
 
 
 def _refuse_under_capture(num_tokens: int) -> None:
