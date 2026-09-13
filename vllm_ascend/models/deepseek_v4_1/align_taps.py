@@ -28,9 +28,15 @@ layer did not run".
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import torch
+
+#: Per-layer dump tags. The only naming rule this module knows,
+#: and it is used to *exclude* other layers -- never to decide
+#: what counts as a tag.
+_LAYER_TAG = re.compile(r"layer_\d+")
 
 #: Protocol key -> what to read at that module edge. "in" takes the module's
 #: first positional input, "out" its output.
@@ -164,33 +170,62 @@ def _decoder_layers(model: torch.nn.Module):
 
 
 def expected_keys(dump_dir: str, layers: tuple[int, ...]) -> set[str]:
-    """What golden will compare, evaluated from golden's own dump.
+    """What golden will compare, from golden's own manifest.
 
-    Taken from the reference dump rather than from a list written here: a
-    hand-written list cannot show the row it is missing, and this one is the
-    same set the comparison will use. Returned as ``tag/key`` pairs so the
-    caller can take the difference in both directions -- keys we never record
-    are a comparison that cannot run, and keys we record that golden does not
-    compare are bytes and seconds spent for nothing.
+    Read from the producer's declaration rather than discovered, because the
+    two ways of discovering it have opposite blind spots and both were hit
+    within a day:
+
+        scanning the directory   picks up things that are not outputs
+                                 (golden's routing_plan fixture, 8 extra keys)
+        scanning by name pattern misses anything the pattern does not cover
+                                 (this function's own hand-written tag list --
+                                 a new protocol tag would silently drop a
+                                 whole file from the comparison)
+
+    A manifest has neither, because the side that produced the tensors is the
+    side that says which ones they are. Returned as ``tag/key`` so the caller
+    can difference in both directions: keys never recorded are a comparison
+    that cannot run, keys recorded that golden does not compare are bytes and
+    seconds spent for nothing -- and they also make the tensor count disagree,
+    which is the number everyone reads first.
     """
+    import json
     import os
 
-    from safetensors import safe_open
+    path = os.path.join(dump_dir, "manifest.json")
+    if not os.path.exists(path):
+        raise ValueError(
+            f"{path} does not exist, so there is no declaration of what this "
+            "dump contains. Falling back to a scan here would reintroduce "
+            "exactly the blind spot the manifest removes -- and it would do "
+            "so silently, since a scan always returns something.")
+    declared = json.loads(open(path).read()).get("tensors")
+    if not isinstance(declared, dict) or not declared:
+        raise ValueError(
+            f"{path} declares no 'tensors'. An empty expected set makes every "
+            "coverage comparison vacuous: the difference in both directions "
+            "is empty, which reads as full agreement.")
 
-    wanted = set()
-    for tag in [f"layer_{i:02d}" for i in layers] + ["prologue", "epilogue"]:
-        path = os.path.join(dump_dir, f"{tag}.safetensors")
-        if not os.path.exists(path):
-            continue
-        with safe_open(path, framework="pt") as handle:
-            for key in handle.keys():
-                wanted.add(f"{tag}/{key}")
+    # An exclusion rule, not an allow-list. Only the per-layer tags are
+    # filtered -- by which layers were asked for -- and everything else the
+    # manifest declares is kept whatever it is called. An allow-list of
+    # {prologue, epilogue, layer_NN} would be this function's own version of
+    # the blind spot above: a protocol that grows a new top-level tag would
+    # drop it silently, and a dropped tag looks exactly like a tag with
+    # nothing in it.
+    keep = {f"layer_{i:02d}" for i in layers}
+    wanted = {f"{tag}/{key}"
+              for tag, keys in declared.items()
+              if not _LAYER_TAG.fullmatch(tag) or tag in keep
+              for key in keys}
     if not wanted:
         raise ValueError(
-            f"no reference tensors found under {dump_dir}. An empty expected "
-            "set makes every coverage comparison vacuous -- it would report "
-            "full agreement against nothing.")
+            f"{path} declares tags {sorted(declared)}; none survived selecting "
+            f"layers {sorted(layers)}. Comparing against an empty set would "
+            "report agreement against nothing.")
     return wanted
+
 
 
 def alignment_active() -> bool:

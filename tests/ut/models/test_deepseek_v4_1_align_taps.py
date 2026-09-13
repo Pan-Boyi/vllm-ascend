@@ -170,25 +170,72 @@ def test_removing_the_handles_restores_the_untapped_model(with_recorder):
 
 # ------------------------------------------------------- the expected key set
 
-def test_the_expected_set_is_read_from_goldens_own_dump(tmp_path):
-    """Not a list written here: a hand-written one cannot show the row it is
-    missing, and this is the same set the comparison will use."""
-    from safetensors.torch import save_file
+def _manifest(tmp_path, tensors):
+    import json
 
-    save_file({"attn.out": torch.zeros(1, 2, 2)},
-              str(tmp_path / "layer_00.safetensors"))
-    save_file({"embed.out": torch.zeros(1, 2, 2)},
-              str(tmp_path / "prologue.safetensors"))
+    (tmp_path / "manifest.json").write_text(json.dumps({"tensors": tensors}))
+    return str(tmp_path)
 
-    got = align_taps.expected_keys(str(tmp_path), (0,))
+
+def test_the_expected_set_comes_from_the_producers_declaration(tmp_path):
+    """Not a scan, in either direction.
+
+    Scanning the directory picks up files that are not outputs; scanning by
+    name pattern misses tags the pattern does not cover. Both were hit within
+    a day. The manifest has neither blind spot because the side that produced
+    the tensors is the side that says which ones they are.
+    """
+    got = align_taps.expected_keys(
+        _manifest(tmp_path, {"layer_00": {"attn.out": {}},
+                             "prologue": {"embed.out": {}}}), (0,))
     assert got == {"layer_00/attn.out", "prologue/embed.out"}
 
 
-def test_an_empty_reference_dump_is_refused_not_treated_as_agreement(tmp_path):
+def test_a_tag_that_is_not_a_layer_is_kept_whatever_it_is_called(tmp_path):
+    """The filter excludes other layers; it does not decide what a tag is.
+
+    An allow-list of {prologue, epilogue, layer_NN} would drop a protocol tag
+    added later, and a dropped tag looks exactly like a tag with nothing in
+    it.
+    """
+    got = align_taps.expected_keys(
+        _manifest(tmp_path, {"something_new": {"a": {}},
+                             "layer_00": {"b": {}}}), (0,))
+    assert got == {"something_new/a", "layer_00/b"}
+
+
+def test_other_layers_are_excluded(tmp_path):
+    got = align_taps.expected_keys(
+        _manifest(tmp_path, {"layer_00": {"a": {}}, "layer_07": {"b": {}}}),
+        (0,))
+    assert got == {"layer_00/a"}
+
+
+def test_a_dump_that_declares_nothing_is_refused(tmp_path):
     """Zero expected keys would make every coverage comparison vacuous: the
     difference in both directions is empty, which reads as full agreement."""
     with pytest.raises(ValueError, match="vacuous"):
+        align_taps.expected_keys(_manifest(tmp_path, {}), (0,))
+
+
+def test_a_missing_manifest_is_refused_rather_than_scanned(tmp_path):
+    """Falling back to a scan would reintroduce the blind spot silently,
+    because a scan always returns something."""
+    with pytest.raises(ValueError, match="no declaration"):
         align_taps.expected_keys(str(tmp_path), (0,))
+
+
+def test_the_real_golden_dump_declares_the_count_golden_states():
+    """67 for layers 0 and 1 -- and no routing_plan, which is an input fixture
+    that a directory scan did pick up."""
+    import os
+
+    dump = "/workspace/code/dsv4_single_card/vllm_project/golden_dumps/len1100"
+    if not os.path.exists(os.path.join(dump, "manifest.json")):
+        pytest.skip("golden dump not present on this host")
+    got = align_taps.expected_keys(dump, (0, 1))
+    assert len(got) == 67
+    assert not any(k.startswith("routing_plan") for k in got)
 
 
 def test_the_norm_modules_are_not_tapped_as_boundaries():
