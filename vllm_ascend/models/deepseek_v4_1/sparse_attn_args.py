@@ -364,10 +364,24 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                f"a compressed stream is present but the window bounds are "
                f"{kwargs.get('ori_win_left')!r}/{kwargs.get('ori_win_right')!r}")
 
-    if has_cmp_kv:
-        if layout_kv == "PA_BBND":
-            _check(kwargs.get("seqused_cmp_kv") is not None,
-                   "has_cmp_kv with layout_kv=PA_BBND requires seqused_cmp_kv")
+    # 🔴 There is deliberately no "has_cmp_kv requires seqused_cmp_kv" rule
+    # here, and the absence is the finding.
+    #
+    # These kwargs are pre-adapter. The bf16 plan's operator is
+    # vllm_ascend.attention.sparse_flash_mla.sparse_flash_mla, which runs
+    # after this and derives the compressed lengths itself
+    # (seqused_ori_kv // cmp_ratio) when they are absent. So "absent here" is
+    # not "absent at the operator", and the rule as first written rejected a
+    # call that would have completed -- it killed the first smoke run to get
+    # past layer 1.
+    #
+    # The obvious repair -- allow it when the adapter *could* derive one --
+    # turns out to be unreachable: cmp_ratio > 0 is already enforced above and
+    # seqused_kv is a required parameter of this function, so the escape
+    # clause is always true. A rule that cannot fire is worse than no rule,
+    # because it reads as coverage. So the rule is gone and the two conditions
+    # it would have depended on are pinned by tests instead, where removing
+    # one of them turns red rather than quietly re-opening this.
         if cmp_ratio == 1:
             residual = kwargs.get("cmp_residual_kv")
             _check(residual is not None,
@@ -383,6 +397,21 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
             _check(residual.numel() == num_requests,
                    "cmp_residual_kv incorrect shape dim. It should be 1",
                    f"got {residual.numel()} values for {num_requests} requests")
+
+    seqused_cmp_kv = kwargs.get("seqused_cmp_kv")
+    if seqused_cmp_kv is not None:
+        # One value per request. A cumulative array has num_requests + 1, and
+        # that count is the only cheap thing that separates the two: dtype,
+        # device and magnitude are identical, and the operator would read a
+        # cumulative array as lengths without complaint.
+        _check(seqused_cmp_kv.numel() == num_requests,
+               "seqused_cmp_kv must hold one length per request",
+               f"got {seqused_cmp_kv.numel()} values for {num_requests} "
+               f"requests"
+               + (" -- that is num_requests + 1, the length of a *cumulative* "
+                  "sequence-length array. cu_cmp_seqlen_list is that array; "
+                  "this parameter wants seq_lens // cmp_ratio."
+                  if seqused_cmp_kv.numel() == num_requests + 1 else ""))
 
     _check_descriptor_is_populated(kwargs, q)
     _check_block_table_addresses_this_cache(kwargs)

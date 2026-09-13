@@ -514,6 +514,15 @@ class AscendDSAReqMetadata:
     #: both builders already compute it (the per-row count of their ``visible``
     #: mask) and both used to discard it.
     ori_topk_length: torch.Tensor | None = None
+    #: Compressed-stream length per request, ``seq_lens // cmp_ratio``, int32.
+    #:
+    #: ⚠️ Not ``cu_cmp_seqlen_list``. That one is cumulative and is what V4.0
+    #: sends as the operator's ``cu_seqlens_cmp_kv`` under layout TND; this is
+    #: one value per request and is what ``seqused_cmp_kv`` means under a
+    #: paged layout. They differ in length by exactly one, which is the only
+    #: cheap way to tell them apart -- their dtype, device and plausibility
+    #: are identical.
+    seqused_cmp_kv: torch.Tensor | None = None
 
 
 @dataclass
@@ -1511,6 +1520,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # compressed stream. Only window-bounds-without-indices is sliding
         # window.
         sas_mask_kwargs: dict = {}
+        seqused_cmp_kv = None
         if is_deepseek_v41_text(self.model_config.hf_text_config):
             from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
                 is_plain_sliding_window, select_ori_sparse_indices)
@@ -1541,8 +1551,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     seq_lens.to(torch.int32)
                 sas_mask_kwargs["cmp_topk"] = (
                     self.model_config.hf_config.index_topk)
-                sas_mask_kwargs["seqused_cmp_kv"] = torch.div(
+                # Computed once and published on the req metadata below, so
+                # the descriptor and the call cannot hold different numbers.
+                # It used to be computed here only: the call site then had
+                # nothing to send and reached the host precheck with
+                # "has_cmp_kv ... requires seqused_cmp_kv" -- a value that
+                # already existed, one frame away, and was not carried.
+                seqused_cmp_kv = torch.div(
                     lens, ratio, rounding_mode="floor").to(torch.int32)
+                sas_mask_kwargs["seqused_cmp_kv"] = seqused_cmp_kv
 
         if self._device_metadata_enabled:
 
@@ -1659,6 +1676,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             vision_swa_indices=vision_swa_indices,
             ori_topk_length=(vision_topk_length if vision_swa_indices
                              is not None else dspark_topk_length),
+            seqused_cmp_kv=seqused_cmp_kv,
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
             assert num_compressed_tokens is not None

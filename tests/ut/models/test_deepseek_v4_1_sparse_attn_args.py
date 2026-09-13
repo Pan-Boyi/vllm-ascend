@@ -187,9 +187,22 @@ def test_cmp_ratio_zero_is_never_legal_at_this_boundary(q):
         _validate(_ori_only(cmp_ratio=0), q)
 
 
-def test_paged_compressed_stream_requires_seqused_cmp_kv(q):
-    with pytest.raises(ValueError, match="requires seqused_cmp_kv"):
-        _validate(_with_compressed(seqused_cmp_kv=None), q)
+def test_a_paged_compressed_stream_without_lengths_is_left_to_the_adapter(q):
+    """This used to raise, and raising was wrong.
+
+    These kwargs are pre-adapter. The bf16 plan's operator is
+    vllm_ascend.attention.sparse_flash_mla.sparse_flash_mla, which derives the
+    compressed lengths itself (seqused_ori_kv // cmp_ratio) when they are
+    absent -- so "absent here" was never "absent at the operator". The rule
+    rejected a call that would have completed, and it killed the first smoke
+    run that got past layer 1.
+
+    What replaced it is nothing: the escape clause it would have needed
+    (a positive cmp_ratio, a present seqused_kv) is already guaranteed, which
+    would have made the rule unreachable. Those two guarantees are pinned in
+    test_deepseek_v4_1_ori_topk_length.py instead.
+    """
+    assert _validate(_with_compressed(seqused_cmp_kv=None), q) is not None
 
 
 def test_cmp_residual_kv_is_one_value_per_request_not_kv_data(q):

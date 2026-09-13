@@ -598,7 +598,13 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             ori_win_right=req.ori_win_right,
             cmp_kv=cmp_kv,
             cmp_block_table=cmp_block_table,
-            seqused_cmp_kv=req.cu_cmp_seqlen_list if attends_compressed else None,
+            # 🔴 req.seqused_cmp_kv, not req.cu_cmp_seqlen_list. The latter is
+            # cumulative and is what V4.0 sends as the operator's
+            # cu_seqlens_cmp_kv under layout TND; this parameter wants one
+            # value per request. Sending the cumulative one would have been
+            # accepted -- same dtype, same device, plausible values, one
+            # element longer -- and read as lengths.
+            seqused_cmp_kv=req.seqused_cmp_kv if attends_compressed else None,
             cmp_residual_kv=req.qli_cmp_residual_k if attends_compressed else None,
             ori_sparse_indices=ori_sparse_indices,
             ori_topk_length=ori_topk_length,

@@ -320,3 +320,82 @@ def test_a_padding_free_row_would_have_declared_the_full_width():
         "with no -1 the true length is the full width, which is exactly what "
         "the operator assumes when no length is passed -- so supplying it "
         "changes nothing for such a table")
+
+
+# ------------------------------- the compressed lengths, and which one they are
+
+def test_the_compressed_lengths_are_sent_when_the_caller_has_them():
+    lengths = torch.tensor([2, 3, 1], dtype=torch.int32)
+    built = build_sparse_flash_mla_kwargs(
+        **_common(attends_compressed=True, cmp_ratio=2,
+                  cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+                  seqused_cmp_kv=lengths))
+    torch.testing.assert_close(built["seqused_cmp_kv"], lengths)
+
+
+def test_a_cumulative_array_is_refused_where_lengths_are_wanted():
+    """cu_cmp_seqlen_list has num_requests + 1 entries and is what V4.0 sends
+    as cu_seqlens_cmp_kv under layout TND. Passing it here would be accepted
+    by the operator and read as lengths: same dtype, same device, plausible
+    magnitudes. The count is the only cheap discriminator."""
+    cumulative = torch.tensor([0, 2, 5, 6], dtype=torch.int32)
+    assert cumulative.numel() == NUM_REQUESTS + 1
+    with pytest.raises(ValueError, match="cumulative"):
+        build_sparse_flash_mla_kwargs(
+            **_common(attends_compressed=True, cmp_ratio=2,
+                      cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
+                      seqused_cmp_kv=cumulative))
+
+
+def test_absent_lengths_pass_when_the_adapter_can_derive_them():
+    """The precheck runs on pre-adapter kwargs.
+
+    The bf16 plan's operator is the adapter, which fills the compressed
+    lengths in itself when they are absent. Demanding them unconditionally
+    rejected a call that would have completed -- the first smoke run to get
+    past layer 1 died exactly there.
+    """
+    built = build_sparse_flash_mla_kwargs(
+        **_common(attends_compressed=True, cmp_ratio=2,
+                  cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM)))
+    assert "seqused_cmp_kv" not in built
+
+
+def test_the_two_conditions_the_adapter_needs_are_enforced_elsewhere():
+    """Why there is no "requires seqused_cmp_kv" rule any more.
+
+    Letting the adapter derive them is safe only while it has something to
+    derive from: a positive cmp_ratio and a seqused_kv. Both are guaranteed
+    here -- the first by an explicit rule, the second by the signature -- so a
+    rule of my own would be unreachable, and an unreachable rule reads as
+    coverage. These two assertions are what keep that true.
+    """
+    import inspect
+
+    with pytest.raises(ValueError, match="cmp_ratio must be greater than 0"):
+        build_sparse_flash_mla_kwargs(
+            **_common(attends_compressed=True, cmp_ratio=0,
+                      cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM)))
+
+    signature = inspect.signature(build_sparse_flash_mla_kwargs)
+    empty = inspect.Parameter.empty
+    assert signature.parameters["seqused_kv"].default is empty, (
+        "seqused_kv became optional; the adapter can no longer be relied on "
+        "to derive the compressed lengths, so the rule removed above has to "
+        "come back")
+
+
+def test_the_builder_publishes_the_length_the_descriptor_computed():
+    """One tensor, not two equal computations.
+
+    dsa_v1 computes seq_lens // ratio for the descriptor; it now publishes
+    that same object on the req metadata, so the descriptor and the call
+    cannot hold different numbers.
+    """
+    import inspect
+
+    from vllm_ascend.attention import dsa_v1
+
+    source = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder.build_req_metadata)
+    assert 'sas_mask_kwargs["seqused_cmp_kv"] = seqused_cmp_kv' in source
+    assert "seqused_cmp_kv=seqused_cmp_kv," in source
