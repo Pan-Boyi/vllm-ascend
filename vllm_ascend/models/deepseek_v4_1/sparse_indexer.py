@@ -222,6 +222,17 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
                                                        self.compress_ratio)
         key_dequant_scale = scales.squeeze(-2) if scales.ndim > 2 else scales
 
+        # Print-only. QuantLightningIndexerV2 reads a block-aligned range,
+        # unlike SparseFlashMla -- so what it may touch is not seqused_k but
+        # ceil(seqused_k / block_size) * block_size, and the difference is
+        # slots this request never wrote.
+        from vllm_ascend.models.deepseek_v4_1.qli_observe import observe
+
+        observe(prefix=self.k_cache.prefix, seqused_k=seqused_k,
+                cu_seqlens_q=req.query_start_loc,
+                block_table=req.block_table,
+                block_size=req.storage_block_size)
+
         topk_idxs = select_topk(
             query=q_values[:num_tokens],
             q_scale=None if q_scale is None else q_scale[:num_tokens],

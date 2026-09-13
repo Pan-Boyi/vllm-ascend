@@ -95,6 +95,21 @@ CMP_MASK_MODE = 3
 #: their own mode, and a call that satisfies both entry conditions at once
 #: satisfies neither mode's requirements. The contradiction was the finding.
 #:
+#: 🔴 Behaviour that is **not** in any of those strings, measured on the bench
+#: by the kernel line and recorded here because it is the sixth time two
+#: operators have shared a parameter name -- and the first time their
+#: behaviour is *opposite* rather than merely different:
+#:
+#:   SparseFlashMla            does NOT read past ``seqused_ori_kv``
+#:   QuantLightningIndexerV2   DOES: its range is block-aligned,
+#:                             ``ceil(seqused_k / block_size) * block_size``
+#:
+#: One code path computes the lengths for both. At block_size 128 a five-token
+#: request lets the indexer touch ``[0, 128)`` -- five real tokens and 123
+#: slots holding whatever the previous owner of that block wrote. Nothing
+#: errors: the indices are in range and the values are real numbers belonging
+#: to someone else. ``qli_observe`` reports the gap per call.
+#:
 #: ⚠️ What is **not** established: which mode a call lands in when several
 #: optional tensors are present, beyond the two implications quoted above
 #: (ori_sparse_indices -> SWA, cmp_sparse_indices -> CSA). The strings name
