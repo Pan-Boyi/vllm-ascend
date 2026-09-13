@@ -308,6 +308,37 @@ class AscendStagedEngramEmbedding:
         self._dev_weight = torch.empty(wshape, dtype=torch.uint8, device=device)
         self._dev_scale = torch.empty(sshape, dtype=torch.uint8, device=device)
 
+    def _staging_host_views(self, rows: int):
+        """The host rows this forward will gather into.
+
+        🔴 One buffer, reused every forward, is the hazard: the H2D issued out
+        of it may still be in flight when the next forward's numpy gather
+        rewrites those bytes. Under ``"double"`` the forwards alternate
+        between two buffers, so the bytes a copy is reading are not the bytes
+        the next gather writes.
+
+        That is the one remedy here that **changes no timing**: no wait, no
+        synchronise, nothing added to the forward that other ranks are not
+        also doing. After a flight died in the MoE all-to-all with a
+        device-wide sync in the forward, that property is the point, not a
+        detail -- it makes the hypothesis testable without the test itself
+        being able to break collectives.
+
+        Allocated lazily so the second buffer costs nothing unless asked for.
+        """
+        if not _double_buffered():
+            return self._host_weight[:rows], self._host_scale[:rows]
+        import numpy as np
+
+        if getattr(self, "_host_weight_alt", None) is None:
+            self._host_weight_alt = np.empty_like(self._host_weight)
+            self._host_scale_alt = np.empty_like(self._host_scale)
+            self._staging_parity = 0
+        self._staging_parity ^= 1
+        if self._staging_parity:
+            return self._host_weight_alt[:rows], self._host_scale_alt[:rows]
+        return self._host_weight[:rows], self._host_scale[:rows]
+
     def lookup(self, indices: torch.Tensor, out: torch.Tensor,
                background: bool = False) -> None:
         """Gather on the host, copy once, let the kernel read HBM.
@@ -354,8 +385,9 @@ class AscendStagedEngramEmbedding:
         # token ids the runner already holds, rather than to make it faster.
         row_ids = indices.reshape(-1).to("cpu", torch.int64).numpy()
 
+        host_weight, host_scale = self._staging_host_views(rows)
         gather_into_staging(weight_table, scale_table, row_ids,
-                            self._host_weight[:rows], self._host_scale[:rows])
+                            host_weight, host_scale)
 
         # ⚠️ The host source is **one buffer, reused every forward**, and the
         # next forward's gather_into_staging overwrites it. Whether that is
@@ -383,12 +415,10 @@ class AscendStagedEngramEmbedding:
         # the default flips on that measurement rather than on this comment.
         non_blocking = not _blocking_h2d()
         self._dev_weight[:rows].copy_(
-            torch.from_numpy(self._host_weight[:rows]),
-            non_blocking=non_blocking)
+            torch.from_numpy(host_weight), non_blocking=non_blocking)
         self._dev_scale[:rows].copy_(
-            torch.from_numpy(self._host_scale[:rows]),
-            non_blocking=non_blocking)
-        if not non_blocking:
+            torch.from_numpy(host_scale), non_blocking=non_blocking)
+        if _h2d_mode() == "sync":
             _synchronize_current_stream()
 
         self._dequantize_staged(rows, out)
@@ -415,10 +445,42 @@ class AscendStagedEngramEmbedding:
                dim=self._layout.dim, quant_block=self._layout.quant_block)
 
 
-def _blocking_h2d() -> bool:
+#: How the staging H2D is made safe against its host source being rewritten.
+#: Four settings rather than a flag, because the first version bundled two
+#: independent changes -- ordering the copy and draining it -- into one, and
+#: the launch that used it died somewhere neither of them is.
+#:
+#:   "0" / ""   today: non_blocking=True, nothing waits
+#:   "block"    non_blocking=False. Orders the copy; does not prove it drained
+#:   "sync"     "block" plus a **current-stream** synchronise
+#:   "double"   two host buffers, used alternately. Removes the reuse entirely
+#:              and changes no timing at all, so it cannot desynchronise ranks
+#:   "1"        alias for "sync" -- what the first flight used
+H2D_MODES = ("0", "", "block", "sync", "double", "1")
+
+
+def _h2d_mode() -> str:
     from vllm_ascend import envs
 
-    return envs.VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D == "1"
+    mode = str(getattr(envs, "VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "")
+               or "").strip()
+    if mode not in H2D_MODES:
+        raise ValueError(
+            f"VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D={mode!r} is not one of "
+            f"{H2D_MODES}. Refusing rather than falling back to the default: "
+            "a typo that silently selects today's behaviour makes the "
+            "experiment read as 'the change had no effect'.")
+    return "sync" if mode == "1" else mode
+
+
+def _blocking_h2d() -> bool:
+    """Whether the copy itself waits."""
+    return _h2d_mode() in ("block", "sync")
+
+
+def _double_buffered() -> bool:
+    """Whether the host source alternates instead of being reused."""
+    return _h2d_mode() == "double"
 
 
 def _synchronize_current_stream() -> None:
@@ -426,19 +488,35 @@ def _synchronize_current_stream() -> None:
 
     ⚠️ ``non_blocking=False`` alone is not obviously enough: it orders the
     copy on the stream, and what this needs is for the copy to have *drained*
-    before the next forward's numpy gather writes the same host bytes. The
-    synchronise is the part that actually establishes that, so it is here
-    rather than left implied by the flag.
+    before the next forward's numpy gather writes the same host bytes. Those
+    are two different claims, which is why they are two different settings.
+
+    🔴 Scoped to the current stream, not the device. The first version called
+    ``torch.npu.synchronize()``, which is a **device-wide** host block placed
+    inside the forward of a model running EP=4 collectives -- and that flight
+    died in ``libccl_kernel.so`` with an aicpu exception, in the MoE
+    all-to-all, without entering this function's own copy at all. Whether the
+    sync caused it is not established; what is established is that the
+    instrument was far broader than the thing it needed to wait for, and an
+    instrument that heavy has no business being the first rung of the
+    experiment.
     """
+    stream = None
     for module in (getattr(torch, "npu", None), getattr(torch, "cuda", None)):
-        sync = getattr(module, "synchronize", None)
-        if sync is None:
+        getter = getattr(module, "current_stream", None)
+        if getter is None:
             continue
         try:
-            sync()
+            stream = getter()
         except Exception:                                   # noqa: BLE001
-            pass
+            stream = None
+        break
+    if stream is None:
         return
+    try:
+        stream.synchronize()
+    except Exception:                                       # noqa: BLE001
+        pass
 
 
 def _refuse_under_capture(num_tokens: int) -> None:

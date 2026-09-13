@@ -725,3 +725,90 @@ def test_no_synchronise_when_the_switch_is_off(monkeypatch):
             as sync:
         layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
     assert not sync.called
+
+
+# --------------------------------- the rungs, separated after the first flight
+
+def test_the_modes_are_separate_rungs(monkeypatch):
+    """🔴 "block" and "sync" are two different claims.
+
+    non_blocking=False orders the copy on the stream; the synchronise is what
+    establishes that it has *drained* before the host bytes are rewritten.
+    Bundling them into one flag meant the first flight changed two things,
+    and it died somewhere neither of them is.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
+
+    for mode, blocking, double in (("", False, False), ("0", False, False),
+                                   ("block", True, False),
+                                   ("sync", True, False),
+                                   ("double", False, True)):
+        monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", mode)
+        assert ee._blocking_h2d() is blocking, mode
+        assert ee._double_buffered() is double, mode
+
+
+def test_one_is_still_what_the_first_flight_used(monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "1")
+    assert ee._h2d_mode() == "sync"
+
+
+def test_a_typo_is_refused_rather_than_silently_off(monkeypatch):
+    """⚠️ Falling back to the default would make the experiment read as
+    'the change had no effect'."""
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "blocking")
+    with pytest.raises(ValueError, match="not one of"):
+        ee._h2d_mode()
+
+
+def test_sync_is_scoped_to_the_stream_not_the_device():
+    """🔴 The first version called torch.npu.synchronize() -- a device-wide
+    host block inside the forward of a model running EP=4 collectives. That
+    flight died in libccl_kernel.so, in the MoE all-to-all, without entering
+    the copy at all. Whether the sync caused it is not established; that the
+    instrument was far broader than what it needed to wait for is."""
+    import inspect
+
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
+
+    body = inspect.getsource(ee._synchronize_current_stream)
+    assert "current_stream" in body
+    assert "stream.synchronize()" in body
+
+
+def test_double_buffering_alternates_and_changes_no_timing(monkeypatch):
+    """The one remedy that adds nothing to the forward.
+
+    No wait and no synchronise, so it cannot desynchronise ranks -- which
+    makes the hypothesis testable without the test being able to break
+    collectives on its own.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "double")
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+
+    seen = []
+    for _ in range(4):
+        weight, _scale = layer._staging_host_views(2)
+        seen.append(weight.ctypes.data)
+    assert seen[0] != seen[1], "both forwards gathered into the same bytes"
+    assert seen[0] == seen[2] and seen[1] == seen[3], "not alternating"
+    assert ee._blocking_h2d() is False, (
+        "double buffering is not supposed to make anything wait")
+
+
+def test_without_double_buffering_it_is_one_buffer(monkeypatch):
+    """Two arms: the hazard has to be present when the switch is off, or the
+    switch is testing nothing."""
+    monkeypatch.delenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", raising=False)
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
+
+    seen = [layer._staging_host_views(2)[0].ctypes.data for _ in range(3)]
+    assert len(set(seen)) == 1

@@ -123,8 +123,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # even on a layer that also attends a compressed stream. Default "0" keeps
     # today's behaviour, which sends ori_mask_mode=0 (NO_MASK) there.
     "VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES": lambda: os.getenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "0"),
-    # Whether the engram staging H2D waits before its host source may be
-    # reused. Default "0" keeps today's non_blocking=True.
+    # How the engram staging H2D is made safe against its host source being
+    # rewritten: "0"/"" (today), "block", "sync", "double". See
+    # engram_embedding.H2D_MODES -- they are separate rungs on purpose.
     "VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "0"),
     # Per-layer output fingerprints in the log: "all", or a comma list of
     # layer indices. Empty (the default) registers no hooks at all.
