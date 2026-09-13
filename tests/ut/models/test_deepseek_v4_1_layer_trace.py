@@ -161,9 +161,13 @@ def test_the_trace_lines_carry_the_layer_and_a_digest(monkeypatch, caplog):
         logger.removeHandler(handler)
 
     lines = [r for r in records if "DSV4.1 trace step=" in r]
-    assert len(lines) == 2, lines
-    assert "layer=00" in lines[0] and "layer=01" in lines[1]
-    assert "rows=3" in lines[0]
+    decoder = [r for r in lines if "layer=0" in r]
+    assert len(decoder) == 2, lines
+    assert "layer=00" in decoder[0] and "layer=01" in decoder[1]
+    assert "rows=3" in decoder[0]
+    # and the point before them, which is what splits "layer 0 differs" into
+    # "it was given something different" and "it did something different".
+    assert any("layer=input_ids" in r for r in lines), lines
 
 
 def test_two_identical_forwards_produce_identical_lines(monkeypatch):
@@ -214,7 +218,7 @@ def test_a_different_input_changes_the_first_layers_line(monkeypatch):
     class _Collect(logging.Handler):
         def emit(self, record):
             message = record.getMessage()
-            if "DSV4.1 trace step=" in message:
+            if "DSV4.1 trace step=" in message and "layer=00" in message:
                 seen.append(message.split("out=")[1])
 
     handler = _Collect()
@@ -391,7 +395,8 @@ def test_the_layer_hooks_bring_nothing_back_to_the_host(monkeypatch):
     assert len(transfers) == 1, (
         f"{len(transfers)} host transfers for 3 layers; the digests are "
         "being read back per layer again")
-    assert transfers[0] == (3, 2), transfers
+    assert transfers[0] == (3 + len(layer_trace.PRE_LAYER_POINTS), 2), \
+        transfers
     assert not reads, (
         f"{len(reads)} host reads inside the forward; each one is a sync the "
         "other ranks are not waiting at")
@@ -545,3 +550,238 @@ def test_a_failed_digest_says_the_trace_is_not_a_reading(monkeypatch):
         reset_for_test()
 
     assert any("no reading at all" in line for line in captured), captured
+
+
+# ---------------------------- a trace of sentinels is not a trace
+
+def _sentinel_model(monkeypatch, n=4, failing=()):
+    """A model whose selected layers cannot be digested."""
+    from vllm_ascend.models.deepseek_v4_1 import layer_trace
+
+    real = layer_trace.fingerprint_tensor
+
+    def _maybe_fail(tensor):
+        if getattr(tensor, "_fail", False):
+            return torch.full((), -1, dtype=torch.int64)
+        return real(tensor)
+
+    monkeypatch.setattr(layer_trace, "fingerprint_tensor", _maybe_fail)
+
+    class _Marking(_Layer):
+        def forward(self, x):
+            out = super().forward(x)
+            if self.value in failing:
+                out._fail = True
+            return out
+
+    model = _Model(n=n)
+    model.language_model.model.layers = torch.nn.ModuleList(
+        _Marking(i) for i in range(n))
+    return model
+
+
+def test_an_all_sentinel_trace_is_refused(monkeypatch):
+    """🔴 The failure that already happened once: 100% sentinel, every line
+    matching every other line, and a log that reads as 'every layer agrees'."""
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "all")
+    model = _sentinel_model(monkeypatch, n=3, failing=(0, 1, 2))
+    handles = install_layer_trace(model)
+    try:
+        with pytest.raises(RuntimeError, match="not a reading at all"):
+            model(torch.zeros(2, 4))
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def test_the_refusal_quotes_why(monkeypatch):
+    """A raise that says 'all sentinel' makes the reader go find the one log
+    line that said why, which is the line they have already scrolled past."""
+    from vllm_ascend.models.deepseek_v4_1 import layer_trace
+    from vllm_ascend.models.deepseek_v4_1.switch_log import reset_for_test
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "all")
+    reset_for_test()
+    layer_trace._LAST_SENTINEL_REASON = ""
+
+    class _Explodes:
+        def detach(self):
+            raise RuntimeError("aclnnBitwiseXorScalar failed")
+
+    layer_trace.fingerprint(_Explodes())
+
+    model = _sentinel_model(monkeypatch, n=2, failing=(0, 1))
+    handles = install_layer_trace(model)
+    try:
+        with pytest.raises(RuntimeError, match="aclnnBitwiseXorScalar"):
+            model(torch.zeros(2, 4))
+    finally:
+        for h in handles:
+            h.remove()
+        reset_for_test()
+
+
+def test_a_minority_of_sentinels_is_reported_not_refused(monkeypatch):
+    """⚠️ Three states. Some layers failing to digest leaves the rest of the
+    reading standing; past the limit it does not."""
+    import logging
+
+    from vllm.logger import logger
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "all")
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    model = _sentinel_model(monkeypatch, n=40, failing=(7, ))
+    handler = _Collect()
+    logger.addHandler(handler)
+    handles = install_layer_trace(model)
+    try:
+        model(torch.zeros(2, 4))          # must not raise
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+
+    assert any("came back as the -1 sentinel" in line for line in lines)
+    assert any("the rest of the reading stands" in line for line in lines)
+
+
+def test_a_clean_trace_neither_raises_nor_complains(monkeypatch):
+    """Two arms: the refusal has to be able to stay quiet."""
+    import logging
+
+    from vllm.logger import logger
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", "all")
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    model = _Model(n=3)
+    handler = _Collect()
+    logger.addHandler(handler)
+    handles = install_layer_trace(model)
+    try:
+        model(torch.zeros(2, 4))
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+
+    assert not any("sentinel" in line for line in lines)
+    decoder = [line for line in lines
+               if "DSV4.1 trace step=" in line and "layer=0" in line]
+    assert len(decoder) == 3, lines
+
+
+def test_the_limit_matches_what_the_analyser_calls_unusable():
+    """The two sides must not disagree about what counts as a reading."""
+    from vllm_ascend.models.deepseek_v4_1.layer_trace import SENTINEL_LIMIT
+
+    assert SENTINEL_LIMIT == 0.05
+
+
+# --------------------- the two points before the first decoder layer
+
+class _WithEmbed(torch.nn.Module):
+    def __init__(self, n=2):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(16, 4)
+        self.layers = torch.nn.ModuleList(_Layer(i) for i in range(n))
+        self.start_layer = 0
+
+    def forward(self, input_ids, positions):
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def _trace_lines(model, *args, monkeypatch, spec="all"):
+    import logging
+
+    from vllm.logger import logger
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_TRACE_LAYERS", spec)
+    out = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            message = record.getMessage()
+            if "DSV4.1 trace step=" in message:
+                out.append(message)
+
+    handler = _Collect()
+    logger.addHandler(handler)
+    handles = install_layer_trace(model)
+    try:
+        model(*args)
+    finally:
+        for h in handles:
+            h.remove()
+        logger.removeHandler(handler)
+    return out
+
+
+def test_the_inputs_and_the_embedding_are_fingerprinted(monkeypatch):
+    """🔴 input_ids first, and it is not a formality.
+
+    Everything downstream is read as "identical input, different output", and
+    that premise has only ever been checked against the prompt *string* --
+    never against the tensor the model received. A chat template, a timestamp
+    or a differing BOS would make the whole investigation a search for a
+    defect that is not there, and nothing else in the trace can tell that
+    apart from a real divergence at layer 0.
+    """
+    model = _WithEmbed()
+    lines = _trace_lines(model, torch.zeros(3, dtype=torch.long),
+                         torch.arange(3), monkeypatch=monkeypatch)
+    for name in ("input_ids", "positions", "embed_out"):
+        assert any(f"layer={name}" in line for line in lines), (name, lines)
+
+
+def test_different_input_ids_show_up_at_that_point(monkeypatch):
+    """Two arms: the point has to move when its own input moves."""
+    model = _WithEmbed()
+    first = _trace_lines(model, torch.zeros(3, dtype=torch.long),
+                         torch.arange(3), monkeypatch=monkeypatch)
+    second = _trace_lines(model, torch.ones(3, dtype=torch.long),
+                          torch.arange(3), monkeypatch=monkeypatch)
+
+    def _digest(lines, name):
+        return [line.split("out=")[1] for line in lines
+                if f"layer={name}" in line][0]
+
+    assert _digest(first, "input_ids") != _digest(second, "input_ids")
+    assert _digest(first, "embed_out") != _digest(second, "embed_out")
+
+
+def test_identical_inputs_agree_at_every_point(monkeypatch):
+    """The reading the real trace is being compared against."""
+    model = _WithEmbed()
+    ids, pos = torch.tensor([1, 2, 3]), torch.arange(3)
+    first = [line.split(" ", 3)[3]
+             for line in _trace_lines(model, ids, pos, monkeypatch=monkeypatch)]
+    second = [line.split(" ", 3)[3]
+              for line in _trace_lines(model, ids, pos,
+                                       monkeypatch=monkeypatch)]
+    assert first == second and first
+
+
+def test_a_step_without_a_prologue_drops_those_rows_rather_than_faking_them(
+        monkeypatch):
+    """⚠️ A decode step does not run the prologue. Reporting those slots as
+    sentinels would make every decode step look like a dead instrument, which
+    is the reading this whole area exists to prevent."""
+    model = _Model(n=2)          # no embed_tokens, forward takes one tensor
+    lines = _trace_lines(model, torch.zeros(2, 4), monkeypatch=monkeypatch)
+    assert not any("layer=embed_out" in line for line in lines), lines
+    assert any("layer=input_ids" in line for line in lines), (
+        "the single positional argument is still digested")
+    assert not any("sentinel" in line for line in lines)

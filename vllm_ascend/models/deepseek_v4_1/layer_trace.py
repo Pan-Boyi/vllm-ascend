@@ -164,6 +164,19 @@ def fingerprint_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 
+#: Fingerprint points before the first decoder layer, so "layer 0 already
+#: differs" can be taken one step further back. Negative so they sort ahead of
+#: the layers and cannot collide with a real index.
+#:
+#: 🔴 ``input_ids`` is here first and it is not a formality. Everything
+#: downstream is being read as "identical input, different output", and that
+#: premise has never been checked against the tensor the model actually
+#: received -- only against the prompt string that was sent. A chat template,
+#: a timestamp or a differing BOS would make the whole investigation a search
+#: for a defect that is not there.
+PRE_LAYER_POINTS = {-3: "input_ids", -2: "positions", -1: "embed_out"}
+
+
 #: Quantisation levels for the coarse digest. 1/64 is about 1.6e-2 relative,
 #: which is comfortably above bf16's ULP of 3.9e-3 -- a threshold at or below
 #: the representation floor cannot separate "the same computation, reassociated"
@@ -217,6 +230,17 @@ def coarse_fingerprint_tensor(tensor: torch.Tensor) -> torch.Tensor:
         return torch.full((), -1, dtype=torch.int64)
 
 
+#: The last reason a digest could not be computed, so the refusal below can
+#: quote it. Without this the raise says "all sentinel" and the caller has to
+#: go find the one log line that said why.
+_LAST_SENTINEL_REASON: str = ""
+
+#: Sentinel proportion above which the trace is reported as unusable rather
+#: than merely incomplete. Matches the threshold integration's analyser uses,
+#: so the two sides do not disagree about what counts as a reading.
+SENTINEL_LIMIT = 0.05
+
+
 def _report_sentinel(which: str, exc: BaseException) -> None:
     """Say why a digest could not be computed, the first time it happens.
 
@@ -227,6 +251,8 @@ def _report_sentinel(which: str, exc: BaseException) -> None:
     """
     from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
 
+    global _LAST_SENTINEL_REASON
+    _LAST_SENTINEL_REASON = f"{which}: {exc!r}"
     announce_once(
         "trace_sentinel_" + which,
         "the %s layer digest could not be computed (%r). Every line from here "
@@ -255,7 +281,7 @@ def install_layer_trace(model: torch.nn.Module) -> list:
             "where nothing diverged.")
     wanted = set(selected_layers(spec, tuple(sorted(layers))))
 
-    ordered = tuple(sorted(wanted))
+    ordered = tuple(sorted(PRE_LAYER_POINTS)) + tuple(sorted(wanted))
     _SLOTS.prepare(ordered)
 
     handles = []
@@ -267,7 +293,11 @@ def install_layer_trace(model: torch.nn.Module) -> list:
             "trace would collect forty values and print none of them, which "
             "reads as a forward that never ran.")
     handles.append(inner.register_forward_pre_hook(_bump_step))
+    handles.append(inner.register_forward_pre_hook(_digest_model_inputs))
     handles.append(inner.register_forward_hook(_flush))
+    embed = getattr(inner, "embed_tokens", None)
+    if embed is not None and type(embed).__name__ != "PPMissingLayer":
+        handles.append(embed.register_forward_hook(_digest_embedding))
     for index, layer in layers.items():
         if index in wanted:
             handles.append(layer.register_forward_hook(_make_hook(index)))
@@ -301,11 +331,13 @@ class _Slots:
         self.layers: tuple[int, ...] = ()
         self.buffer: torch.Tensor | None = None
         self.rows = [0] * 0
+        self.written: list[int] = []
 
     def prepare(self, layers: tuple[int, ...]) -> None:
         self.layers = layers
         self.buffer = None
         self.rows = [0] * len(layers)
+        self.written: list[int] = []
 
     def slot_of(self, layer: int) -> int:
         return self.layers.index(layer)
@@ -318,15 +350,24 @@ class _Slots:
         self.buffer[slot, 0] = exact
         self.buffer[slot, 1] = coarse
         self.rows[slot] = rows
+        self.written.append(self.layers[slot])
 
     def drain(self) -> list[tuple[int, int, int, int]]:
-        """``(layer, exact, coarse, rows)`` per slot, in one transfer."""
+        """``(layer, exact, coarse, rows)`` per slot, in one transfer.
+
+        Slots nothing wrote this forward are dropped rather than reported as
+        sentinels: a decode step does not run the prologue, and calling that
+        "could not be digested" would make every decode step look like a dead
+        instrument.
+        """
         if self.buffer is None:
             return []
         values = self.buffer.to("cpu").tolist()
+        written = set(self.written)
         self.buffer = None
+        self.written = []
         return [(layer, values[i][0], values[i][1], self.rows[i])
-                for i, layer in enumerate(self.layers)]
+                for i, layer in enumerate(self.layers) if layer in written]
 
 
 _SLOTS = _Slots()
@@ -345,11 +386,91 @@ def _flush(_module: torch.nn.Module, _args: tuple, _output) -> None:
     """
     from vllm.logger import logger
 
-    for layer, exact, coarse, rows in _SLOTS.drain():
+    drained = _SLOTS.drain()
+    if not drained:
+        return
+    sentinels = sum(1 for _, exact, coarse, _ in drained
+                    if exact == -1 or coarse == -1)
+    for layer, exact, coarse, rows in drained:
+        name = PRE_LAYER_POINTS.get(layer, "%02d" % layer)
         logger.info(
-            "DSV4.1 trace step=%d layer=%02d out=0x%016x coarse=0x%016x "
-            "rows=%d", _STEP, layer, exact & 0xFFFFFFFFFFFFFFFF,
+            "DSV4.1 trace step=%d layer=%s out=0x%016x coarse=0x%016x "
+            "rows=%d", _STEP, name, exact & 0xFFFFFFFFFFFFFFFF,
             coarse & 0xFFFFFFFFFFFFFFFF, rows)
+    _refuse_a_trace_that_is_not_a_reading(sentinels, len(drained))
+
+
+def _refuse_a_trace_that_is_not_a_reading(sentinels: int, total: int) -> None:
+    """Stop, loudly, when the trace is sentinels rather than digests.
+
+    🔴 The failure this exists for has already happened: a whole run's trace
+    was 100% sentinel, and because the sentinel is a *constant*, the lines all
+    matched and the log read as "every layer agrees" -- the strongest possible
+    wrong conclusion, produced by a dead instrument rather than by the model.
+
+    Raising is safe here in a way it would not normally be: nothing registers
+    these hooks unless the trace was explicitly asked for, so this can only
+    stop a run that was started to collect a trace. It fires on the first
+    forward, which is warmup, so the cost is the cheapest one available.
+
+    ⚠️ Three states, not two. Some sentinels is not the same as all of them:
+    a minority means particular layers could not be digested and the rest of
+    the reading stands; past SENTINEL_LIMIT the reading does not.
+    """
+    if not sentinels:
+        return
+    from vllm.logger import logger
+
+    share = sentinels / total
+    if share <= SENTINEL_LIMIT:
+        logger.error(
+            "DSV4.1 trace: %d of %d layers came back as the -1 sentinel (%s). "
+            "Those lines are not digests; the rest of the reading stands.",
+            sentinels, total, _LAST_SENTINEL_REASON or "reason not recorded")
+        return
+    raise RuntimeError(
+        f"DSV4.1 trace: {sentinels} of {total} layers came back as the -1 "
+        f"sentinel ({_LAST_SENTINEL_REASON or 'reason not recorded'}). The "
+        "sentinel is a constant, so these lines all match each other and the "
+        "log reads as 'every layer agrees' -- which is the opposite of a "
+        "finding. Refusing to produce that trace: it would be spent as "
+        "evidence, and it is not a reading at all.")
+
+
+def _digest_model_inputs(_module: torch.nn.Module, args: tuple) -> None:
+    """The tensors the model was actually handed.
+
+    🔴 Not a formality. Everything downstream is read as "identical input,
+    different output", and that premise has only ever been checked against the
+    prompt *string* that was sent -- never against the tensor the model
+    received. A chat template, a timestamp or a differing BOS would make the
+    whole investigation a search for a defect that is not there, and nothing
+    else in the trace can tell that apart from a real divergence at layer 0.
+
+    Positional, because the inner model's signature is
+    ``forward(input_ids, positions, ...)`` and both are what they are called.
+    Anything that is not a tensor is skipped rather than guessed at.
+    """
+    for label, value in zip((-3, -2), args[:2]):
+        if isinstance(value, torch.Tensor):
+            _store(label, value)
+
+
+def _digest_embedding(_module: torch.nn.Module, _args: tuple, output) -> None:
+    """What the first decoder layer receives.
+
+    Splits "layer 0's output differs" into its two possible causes: the input
+    it was given, or what it did with it.
+    """
+    tensor = output[0] if isinstance(output, tuple) else output
+    if isinstance(tensor, torch.Tensor):
+        _store(-1, tensor)
+
+
+def _store(label: int, tensor: torch.Tensor) -> None:
+    _SLOTS.store(_SLOTS.slot_of(label), fingerprint_tensor(tensor),
+                 coarse_fingerprint_tensor(tensor),
+                 tensor.shape[0] if tensor.ndim else 0)
 
 
 def _make_hook(index: int):
