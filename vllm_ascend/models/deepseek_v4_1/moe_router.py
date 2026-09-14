@@ -198,10 +198,12 @@ def _tap_select_experts(router):
                                    align_taps.current_positions())
                 else:
                     _report_no_layer()
-        except Exception:                                    # noqa: BLE001
-            # Instrument. It has already cost this line one flight to let one
-            # of these propagate.
-            pass
+        except Exception as exc:                             # noqa: BLE001
+            # Instrument: it must not propagate. But it must not be silent
+            # either -- a swallowed failure and a hook that never ran produce
+            # the same empty dump, and this tap has already spent four
+            # flights on exactly that ambiguity.
+            _report_tap_failed(exc)
         return weights, ids
 
     router._select_experts = _wrapped
@@ -217,11 +219,55 @@ def router_tap_calls() -> int:
     return _ROUTER_CALLS
 
 
+def report_router_tap_coverage() -> None:
+    """Print the count every flush, **including zero**.
+
+    🔴 The count existed for three flights and was never printed -- I defined
+    the reader and called it from nowhere. So "the wrapper did not run" and
+    "the wrapper ran and the count has no printer" produced the same output:
+    nothing. An accounting bit with no reader is not an accounting bit.
+
+    Unconditional on purpose. A line that appears only when the count is
+    non-zero carries exactly the information that is missing when it is zero.
+    """
+    from vllm.logger import logger
+
+    logger.info(
+        "DSV4.1 MoE routing tap: entered %d time(s) this dump%s", _ROUTER_CALLS,
+        "" if _ROUTER_CALLS else
+        " -- ZERO. The wrapper is installed on the router object the factory "
+        "returned (ops/fused_moe/fused_moe.py:111 assigns it to "
+        "routed_experts.router, and routed_experts.py:571 calls "
+        "_select_experts on it), so zero means either that assignment did not "
+        "happen for this layer or the routing did not go through Python at "
+        "all. It does NOT mean the count is broken: this line prints either "
+        "way.")
+
+
+_TAP_FAILURE_REPORTED = False
+
+
+def _report_tap_failed(exc: BaseException) -> None:
+    global _TAP_FAILURE_REPORTED
+    if _TAP_FAILURE_REPORTED:
+        return
+    _TAP_FAILURE_REPORTED = True
+    from vllm.logger import logger
+
+    logger.warning(
+        "DSV4.1 MoE routing tap raised and was swallowed (%r). The routing "
+        "itself is unaffected -- the value was already computed -- but "
+        "moe_gate.out.* will be absent from this dump for that reason and "
+        "not because the path was not taken.", exc)
+
+
 def reset_router_tap_for_test() -> None:
     global _ROUTER_CALLS, _REPORTED_ARGUMENTS, _REPORTED_NO_LAYER
+    global _TAP_FAILURE_REPORTED
     _ROUTER_CALLS = 0
     _REPORTED_ARGUMENTS = False
     _REPORTED_NO_LAYER = False
+    _TAP_FAILURE_REPORTED = False
 
 
 def _report_no_layer() -> None:

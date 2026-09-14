@@ -614,6 +614,13 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
     from vllm_ascend.models.deepseek_v4_1.compressor_insert import \
         reset_write_call_index
     reset_write_call_index()
+    # 🔴 Unconditionally, including zero. The routing tap's counter existed
+    # for three flights with no reader, so "it did not run" and "nobody
+    # printed the count" looked identical -- which is the ambiguity the
+    # counter was added to remove.
+    from vllm_ascend.models.deepseek_v4_1.moe_router import \
+        report_router_tap_coverage
+    report_router_tap_coverage()
     from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
 
     rotate_recorder()

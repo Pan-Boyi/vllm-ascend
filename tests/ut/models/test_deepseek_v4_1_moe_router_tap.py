@@ -159,3 +159,70 @@ def test_the_arguments_actually_used_are_reported_once(monkeypatch):
 
     moe_router._report_router_arguments({"top_k": 1}, {"top_k"})
     assert len(said) == 1, "once per process, not once per layer"
+
+
+def test_the_count_is_printed_even_when_it_is_zero(monkeypatch):
+    """🔴 The ambiguity that cost four flights.
+
+    The counter existed for three of them and was never printed -- the reader
+    was defined and called from nowhere. "The wrapper did not run" and "the
+    wrapper ran and the count has no printer" then produce the same output:
+    nothing. A line that appears only when the count is non-zero carries
+    exactly the information that is missing when it is zero.
+    """
+    said = []
+    monkeypatch.setattr("vllm.logger.logger.info",
+                        lambda fmt, *a: said.append(fmt % a))
+    moe_router.reset_router_tap_for_test()
+    moe_router.report_router_tap_coverage()
+    assert len(said) == 1
+    assert "entered 0 time(s)" in said[0] and "ZERO" in said[0]
+
+    router = moe_router._tap_select_experts(_Router())
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        lambda: False)
+    router._select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
+    said.clear()
+    moe_router.report_router_tap_coverage()
+    assert "entered 1 time(s)" in said[0] and "ZERO" not in said[0]
+
+
+def test_the_flush_path_prints_it():
+    """Wired where the recorder rotates, not called by hand -- a reader
+    nobody calls is the same as no reader, which is the whole lesson here."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    source = textwrap.dedent(inspect.getsource(align_taps._flush_and_rotate))
+    called = {node.func.id for node in ast.walk(ast.parse(source))
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert "report_router_tap_coverage" in called
+
+
+def test_a_swallowed_tap_failure_says_so_once(monkeypatch):
+    """A swallowed failure and a hook that never ran produce the same empty
+    dump; this tap has already spent four flights on that ambiguity."""
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    warned = []
+    monkeypatch.setattr("vllm.logger.logger.warning",
+                        lambda fmt, *a: warned.append(fmt % a))
+    moe_router.reset_router_tap_for_test()
+    monkeypatch.setattr(align_taps, "alignment_active", lambda: True)
+    monkeypatch.setattr(align_taps, "current_layer", lambda: 0)
+    monkeypatch.setattr(align_taps, "current_positions",
+                        lambda: torch.arange(2))
+
+    def _explode(*a, **k):
+        raise RuntimeError("instrument")
+
+    monkeypatch.setattr(align_taps, "tap", _explode)
+    router = moe_router._tap_select_experts(_Router())
+    for _ in range(3):
+        router._select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
+    assert len(warned) == 1, "once, not once per token"
+    assert "swallowed" in warned[0] and "not because the path was not taken" in warned[0]
