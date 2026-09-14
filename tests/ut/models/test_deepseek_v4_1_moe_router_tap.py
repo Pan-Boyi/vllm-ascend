@@ -9,8 +9,10 @@ never fire" need different fixes -- wait for the condition, or move the hook --
 and only tracing who actually does the work separates them. Measured: 160
 reconstruction lines across 40 layers x 4 ranks, zero of them successful.
 
-select_experts is the non-abstract method on FusedMoERouter that every
-implementation goes through, returning (topk_weights, topk_ids).
+The routing does go through a router method -- Ascend's routed experts call
+the private one, router._select_experts (ops/fused_moe/routed_experts.py:571).
+Two peers and I all said otherwise, reading a block that ends in
+forward_impl(...); the call is one frame further in.
 """
 
 import pytest
@@ -26,8 +28,10 @@ class _Router:
     def __init__(self):
         self.calls = 0
 
-    def select_experts(self, hidden_states, router_logits,
-                       topk_indices_dtype=None, *, input_ids=None):
+    def _select_experts(self, hidden_states, router_logits,
+                        topk_indices_dtype=None, *, input_ids=None):
+        """⚠️ The PRIVATE name, copied from the call site that actually runs:
+        ops/fused_moe/routed_experts.py:571 calls router._select_experts."""
         self.calls += 1
         n = hidden_states.shape[0]
         return torch.ones(n, 6), torch.arange(n * 6).reshape(n, 6)
@@ -55,7 +59,7 @@ def test_the_tap_speaks_before_anything_depends_on_it(armed):
     same dump, so the wiring is exercised here rather than assumed.
     """
     router = moe_router._tap_select_experts(_Router())
-    weights, ids = router.select_experts(torch.zeros(3, 8), torch.zeros(3, 4))
+    weights, ids = router._select_experts(torch.zeros(3, 8), torch.zeros(3, 4))
 
     assert [key for _, key, _ in armed] == ["moe_gate.out.0", "moe_gate.out.1"]
     assert [layer for layer, _, _ in armed] == [7, 7]
@@ -71,7 +75,7 @@ def test_the_wrapper_counts_itself(armed):
     assert moe_router.router_tap_calls() == 0
     router = moe_router._tap_select_experts(_Router())
     for _ in range(3):
-        router.select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
+        router._select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
     assert moe_router.router_tap_calls() == 3
 
 
@@ -80,7 +84,7 @@ def test_the_underlying_router_still_runs_and_its_result_is_untouched():
     moe_router.reset_router_tap_for_test()
     inner = _Router()
     router = moe_router._tap_select_experts(inner)
-    weights, ids = router.select_experts(torch.zeros(4, 8), torch.zeros(4, 4))
+    weights, ids = router._select_experts(torch.zeros(4, 8), torch.zeros(4, 4))
     assert inner.calls == 1
     assert torch.equal(weights, torch.ones(4, 6))
     assert torch.equal(ids, torch.arange(24).reshape(4, 6))
@@ -102,7 +106,7 @@ def test_a_tap_failure_does_not_reach_the_model(monkeypatch):
 
     monkeypatch.setattr(align_taps, "tap", _explode)
     router = moe_router._tap_select_experts(_Router())
-    weights, ids = router.select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
+    weights, ids = router._select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
     assert weights.shape == (2, 6)
 
 
@@ -121,7 +125,7 @@ def test_routing_outside_a_layer_records_nothing_and_says_so(monkeypatch):
                         lambda *a, **k: recorded.append(a))
 
     router = moe_router._tap_select_experts(_Router())
-    router.select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
+    router._select_experts(torch.zeros(2, 8), torch.zeros(2, 4))
     assert recorded == []
     assert len(warned) == 1 and "which layer" in warned[0]
 

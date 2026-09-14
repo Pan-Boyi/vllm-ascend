@@ -157,9 +157,18 @@ def _tap_select_experts(router):
     for the condition, or move the hook -- and only tracing who actually does
     the work separates them.
 
-    ``select_experts`` is the non-abstract method on ``FusedMoERouter`` that
-    every implementation goes through and that returns ``(topk_weights,
-    topk_ids)``, so one wrapper covers both the mega and the fused path.
+    🔴 And not on ``select_experts`` either, which was the second wrong
+    answer. That is the *public* method; Ascend's routed experts call the
+    private one directly -- ``self.router._select_experts(...)``
+    (ops/fused_moe/routed_experts.py:571). ``select_experts`` calls
+    ``_select_experts`` too, so wrapping the private one covers both callers
+    and the public method needs no wrapper of its own.
+
+    ⚠️ Two peers and I all said "this path goes through no router method at
+    all", reading a block that ends in ``routed_experts.forward_impl(...)``.
+    The routing does go through a router method; the call is one frame
+    further in. The conclusion was one step past the evidence, and the
+    correction is a line number, not an opinion.
 
     ⚠️ The wrapper also counts its own calls. An absent key has three causes
     -- no alignment run, this path not taken, the hook attached to something
@@ -168,9 +177,9 @@ def _tap_select_experts(router):
     """
     import torch
 
-    original = router.select_experts
+    original = router._select_experts
 
-    def _select_experts(*args, **kwargs):
+    def _wrapped(*args, **kwargs):
         weights, ids = original(*args, **kwargs)
         global _ROUTER_CALLS
         _ROUTER_CALLS += 1
@@ -195,7 +204,7 @@ def _tap_select_experts(router):
             pass
         return weights, ids
 
-    router.select_experts = _select_experts
+    router._select_experts = _wrapped
     return router
 
 
