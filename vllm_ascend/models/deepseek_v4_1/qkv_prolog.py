@@ -132,6 +132,14 @@ def rope_tail(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     return out
 
 
+_ROW_ALIGN = {"aligned": 0, "misaligned": 0, "last": None}
+
+
+def row_align_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_ROW_ALIGN)
+
+
 _CLAMP_SLOT_CHECK = {"ran": 0, "skipped_under_capture": 0, "violations": 0}
 
 
@@ -171,6 +179,20 @@ def _payload_that_leaves_invalid_rows_untouched(current: torch.Tensor,
     成立，捕获后的图保留同一条流的依赖。**若哪天有人把其中一个挪到别的流，这个前提
     就没了**，而失效形态是"无效行把一个刚写对的槽改回旧值" —— 无声。
     """
+    # 🔴 rows 和 slot_mapping 的长度【可以不同】——实测 xr_gr4_161349（图模式下
+    #    服务已起来、处理第一个请求时）：rows=8、slot_mapping=5，
+    #    RuntimeError: The size of tensor a (8) must match the size of tensor b (5)。
+    #    图模式下 rows 被 padding 到捕获桶的大小，而 slot_mapping 是真实 token 数。
+    #    ⚪ 旧的过滤写法碰不到这一格：它先 rows[valid]，两边一起变短。
+    #    ⇒ 按【槽位数】对齐：第 i 行写第 i 个槽，多出来的 padding 行没有去处。
+    #    ⚠️ 不静默截断：长度不一致要记账，否则"对齐了"和"本来就一样长"读数相同。
+    n = current.shape[0]
+    if rows.shape[0] != n:
+        _ROW_ALIGN["misaligned"] += 1
+        _ROW_ALIGN["last"] = (int(rows.shape[0]), int(n))
+        rows = rows[:n]
+    else:
+        _ROW_ALIGN["aligned"] += 1
     return torch.where(valid.unsqueeze(-1), rows.to(current.dtype), current)
 
 
