@@ -724,6 +724,18 @@ def _capture_positions(_module: torch.nn.Module, args: tuple,
     _record_model_inputs(_module, args, kwargs)
 
 
+_CURRENT_LAYER: int | None = None
+
+
+def current_layer() -> int | None:
+    """Which decoder layer is currently in its forward, for inline taps.
+
+    ``None`` outside any layer, which a caller must treat as "cannot say
+    where this belongs" rather than as layer 0.
+    """
+    return _CURRENT_LAYER
+
+
 def current_positions() -> torch.Tensor | None:
     """The positions of the layer currently being tapped, for inline taps.
 
@@ -1066,6 +1078,13 @@ def _make_argument_tap(layer_id: int, positions: dict[str, int]):
     # keyword, which is how the real model passes it.
     def _tap(_module: torch.nn.Module, args: tuple,
              kwargs: dict | None = None) -> None:
+        global _CURRENT_LAYER
+        # Set here because this hook is per layer and fires before anything
+        # inside it. An inline tap deeper down -- the MoE router, which is
+        # built by a factory that is never told its layer -- has no other way
+        # to say which layer it is in, and a key under the wrong layer is
+        # worse than no key.
+        _CURRENT_LAYER = layer_id
         if layer_id == 0:
             # 🔵 What layer 0 was handed *is* the embedding output, whichever
             # path produced it -- the embedding module, a multimodal wrapper's
