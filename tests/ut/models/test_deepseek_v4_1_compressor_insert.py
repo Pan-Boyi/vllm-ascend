@@ -347,9 +347,9 @@ def test_the_write_side_is_recorded_before_the_operator_runs(monkeypatch):
 
     ci._tap_write_side("rope_quant_insert", torch.tensor([5, 6]),
                        torch.zeros(2, 4), torch.zeros(4, 4))
-    assert order == ["compressor.rope_quant_insert.00.slots",
-                     "compressor.rope_quant_insert.00.latent",
-                     "compressor.rope_quant_insert.00.cache_id.process_local"]
+    assert order == ["read.compressor.rope_quant_insert.00.slots",
+                     "read.compressor.rope_quant_insert.00.latent",
+                     "read.compressor.rope_quant_insert.00.cache_id.process_local"]
 
 
 def test_calls_are_numbered_so_a_forward_can_be_ordered(monkeypatch):
@@ -609,3 +609,92 @@ def test_the_ring_reader_count_is_reported(ctx, monkeypatch):
     only_first_chunks = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
     assert compressed_slots.ring_readers_this_forward(
         torch.tensor([0, 5], dtype=torch.int32), only_first_chunks) == (0, 1)
+
+
+# ------------------------- the call index is per forward, and under read.
+
+def test_the_call_index_restarts_each_forward(monkeypatch):
+    """🔴 It used to be a process-level counter, and it is part of a key name.
+
+    Measured on flight-24: req_000 ended at index 3 and req_001 started at 48
+    -- the same tensor carried a different name in two dumps, and a key-by-key
+    comparison saw two unrelated keys instead of one pair. A name must not
+    carry state that has nothing to do with what it names.
+    """
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    keys = []
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        lambda: True)
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
+        lambda: (2, ))
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole",
+        lambda layer, key, tensor: keys.append(key))
+    ci.reset_write_taps_for_test()
+
+    for _ in range(3):
+        ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                           torch.zeros(1, 4), torch.zeros(4, 4))
+    assert [k for k in keys if k.endswith(".slots")] == [
+        "read.compressor.rope_quant_insert.00.slots",
+        "read.compressor.rope_quant_insert.01.slots",
+        "read.compressor.rope_quant_insert.02.slots"]
+
+    # The next forward starts over, so the second request's keys match the
+    # first's instead of continuing from wherever the process happened to be.
+    keys.clear()
+    ci.reset_write_call_index()
+    ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                       torch.zeros(1, 4), torch.zeros(4, 4))
+    assert keys[0] == "read.compressor.rope_quant_insert.00.slots"
+
+
+def test_the_rotate_path_resets_the_index():
+    """Wired to the same place the recorder rotates, not called by hand --
+    a reset nobody calls is the same as no reset."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    source = textwrap.dedent(inspect.getsource(align_taps._flush_and_rotate))
+    called = {node.func.id for node in ast.walk(ast.parse(source))
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert "reset_write_call_index" in called
+
+
+def test_rows_that_were_never_written_are_reported(monkeypatch, caplog):
+    """🔴 The latent is torch.empty and only group boundaries are written, so
+    rows with a negative slot are uninitialised memory -- measured as the
+    constant 5.0097551721019626e+33, which looks like a value and is not.
+
+    Recorded whole rather than masked (the companion .slots says which to
+    drop, and masking would hide which rows they were), but said out loud.
+    """
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    said = []
+    monkeypatch.setattr("vllm.logger.logger.info",
+                        lambda fmt, *a: said.append(fmt % a))
+    ci.reset_write_taps_for_test()
+    ci._report_uninitialised_rows(
+        "rope_quant_insert", torch.tensor([10752, -1, 10753, -1, -1]),
+        torch.zeros(5, 4))
+    assert len(said) == 1 and "3 of 5 rows" in said[0]
+    assert "uninitialised memory, not values" in said[0]
+
+    # Once per writer: a per-call line would bury the flight log.
+    ci._report_uninitialised_rows(
+        "rope_quant_insert", torch.tensor([-1]), torch.zeros(1, 4))
+    assert len(said) == 1
+
+    # And nothing to say when every row was written.
+    ci.reset_write_taps_for_test()
+    said.clear()
+    ci._report_uninitialised_rows(
+        "rope_quant_insert", torch.tensor([1, 2]), torch.zeros(2, 4))
+    assert said == []

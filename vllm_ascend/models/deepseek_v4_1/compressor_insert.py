@@ -237,8 +237,37 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
     try:
         index = _WRITE_CALLS.get(who, 0)
         _WRITE_CALLS[who] = index + 1
-        prefix = f"compressor.{who}.{index:02d}"
+        if index == 100:
+            from vllm.logger import logger
+
+            logger.warning(
+                "DSV4.1 compressor tap: call index reached 100 for %r in one "
+                "forward, and the key is formatted %%02d, so indices from "
+                "here on collide with earlier ones. The counter resets per "
+                "forward, so this means far more compressor calls per forward "
+                "than the four-per-kv-source-layer this was sized for.", who)
+        # 🔴 Per forward, and under `read.`. Two separate defects, both found
+        # by the comparison rather than by this code:
+        #
+        # * The index used to be a **process-level** counter, so req_000 ended
+        #   at 3 and req_001 started at 48 -- the same tensor carried a
+        #   different name in two dumps, and a key-by-key comparison saw two
+        #   unrelated keys instead of one pair. A name must not carry state
+        #   that has nothing to do with what it names.
+        # * These are **instrument read-backs**, not model tensors. Under a
+        #   bare name they sat in the same namespace as attn.out and moe.out,
+        #   so a bit-exact comparison counted them as model differences.
+        prefix = f"read.compressor.{who}.{index:02d}"
         align_taps.tap_whole(0, f"{prefix}.slots", flat_slots)
+        # ⚠️ `latent` is `torch.empty` (upstream compressor.py:273-278) and is
+        # written only at valid group boundaries, so the rows whose slot is
+        # negative are **uninitialised memory** -- measured as the constant
+        # 5.0097551721019626e+33, which is a recognisable bit pattern and not
+        # a value. Recorded whole rather than masked, because masking would
+        # change the shape and hide which rows those are; the companion
+        # `.slots` says exactly which to drop, and the key's meaning says so
+        # too. Reported once so the log says it as well as the manifest.
+        _report_uninitialised_rows(who, flat_slots, latent)
         align_taps.tap_whole(0, f"{prefix}.latent", latent)
         # 🔴 Correction. This used to be hashed, with a comment saying the
         # hash let the four-rank same-state comparison report a clean zero.
@@ -263,7 +292,48 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
         pass
 
 
+def _report_uninitialised_rows(who: str, flat_slots, latent) -> None:
+    """Say how many recorded rows were never written, once per writer.
+
+    The dump would otherwise carry a plausible-looking float where nothing
+    was ever stored, and a comparison that does not know to drop those rows
+    reports them as model differences -- which is what happened.
+    """
+    if who in _REPORTED_UNINITIALISED:
+        return
+    try:
+        invalid = int((flat_slots.reshape(-1) < 0).sum())
+    except Exception:                                        # noqa: BLE001
+        return
+    _REPORTED_UNINITIALISED.add(who)
+    if not invalid:
+        return
+    from vllm.logger import logger
+
+    logger.info(
+        "DSV4.1 compressor tap: %d of %d rows of %r's latent have a negative "
+        "slot and were never written -- the compressor allocates it with "
+        "torch.empty and fills only group boundaries. Those rows are "
+        "uninitialised memory, not values; drop them using the companion "
+        ".slots key before comparing anything.", invalid,
+        int(flat_slots.reshape(-1).numel()), who)
+
+
+_REPORTED_UNINITIALISED: set = set()
+
+
 def reset_write_taps_for_test() -> None:
+    _WRITE_CALLS.clear()
+    _REPORTED_UNINITIALISED.clear()
+
+
+def reset_write_call_index() -> None:
+    """Start the per-forward call index over.
+
+    Called from the same place the recorder rotates. The index orders calls
+    **within one forward**, which is all it was ever meant to do; letting it
+    run process-wide gave the same tensor a different name in every dump.
+    """
     _WRITE_CALLS.clear()
 
 

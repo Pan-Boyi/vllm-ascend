@@ -108,6 +108,23 @@ KEY_SEMANTICS: dict = {
                  "pass through unchanged and are already in sa_in.q, so "
                  "recording them again would be the same numbers at eight "
                  "times the size. Named to match golden's rope.kv.in",
+    "read.compressor.*.latent":
+        "🔴 an **instrument read-back**, not a model tensor -- hence the "
+        "`read.` prefix. It is the compressor's `latent`, which upstream "
+        "allocates with `torch.empty` (compressor.py:273-278) and fills only "
+        "at valid group boundaries, so every row whose companion `.slots` "
+        "entry is negative is **uninitialised memory**: measured as the "
+        "constant 5.0097551721019626e+33, a recognisable bit pattern that "
+        "looks like a value. ⚠️ Drop those rows using `.slots` before "
+        "comparing anything; a comparison that does not counts them as model "
+        "differences, which is what happened",
+    "read.compressor.*.slots":
+        "the flat destination slots this compressor call was handed, taken "
+        "before the operator runs. Also the mask for the `.latent` key above: "
+        "negative means that row was never written. ⚠️ The `<NN>` in these "
+        "keys is the call's index **within one forward** and restarts each "
+        "forward; it used to be a process-level counter, which gave the same "
+        "tensor a different name in every dump",
     "rope.kv.out": "🔵 the **post-RoPE** kv, i.e. the rows written to the SWA "
                    "cache. This is the key to compare with golden's "
                    "rope.kv.out; sa_in.kv is a stage below it and is not "
@@ -512,6 +529,14 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
     _ARMED = False
     # Per forward, so the next one records its own.
     _FORWARD_RECORDED.clear()
+    # 🔴 And the compressor's call index, for the same reason and with a
+    # sharper symptom: it is part of a **key name**, so letting it run
+    # process-wide made req_000 end at index 3 and req_001 start at 48 -- the
+    # same tensor under a different name in two dumps, which a key-by-key
+    # comparison reads as two unrelated keys rather than as a pair.
+    from vllm_ascend.models.deepseek_v4_1.compressor_insert import \
+        reset_write_call_index
+    reset_write_call_index()
     from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
 
     rotate_recorder()
