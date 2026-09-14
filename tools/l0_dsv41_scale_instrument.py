@@ -119,6 +119,37 @@ step("report_scale_bytes",
      lambda: slc.report_scale_bytes(layer, ("weight_scale",), where="l0",
                                     weights=("weight_scale",)))
 
+print("=== 6. the entry points on an INTERNAL-FORMAT tensor ===")
+print("  🔴 This is the step that matters. Flight xr_sc_032634 died at")
+print("  scale_layout_check.py:223 -- report_scale_bytes, on a weight in")
+print("  internal format. Step 5 runs the same entry points on an ND tensor")
+print("  and passes either way, so a gate built only from step 5 would have")
+print("  waved that build through: the gate has to be exercised on the")
+print("  format the failure needs, not merely on the function that failed.")
+try:
+    nz = torch_npu.npu_format_cast(
+        torch.randint(-120, 120, (64, 160), dtype=torch.int8).npu(), 29)
+    assert slc._storage_format(nz) not in ("ND", "host/ND"), "cast did not take"
+except Exception as exc:
+    print(f"  ⚠️ could not build an internal-format tensor here: {exc}")
+    nz = None
+if nz is not None:
+    print(f"  built an internal-format tensor: stored as {slc._storage_format(nz)}")
+    layer_nz = L()
+    layer_nz.w13_weight = torch.nn.Parameter(nz, requires_grad=False)
+    layer_nz.weight_scale = torch.nn.Parameter(nz, requires_grad=False)
+    before_nz = step("snapshot_scales on internal format",
+                     lambda: slc.snapshot_scales(layer_nz, ("weight_scale",)))
+    step("verify_scale_layout_preserved on internal format",
+         lambda: slc.verify_scale_layout_preserved(
+             before_nz, layer_nz, ("weight_scale",), what="l0_nz"))
+    step("report_scale_bytes on internal format  <-- the line that flew",
+         lambda: slc.report_scale_bytes(layer_nz, ("weight_scale",),
+                                        where="l0_nz", weights=("w13_weight",)))
+    if before_nz is None:
+        print("  ⚠️ the snapshot came back empty -- the instrument survived, "
+              "but it has nothing to say on this format")
+
 print()
 print("=== VERDICT ===")
 print("🔴 FAILURES: " + ", ".join(fails) if fails else
