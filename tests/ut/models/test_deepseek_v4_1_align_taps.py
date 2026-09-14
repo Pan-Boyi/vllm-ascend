@@ -1491,3 +1491,64 @@ def test_a_layer_whose_every_key_was_refused_still_appears(tmp_path):
     assert told["layers_seen"] == 2
     assert told["per_layer"]["attn.in"]["missing"] == ["layer_00", "layer_01"]
     assert told["state"] == "incomplete"
+
+
+# --------------------------------- the MoE reconstruction check
+
+def test_the_reconstruction_check_localises_without_a_reference(monkeypatch):
+    """🔵 experts + shared == moe.out, from one side's dump alone.
+
+    It is what makes the other MoE keys usable: without it, "one part
+    disagrees" cannot be told from "the taps caught only part of the sum".
+    And it localises on its own -- a mismatch puts the defect in the
+    aggregation, a match puts it in one of the recorded parts.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    said = []
+    monkeypatch.setattr("vllm.logger.logger.info",
+                        lambda fmt, *a: said.append(fmt % a))
+    whole = []
+    monkeypatch.setattr(align_taps, "tap_whole",
+                        lambda layer, key, tensor: whole.append(key))
+    align_taps._MOE_PARTS.clear()
+    align_taps._RECONSTRUCTION_REPORTED.clear()
+
+    experts = torch.randn(5, 8)
+    shared = torch.randn(5, 8)
+    align_taps._MOE_PARTS[0] = {"moe.experts.out": experts,
+                                "moe.shared.out": shared}
+    align_taps.check_moe_reconstruction(0, (experts + shared).reshape(1, 5, 8))
+    assert "moe.reconstruction_residual" in whole
+    assert "reconstruction" in said[0] and "RMS error 0.000e+00" in said[0]
+
+
+def test_a_reconstruction_that_cannot_be_computed_says_so(monkeypatch):
+    """⚠️ And it must not pass quietly: per-part keys with no completeness
+    evidence behind them read exactly like per-part keys with it."""
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    warned = []
+    monkeypatch.setattr("vllm.logger.logger.warning",
+                        lambda fmt, *a: warned.append(fmt % a))
+    align_taps._MOE_PARTS.clear()
+    align_taps._RECONSTRUCTION_REPORTED.clear()
+
+    align_taps._MOE_PARTS[3] = {"moe.experts.out": torch.randn(5, 8)}
+    align_taps.check_moe_reconstruction(3, torch.randn(1, 5, 8))
+    assert len(warned) == 1
+    assert "moe.shared.out" in warned[0]
+    assert "no completeness evidence" in warned[0]
+
+
+def test_the_parts_do_not_survive_into_the_next_forward():
+    """A stale part would be summed against the next forward's output and the
+    residual would be a number about nothing."""
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    align_taps._MOE_PARTS.clear()
+    align_taps._RECONSTRUCTION_REPORTED.clear()
+    align_taps._MOE_PARTS[0] = {"moe.experts.out": torch.zeros(5, 8),
+                                "moe.shared.out": torch.zeros(5, 8)}
+    align_taps.check_moe_reconstruction(0, torch.zeros(1, 5, 8))
+    assert 0 not in align_taps._MOE_PARTS

@@ -939,6 +939,8 @@ def _make_moe_tap(layer_id: int, key: str):
             if not isinstance(tensor, torch.Tensor):
                 continue
             name = f"{key}{suffix}"
+            if suffix == "" and key in _MOE_RECONSTRUCTION_PARTS:
+                _MOE_PARTS.setdefault(layer_id, {})[key] = tensor.detach()
             positions = _current_positions()
             rows = tensor.shape[0] if tensor.ndim else 0
             if positions is not None and rows == positions.shape[0]:
@@ -950,6 +952,89 @@ def _make_moe_tap(layer_id: int, key: str):
                 tap_whole(layer_id, name, tensor)
 
     return _tap
+
+
+#: The parts whose sum must reproduce ``moe.out``. Not every tapped key: the
+#: gate's output is a routing decision, not a contribution.
+_MOE_RECONSTRUCTION_PARTS = ("moe.experts.out", "moe.shared.out")
+
+_MOE_PARTS: dict = {}
+_RECONSTRUCTION_REPORTED: set = set()
+
+
+def check_moe_reconstruction(layer_id: int, out: torch.Tensor) -> None:
+    """Does the routed aggregate plus the shared expert add up to ``moe.out``?
+
+    🔵 The check that makes the other MoE taps usable, and it needs no
+    reference: without it, "one expert disagrees" cannot be told from "the tap
+    recorded only part of the sum". golden measures its own side at
+    E = 2.94e-06, the bf16 storage floor.
+
+    🔴 And it can localise on its own, from one side's dump:
+
+        sum != moe.out  ⇒ the defect is in the **aggregation**
+        sum == moe.out  ⇒ it is in a part -- an expert, the shared expert,
+                          or the gate -- and the parts are recorded
+
+    ⚠️ The shared expert is not a detail to fold into "the experts": golden
+    measures shared RMS 0.0865 against routed RMS 0.0602, so it is more than
+    half of the output and its own path entirely.
+    """
+    parts = _MOE_PARTS.pop(layer_id, None)
+    if not parts:
+        return
+    missing = [name for name in _MOE_RECONSTRUCTION_PARTS if name not in parts]
+    if missing:
+        _report_reconstruction_impossible(layer_id, missing)
+        return
+    try:
+        total = None
+        for name in _MOE_RECONSTRUCTION_PARTS:
+            piece = parts[name].reshape(-1, parts[name].shape[-1])
+            total = piece if total is None else total + piece
+        target = out.detach().reshape(-1, out.shape[-1])
+        if total.shape != target.shape:
+            _report_reconstruction_impossible(
+                layer_id, [f"shapes {tuple(total.shape)} vs "
+                           f"{tuple(target.shape)}"])
+            return
+        residual = (total.float() - target.float())
+        scale = target.float().pow(2).mean().sqrt()
+        error = residual.pow(2).mean().sqrt()
+        tap_whole(layer_id, "moe.reconstruction_residual", residual)
+        _report_reconstruction(layer_id, float(error), float(scale))
+    except Exception as exc:                                 # noqa: BLE001
+        _report_reconstruction_impossible(layer_id, [repr(exc)])
+
+
+def _report_reconstruction(layer_id: int, error: float, scale: float) -> None:
+    if layer_id in _RECONSTRUCTION_REPORTED:
+        return
+    _RECONSTRUCTION_REPORTED.add(layer_id)
+    from vllm.logger import logger
+
+    relative = error / scale if scale else float("inf")
+    logger.info(
+        "DSV4.1 alignment: layer %d MoE reconstruction -- "
+        "experts + shared vs moe.out: RMS error %.3e against output RMS "
+        "%.3e (relative %.3e). At the bf16 storage floor this reads ~3e-06; "
+        "anything larger puts the defect in the AGGREGATION, and anything "
+        "at the floor puts it in one of the recorded parts.",
+        layer_id, error, scale, relative)
+
+
+def _report_reconstruction_impossible(layer_id: int, why: list) -> None:
+    if layer_id in _RECONSTRUCTION_REPORTED:
+        return
+    _RECONSTRUCTION_REPORTED.add(layer_id)
+    from vllm.logger import logger
+
+    logger.warning(
+        "DSV4.1 alignment: layer %d MoE reconstruction could NOT be computed "
+        "(%s), so the per-part keys in this dump have no completeness "
+        "evidence behind them. 'one part disagrees' and 'the taps caught only "
+        "part of the sum' are not distinguishable without it.",
+        layer_id, ", ".join(str(w) for w in why))
 
 
 def _flatten_outputs(output, prefix: str = ""):
@@ -1167,6 +1252,12 @@ def _attach(module: torch.nn.Module, layer_id: int, key: str,
         tensor = _first_tensor(output)
         if tensor is not None:
             _record(layer_id, key, tensor)
+            if key == "moe.out":
+                # 🔵 Here, not in its own hook: this is the one moment at
+                # which every part of the sum has been recorded and the total
+                # exists. A separate hook would have to be ordered against
+                # this one, and hook order is not something this module owns.
+                check_moe_reconstruction(layer_id, tensor)
 
     if side == "in":
         return module.register_forward_pre_hook(_pre)
