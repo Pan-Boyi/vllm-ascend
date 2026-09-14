@@ -321,6 +321,57 @@ def _causal_without_indices() -> bool:
     return envs.VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES == "1"
 
 
+_DEVICE_PRED = {"evaluated": 0, "skipped_under_capture": 0}
+
+
+def device_predicate_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_DEVICE_PRED)
+
+
+def _device_scalar(t, when_capturing: int) -> int:
+    """把设备上的标量取回 host —— 捕获期返回 ``when_capturing`` 并记账。
+
+    🔴 ``int(t)`` 同样是一次 host 读回（107027 / LocalScalarDenseNpu.cpp:23）。
+    ⚠️ ``when_capturing`` 由调用方给，且必须是一个【能让下游检查通过】的值 ——
+    这是偏宽松的方向，所以要在调用处写清为什么那个值是安全的，并靠
+    ``device_predicate_accounting()`` 的 skipped 计数留痕。
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _DEVICE_PRED["skipped_under_capture"] += 1
+        return when_capturing
+    _DEVICE_PRED["evaluated"] += 1
+    return int(t)
+
+
+def _device_predicate(t) -> bool:
+    """把一个【设备上的布尔张量】变成 host 布尔 —— 捕获期【跳过】并视为通过。
+
+    🔴 为什么要跳过：``bool(t)`` 把一个标量从设备读回 host，而捕获期对 stream 的
+    同步在任何捕获模式下都非法（实测 107027 /
+    ``LocalScalarDenseNpu.cpp:23``；CANN 把这一类叫
+    "dynamic control flow on tensor values"）。
+
+    ⚠️ **方向是偏宽松的那一侧**，而偏宽松的错不会被后续工作发现 —— 所以：
+      · 只在捕获期跳过。捕获只发生在 warmup，那时喂的是 dummy 数据，
+        这些断言本来也说明不了生产的情况。
+      · 每次跳过都记账（``device_predicate_accounting()``），
+        否则"跳过了"和"检查通过了"读数一样。
+      · 真正的生产请求走的是 replay，不在捕获里 ⇒ eager 路径上这些检查一次不少。
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _DEVICE_PRED["skipped_under_capture"] += 1
+        return True
+    _DEVICE_PRED["evaluated"] += 1
+    return bool(t)
+
+
 def _check(condition: bool, operator_message: str, detail: str = "") -> None:
     if condition:
         return
@@ -382,7 +433,8 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any],
             raise ValueError(
                 f"{table_key} is empty, so this check did not run. An empty "
                 "table is not a batch needing no blocks; it addresses nothing.")
-        highest = int(table.max())
+        # 捕获期返回 -1：下游判据是 `highest >= num_blocks`，-1 必然通过。
+        highest = _device_scalar(table.max(), -1)
         if highest >= num_blocks:
             raise ValueError(
                 f"{table_key}'s highest block id is {highest} and {cache_key} "
@@ -398,7 +450,8 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any],
                 f"not run against {cache_key}. Calling that a pass would claim "
                 "coverage this call does not have.")
         capacity = num_blocks * block_size
-        longest = int(used.max())
+        # 捕获期返回 -1：下游判据是 `longest > capacity`，-1 必然通过。
+        longest = _device_scalar(used.max(), -1)
         if longest > capacity:
             raise ValueError(
                 f"{used_key}'s longest sequence is {longest} tokens and "
@@ -456,7 +509,7 @@ def _check_descriptor_is_populated(kwargs: dict[str, Any],
             "empty batch legitimately produces")
         return
 
-    _check(bool(metadata.any()),
+    _check(_device_predicate(metadata.any()),
            "metadata must be a populated descriptor",
            f"all {DESCRIPTOR_WORDS} words are zero while this call has "
            f"{num_tokens} query tokens, so the metadata operator never wrote "
@@ -511,7 +564,7 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
         _check(cu_seqlens_q.ndim == 1 and cu_seqlens_q.numel() == num_requests + 1,
                "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
                f"got shape {tuple(cu_seqlens_q.shape)} for {num_requests} requests")
-        _check(bool(torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1])),
+        _check(_device_predicate(torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1])),
                "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
                "the values are not non-decreasing, so they are lengths rather "
                "than a cumulative sum")

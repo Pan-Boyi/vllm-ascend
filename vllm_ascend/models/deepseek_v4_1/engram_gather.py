@@ -95,6 +95,14 @@ ACL_HOST_REG_MAPPED = 0x2
 SCALE_BLOCK = 32
 
 
+_RANGE_CHECK = {"ran": 0, "skipped_under_capture": 0}
+
+
+def range_check_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_RANGE_CHECK)
+
+
 @triton.jit
 def engram_lookup_hostptr(
     weight_addr,          # 1-element int64 tensor: device address of the fp8 table
@@ -272,6 +280,17 @@ def check_in_range(hash_ids: torch.Tensor, num_rows: int) -> None:
     """
     if hash_ids.numel() == 0:
         return
+    # 🔴 捕获期跳过：min()/max() 要把标量读回 host，而捕获期对 stream 的同步在
+    #    任何捕获模式下都非法（107027 / LocalScalarDenseNpu.cpp:23）。
+    #    ⚪ 捕获只发生在 warmup，那时是 dummy hash id，这个范围检查本来也说明不了
+    #      生产的情况；真正的请求走 replay ⇒ eager 路径上一次不少。
+    #    ⚠️ 跳过要留痕，否则"跳过了"和"检查通过了"读数一样。
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+    if _stream_is_capturing():
+        _RANGE_CHECK["skipped_under_capture"] += 1
+        return
+    _RANGE_CHECK["ran"] += 1
     lo = int(hash_ids.min())
     hi = int(hash_ids.max())
     if lo < 0 or hi >= num_rows:

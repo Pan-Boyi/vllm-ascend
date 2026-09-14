@@ -168,6 +168,8 @@ def _log_compressed_selection(*, prefix, layer_ratio, attends_compressed,
             prefix, layer_ratio, attends_compressed, num_tokens)
         return
 
+    if _skip_under_capture("ori-idx buffer describe"):
+        return
     rows = buffer[:num_tokens]
     capacity = int(rows.numel())
     pad = int((rows == -1).sum())
@@ -200,9 +202,42 @@ def _log_batch_shape(prefix, query_start_loc, seq_lens) -> None:
     """
     from vllm.logger import logger
 
+_CAPTURE_SKIP = {"skipped": 0, "ran": 0}
+
+
+def capture_skip_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_CAPTURE_SKIP)
+
+
+def _skip_under_capture(what: str) -> bool:
+    """诊断类读数在捕获期【跳过】—— 它们把设备上的标量读回 host。
+
+    🔴 捕获期对 stream 的同步在任何捕获模式下都非法（实测 107027 /
+    ``LocalScalarDenseNpu.cpp:23``；CANN 把这一类叫 "dynamic control flow on
+    tensor values"）。这些函数只用来【打印一行】，不参与计算 —— 跳过它们
+    不改变任何数值。
+
+    ⚠️ 跳过是【偏宽松】的方向，所以要留痕：``capture_skip_accounting()``
+    无条件可读，否则"捕获期全跳过"和"跑过且没问题"读数一样。
+    ⚪ 捕获只发生在 warmup；真正的请求走 replay，不在捕获里
+      ⇒ eager 路径上这些诊断一次不少。
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _CAPTURE_SKIP["skipped"] += 1
+        return True
+    _CAPTURE_SKIP["ran"] += 1
+    return False
+
+
     if prefix in _LOGGED_BATCH_SHAPES:
         return
     _LOGGED_BATCH_SHAPES.add(prefix)
+    if _skip_under_capture("batch shape log"):
+        return
     starts = query_start_loc.tolist() if query_start_loc is not None else None
     lens = seq_lens.tolist() if seq_lens is not None else None
     logger.info(

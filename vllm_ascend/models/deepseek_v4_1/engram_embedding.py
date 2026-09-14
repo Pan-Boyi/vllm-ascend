@@ -308,6 +308,66 @@ class AscendStagedEngramEmbedding:
         self._dev_weight = torch.empty(wshape, dtype=torch.uint8, device=device)
         self._dev_scale = torch.empty(sshape, dtype=torch.uint8, device=device)
 
+        # 捕获路线的 pinned 缓冲：【捕获前】分配一次，地址此后不再变动。
+        # 惰性分配在这里是错的 —— NPU 没有 eager warmup forward，第一次 forward
+        # 就在捕获里，届时任何分配/H2D 都会被 ACL 拒（107030）。
+        self._pin_ready = False
+        if _capture_route_enabled():
+            self._allocate_pinned_for_capture(wshape, sshape)
+
+    def _allocate_pinned_for_capture(self, wshape, sshape) -> None:
+        """捕获期可用的 host 缓冲。异步拷贝只有对 pinned 内存才是可捕获的。
+
+        🔴 和被禁的那个调用的关系，按【产物】核过，不是按名字猜的（2026-09-14）：
+            nm -D --undefined-only libtorch_npu.so
+              U aclrtFreeHost
+              U aclrtMallocHost          ← pinned 分配走这个，【已链接】
+            aclrtHostRegisterV2 只以【字符串】出现，且旁边就是
+              "Failed to find function aclrtHostRegisterV2"
+            ⇒ 它是 dlsym 动态查找的另一个特性（UVA / host register），
+              不在 pin_memory 这条路上。**HostRegisterV2 的禁令不受影响。**
+        ⚠️ 残余不确定性：dlsym 的调用者无法只靠链接关系确定。所以这条路默认关着，
+           打开它是一次显式的决定（见 _CAPTURE_ROUTE_ENV），不是优化里顺带发生的事。
+
+        ids 两种 dtype 各备一份：在捕获里做 dtype 转换要么带分配、要么要额外 kernel，
+        而这两个缓冲一共只有几 MB（8192 token × n_hash_cols × 12 B）。
+        """
+        # 🔴 device="cpu" 必须显式写。第一版没写，实测(xr_hostfunc2_100807)当场死在
+        #    `RuntimeError: Only dense CPU tensors can be pinned` —— 因为 worker 里
+        #    默认设备是 npu，torch.empty(..., pin_memory=True) 就去 pin 了一个 NPU 张量。
+        #    ⚠️ "pinned host buffer" 这个名字读起来已经说了它在 host 上，而代码没说。
+        rows = wshape[0]
+        self._pin_ids64 = torch.empty(rows, dtype=torch.int64,
+                                      device="cpu", pin_memory=True)
+        self._pin_ids32 = torch.empty(rows, dtype=torch.int32,
+                                      device="cpu", pin_memory=True)
+        self._pin_weight = torch.empty(wshape, dtype=torch.uint8,
+                                       device="cpu", pin_memory=True)
+        self._pin_scale = torch.empty(sshape, dtype=torch.uint8,
+                                      device="cpu", pin_memory=True)
+        for _name, _t in (("ids64", self._pin_ids64), ("ids32", self._pin_ids32),
+                          ("weight", self._pin_weight), ("scale", self._pin_scale)):
+            # 记账位要有区分力：is_pinned() 为假时这条路【静默退化】成普通 pageable，
+            # 而 pageable 的异步拷贝在捕获期是不可捕获的 —— 那会变成下一个静默失效。
+            if _t.device.type != "cpu" or not _t.is_pinned():
+                raise RuntimeError(
+                    f"engram capture buffer {_name} is on {_t.device} "
+                    f"pinned={_t.is_pinned()}; the capture route needs "
+                    "dense pinned CPU memory or its async copies are not "
+                    "capturable.")
+        self._pin_ids64_np = self._pin_ids64.numpy()
+        self._pin_ids32_np = self._pin_ids32.numpy()
+        self._pin_weight_np = self._pin_weight.numpy()
+        self._pin_scale_np = self._pin_scale.numpy()
+        self._pin_ready = True
+
+        from vllm.logger import logger
+        logger.info(
+            "engram capture route ON: pinned staging allocated "
+            "(ids %d rows, weight %s, scale %s). The host gather will be "
+            "submitted as a graph node via _launch_host_func.",
+            rows, tuple(wshape), tuple(sshape))
+
     def _staging_host_views(self, rows: int):
         """The host rows this forward will gather into.
 
@@ -339,6 +399,73 @@ class AscendStagedEngramEmbedding:
             return self._host_weight_alt[:rows], self._host_scale_alt[:rows]
         return self._host_weight[:rows], self._host_scale[:rows]
 
+    def _submit_under_capture(self, indices: torch.Tensor, out: torch.Tensor,
+                              rows: int, weight_table, scale_table) -> None:
+        """把 host gather 作为【图节点】提交，一次图都不切。
+
+        三步各自换成可被捕获的那一种：
+
+          ① hash id 的 D2H  →  异步拷进捕获前就固定的 pinned buffer
+          ② numpy gather    →  _launch_host_func，录成图节点，重放时在 host 执行
+          ③ staged rows H2D →  从同一块 pinned buffer 异步拷回
+
+        ⚠️ **host func 会阻塞本流**：ACL 的语义是回调未返回、本流不许继续。
+           另一条线实测（43 层 × 每层一个回调）：每步 8.58 ms 花在
+           HOSTFUNC_CALLBACK + NOTIFY_WAIT 上，占 token 时间的 41.3%，零重叠；
+           他们把提交 fork 到侧流、在 combine 后 join，才拿到 −5.97 ms/token。
+           ⇒ **"进得了图" 和 "变快了" 是两件事。** 本函数只做前者；侧流重叠是下一步，
+             而且在量到串行化【之前】不该先写，否则又是一个没有对照的优化。
+
+        ⚪ **行数是 token 数的纯函数**，与 hash 内容无关：
+           rows = num_tokens * part_n_hash_cols（:458），part_n_hash_cols 在
+           __init__ 里定死（common/engram.py:649，TP=1 下 = n_hash_cols），
+           而 gather_into_staging 的 docstring 明写 "No de-duplication"。
+           ⇒ 同一张捕获图里 num_tokens 是桶大小、恒定 ⇒ rows 恒定 ⇒ 可以烘进图。
+           🔴 **触发条件**：哪天有人给 gather 加了去重，rows 就变成【内容相关】，
+             而这里烘进图的 [:rows] 会静默地切错 —— 那时这条路必须重新判，
+             不是调参数能补的。
+
+        ⚪ 这里【绕开】了 _staging_host_views 的双缓冲：捕获把地址烘进图里，
+           而双缓冲每次换地址 —— 两者不兼容。捕获路线用固定的那一块。
+        """
+        import torch_npu
+
+        flat = indices.reshape(-1)
+        if flat.numel() != rows:
+            raise AssertionError(
+                f"{flat.numel()} ids for {rows} staging rows -- the row "
+                "numbering the gather recomputes would not match. "
+                "(EngramLayout.row_index is the only definition of it.)")
+        if flat.dtype == torch.int64:
+            pin_ids, ids_np = self._pin_ids64, self._pin_ids64_np
+        elif flat.dtype == torch.int32:
+            pin_ids, ids_np = self._pin_ids32, self._pin_ids32_np
+        else:
+            raise TypeError(
+                f"hash ids are {flat.dtype}; the pinned id buffers are int32 "
+                "and int64. Converting here would allocate inside the "
+                "capture, which is the thing this path exists to avoid.")
+
+        stream = torch.npu.current_stream(indices.device)
+        _ensure_subscribe_report(stream)
+
+        pin_ids[:rows].copy_(flat, non_blocking=True)
+
+        # 🔴 payload 必须活到进程结束：节点在【重放】时才读它。
+        #    只有捕获期的调用会走到这里（重放不执行 Python），
+        #    所以它的上界是 (被捕获的形状数 × warmup 次数)，不随请求增长。
+        payload = (weight_table, scale_table, ids_np,
+                   self._pin_weight_np, self._pin_scale_np, rows)
+        _CAPTURED_PAYLOADS.append(payload)
+        torch_npu.npu._launch_host_func(stream, _engram_host_gather, payload)
+
+        self._dev_weight[:rows].copy_(self._pin_weight[:rows],
+                                      non_blocking=True)
+        self._dev_scale[:rows].copy_(self._pin_scale[:rows],
+                                     non_blocking=True)
+
+        self._dequantize_staged(rows, out)
+
     def lookup(self, indices: torch.Tensor, out: torch.Tensor,
                background: bool = False) -> None:
         """Gather on the host, copy once, let the kernel read HBM.
@@ -359,8 +486,6 @@ class AscendStagedEngramEmbedding:
         if not rows:
             return
 
-        _refuse_under_capture(num_tokens)
-
         layout = getattr(self, "_layout", None)
         if layout is None:
             raise RuntimeError(
@@ -378,6 +503,18 @@ class AscendStagedEngramEmbedding:
                 "cannot grow on demand.")
 
         weight_table, scale_table = self.staged_tables()
+
+        # 🔴 捕获中 ⇒ 【选路】，不是拒绝。
+        #    同一个谓词，之前拿来 raise，现在拿来选提交方式。原先那条拒绝
+        #    仍然是默认行为：捕获路线没打开、或 pinned 缓冲没就绪时，照旧拒绝。
+        #    （拒绝的理由一个字没变，见 _refuse_under_capture 的 docstring。）
+        if _stream_is_capturing():
+            if not (_capture_route_enabled()
+                    and getattr(self, "_pin_ready", False)):
+                _refuse_under_capture(num_tokens)
+            self._submit_under_capture(indices, out, rows,
+                                       weight_table, scale_table)
+            return
 
         # The one synchronising transfer on this path: the hash ids have to
         # reach the host to be gathered. Small (24 int32 per token) but it is a
@@ -528,6 +665,101 @@ def _synchronize_current_stream() -> None:
         pass
 
 
+# 🔴 被捕获的图【重放的是设备操作】。engram 的 host gather 里没有设备操作，
+#    所以三步要各自变成【可被捕获的那一种】才进得去图：
+#
+#      ① hash id 的 D2H   →  异步拷进【捕获前就分配好的 pinned buffer】
+#      ② numpy gather     →  torch_npu.npu._launch_host_func，录成【图节点】
+#      ③ staged rows H2D  →  从同一块 pinned buffer 异步拷回
+#
+#    ⚠️ 现在失败的是 ①：`indices.to("cpu", ...)` 是【同步且带分配】的拷贝，
+#       CANN 在捕获期拒绝它（107030）。异步 + pinned + 地址预先固定才是可捕获的形状。
+#
+# ⚪ 默认【关】。打开它要显式设 VLLM_ASCEND_DSV41_ENGRAM_CAPTURE_ROUTE=1。
+#    偏严的错会被后续工作发现，偏松的错会发一张假的安全证明 —— 所以默认留在拒绝那一侧。
+_CAPTURE_ROUTE_ENV = "VLLM_ASCEND_DSV41_ENGRAM_CAPTURE_ROUTE"
+
+
+def _capture_route_enabled() -> bool:
+    import os
+    return os.environ.get(_CAPTURE_ROUTE_ENV, "0") == "1"
+
+
+# 🔴 捕获图里保留着引用这些对象的节点，回调在【重放】时才执行。
+#    payload 被 GC 掉 ⇒ 重放时读到已释放的对象 ⇒ 静默错值。整个进程都要留着。
+_CAPTURED_PAYLOADS: list = []
+# 🔴 "回调一次都没跑" 和 "跑了但结果不对" 在产物上长得一样。记账位无条件存在。
+_HOST_GATHER_CALLS = [0]
+_HOST_GATHER_ERRORS: list = []
+_REPORT_SUBSCRIBED: set = set()
+
+
+def _ensure_subscribe_report(stream) -> None:
+    """回调必须先订阅本流，否则【不会被投递】——而且不报错。
+
+    🔴 torch_npu >= 2.10 在 NPUGraph 内部已经预先订阅了捕获流，再订一次会得到
+    **107011**。只吞这一个错误码：把整个 except 吞掉会让真正的订阅失败也消失，
+    表现为"回调从不执行、零报错、只是数值不对"（另一条线实测踩过）。
+    """
+    import torch_npu
+
+    key = int(stream.npu_stream)
+    if key in _REPORT_SUBSCRIBED:
+        return
+    try:
+        torch_npu.npu._subscribe_report(stream)
+    except RuntimeError as exc:                              # noqa: BLE001
+        if "107011" not in str(exc):
+            raise
+    _REPORT_SUBSCRIBED.add(key)
+
+
+def _engram_host_gather(payload) -> None:
+    """图节点的回调体：在 host 上把这一步要的行 gather 进 pinned 输出缓冲。
+
+    🔴 异常绝不能逃出去。ACL 这一侧没有地方接，抛出去等于"什么都没发生"，
+    而下游会照常读到【上一次】的内容 —— 一个成功启动、零报错的错答案。
+    ⇒ 记进 ``_HOST_GATHER_ERRORS`` 并打日志，让它有产物可查。
+    """
+    import numpy as np
+
+    from vllm_ascend.models.deepseek_v4_1.engram_layout import         gather_into_staging
+
+    try:
+        weight_table, scale_table, ids_np, host_weight, host_scale, rows = payload
+        row_ids = ids_np[:rows]
+        if row_ids.dtype != np.int64:
+            row_ids = row_ids.astype(np.int64)
+        gather_into_staging(weight_table, scale_table, row_ids,
+                            host_weight[:rows], host_scale[:rows])
+        _HOST_GATHER_CALLS[0] += 1
+        if _HOST_GATHER_CALLS[0] == 1:
+            # 🔴 "回调一次都没被投递" 是这条路最可能的静默失效，而它的产物是
+            #    【什么都没有】—— 没有报错、没有缺键，只有陈旧的 staged_rows。
+            #    ⇒ 第一次执行必须留下一行，否则"成功"和"从没跑过"读起来一样。
+            #    只印一次：这是每步都会走的路径。
+            from vllm.logger import logger
+            logger.info(
+                "engram host gather callback EXECUTED (first time), "
+                "rows=%d. This is the line that distinguishes 'the graph "
+                "node ran' from 'the node was never delivered'.", rows)
+    except BaseException as exc:                             # noqa: BLE001
+        _HOST_GATHER_ERRORS.append(repr(exc))
+        # vllm.logger，理由同 __init__ 里那条：裸模块 logger 在 vLLM 配置完日志后是哑的，
+        # 而这条是这次失效【唯一】的证据行。
+        from vllm.logger import logger
+        logger.error(
+            "engram host gather callback raised inside a graph node: %r. "
+            "The staged rows for this step are NOT this step's rows -- the "
+            "device will read whatever the buffer held before. This is a "
+            "wrong answer, not a slowdown.", exc)
+
+
+def host_gather_accounting() -> tuple:
+    """(回调执行次数, 回调内异常数)。无条件可读，包括为零。"""
+    return _HOST_GATHER_CALLS[0], len(_HOST_GATHER_ERRORS)
+
+
 def _refuse_under_capture(num_tokens: int) -> None:
     """Say who is incompatible with graph capture, in this frame.
 
@@ -560,6 +792,36 @@ def _refuse_under_capture(num_tokens: int) -> None:
     Ascend, where vllm_ascend keeps it opt-in on purpose, and
     ``DeepseekV41ForCausalLM`` is **not** in upstream's auto-enable set
     (``config/vllm.py:77``), so it is never turned on for us by default.
+
+    🔴 **Do NOT silence this by switching the capture mode to relaxed**
+    (``capture_error_mode="relaxed"`` in ``torch_npu/npu/graphs.py:619``,
+    ``ACL_MODEL_RI_CAPTURE_MODE_RELAXED`` in ``acl_rt.h:405``). Measured
+    2026-09-14: the CANN 9.1 runtime string this error comes from is only
+    the first half of ``operation not permitted when a stream is capturing
+    and the specified capture mode is not relaxed``; the sibling string in
+    the same ``.so`` says ``the operation has been converted to a
+    synchronous operation``. So relaxed does not make the copy capturable --
+    it runs it **once, synchronously, during capture**, and records no node.
+    Replay then never performs it, and every decode step reads whatever the
+    warmup batch (``num_tokens=8``) left in ``staged_rows``. That failure is
+    a silent wrong answer with a successful startup and no error at all,
+    which is strictly worse than this refusal. ⚠️ The error text itself
+    names ``relaxed`` and therefore invites exactly this mistake.
+
+    🔵 The shape that does work (another line's measured implementation,
+    SGLang + torch_npu 2.10 + CANN 9.1, DeepSeek MoE CPU offload): do not
+    refuse and do not break the graph -- **route**. Under capture, submit the
+    host work as a graph node via ``torch_npu.npu._launch_host_func`` (all of
+    ``_launch_host_func`` / ``_subscribe_report`` / ``_unsubscribe_report``
+    are present in this container). Their predicate is the same
+    ``is_current_stream_capturing()`` used here, but it selects a path
+    instead of raising. Three conditions they had to satisfy: the stream must
+    be subscribed before capture (a second subscribe raises 107011 on
+    torch_npu >= 2.10 -- swallow only that code); every H2D must be hoisted
+    to a pre-capture point because capture rejects it (107030); and any event
+    referenced by a captured record/wait node must outlive the process.
+    ⚠️ A host func **blocks its stream** until it returns -- they measured
+    41.3% of each token in ``NOTIFY_WAIT`` before forking to a side stream.
     """
     if not _stream_is_capturing():
         return

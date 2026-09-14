@@ -132,6 +132,76 @@ def rope_tail(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     return out
 
 
+_CLAMP_SLOT_CHECK = {"ran": 0, "skipped_under_capture": 0, "violations": 0}
+
+
+def clamp_slot_check_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_CLAMP_SLOT_CHECK)
+
+
+def _payload_that_leaves_invalid_rows_untouched(current: torch.Tensor,
+                                                rows: torch.Tensor,
+                                                valid: torch.Tensor):
+    """有效行写新值，无效行【写回它原本的值】—— 对读侧是真正的 no-op。
+
+    🔴 上一版把无效行导向 block 0 并【写垃圾进去】。那是错的，而且三档判据
+    全绿：捕获台架 OK、等价性 5 正例逐位相同、还专门写了守卫。**守卫守错了一侧** ——
+    它检查"有没有有效 token 【写】到 block 0"，而真正的危险是"有没有层【读】
+    block 0"。实测(xr_sanity5 的 dump)：``read.ori_win_left = ori_win_right = -1``
+    在 **ratio-2 的 layer_02** 上就成立 ⇒ 那一层按 ``[0, seqused)`` 全范围读，
+    block table 里的 null 填充会让它读到 block 0。
+    ⇒ 写进去的 padding 垃圾会被读进注意力，静默错值，没有任何检查会响。
+
+    改成写回原值之后，**读侧看不到任何变化**，所以那一层读不读 block 0 都无所谓。
+
+    ⚠️ **仍然剩一个【弱】依赖，写出来而不是假装没有**：
+    无效行被 clamp 到槽 0。若某个【有效】行也落在槽 0，两者是重复索引，
+    谁最后写由实现定 ⇒ 有效行可能被写回的旧值盖掉。
+    ⇒ 依赖的是「没有有效行落在槽 0」（比上一版的「没人读 block 0」弱得多，
+      而且**可检查**）。由 ``_assert_clamp_slot_unused`` 在非捕获期查并记账。
+
+    ⚫ **边界检查这一格在 NPU 上未验**（2026-09-14）。CPU 实测 ``index_put_``
+    对 block/offset 越界都抛 ``IndexError``（而 ``npu_scatter_nd_update_`` 的
+    offset 轴是**静默写进邻块**，block 轴是忽略 —— 同一接口的两个轴失效模式相反）。
+    这是保留本实现而不换用 ``npu_scatter_nd_update_`` 的理由之一，但
+    **NPU 上 ``index_put_`` 是否同样抛，没有实测** ⇒ 不要读成"(b) 在 NPU 上有边界检查"。
+
+    ⚠️ 顺序前提：``current`` 的 gather 必须严格早于 scatter。同一个流内按下发顺序
+    成立，捕获后的图保留同一条流的依赖。**若哪天有人把其中一个挪到别的流，这个前提
+    就没了**，而失效形态是"无效行把一个刚写对的槽改回旧值" —— 无声。
+    """
+    return torch.where(valid.unsqueeze(-1), rows.to(current.dtype), current)
+
+
+def _assert_clamp_slot_unused(valid: torch.Tensor,
+                              slot_mapping: torch.Tensor) -> None:
+    """查上面那个弱依赖：有没有【有效】行落在 clamp 目标（槽 0）。
+
+    捕获期跳过（检查本身要读设备值），但**跳过要记账**，否则"跳过了"和
+    "检查通过了"读数一样。
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _CLAMP_SLOT_CHECK["skipped_under_capture"] += 1
+        return
+    _CLAMP_SLOT_CHECK["ran"] += 1
+    if slot_mapping.ndim == 2:
+        at0 = torch.logical_and(slot_mapping[:, 0] == 0, slot_mapping[:, 1] == 0)
+    else:
+        at0 = slot_mapping == 0
+    if bool(torch.logical_and(valid, at0).any()):
+        _CLAMP_SLOT_CHECK["violations"] += 1
+        from vllm.logger import logger
+        logger.warning(
+            "scatter_rows: a VALID row targets slot 0, which is also where "
+            "invalid (-1) rows are clamped. Their write-back of the old value "
+            "may race with the valid write. Accounting: %s",
+            dict(_CLAMP_SLOT_CHECK))
+
+
 def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
                  slot_mapping: torch.Tensor, block_size: int) -> None:
     """Write one row per token into a paged ``[blocks, block_size, dim]`` cache.
@@ -159,16 +229,18 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
     if slot_mapping.ndim == 2 and slot_mapping.shape[-1] == 2:
         blocks, offsets = slot_mapping[:, 0], slot_mapping[:, 1]
         valid = blocks >= 0
-        if not bool(valid.all()):
-            blocks, offsets, rows = blocks[valid], offsets[valid], rows[valid]
+        b_i = torch.where(valid, blocks, blocks.new_zeros(())).to(torch.long)
+        o_i = torch.where(valid, offsets, offsets.new_zeros(())).to(torch.long)
         _log_slot_form("(block, offset)", int(blocks.numel()))
         if blocks.numel() == 0:
             return
         # Indexed directly rather than flattened to block * block_size +
         # offset. The flattening is correct but needs block_size, and the two
         # numbers here are already the two the paged write wants.
-        cache.index_put_((blocks.to(torch.long), offsets.to(torch.long)),
-                         rows.to(cache.dtype))
+        _assert_clamp_slot_unused(valid, slot_mapping)
+        payload = _payload_that_leaves_invalid_rows_untouched(
+            cache[b_i, o_i], rows, valid)
+        cache.index_put_((b_i, o_i), payload)
         return
 
     if slot_mapping.ndim != 1:
@@ -176,16 +248,15 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
             f"slot_mapping is {tuple(slot_mapping.shape)}; this takes flat "
             "[num_tokens] slots or [num_tokens, 2] (block, offset) pairs.")
     valid = slot_mapping >= 0
-    if not bool(valid.all()):
-        slots = slot_mapping[valid]
-        rows = rows[valid]
-    else:
-        slots = slot_mapping
+    slots = torch.where(valid, slot_mapping, slot_mapping.new_zeros(())).to(torch.long)
     _log_slot_form("flat", int(slots.numel()))
     if slots.numel() == 0:
         return
-    cache.view(-1, cache.shape[-1]).index_copy_(
-        0, slots.to(torch.long), rows.to(cache.dtype))
+    flat_cache = cache.view(-1, cache.shape[-1])
+    _assert_clamp_slot_unused(valid, slot_mapping)
+    payload = _payload_that_leaves_invalid_rows_untouched(
+        flat_cache[slots], rows, valid)
+    flat_cache.index_copy_(0, slots, payload)
 
 
 _LOGGED_SLOT_FORMS: set[str] = set()
