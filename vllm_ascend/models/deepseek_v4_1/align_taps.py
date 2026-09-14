@@ -159,7 +159,7 @@ KEY_SEMANTICS: dict = {
                        "moe.fused_out instead. golden has no counterpart; "
                        "this key exists so our own chain can contradict "
                        "itself, which is how the q chain's defect was found",
-    "epilogue.logits.last": "the next-token logits for the LAST position of "
+    "logits": "the next-token logits for the LAST position of "
                             "this forward, full vocabulary, float32 -- "
                             "exactly golden's logits[0, -1]. ⚠️ SCOPE: under "
                             "DP this exists only on the rank that served the "

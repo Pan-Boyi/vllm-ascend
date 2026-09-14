@@ -145,3 +145,26 @@ def test_the_coverage_reader_is_actually_called_at_flush():
 
     src = inspect.getsource(align_taps._flush_and_rotate)
     assert "report_logits_tap_coverage()" in src
+
+
+def test_the_key_addresses_as_the_name_golden_declares():
+    """🔴 A tap that runs and a key that matches are two different things.
+
+    Keys are addressed ``<tag>/<key>``. Golden declares this one as
+    ``epilogue/logits`` -- read out of a real dump's
+    ``golden_coverage.missing``, next to ``epilogue/final_norm.out`` and
+    ``layer_00/attn_norm.out``.
+
+    The tap originally used ``KEY = "epilogue.logits.last"``, which would
+    have been written as ``epilogue/epilogue.logits.last``. It would have
+    flown, produced its 517 KB, and left ``epilogue/logits`` reported
+    missing -- a dump that is well formed, a tensor that is right, and a
+    coverage line saying the key was never recorded.
+
+    ⚠️ This asserts the composed address, not the constant, because the
+    defect lived in the composition rather than in either half.
+    """
+    from vllm_ascend.models.deepseek_v4_1.logits_tap import KEY, TAG
+
+    assert f"{TAG}/{KEY}" == "epilogue/logits", (
+        f"this tap writes {TAG}/{KEY}; golden declares epilogue/logits")

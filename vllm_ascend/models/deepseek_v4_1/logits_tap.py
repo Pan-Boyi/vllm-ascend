@@ -30,12 +30,32 @@ _CALLS = 0
 _SKIPPED_UNARMED = 0
 _ROWS_SEEN: set = set()
 
-#: golden's reference is (1, T, 129280) float32 and the comparison takes
-#: ``[0, -1]``. This key holds exactly that slice: the next-token logits for
-#: the last position of this forward, as a 1-D float32 tensor of vocabulary
-#: size. 🔴 Written down because "logits" has named four different tensors in
-#: this port already -- pre/post gather, per-row and per-request.
-KEY = "epilogue.logits.last"
+#: 🔴 ``"logits"``, not ``"epilogue.logits.last"``. Keys are addressed as
+#: ``<tag>/<key>``, and golden declares this one as **``epilogue/logits``** --
+#: read out of a real manifest's ``golden_coverage.missing``, alongside
+#: ``epilogue/final_norm.out`` and ``layer_00/attn_norm.out``. The first
+#: spelling would have been written as ``epilogue/epilogue.logits.last``:
+#: the tap would fly, produce its 517 KB, and ``epilogue/logits`` would still
+#: be reported missing.
+#:
+#: ⚠️ "I have a tap" and "the dump carries the key golden asked for" are two
+#: different statements, and the gap between them is silent -- the dump is
+#: well formed, the tensor is right, and the coverage line says the key was
+#: never recorded.
+#:
+#: The content is golden's ``logits[0, -1]``: the next-token logits for the
+#: last position of this forward, a 1-D float32 tensor of vocabulary size.
+#: ⚫ Golden stores the full ``(1, T, 129280)`` and slices at comparison
+#: time; this stores the slice. That is what "align with golden's shape"
+#: was specified to mean, but it has NOT been confirmed against golden's
+#: comparator, and a comparator that matches shapes before values would
+#: reject the pair. Confirm before reading a mismatch as a model difference.
+KEY = "logits"
+
+#: The dump tag this key lives under. Named rather than inlined so the
+#: composed address ``TAG/KEY`` -- which is what golden actually matches on
+#: -- can be asserted in one place.
+TAG = "epilogue"
 
 
 def record_logits(logits: torch.Tensor | None) -> None:
@@ -77,7 +97,7 @@ def record_logits(logits: torch.Tensor | None) -> None:
     # the manifest has to say so, because a silent upcast here would make a
     # storage difference look like an agreement.
     was = flat.dtype
-    recorder.record_whole("epilogue", KEY, flat.to(torch.float32).cpu())
+    recorder.record_whole(TAG, KEY, flat.to(torch.float32).cpu())
     recorder.add_manifest(logits_source_dtype=str(was),
                           logits_vocab=int(flat.numel()),
                           logits_sampled_rows=sorted(_ROWS_SEEN))

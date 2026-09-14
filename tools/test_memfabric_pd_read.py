@@ -36,6 +36,20 @@ import sys
 import time
 from typing import Any
 
+# 🔴 Before anything imports torch -- including the deferred ``import torch``
+# further down, which is deferred but not exempt. This script's own docstring
+# says to run it as ``python tools/test_memfabric_pd_read.py``, which puts
+# ``tools/`` at sys.path[0], where ``tools/bisect/`` shadows the STDLIB
+# ``bisect`` that ``random`` -> ``tempfile`` -> ``torch`` needs. The failure
+# is total and the error names ``bisect``, not this directory.
+#
+# ⚠️ Deferring the import moves the failure from start-up to call time, which
+# makes it later and harder to read, not less certain.
+#
+# ⚪ Upstream file (PR #12831). This guard is local and belongs upstream.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [_p for _p in sys.path if os.path.abspath(_p or ".") != _HERE]
+
 CONTROL_PORT = 29599
 DEFAULT_NUM_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120.0
