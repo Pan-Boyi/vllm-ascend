@@ -42,6 +42,14 @@ _LAST: tuple | None = None
 _BLOCK_FIRST_SEEN: dict = {}
 
 
+_OBSERVE_SKIP = {"ran": 0, "skipped_under_capture": 0}
+
+
+def observe_skip_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_OBSERVE_SKIP)
+
+
 def reset_for_test() -> None:
     global _CALLS, _LAST
     _CALLS = 0
@@ -117,4 +125,18 @@ def _small_list(tensor: torch.Tensor, limit: int = 8) -> list:
     """
     if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
         return []
+    # 🔴 捕获期跳过：.cpu() 把值读回 host，而捕获期对 stream 的同步在任何捕获模式下
+    #    都非法（rtMemcpy / "operation not permitted when a stream is capturing"）。
+    #    实测 xr_gr3_155756：这是拆掉 engram 和 qkv_prolog 两堵墙之后的【第三堵】。
+    # 🔴 而它【不在】那份九处清单里，原因值得记：我的普查把本文件当"仪表文件"整体
+    #    排除了，依据是【文件名/用途】——而 observe() 在 sparse_indexer.py:231 是
+    #    **无条件调用**的，没有任何 env 门控。
+    #    ⇒ "名字像仪表" 被当成了 "不在生产路径上"：过滤器里写进了我预期的分类。
+    # ⚠️ 跳过要留痕，否则"跳过了"和"这一批没有可观察的东西"读数一样（都是 []）。
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+    if _stream_is_capturing():
+        _OBSERVE_SKIP["skipped_under_capture"] += 1
+        return []
+    _OBSERVE_SKIP["ran"] += 1
     return [int(v) for v in tensor.reshape(-1)[:limit].detach().cpu()]
