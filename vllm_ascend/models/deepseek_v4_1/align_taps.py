@@ -134,6 +134,30 @@ KEY_SEMANTICS: dict = {
         "keys is the call's index **within one forward** and restarts each "
         "forward; it used to be a process-level counter, which gave the same "
         "tensor a different name in every dump",
+    "moe_gate.out": "the router's decision, under golden's own key name so the "
+                    "two dumps need no mapping: `.0` is the normalised "
+                    "top-k weights [T, topk] and `.1` the expert ids "
+                    "[T, topk].\n"
+                    "🔴 **How to compare `.1`, and it is not elementwise.** "
+                    "Compare the ids as a SET per token: topk's return order "
+                    "is not a difference, and comparing by position "
+                    "manufactures a routing mismatch out of an ordering.\n"
+                    "🔴 **And never without the margin.** golden's layer_00 "
+                    "routing margins are 0.05159 / 0.10506 / 0.00314 / "
+                    "0.00126 / 0.01951 for the five tokens: on tokens 2 and 3 "
+                    "the 6th and 7th experts are all but tied, so two correct "
+                    "implementations can pick different 6th experts. An id "
+                    "difference where the margin is ~1e-3 is ⚫ undecidable, "
+                    "not a defect -- and the two readings lead to opposite "
+                    "next steps",
+    "moe.experts.out": "the routed experts' aggregate, before the shared "
+                       "expert is added. golden has no counterpart; this key "
+                       "exists so our own chain can contradict itself, which "
+                       "is how the q chain's defect was found",
+    "moe.shared.out": "the shared expert's output. Every token goes through "
+                      "it and it is added separately from the routed "
+                      "aggregate (ref/model.py:889-891), so it is the one "
+                      "part of moe.out that does not depend on routing at all",
     "rope.kv.out": "🔵 the **post-RoPE** kv, i.e. the rows written to the SWA "
                    "cache. This is the key to compare with golden's "
                    "rope.kv.out; sa_in.kv is a stage below it and is not "
@@ -810,6 +834,7 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
                 continue
             handles.append(_attach(module, layer_id, key, side, parameter))
             taps_installed += 1
+        taps_installed += _attach_moe_internals(layer, layer_id, handles)
 
     # Said out loud, because the two failures so far were both diagnosed by
     # inferring "the hooks were never installed" from "the dump is empty" --
@@ -830,6 +855,113 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
             "recognises. Every inline tap will reach record() before "
             "set_seq_len() and raise.", type(inner).__name__)
     return handles
+
+
+#: Submodules of the FFN whose outputs bracket the MoE's own steps. Golden
+#: records only ``moe.in`` and ``moe.out``, so when those two disagree the
+#: segment between them is a black box -- the same shape as the q chain,
+#: where the defect was found by two of **our** keys contradicting each other
+#: rather than by comparing with the reference.
+#:
+#: Measured on flight xr_a2b_011352: moe.in agrees with golden (RMS 0.1263 vs
+#: 0.1264) and moe.out is ~5e6x too large *and* pointing elsewhere (per-row
+#: cosine 0.29-0.34), so it is not a missing scalar factor. Magnitude and
+#: direction are separable by these three:
+#:
+#:   moe.router.out   which experts, with what weights -- wrong experts move
+#:                    direction, unnormalised weights move magnitude
+#:   moe.experts.out  the routed experts' aggregate, before the shared expert
+#:   moe.shared.out   the shared expert, which every token goes through and
+#:                    which is added separately (ref/model.py:889-891)
+_MOE_TAPS: tuple[tuple[str, str], ...] = (
+    # 🔵 golden's own key name, so the two dumps need no mapping: the gate
+    # returns (weights, indices) and _flatten_outputs suffixes them, giving
+    # moe_gate.out.0 (F32 [T, topk] weights) and moe_gate.out.1 (I64 [T, topk]
+    # expert ids) -- exactly what golden records.
+    ("gate", "moe_gate.out"),
+    ("experts", "moe.experts.out"),
+    ("shared_experts", "moe.shared.out"),
+)
+
+
+def _attach_moe_internals(layer: torch.nn.Module, layer_id: int,
+                          handles: list) -> int:
+    """Hook the FFN's own submodules, and say which ones were not there.
+
+    ⚠️ Attached by attribute name on the module this build actually has, and
+    an absent name is reported rather than skipped: "this build fuses the
+    gate into the experts" and "the tap table is stale" produce the same
+    empty section otherwise.
+    """
+    ffn = getattr(layer, "ffn", None) or getattr(layer, "moe", None)
+    if ffn is None:
+        return 0
+    attached = 0
+    for attribute, key in _MOE_TAPS:
+        module = getattr(ffn, attribute, None)
+        if module is None or not isinstance(module, torch.nn.Module):
+            _report_missing_moe_part(attribute, type(ffn).__name__)
+            continue
+        handles.append(module.register_forward_hook(
+            _make_moe_tap(layer_id, key)))
+        attached += 1
+    return attached
+
+
+_REPORTED_MISSING_MOE: set = set()
+
+
+def _report_missing_moe_part(attribute: str, owner: str) -> None:
+    if attribute in _REPORTED_MISSING_MOE:
+        return
+    _REPORTED_MISSING_MOE.add(attribute)
+    from vllm.logger import logger
+
+    logger.warning(
+        "DSV4.1 alignment: %s has no %r submodule, so moe.%s will be absent "
+        "from every dump. That may be right -- a fused build has no separate "
+        "gate -- but absent-because-fused and absent-because-this-table-is-"
+        "stale produce the same empty section, so it is said here.",
+        owner, attribute, attribute)
+
+
+def _make_moe_tap(layer_id: int, key: str):
+    """Record whatever this submodule returned, under one key per element.
+
+    The gate returns ``(weights, indices)`` and the experts return a tensor;
+    rather than branch on which, every tensor in the returned structure is
+    recorded under a suffixed key. A branch would have to be right about a
+    shape this module does not own.
+    """
+
+    def _tap(_module: torch.nn.Module, _args, output) -> None:
+        for suffix, tensor in _flatten_outputs(output):
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            name = f"{key}{suffix}"
+            positions = _current_positions()
+            rows = tensor.shape[0] if tensor.ndim else 0
+            if positions is not None and rows == positions.shape[0]:
+                _record(layer_id, name, tensor)
+            else:
+                # No token axis (or a fused layout this does not understand):
+                # recorded whole rather than scattered, because a wrong
+                # scatter is silent and an unscattered tensor is not.
+                tap_whole(layer_id, name, tensor)
+
+    return _tap
+
+
+def _flatten_outputs(output, prefix: str = ""):
+    """``(suffix, value)`` for every tensor in a returned structure."""
+    if isinstance(output, torch.Tensor):
+        yield prefix, output
+    elif isinstance(output, (tuple, list)):
+        for i, item in enumerate(output):
+            yield from _flatten_outputs(item, f"{prefix}.{i}")
+    elif isinstance(output, dict):
+        for name, item in output.items():
+            yield from _flatten_outputs(item, f"{prefix}.{name}")
 
 
 def _make_argument_tap(layer_id: int, positions: dict[str, int]):
