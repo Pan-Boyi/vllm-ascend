@@ -256,8 +256,15 @@ KEY_SEMANTICS: dict = {
     #                   sentence about the model.
     #   ✅ established  Row layout is [448 NoPE | 64 RoPE] within the 512, in
     #                   that order -- upstream's words for the bfloat16 case.
+    #                   SCOPE: a **cached KV row**. It says nothing about the
+    #                   q rows, which are [T, heads, 512] with the same split
+    #                   per head, nor about the compressed stream's latent.
     #   ✅ established  Addressing is PA_BBND: a row is at
     #                   block * block_size + offset, flat.
+    #                   SCOPE: **the caches read through a block table** on
+    #                   this plan. The compressor's state ring addresses by
+    #                   position % capacity instead, which is a different
+    #                   rule under the same word "slot".
     #   ✅ established  golden's ``sa_in.kv`` is **post-rope and
     #                   post-quant**: golden measured its own chain,
     #                   ``rope.kv.out == quant.window.in`` and
@@ -268,6 +275,10 @@ KEY_SEMANTICS: dict = {
     #                   the same stage -- the rotation does not reach it --
     #                   which is what makes "the kv projection is clean,
     #                   0.099% error energy" a real result.
+    #                   SCOPE: **golden's key of that name at layer_00**, as
+    #                   golden measured its own chain. It is not a statement
+    #                   about ours, which is pre-rope, and not about any
+    #                   other layer, which nobody has measured.
     "read.write.ori_kv.latent_pre_rope":
         "🔴 the **sliding-window** stream's row, pre-RoPE: the `kv` argument "
         "of _fused_qnorm_rope_kv_insert, post-kv_norm, which is what gets "
