@@ -323,16 +323,40 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
+        """🔴 uint8, like every other scale parameter in this tree.
+
+        These two were declared ``float8_e8m0fnu``, and they were the only
+        two in the whole quantization tree that were. The loader moves the
+        checkpoint's scale as **raw bytes** (uint8), so a copy into an E8M0
+        parameter is a *value* conversion, not a byte move: every byte in
+        96..191 rounds to the same power of two and is stored as 134. The
+        checkpoint's own bytes are 119..122 for w1/w3 and 119..123 for w2,
+        all inside that window, so all 70,778,880 of them collapsed to the
+        single value 134 -- scale 2^7 = 128 where 2^-6 was meant.
+
+        Measured, not reasoned: flight xr_sc2_040330 read min=median=max=134,
+        1 distinct value, on both keys; the same instrument in the same
+        flight read attn.wq_b at 114..117, which is bit-for-bit the range in
+        the checkpoint file. The layout invariant passed on the expert
+        scales, so the collapse was already there before any transform.
+
+        ⚠️ Nothing downstream wanted E8M0: ``process_weights_after_loading``
+        immediately does ``.view(torch.uint8)`` on both, so the operator was
+        always handed uint8. The declaration was the only thing that
+        differed -- and a dtype that is *narrower in meaning but identical in
+        width* changes a byte move into an arithmetic one without changing a
+        single shape, which is why nothing downstream complained.
+        """
         param_dict = {}
         param_dict["w13_weight_scale"] = torch.empty(
             num_experts,
             2 * intermediate_size_per_partition,
             hidden_sizes // self.group_size,
-            dtype=torch.float8_e8m0fnu,
+            dtype=torch.uint8,
         )
 
         param_dict["w2_weight_scale"] = torch.empty(
-            num_experts, hidden_sizes, intermediate_size_per_partition // self.group_size, dtype=torch.float8_e8m0fnu
+            num_experts, hidden_sizes, intermediate_size_per_partition // self.group_size, dtype=torch.uint8
         )
         return param_dict
 
