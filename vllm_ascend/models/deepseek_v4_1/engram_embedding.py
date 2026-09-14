@@ -457,6 +457,19 @@ class AscendStagedEngramEmbedding:
         payload = (weight_table, scale_table, ids_np,
                    self._pin_weight_np, self._pin_scale_np, rows)
         _CAPTURED_PAYLOADS.append(payload)
+        if len(_CAPTURED_PAYLOADS) == 1:
+            # 🔴 与 "callback EXECUTED" 对称的证据行。两条一起才分得开三种去向：
+            #   无 SUBMITTED              ⇒ 这两层根本没走到捕获路径
+            #   有 SUBMITTED 无 EXECUTED  ⇒ 录进去了但没被投递，或图没被重放
+            #   两条都有                  ⇒ 路线真的跑过
+            # ⚪ _CAPTURED_PAYLOADS 原先【只被写、从不被读】—— 一个没有读者的
+            #    记账位，记的恰好是我们最想知道的那个数。
+            from vllm.logger import logger
+            logger.info(
+                "engram host gather SUBMITTED to the graph (first time), "
+                "rows=%d. Pair this with the EXECUTED line: submitted without "
+                "executed means the node was recorded but never delivered.",
+                rows)
         torch_npu.npu._launch_host_func(stream, _engram_host_gather, payload)
 
         self._dev_weight[:rows].copy_(self._pin_weight[:rows],
@@ -756,8 +769,13 @@ def _engram_host_gather(payload) -> None:
 
 
 def host_gather_accounting() -> tuple:
-    """(回调执行次数, 回调内异常数)。无条件可读，包括为零。"""
-    return _HOST_GATHER_CALLS[0], len(_HOST_GATHER_ERRORS)
+    """(提交进图的次数, 回调执行次数, 回调内异常数)。无条件可读，包括全为零。
+
+    🔴 三个数缺一不可：只有 (执行, 异常) 时，"从没提交" 和 "提交了没被投递"
+    读数完全一样 —— 而这两者的去向相反。
+    """
+    return (len(_CAPTURED_PAYLOADS), _HOST_GATHER_CALLS[0],
+            len(_HOST_GATHER_ERRORS))
 
 
 def _refuse_under_capture(num_tokens: int) -> None:

@@ -253,6 +253,29 @@ def _skip_under_capture(what: str) -> bool:
 _LOGGED_BATCH_SHAPES: set = set()
 
 
+_PAD_TAIL = {"strict": 0, "relaxed": 0, "last": None}
+
+
+def pad_tail_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_PAD_TAIL)
+
+
+def _num_actual_tokens_or_none():
+    """这一次前向的【真实】token 数；拿不到就返回 None（调用方退回严格判据）。"""
+    from vllm.forward_context import get_forward_context
+
+    try:
+        ctx = get_forward_context()
+    except AssertionError:
+        return None
+    v = getattr(ctx, "num_actual_tokens", None)
+    if v is None:
+        md = getattr(ctx, "attn_metadata", None)
+        v = getattr(md, "num_actual_tokens", None) if md is not None else None
+    return int(v) if isinstance(v, int) else None
+
+
 def _is_real_batch() -> bool:
     """Whether this forward has scheduler metadata behind it.
 
@@ -1131,7 +1154,24 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 "it is whatever was in HBM -- reading it would make the "
                 "output depend on the contents of device memory rather than "
                 "on the prompt.")
-        if num_tokens > written:
+        # 🔴 图捕获下 num_tokens 是【被 padding 到捕获桶】的数，而 indexer 只写
+        #    了真实 token 那几行。实测 xr_gr5_163515：读 8 写 5。
+        #    而这条守卫的前提（"多出来的行是上一步的残留 ⇒ 错答案"）对【padding 那
+        #    一段】不成立：主干把 padding token 的注意力输出整段丢掉
+        #    （attention_v1.py:360 "the attention output for padding tokens is
+        #    trimmed by hidden_states = hidden_states[:-pad_size, :]"）。
+        # ⇒ 判据改成对【真实 token 数】比较；拿不到真实数时【退回严格比较】——
+        #   fail-safe 的方向是拦，不是放行。
+        # ⚠️ 放宽是偏宽松的方向，所以记账：跳过了几次、每次跳过多少行。
+        real = _num_actual_tokens_or_none()
+        if real is not None and real < num_tokens:
+            _PAD_TAIL["relaxed"] += 1
+            _PAD_TAIL["last"] = (int(num_tokens), int(real), int(written))
+            compare_against = real
+        else:
+            _PAD_TAIL["strict"] += 1
+            compare_against = num_tokens
+        if compare_against > written:
             raise ValueError(
                 f"{self.prefix}: reading {num_tokens} rows of the indexer "
                 f"selection but only {written} were written this step. The "
