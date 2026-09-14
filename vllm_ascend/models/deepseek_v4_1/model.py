@@ -67,6 +67,32 @@ class AscendDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
 
         install_layer_trace(self)
 
+    def compute_logits(self, hidden_states):
+        """Upstream's, with the result recorded.
+
+        🔴 An override rather than a forward hook, and on **this** class.
+        ``compute_logits`` is not a module ``forward``, so there is no hook to
+        register; and the runner reaches it through wrappers
+        (``aclgraph_utils.py:274`` delegates to ``original_model``), so a tap
+        installed on whatever ``self.model`` happens to be would be one
+        wrapper away from where the call lands. Every path ends here.
+
+        ⚠️ Recorded **after** the call returns. Reading before it would
+        capture the previous invocation's tensor -- in range, correctly
+        shaped, and wrong, which is the failure mode that looks least like
+        one.
+
+        ⚫ ``compute_logits_local`` is deliberately not tapped: the runner
+        calls ``compute_logits`` (model_runner.py:577, model_runner_v1.py:
+        2553/2564), and tapping the other one would produce a key that is
+        always absent while looking installed.
+        """
+        logits = super().compute_logits(hidden_states)
+        from vllm_ascend.models.deepseek_v4_1.logits_tap import record_logits
+
+        record_logits(logits)
+        return logits
+
 
 def _assert_patches_applied() -> None:
     """Refuse to build out of upstream's CUDA-selected parts.

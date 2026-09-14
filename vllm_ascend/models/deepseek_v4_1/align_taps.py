@@ -159,6 +159,17 @@ KEY_SEMANTICS: dict = {
                        "moe.fused_out instead. golden has no counterpart; "
                        "this key exists so our own chain can contradict "
                        "itself, which is how the q chain's defect was found",
+    "epilogue.logits.last": "the next-token logits for the LAST position of "
+                            "this forward, full vocabulary, float32 -- "
+                            "exactly golden's logits[0, -1]. ⚠️ SCOPE: under "
+                            "DP this exists only on the rank that served the "
+                            "request, so its absence from a dump is the "
+                            "normal state of three ranks in four and is not "
+                            "a missing tap. ⚫ NOT derivable from logprobs: "
+                            "those give the candidate's own top-k, while a "
+                            "KL needs the candidate's mass where GOLDEN has "
+                            "mass, and summing over the overlap alone biases "
+                            "the KL small -- toward 'pass'",
     "moe.fused_out": "what the experts module returned WITH the shared "
                      "expert already added (fused_moe.py:320+, taken "
                      "whenever ascend_shared_experts is not None). 🔴 It is "
@@ -674,6 +685,10 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
     from vllm_ascend.models.deepseek_v4_1 import decode_step1
 
     decode_step1.report_decode_step1_coverage()
+    from vllm_ascend.models.deepseek_v4_1.logits_tap import \
+        report_logits_tap_coverage
+
+    report_logits_tap_coverage()
     # 🔴 Stamped, because a decode dump and a prefill dump carry the same key
     # names and the same shapes -- which is exactly what makes them
     # comparable, and exactly what makes them indistinguishable on disk.
