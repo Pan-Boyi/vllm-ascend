@@ -889,3 +889,48 @@ def test_a_cumulative_array_is_still_named_as_one(q):
         seqused_cmp_kv=torch.tensor([0, 2, 5, 7], dtype=torch.int32))
     with pytest.raises(ValueError, match="cumulative"):
         validate_sparse_flash_mla_args(kwargs, q, NUM_REQUESTS)
+
+
+def test_the_message_reads_the_switch_instead_of_asserting_it(monkeypatch):
+    """🔴 A sentence naming a runtime fact has to read it.
+
+    This message used to end with "MM_RANGES_REQUIRE_SPANS is off" as a plain
+    constant. Flight xr_eager_140615 died here and the switch's real state
+    could not be recovered from any artifact: the message asserted "off", the
+    provenance carried no env lines, and nothing else logged it. So the one
+    line that spoke about the switch was the one line that could not be
+    trusted about it.
+
+    ⚠️ Both values get a next action. With the switch ON the vision builder
+    is already blocked, so "set it to 1" would send someone to set something
+    that is already set -- a gap that does not raise, it just produces "this
+    one needs a human".
+    """
+    import torch
+
+    from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args as saa
+
+    kwargs = {
+        "ori_sparse_indices": torch.zeros(5, 1, 8),
+        "cmp_mask_mode": 3,
+        "cmp_ratio": 2,
+    }
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "0")
+    with pytest.raises(ValueError) as off:
+        saa._check_modes_are_not_both_requested(dict(kwargs))
+    assert "is OFF" in str(off.value)
+    assert "one-variable test" in str(off.value)
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "1")
+    with pytest.raises(ValueError) as on:
+        saa._check_modes_are_not_both_requested(dict(kwargs))
+    assert "is ON" in str(on.value)
+    assert "NOT the source" in str(on.value), (
+        "with the switch on, the message must not send anyone to set it")
+    assert "one-variable test" not in str(on.value)
+
+    # The runtime values stay in both, since they are what localises the call.
+    for exc in (off, on):
+        assert "cmp_mask_mode=3" in str(exc.value)
+        assert "cmp_ratio=2" in str(exc.value)

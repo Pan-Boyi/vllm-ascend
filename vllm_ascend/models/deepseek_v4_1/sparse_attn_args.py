@@ -896,6 +896,34 @@ def _check_modes_are_not_both_requested(kwargs: dict[str, Any]) -> None:
     cmp_mask_mode = kwargs.get("cmp_mask_mode", NO_MASK_MODE)
     if cmp_mask_mode == NO_MASK_MODE:
         return
+    # 🔴 Read at raise time, not asserted. This message used to end with
+    # "...MM_RANGES_REQUIRE_SPANS is off; setting it to 1 is the one-variable
+    # test" as a plain *constant*, which made it a claim about the run that
+    # was true only when it happened to be. Flight xr_eager_140615 died here
+    # and the switch's real state could not be recovered from any artifact:
+    # the message asserted "off", the provenance file carried no env lines,
+    # and nothing else logged it. A sentence that names a runtime fact has to
+    # read it, or it is a snapshot frozen into a constant.
+    import os
+
+    spans_switch = os.environ.get(
+        "VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "0")
+    # ⚠️ Both values of the switch get a next action. A gap here does not
+    # raise -- it shows up as "this one needs a human", which is the thing
+    # the pre-registered branch exists to remove.
+    if spans_switch == "1":
+        guidance = (
+            "⚠️ VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS is ON (=1) and this "
+            "still fired, so the vision index builder is NOT the source -- "
+            "that path is already blocked. Look at the other producer of "
+            "ori_sparse_indices (select_ori_sparse_indices' non-vision "
+            "branch) rather than at the mm ranges.")
+    else:
+        guidance = (
+            f"VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS is OFF (={spans_switch!r}). "
+            "For a text-only request the indices most likely come from the "
+            "vision builder, which runs because mm_req_doc_ranges is {0: []} "
+            "-- truthy. Setting that switch to 1 is the one-variable test.")
     _check(
         False,
         "Sparse ori_kv mode requires ori_mask_mode=cmp_mask_mode=0 (EZ0027); "
@@ -904,11 +932,8 @@ def _check_modes_are_not_both_requested(kwargs: dict[str, Any]) -> None:
         f"this call supplies ori_sparse_indices "
         f"{tuple(kwargs['ori_sparse_indices'].shape)} together with "
         f"cmp_mask_mode={cmp_mask_mode} and cmp_ratio="
-        f"{kwargs.get('cmp_ratio')}. Those select two different modes. For a "
-        "text-only request the indices most likely come from the vision "
-        "builder, which runs because mm_req_doc_ranges is {0: []} and "
-        "VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS is off; setting it to 1 "
-        "is the one-variable test.")
+        f"{kwargs.get('cmp_ratio')}. Those select two different modes. "
+        + guidance)
 
 
 def kv_with_layout_rank(cache, layout_kv: str):
