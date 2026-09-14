@@ -325,10 +325,17 @@ def test_the_pre_rope_value_is_offered_to_the_caller():
         tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
 
     assert set(seen) == {"rope.q.in", "rope.kv.out"}
-    # The normed q before the rotation, and only the slice the rotation
-    # touches: the leading dims pass through and are already in sa_in.q.
-    normed = rms_norm_weightless(q, 1e-6)
-    torch.testing.assert_close(seen["rope.q.in"], normed[..., -4:])
+    # ⚠️ This used to assert the value was `rms_norm_weightless(q)`, and it
+    # was green -- because it was written from the implementation rather than
+    # from the contract, and the implementation was running V4.0's norm. A
+    # test that states what the code does cannot go red when the code is
+    # wrong; it testifies for the defect instead.
+    #
+    # The contract: the rotation's input is the projected query, and only the
+    # slice the rotation touches (the leading dims pass through and are
+    # already in sa_in.q).
+    torch.testing.assert_close(seen["rope.q.in"].to(torch.float32),
+                               q[..., -4:].to(torch.float32))
     assert seen["rope.q.in"].shape == (3, 2, 4)
     assert out.shape == (3, 2, 8)
 
@@ -352,12 +359,13 @@ def test_the_rotation_still_happens_on_the_tapped_value():
     nope = 8 - 4
     # The tapped slice is the rotation's input; the rotation changed it.
     assert not torch.allclose(out[..., nope:].to(torch.float32),
-                              seen["rope.q.in"])
-    # And the leading dims the tap deliberately omits did pass through, which
-    # is the reason omitting them loses nothing.
-    normed = qkv_prolog_rms(q, 1e-6)
+                              seen["rope.q.in"].to(torch.float32))
+    # And the leading dims the tap deliberately omits did pass through
+    # untouched -- which is both why omitting them loses nothing and why the
+    # q path must carry no norm: a norm would change them too.
     torch.testing.assert_close(out[..., :nope].to(torch.float32),
-                               normed[..., :nope], rtol=2e-2, atol=2e-2)
+                               q[..., :nope].to(torch.float32),
+                               rtol=2e-2, atol=2e-2)
 
 
 def test_no_tap_is_the_default_and_changes_nothing():
@@ -409,3 +417,66 @@ def test_the_post_rope_kv_is_offered_and_is_what_reaches_the_cache():
         torch.testing.assert_close(
             cache[0, t].to(torch.float32),
             seen["rope.kv.out"][t].to(torch.float32), rtol=1e-2, atol=1e-2)
+
+
+# ----------------------------- the q path applies no norm of its own (A-2)
+
+def test_the_q_path_rotates_the_projected_query_with_no_norm_of_its_own():
+    """🔴 A-2. V4.1 passes apply_q_norm=False; this decomposition did not.
+
+    The fused op is shared by both models and its signature ends
+    ``bool apply_q_norm=True`` (csrc/libtorch_stable/torch_bindings.cpp:441).
+    V4.0 omits the argument and gets the norm; V4.1 passes False at every one
+    of its call sites (deepseek_v4_1/attention.py:881, :901). This module was
+    transcribed from V4.0's description of the same op
+    (deepseek_v4/cpu/cpu_sparse.py:426, "Q side does per-head weight-free
+    RMSNorm + GPT-J RoPE") and carried the default over with it.
+
+    The reference agrees, read directly rather than taken second-hand
+    (dsv41_golden/ref/model.py:770-772)::
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+    Nothing between wq_b and the rotation.
+    """
+    seen = {}
+    torch.manual_seed(0)
+    # Rows with very different magnitudes: a per-row norm collapses them and
+    # a correct path does not, so the two outcomes are far apart rather than
+    # a few ULP apart.
+    q = torch.randn(3, 2, 8, dtype=torch.bfloat16)
+    q[0] *= 8.0
+    q[2] *= 0.125
+    cos_sin = torch.zeros(16, 4, dtype=torch.float32)
+    cos_sin[:, :2] = 1.0
+
+    qnorm_rope_kv_insert(
+        q=q, kv=torch.randn(3, 8, dtype=torch.bfloat16),
+        positions=torch.arange(3), cos_sin_cache=cos_sin,
+        swa_kv_cache=torch.zeros(2, 4, 8, dtype=torch.bfloat16),
+        slot_mapping=torch.tensor([0, 1, 2], dtype=torch.int32),
+        eps=1e-6, rope_head_dim=4,
+        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
+
+    # What enters the rotation is the projected query itself.
+    torch.testing.assert_close(seen["rope.q.in"].to(torch.float32),
+                               q[..., -4:].to(torch.float32),
+                               rtol=1e-2, atol=1e-2)
+
+
+def test_the_weightless_norm_is_not_on_the_q_path_at_all():
+    """The helper stays -- V4.0's path and the op's apply_q_norm=True branch
+    are the same computation, and deleting it would leave nothing to point at
+    when that path is next read. What must not happen is this module calling
+    it."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(qnorm_rope_kv_insert)))
+    called = {node.func.id for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert "rms_norm_weightless" not in called, (
+        "V4.1 passes apply_q_norm=False; a norm here is V4.0's behaviour")

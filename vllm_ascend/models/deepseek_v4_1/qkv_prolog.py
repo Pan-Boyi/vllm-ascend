@@ -5,11 +5,32 @@ Upstream fuses five steps into one CUDA op per cache dtype, and all three of
 those symbols are absent on Ascend. Reached from ``_prepare_and_attn_eager`` on
 every forward, so this is not a dormant path.
 
-The contract is not inferred from the operator's name. ``deepseek_v4/cpu/
-cpu_sparse.py:427`` states it, for the same fused op:
+🔴 **The contract this was first written from was the wrong model's.** It came
+from ``deepseek_v4/cpu/cpu_sparse.py:426`` -- a **V4.0** file -- describing the
+same fused operator:
 
     Q side does per-head weight-free RMSNorm + GPT-J RoPE (zero-filling padded
     head slots); KV side does GPT-J RoPE + UE8M0 FP8 quant + paged insert.
+
+That sentence is true of V4.0 and false of V4.1, and the difference is a
+single argument the prose does not mention. The operator is shared and its
+signature ends ``bool apply_q_norm=True``
+(``csrc/libtorch_stable/torch_bindings.cpp:441``). V4.0 omits it and takes the
+norm (``deepseek_v4/attention.py:801-810``); **V4.1 passes ``False`` at every
+call site** (``deepseek_v4_1/attention.py:881``, ``:901``), and its own comment
+for the uint8 branch says only "Q side: GPT-J RoPE, zero-filling the padding
+head slots" -- no norm. The reference agrees
+(``dsv41_golden/ref/model.py:770-772``: ``wq_b`` then ``apply_rotary_emb``,
+nothing between).
+
+So the q side here does **RoPE only**. Measured cost of getting it wrong: q
+left the projection matching the reference to the floor (2.6e-4) and reached
+the operator 1000x off (3.1e-1), because a per-(token, head) RMS factor
+ranging 0.21-1.23 had been applied to it.
+
+⚠️ The lesson is not "read the contract" -- the contract was read. It is that
+**a prose contract for a shared operator describes one caller's arguments**,
+and the argument that differed was the one prose omits.
 
 Two things follow that a reading of the name would have got wrong. The q norm
 takes no learned weight -- the op is passed ``eps`` and nothing else, and the
@@ -198,7 +219,12 @@ def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
     the caller does.
     """
     cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
-    q_normed = rms_norm_weightless(q, eps)
+    # 🔴 No norm on the q side. V4.1 passes ``apply_q_norm=False`` at every
+    # call site of the fused op (attention.py:881 and :901); the argument
+    # defaults to True and V4.0 takes the default. This function used to run
+    # the norm, because it was transcribed from V4.0's description of the
+    # same operator -- see the module docstring.
+    q_normed = q
     if tap is not None:
         # 🔵 Only the slice the rotation touches. The leading
         # ``head_dim - rope_head_dim`` dims pass through unchanged, so they
