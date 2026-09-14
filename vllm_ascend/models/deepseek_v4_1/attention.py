@@ -253,7 +253,7 @@ def _skip_under_capture(what: str) -> bool:
 _LOGGED_BATCH_SHAPES: set = set()
 
 
-_PAD_TAIL = {"strict": 0, "relaxed": 0, "last": None}
+_PAD_TAIL = {"intact": 0, "repaired": 0, "last": None}
 
 
 def pad_tail_accounting() -> dict:
@@ -1163,15 +1163,29 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # ⇒ 判据改成对【真实 token 数】比较；拿不到真实数时【退回严格比较】——
         #   fail-safe 的方向是拦，不是放行。
         # ⚠️ 放宽是偏宽松的方向，所以记账：跳过了几次、每次跳过多少行。
-        real = _num_actual_tokens_or_none()
-        if real is not None and real < num_tokens:
-            _PAD_TAIL["relaxed"] += 1
-            _PAD_TAIL["last"] = (int(num_tokens), int(real), int(written))
-            compare_against = real
+        # 🔴 上一版在这里【放宽判据】（改成和真实 token 数比），那是错的，两重：
+        #   ① 它是死代码：_num_actual_tokens_or_none() 永远返回 None ——
+        #      ForwardContext 没有 num_actual_tokens 这个字段（上游
+        #      vllm/forward_context.py 里该名字命中 0 次），而 attn_metadata 是
+        #      dict，getattr 取不到。⇒ relaxed 恒为 0，"已修好"和"从未生效"读数一样。
+        #   ② 就算接通也不安全：放宽等于【信任】第 written..num_tokens 行，而那些行
+        #      是上一步的残留 slot id，会被 _compressed_topk_length 数成有效。
+        #      "padding 行的输出会被丢弃"这句话的前提是注意力在 query 维严格独立，
+        #      而那一条【没有在算子层面核实过】。
+        # ⇒ 改成【修复】而不是【放宽】或【拒绝】：把尾部那几行显式写成 NO_TOKEN。
+        #   形状恒定、纯设备写、可捕获；而且它把"残留"这个危险【消掉】，
+        #   不是绕过它 —— 之后严格判据照常成立。
+        if written < num_tokens:
+            from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
+                NO_TOKEN, mark_rows_written)
+            self.topk_indices_buffer[written:num_tokens] = NO_TOKEN
+            mark_rows_written(self.topk_indices_buffer, num_tokens)
+            _PAD_TAIL["repaired"] += 1
+            _PAD_TAIL["last"] = (int(num_tokens), int(written))
+            written = num_tokens
         else:
-            _PAD_TAIL["strict"] += 1
-            compare_against = num_tokens
-        if compare_against > written:
+            _PAD_TAIL["intact"] += 1
+        if num_tokens > written:
             raise ValueError(
                 f"{self.prefix}: reading {num_tokens} rows of the indexer "
                 f"selection but only {written} were written this step. The "
