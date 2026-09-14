@@ -545,6 +545,17 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         # Broadcast the [out/block, in/block] tile scales out to [out, in/group_size], which is what
         # npu_quant_matmul consumes. Both factors follow weight_block_size: V4.0's 128 gives (4, 128) --
         # the constants that used to be hard-coded here -- and V4.1's 32 gives (1, 32).
+        # 🔵 Checked, because a wrong scale leaves no downstream trace: the
+        # blocks are cut along the reduction dimension and the GEMM's sum
+        # flattens the structure, so nothing in the output says which block
+        # scale was applied. The broadcast below must *copy* -- a version
+        # that averaged or requantised would keep the element count right and
+        # produce byte values that were never in the checkpoint.
+        from vllm_ascend.quantization.scale_layout_check import (
+            snapshot_scales, verify_scale_layout_preserved)
+
+        _scales_before = snapshot_scales(layer, ("weight_scale", ))
+        _copy_factor = (self.block_size // self.group_size) * self.block_size
         layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(
             self.block_size // self.group_size, dim=1
         ).repeat_interleave(self.block_size, dim=0)
@@ -552,6 +563,10 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)
         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
+        verify_scale_layout_preserved(
+            _scales_before, layer, ("weight_scale", ),
+            expanded={"weight_scale": _copy_factor},
+            what=f"{getattr(layer, 'prefix', '?')} weight_scale")
 
         if layer.prefix.endswith("wo_a"):
             layer.weight.data = (

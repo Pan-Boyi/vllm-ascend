@@ -151,6 +151,7 @@ class AscendW4A4MXFP4DynamicLinearMethod(AscendLinearScheme):
         _rename_packed_weight_parameter(layer, "weight")
 
         n_dim, k_dim = layer.weight_scale.data.shape
+
         # Shape should be padded if it cannot be divided by 2
         if k_dim % 2 != 0:
             layer.weight_scale.data = F.pad(layer.weight_scale.data, (0, 1), mode="constant", value=0)
