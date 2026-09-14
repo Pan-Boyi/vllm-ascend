@@ -236,9 +236,24 @@ KEY_SEMANTICS: dict = {
     #                   argument (see its own entry), and reading this line
     #                   as covering it is how a stage mismatch between the
     #                   two dumps looked, for one day, like a rope defect.
-    #   ✅ established  On the A5 bf16 plan nothing is quantised: the cache
+    #   ✅ measured  **This cache** is not quantised on the A5 bf16 plan: its
     #                   dtype is bfloat16 and fp8_scale is None. The uint8
     #                   fp8_ds_mla layout is a different plan.
+    #   🔴 SCOPE  the line above is about **the KV cache write path**, and its
+    #                   evidence is entirely that path's -- a cache dtype and
+    #                   the fp8_scale argument of rope_quant_insert. It was
+    #                   written as "nothing is quantised", and that wording
+    #                   got carried to the whole model. It is false there:
+    #                   the MoE expert weights are **MXFP4** with E8M0 block
+    #                   scales (checkpoint: w1.weight I8 (2304, 2560),
+    #                   w1.scale F8_E8M0 (2304, 160), block 32), and the
+    #                   engine also runs with fuse_norm_quant, fuse_act_quant
+    #                   and '+quant_fp8'. Quantisation is on in at least four
+    #                   places this line never looked at.
+    #                   ⚠️ Fourth time in this file that a claim's subject was
+    #                   narrower than its wording, and the third in this very
+    #                   block. Two facts about one path do not license a
+    #                   sentence about the model.
     #   ✅ established  Row layout is [448 NoPE | 64 RoPE] within the 512, in
     #                   that order -- upstream's words for the bfloat16 case.
     #   ✅ established  Addressing is PA_BBND: a row is at
@@ -915,6 +930,7 @@ def _attach_moe_internals(layer: torch.nn.Module, layer_id: int,
     ffn = getattr(layer, "ffn", None) or getattr(layer, "moe", None)
     if ffn is None:
         return 0
+    _report_moe_configuration(ffn)
     attached = 0
     for attribute, key in _MOE_TAPS:
         module = getattr(ffn, attribute, None)
@@ -925,6 +941,53 @@ def _attach_moe_internals(layer: torch.nn.Module, layer_id: int,
             _make_moe_tap(layer_id, key)))
         attached += 1
     return attached
+
+
+_REPORTED_MOE_CONFIG = False
+
+
+def _report_moe_configuration(ffn: torch.nn.Module) -> None:
+    """The MoE's live settings, read off the built object, once.
+
+    🔴 A reading, not a check, and taken from the object rather than from the
+    config file: "the config says 10.0" and "this layer is using 10.0" are
+    different claims, and only the second one is about what ran. The gap
+    between them is where ``apply_q_norm`` lived -- a value present in the
+    config, correct in the caller, and not what the callee used.
+
+    ``swiglu_limit`` is here because a live hypothesis needs it: if the expert
+    weights were losing their block scale, x @ w1 would be ~2^6 too large and
+    a clamp at 10.0 would saturate the output -- and the output is measured
+    *not* saturated. Either the clamp is not in force or the scale is not lost
+    before it. A reading of 0.0 decides that, and neither reading can be got
+    from the source.
+    """
+    global _REPORTED_MOE_CONFIG
+    if _REPORTED_MOE_CONFIG:
+        return
+    _REPORTED_MOE_CONFIG = True
+    experts = getattr(ffn, "experts", None)
+    moe_config = getattr(experts, "moe_config", None)
+    seen = {}
+    for name in ("swiglu_limit", "num_fused_shared_experts",
+                 "shared_expert_weight", "routed_scaling_factor",
+                 "scoring_func", "renormalize", "top_k", "num_experts",
+                 "ep_size", "has_fused_shared_experts"):
+        for owner, label in ((moe_config, "moe_config"), (experts, "experts"),
+                             (ffn, "ffn")):
+            if owner is not None and hasattr(owner, name):
+                seen[f"{label}.{name}"] = getattr(owner, name)
+                break
+    from vllm.logger import logger
+
+    logger.info(
+        "DSV4.1 alignment: MoE as built -- %s. shared_experts=%s, "
+        "ascend_shared_experts=%s. These are read off the live objects, not "
+        "off the config: 'the config says X' and 'this layer uses X' are "
+        "different claims and only the second is about what ran.",
+        seen or "<no readable settings>",
+        type(getattr(ffn, "shared_experts", None)).__name__,
+        type(getattr(experts, "ascend_shared_experts", None)).__name__)
 
 
 _REPORTED_MISSING_MOE: set = set()
