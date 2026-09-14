@@ -77,20 +77,68 @@ def _mx_block_scale_params():
     return found
 
 
-def test_every_mx_block_scale_is_declared_as_a_byte_buffer():
+def _survives_a_byte_copy(dtype_src: str) -> bool:
+    """Run the loader's copy through this dtype and see if the bytes live.
+
+    🔴 Behavioural, not a restatement. The first version of this asserted
+    ``dtype == "torch.uint8"``, which is a rule about how we spell things,
+    wearing the failure message of a rule about what happens to the bytes --
+    and the two come apart: ``int8`` is byte-exact through ``copy_`` (two's
+    complement wraps, it does not saturate), so the literal check fails a
+    declaration that is perfectly safe. Measured: uint8 and int8 round trip
+    [0,1,119,120,127,128,134,191,200,255] unchanged; float8_e8m0fnu and
+    float8_e4m3fn do not.
+
+    ⚠️ A criterion that restates the convention is green for every *new* way
+    of breaking it. This one names no dtype, so a third byte-destroying
+    dtype fails it without anyone having thought of that dtype first.
+    """
+    try:
+        dtype = eval(dtype_src, {"torch": torch})       # noqa: S307
+    except Exception:                                   # noqa: BLE001
+        return False                                    # params_dtype etc.
+    if not isinstance(dtype, torch.dtype):
+        return False
+    probe = torch.tensor([0, 1, 119, 120, 127, 128, 134, 191, 200, 255],
+                         dtype=torch.uint8)
+    buf = torch.empty(probe.numel(), dtype=dtype)
+    if buf.element_size() != 1:
+        return False
+    buf.copy_(probe)                                    # what the loader does
+    return torch.equal(buf.view(torch.uint8), probe)
+
+
+def test_every_mx_block_scale_survives_the_loaders_copy():
     entries = _mx_block_scale_params()
     # Zero coverage must fail: a walk that found nothing looks exactly like a
     # walk in which everything passed.
     assert len(entries) >= 10, f"only found {len(entries)}: {entries}"
 
-    wrong = [e for e in entries if e[3] != "torch.uint8"]
+    wrong = [e for e in entries if not _survives_a_byte_copy(e[3])]
     assert not wrong, (
-        "an MX block-scale parameter is declared with a dtype that gives it "
-        "arithmetic meaning. The loader copies raw bytes into it, so the "
-        "copy becomes a value conversion and the bytes are silently "
-        "rewritten:\n  "
+        "an MX block-scale parameter is declared with a dtype that does not "
+        "survive the loader's copy. The loader moves the checkpoint's scale "
+        "as raw bytes, so a copy into a parameter with arithmetic meaning is "
+        "a value conversion and the bytes are silently rewritten:\n  "
         + "\n  ".join(f"{f}:{ln} {name} declared {dt}"
                       for f, ln, name, dt in wrong))
+
+
+def test_the_criterion_accepts_what_is_actually_safe_and_rejects_what_is_not():
+    """The criterion's own discriminating power, pinned.
+
+    🔴 Without this, "every entry passed" and "the check cannot fail" read
+    the same. It also pins kernel's correction: int8 belongs on the safe
+    side, so that nobody later "fixes" it back out on a bad memory.
+    """
+    assert _survives_a_byte_copy("torch.uint8")
+    assert _survives_a_byte_copy("torch.int8"), (
+        "two's complement wraps rather than saturating, so int8 is a byte "
+        "buffer too -- verified, not assumed")
+    assert not _survives_a_byte_copy("torch.float8_e8m0fnu")
+    assert not _survives_a_byte_copy("torch.float8_e4m3fn")
+    assert not _survives_a_byte_copy("torch.int16"), "wider: not a byte move"
+    assert not _survives_a_byte_copy("params_dtype"), "unresolvable: refuse"
 
 
 def test_the_conversion_that_actually_happened():
