@@ -150,10 +150,24 @@ KEY_SEMANTICS: dict = {
                     "difference where the margin is ~1e-3 is ⚫ undecidable, "
                     "not a defect -- and the two readings lead to opposite "
                     "next steps",
-    "moe.experts.out": "the routed experts' aggregate, before the shared "
-                       "expert is added. golden has no counterpart; this key "
-                       "exists so our own chain can contradict itself, which "
-                       "is how the q chain's defect was found",
+    "moe.experts.out": "the routed experts' aggregate, WITHOUT the shared "
+                       "expert. ⚠️ SCOPE: emitted only when the experts "
+                       "module really excludes shared -- that is the mega "
+                       "path, where ascend_shared_experts is None. On the "
+                       "path this port actually takes the same module "
+                       "returns routed+shared and the key is called "
+                       "moe.fused_out instead. golden has no counterpart; "
+                       "this key exists so our own chain can contradict "
+                       "itself, which is how the q chain's defect was found",
+    "moe.fused_out": "what the experts module returned WITH the shared "
+                     "expert already added (fused_moe.py:320+, taken "
+                     "whenever ascend_shared_experts is not None). 🔴 It is "
+                     "NOT the routed aggregate, and it was called "
+                     "moe.experts.out until 2026-09-14, under a docstring "
+                     "saying 'before the shared expert is added' -- golden "
+                     "nearly derived a defect that does not exist from it. "
+                     "⚠️ shared is 73% of the norm of moe.out, so any ratio "
+                     "on this key is mostly a statement about shared",
     "moe.shared.out": "the shared expert's output. Every token goes through "
                       "it and it is added separately from the routed "
                       "aggregate (ref/model.py:889-891), so it is the one "
@@ -671,7 +685,14 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
             forward_kind=("decode_step_1" if _DECODE_STEP_THIS_FORWARD
                           else "prefill"),
             request_identity=(_DECODE_STEP_THIS_FORWARD[-1]
-                              if _DECODE_STEP_THIS_FORWARD else None))
+                              if _DECODE_STEP_THIS_FORWARD else None),
+            # 🔴 Recorded because the meaning of the experts key depends on
+            # which MoE path this build takes, and the two paths produce two
+            # different quantities under what used to be one name. A reader
+            # holding only the dump could not tell them apart; now the key
+            # name says it and the manifest says it, and they have to agree.
+            experts_output_includes_shared=_EXPERTS_INCLUDE_SHARED[-1]
+            if _EXPERTS_INCLUDE_SHARED else None)
     _DECODE_STEP_THIS_FORWARD.clear()
     from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
 
@@ -967,9 +988,18 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
 #:
 #:   moe.router.out   which experts, with what weights -- wrong experts move
 #:                    direction, unnormalised weights move magnitude
-#:   moe.experts.out  the routed experts' aggregate, before the shared expert
+#:   moe.experts.out  the routed aggregate WITHOUT shared -- mega path only;
+#:                    on the fused path the same module returns routed+shared
+#:                    and the key is named moe.fused_out (decided at attach
+#:                    time off the live object, not off the config)
 #:   moe.shared.out   the shared expert, which every token goes through and
 #:                    which is added separately (ref/model.py:889-891)
+#: What the experts module was found to do, at attach time, per layer. A
+#: list rather than a bool so that "never looked" stays distinct from
+#: "looked and the answer was False" -- the two mean opposite things when a
+#: dump turns up with neither key.
+_EXPERTS_INCLUDE_SHARED: list = []
+
 _MOE_TAPS: tuple[tuple[str, str], ...] = (
     # 🔴 No ("gate", ...) entry, and it is not an oversight. On this platform
     # the fused layer never calls the gate as a module -- it reads
@@ -1007,10 +1037,41 @@ def _attach_moe_internals(layer: torch.nn.Module, layer_id: int,
         if module is None or not isinstance(module, torch.nn.Module):
             _report_missing_moe_part(attribute, type(ffn).__name__)
             continue
+        if attribute == "experts":
+            includes = experts_include_shared(module)
+            _EXPERTS_INCLUDE_SHARED.append(includes)
+            if includes:
+                key = "moe.fused_out"
         handles.append(module.register_forward_hook(
             _make_moe_tap(layer_id, key)))
         attached += 1
     return attached
+
+
+def experts_include_shared(experts: torch.nn.Module) -> bool:
+    """Whether this experts module's output already contains the shared expert.
+
+    🔴 The hardest kind of same-name-different-thing, because nothing in this
+    file is wrong. The hook point is right, the key name is right *for what
+    it was meant to be*, and the docstring even explained why the key exists.
+    What drifted was neither description-vs-code nor one team's name against
+    another's: it was the description against **what the module it is
+    attached to actually is on the path taken at runtime**, and that fact
+    lives in another file's other branch (``fused_moe.py:304`` returns early
+    without shared, ``:320+`` returns routed+shared, and the condition is
+    ``ascend_shared_experts is not None``, which holds here because
+    ``n_shared_experts = 1``).
+
+    ⇒ So it is decided here, off the **live object**, and the answer is
+    stamped into the dump. "The config says X" and "this module does X" are
+    different claims, and only the second is about what ran.
+
+    Measured two ways before this was changed: our ``moe.experts.out`` was
+    bit-identical to ``moe.out``, and golden subtracting shared from its own
+    reference moved the comparison from 3.20e-02 to 1.3999e+00 -- 43.76x
+    worse. Both say the key contained shared.
+    """
+    return getattr(experts, "ascend_shared_experts", None) is not None
 
 
 _REPORTED_MOE_CONFIG = False
@@ -1110,6 +1171,29 @@ def _make_moe_tap(layer_id: int, key: str):
 #: gate's output is a routing decision, not a contribution.
 _MOE_RECONSTRUCTION_PARTS = ("moe.experts.out", "moe.shared.out")
 
+_REPORTED_RECONSTRUCTION_NA: set = set()
+
+
+def _report_reconstruction_not_applicable(layer_id: int) -> None:
+    """Say that the sum is not defined here, and why -- once.
+
+    ⚠️ Distinct wording from "could NOT be computed", which means the parts
+    were missing. This one means the parts would be wrong: a decomposition
+    check on an output that is already the whole sum has no content.
+    """
+    if "na" in _REPORTED_RECONSTRUCTION_NA:
+        return
+    _REPORTED_RECONSTRUCTION_NA.add("na")
+    from vllm.logger import logger
+
+    logger.info(
+        "DSV4.1 alignment: the MoE reconstruction is NOT APPLICABLE on this "
+        "path (layer %d and after). The experts module already adds the "
+        "shared expert (moe.fused_out), so routed+shared would count shared "
+        "twice and the residual would be about 73%% of the norm -- large, "
+        "confident and meaningless. ⚠️ This is not 'the parts are missing': "
+        "it is 'the sum is not defined here'.", layer_id)
+
 _MOE_PARTS: dict = {}
 _RECONSTRUCTION_REPORTED: set = set()
 
@@ -1134,6 +1218,17 @@ def check_moe_reconstruction(layer_id: int, out: torch.Tensor) -> None:
     """
     parts = _MOE_PARTS.pop(layer_id, None)
     if not parts:
+        return
+    if "moe.fused_out" in parts:
+        # 🔴 Structural refusal, not a missing-key one. On this path the
+        # experts module has already added shared, so "routed + shared"
+        # would count shared twice and the residual would be ~73% of the
+        # norm -- a large, confident, meaningless number. It does not fire
+        # today only because moe.shared.out happens to be absent as well;
+        # that is a coincidence of which submodules exist, and the next
+        # build that exposes shared_experts as a module would turn this
+        # into a silently wrong reading rather than an error.
+        _report_reconstruction_not_applicable(layer_id)
         return
     missing = [name for name in _MOE_RECONSTRUCTION_PARTS if name not in parts]
     if missing:

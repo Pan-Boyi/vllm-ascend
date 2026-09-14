@@ -156,3 +156,107 @@ def test_the_arming_check_count_is_reported_even_when_nothing_arms():
     decode_step1.is_first_decode_step("req:1", rows=1, seq_len=6)
     decode_step1.is_first_decode_step("req:1", rows=1, seq_len=6)
     assert decode_step1._ARM_CALLS == 2
+
+
+# --- the experts key names what it actually holds ---------------------------
+
+def test_the_key_is_named_for_what_the_module_actually_returns():
+    """🔴 The hardest same-name-different-thing: nothing in align_taps was
+    wrong.
+
+    The hook point was right, the key name was right for what it was *meant*
+    to be, and the docstring even explained why the key existed. What drifted
+    was the description against **what the attached module is on the path
+    taken at runtime** -- a fact that lives in another file's other branch
+    (fused_moe.py:304 returns early without shared, :320+ returns
+    routed+shared, and the condition is ascend_shared_experts is not None).
+    golden nearly derived a defect that does not exist from it.
+    """
+    from vllm_ascend.models.deepseek_v4_1.align_taps import (
+        experts_include_shared)
+
+    class _Experts(torch.nn.Module):
+        def __init__(self, shared):
+            super().__init__()
+            self.ascend_shared_experts = shared
+
+    assert experts_include_shared(_Experts(torch.nn.Identity())) is True
+    assert experts_include_shared(_Experts(None)) is False
+    # ⚠️ Read off the live object, so a module that has never heard of the
+    # attribute is the mega-path answer, not a crash.
+    assert experts_include_shared(torch.nn.Identity()) is False
+
+
+def test_the_reconstruction_refuses_when_the_parts_would_double_count(
+        monkeypatch):
+    """🔴 Refused structurally, not by the parts happening to be absent.
+
+    Today it does not fire only because moe.shared.out is absent as well --
+    a coincidence of which submodules exist. The next build that exposes
+    shared_experts as a module would turn this from an error into a silently
+    wrong reading: a residual of about 73% of the norm, large and confident
+    and meaningless.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    said = []
+    monkeypatch.setattr("vllm.logger.logger.info",
+                        lambda fmt, *a: said.append(fmt % a))
+    align_taps._REPORTED_RECONSTRUCTION_NA.clear()
+    # Both parts present AND the fused key present: the double-count setup.
+    align_taps._MOE_PARTS[3] = {
+        "moe.fused_out": torch.ones(2, 4),
+        "moe.experts.out": torch.ones(2, 4),
+        "moe.shared.out": torch.ones(2, 4),
+    }
+    align_taps.check_moe_reconstruction(3, torch.ones(2, 4))
+
+    assert any("NOT APPLICABLE" in t for t in said), said
+    assert any("twice" in t for t in said), said
+    # 🔴 And it must not be mistaken for the missing-parts case: the two
+    # readings lead to opposite next steps (go find the tap / stop asking).
+    assert not any("could NOT be computed" in t for t in said), said
+
+
+def test_the_attach_code_actually_uses_the_predicate(monkeypatch):
+    """🔴 The predicate being right is not the same as the key being right.
+
+    Written with only the predicate under test, a mutant that computes
+    ``includes`` and then always attaches the old name stays green -- the
+    answer is correct and nothing acts on it. That is the same shape as a
+    counter with no reader: the piece that decides works, and the piece that
+    uses it is what nobody drove.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    keys = []
+    monkeypatch.setattr(align_taps, "_make_moe_tap",
+                        lambda layer_id, key: keys.append(key) or (
+                            lambda *a, **k: None))
+    monkeypatch.setattr(align_taps, "_report_moe_configuration",
+                        lambda ffn: None)
+
+    class _Experts(torch.nn.Module):
+        def __init__(self, shared):
+            super().__init__()
+            self.ascend_shared_experts = shared
+
+    class _Ffn(torch.nn.Module):
+        def __init__(self, shared):
+            super().__init__()
+            self.experts = _Experts(shared)
+
+    class _Layer(torch.nn.Module):
+        def __init__(self, shared):
+            super().__init__()
+            self.ffn = _Ffn(shared)
+
+    align_taps._attach_moe_internals(_Layer(torch.nn.Identity()), 0, [])
+    assert "moe.fused_out" in keys, keys
+    assert "moe.experts.out" not in keys, (
+        "the fused path must not publish the routed-only name", keys)
+
+    keys.clear()
+    align_taps._attach_moe_internals(_Layer(None), 0, [])
+    assert "moe.experts.out" in keys, keys
+    assert "moe.fused_out" not in keys, keys
