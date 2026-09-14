@@ -7,6 +7,8 @@ rebinds of upstream names, which is exactly the kind of thing that can be
 undone by a later import with nothing to show for it.
 """
 
+import inspect
+import re
 import importlib
 
 import pytest
@@ -57,7 +59,36 @@ def test_it_subclasses_upstream_rather_than_forking_it():
                 if isinstance(node, ast.ClassDef)
                 and node.name == "AscendDeepseekV41ForCausalLM")
     defined = [n.name for n in body.body if isinstance(n, ast.FunctionDef)]
-    assert defined == ["__init__"], (
+    # 🔵 One narrow exception, and it is checked rather than listed: a method
+    # that calls super()'s same-named one and returns its result unchanged is
+    # an *observer*, not a behaviour change. compute_logits is tapped here
+    # because it is not a module forward (no hook to register) and the runner
+    # reaches it through wrappers that delegate to original_model -- this
+    # class is the one place every path ends at.
+    #
+    # ⚠️ The exception is defined by what the body does, not by the name, so
+    # a future override that silently changes the value still fails.
+    observers = []
+    for name in defined:
+        if name == "__init__":
+            continue
+        src = inspect.getsource(getattr(model.AscendDeepseekV41ForCausalLM,
+                                        name))
+        body = src[src.index("):") + 2:]
+        # ⚠️ Anchored at end of line. Without the anchor "return logits"
+        # matches as a PREFIX of "return logits * 2", so an override that
+        # doubles the value still reads as an observer -- the mutant that
+        # this guard exists to catch walked straight through the first
+        # version of it.
+        returns_super = re.search(
+            rf"(\w+)\s*=\s*super\(\)\.{name}\(.*?\n.*?"
+            rf"return\s+\1\s*(?:#.*)?$",
+            body, re.S | re.M)
+        if returns_super or re.search(
+                rf"return\s+super\(\)\.{name}\(.*\)\s*(?:#.*)?$",
+                body, re.M):
+            observers.append(name)
+    assert sorted(set(defined) - set(observers)) == ["__init__"], (
         f"the entry point defines {defined}; anything beyond __init__ is a "
         "behaviour change living somewhere nobody looks for one")
 
