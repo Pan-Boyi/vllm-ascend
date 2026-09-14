@@ -137,12 +137,21 @@ def test_the_arguments_actually_used_are_reported_once(monkeypatch):
     moe_router.reset_router_tap_for_test()
 
     moe_router._report_router_arguments(
-        {"top_k": 6, "routed_scaling_factor": 1.5, "zero_expert_type": None},
-        {"top_k", "routed_scaling_factor"})
+        {"top_k": 6, "routed_scaling_factor": 1.5, "zero_expert_type": None,
+         "e_score_correction_bias": torch.zeros(384)},
+        {"top_k", "routed_scaling_factor", "e_score_correction_bias"})
     assert len(said) == 1
     assert "'routed_scaling_factor': 1.5" in said[0]
-    assert "'shared_expert_weight': '<not passed -- DEFAULT>'" in said[0]
     assert "zero_expert_type" in said[0]
+    # 🔴 The hole this closed. e_score_correction_bias is ACCEPTED by the
+    # factory, so it is not "dropped"; it was not on the hand-written list of
+    # interesting names, so it was not "seen" either. A reader looking for it
+    # found it in neither column and could not tell "not passed" from "passed
+    # and not printed" -- and those have opposite meanings.
+    assert "e_score_correction_bias" in said[0]
+    assert "<tensor (384,)" in said[0], "a tensor is summarised, not dumped"
+    # And a behavioural default that really was not passed still says so.
+    assert "shared_expert_weight" in said[0]
 
     moe_router._report_router_arguments({"top_k": 1}, {"top_k"})
     assert len(said) == 1, "once per process, not once per layer"

@@ -116,9 +116,23 @@ class AscendGroupedTopKRouter(BaseRouter):
             return topk_weights * self.routed_scaling_factor, topk_ids
 
         if self.e_score_correction_bias is not None:
-            topk_weights = topk_weights + self.e_score_correction_bias
-
-        topk_weights, topk_ids = topk_weights.topk(self.top_k, dim=-1)
+            # 🔴 The bias picks the experts; it must not scale them. Keep the
+            # unbiased scores and gather the weights from those -- the same
+            # thing the grouped branch above does, and the same thing the
+            # reference does (ref/model.py:820-822, "the bias picks experts
+            # but does not scale them: weights come from the raw scores").
+            #
+            # This branch used to take the biased scores as the weights. The
+            # bias was wired, passed and applied -- to the wrong thing, which
+            # is harder to find than a missing bias: every "is the bias
+            # connected?" check answers yes, and the question has to be
+            # "does it reach the weights?", which is what it must not do.
+            original_weights = topk_weights
+            topk_ids = (topk_weights + self.e_score_correction_bias).topk(
+                self.top_k, dim=-1)[1]
+            topk_weights = original_weights.gather(1, topk_ids)
+        else:
+            topk_weights, topk_ids = topk_weights.topk(self.top_k, dim=-1)
 
         # Required by npu_moe_init_routing
         topk_ids = topk_ids.to(torch.int32)

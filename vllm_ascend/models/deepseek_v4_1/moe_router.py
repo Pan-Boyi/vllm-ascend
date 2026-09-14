@@ -118,13 +118,32 @@ def _report_router_arguments(kwargs: dict, accepted: set) -> None:
     _REPORTED_ARGUMENTS = True
     from vllm.logger import logger
 
-    seen = {name: kwargs.get(name, "<not passed -- DEFAULT>")
-            for name in _BEHAVIOURAL_DEFAULTS}
+    # 🔴 Every argument, not a hand-picked list. The first version printed
+    # only _BEHAVIOURAL_DEFAULTS, and a reader went looking for
+    # e_score_correction_bias in the output: it was in neither column --
+    # not "dropped", because the Ascend factory accepts it, and not "seen",
+    # because it was not on my list. An instrument that shows a subset chosen
+    # in advance cannot answer a question nobody had when the list was
+    # written, and this line exists precisely for those questions.
+    #
+    # Tensors are summarised rather than dumped: what a reader needs from one
+    # here is whether it arrived at all and what shape it is.
+    def _describe(value):
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            return f"<tensor {tuple(shape)} {getattr(value, 'dtype', '?')}>"
+        return value
+
+    passed = {name: _describe(value) for name, value in sorted(kwargs.items())}
+    not_passed = sorted(name for name in _BEHAVIOURAL_DEFAULTS
+                        if name not in kwargs)
     dropped = sorted(set(kwargs) - accepted)
     logger.info(
-        "DSV4.1 MoE router built with: %s. Arguments upstream passed that the "
-        "Ascend factory does not take (all at upstream's default, or this "
-        "would have raised): %s.", seen, dropped or "none")
+        "DSV4.1 MoE router built with ALL arguments as passed: %s. Of the "
+        "ones whose default is a behaviour, these were NOT passed and so took "
+        "the default: %s. Arguments upstream passed that the Ascend factory "
+        "does not take (all at upstream's default, or this would have "
+        "raised): %s.", passed, not_passed or "none", dropped or "none")
 
 
 def _tap_select_experts(router):
