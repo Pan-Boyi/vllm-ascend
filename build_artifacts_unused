@@ -1,0 +1,62 @@
+"""Mechanically: which torch.ops._C.* ops does V4.1 call, with what arguments,
+against the binding's declared defaults -- and what does our line substitute."""
+import ast, pathlib, re, json
+
+VLLM = pathlib.Path("/workspace/code/dsv4_single_card/vllm_project/vllm")
+OURS = pathlib.Path("/workspace/code/dsv4_single_card/vllm_project/worktrees/model")
+
+# --- 1. binding signatures with defaults, from the .cpp ------------------
+sigs = {}
+for cpp in (VLLM / "csrc").rglob("torch_bindings.cpp"):
+    text = cpp.read_text()
+    # ops.def("name(args...) -> ..."); possibly split across string literals
+    for m in re.finditer(r'ops\.def\(\s*((?:"[^"]*"\s*)+)\)', text):
+        joined = "".join(re.findall(r'"([^"]*)"', m.group(1)))
+        head = joined.split("(", 1)
+        if len(head) != 2:
+            continue
+        name, rest = head[0].strip(), head[1]
+        params = rest.rsplit(")", 1)[0]
+        sigs[name] = [p.strip() for p in params.split(",") if p.strip()]
+
+# --- 2. V4.1's call sites -------------------------------------------------
+def calls_in(path, prefix="_C"):
+    tree = ast.parse(path.read_text())
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if not isinstance(f, ast.Attribute):
+            continue
+        chain, cur = [], f
+        while isinstance(cur, ast.Attribute):
+            chain.append(cur.attr); cur = cur.value
+        chain = list(reversed(chain))
+        if len(chain) >= 3 and chain[0] == "ops" and chain[1] == prefix:
+            out.append((chain[-1], node.lineno,
+                        [ast.unparse(a) for a in node.args],
+                        {k.arg: ast.unparse(k.value) for k in node.keywords}))
+    return out
+
+v41 = {}
+for py in (VLLM / "vllm/models/deepseek_v4_1").rglob("*.py"):
+    for name, line, args, kw in calls_in(py):
+        v41.setdefault(name, []).append((str(py.relative_to(VLLM)), line, args, kw))
+v40 = {}
+for py in (VLLM / "vllm/models/deepseek_v4").rglob("*.py"):
+    for name, line, args, kw in calls_in(py):
+        v40.setdefault(name, []).append((str(py.relative_to(VLLM)), line, args, kw))
+
+report = []
+for name in sorted(set(v41) | set(v40)):
+    sig = sigs.get(name)
+    if sig is None:
+        report.append({"op": name, "signature": "NOT FOUND in torch_bindings.cpp",
+                       "v41": v41.get(name, []), "v40": v40.get(name, [])})
+        continue
+    defaults = [p for p in sig if "=" in p]
+    report.append({"op": name, "params": sig, "with_defaults": defaults,
+                   "v41": [(f, l, len(a), a[len(sig) - len(defaults):] if len(a) > len(sig) - len(defaults) else [], kw) for f, l, a, kw in v41.get(name, [])],
+                   "v40": [(f, l, len(a), a[len(sig) - len(defaults):] if len(a) > len(sig) - len(defaults) else [], kw) for f, l, a, kw in v40.get(name, [])]})
+print(json.dumps(report, indent=1)[:9000])

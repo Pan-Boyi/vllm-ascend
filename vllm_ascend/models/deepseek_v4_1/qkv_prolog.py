@@ -15,13 +15,24 @@ same fused operator:
 That sentence is true of V4.0 and false of V4.1, and the difference is a
 single argument the prose does not mention. The operator is shared and its
 signature ends ``bool apply_q_norm=True``
-(``csrc/libtorch_stable/torch_bindings.cpp:441``). V4.0 omits it and takes the
-norm (``deepseek_v4/attention.py:801-810``); **V4.1 passes ``False`` at every
-call site** (``deepseek_v4_1/attention.py:881``, ``:901``), and its own comment
-for the uint8 branch says only "Q side: GPT-J RoPE, zero-filling the padding
-head slots" -- no norm. The reference agrees
+(``csrc/libtorch_stable/torch_bindings.cpp:441``). V4.0 omits it everywhere and
+takes the norm; **V4.1's attention path passes ``False``** at all three dtype
+branches (``deepseek_v4_1/attention.py:871``, ``:892``, ``:907``), and its own
+comment for the uint8 branch says only "Q side: GPT-J RoPE, zero-filling the
+padding head slots" -- no norm. The reference agrees
 (``dsv41_golden/ref/model.py:770-772``: ``wq_b`` then ``apply_rotary_emb``,
 nothing between).
+
+⚠️ **Not "every V4.1 call site"**, which is what this said first. V4.1's DSpark
+path omits the argument at all six of its sites
+(``deepseek_v4_1/{nvidia,amd}/dspark.py``) and therefore takes ``True``, the
+same as V4.0. Whether that is deliberate upstream is not this line's question;
+what matters here is that DSpark calls ``torch.ops._C`` directly rather than
+through ``_fused_qnorm_rope_kv_insert``, so it does not reach this function --
+on Ascend it would fail on the missing symbol, loudly. The scope of the claim
+is **the attention path**, and it is written down because the first version of
+this paragraph generalised one call site's argument to a whole model, which is
+the same mistake in the other direction as the one it describes.
 
 So the q side here does **RoPE only**. Measured cost of getting it wrong: q
 left the projection matching the reference to the floor (2.6e-4) and reached
@@ -64,6 +75,13 @@ from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
 
 def rms_norm_weightless(x: torch.Tensor, eps: float) -> torch.Tensor:
     """Per-row RMS norm with no learned weight, in float32.
+
+    🔴 **V4.1 does not take this path.** This is the operator's
+    ``apply_q_norm=True`` branch, which is V4.0's: V4.1 passes ``False`` at
+    every call site. Kept so that branch has something to point at, and
+    labelled so the next reader does not take it for a general helper the way
+    this module once did -- which cost q a factor of 0.21-1.23 per row, all
+    the way to the attention operator.
 
     "Per-head" for ``q`` of ``[tokens, heads, head_dim]`` is the same statement
     as "per-row" over the last axis -- which is why this takes no axis
@@ -211,6 +229,12 @@ def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
     ``q`` is ``[tokens, heads, head_dim]`` and ``kv`` is ``[tokens, head_dim]``;
     both are rotated over the same trailing slice at the same positions, so the
     cos/sin pair is built once.
+
+    ⚠️ ``eps`` is **unused on this path** and is kept for signature parity with
+    the operator, which also takes it and also ignores it once
+    ``apply_q_norm`` is false. Its only consumer here was the norm that no
+    longer runs. Said out loud because an unused parameter is exactly where
+    the next reader puts a norm back.
 
     ``tap`` -- optional ``(key, tensor) -> None`` -- is offered two values
     that exist only inside this function: the rotation's input on the q side
