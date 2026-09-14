@@ -159,6 +159,17 @@ class AlignRecorder:
         self.dump_dir = dump_dir
         self.seq_len = seq_len
         self.enabled = True
+        # 🔵 Which positions this forward is *supposed* to write. None means
+        # all of them, which is a prefill and was the only case until decode
+        # step 1 had to be recorded too.
+        #
+        # 🔴 Stated as "exactly the supplied positions", not relaxed to "at
+        # least one". A decode step writes one row, and a criterion of "some
+        # position was written" would accept a row scattered to the WRONG
+        # position -- which is the failure this whole assertion exists for,
+        # and the one that produces a tensor that looks right and compares
+        # wrong. Narrowing the expectation must not weaken it.
+        self.expected_positions: Optional[list[int]] = None
         self._bufs: Dict[str, Dict[str, torch.Tensor]] = {}
         self._coverage: Dict[str, Dict[str, torch.Tensor]] = {}
         self._meta: Dict[str, object] = {}
@@ -269,6 +280,11 @@ class AlignRecorder:
                    for tag, keys in self._bufs.items()}
         manifest = dict(self._meta)
         manifest.setdefault("seq_len", self.seq_len)
+        # 🔴 In the manifest, because a decode dump and a prefill dump have
+        # the same key names and the same shapes by construction -- that is
+        # what makes them comparable, and it is also what makes them
+        # indistinguishable unless the artifact says which it is.
+        manifest.setdefault("expected_positions", self.expected_positions)
         manifest.setdefault("tags", sorted(self._bufs))
         manifest["tensors"] = written
         manifest["golden_coverage"] = self._golden_coverage(refused)
@@ -483,22 +499,56 @@ class AlignRecorder:
         worst of the three outcomes.
         """
         bad = []
+        want = self._expected_mask()
         for tag, keys in sorted(self._coverage.items()):
             for key, cov in sorted(keys.items()):
-                if not torch.all(cov == 1):
+                if want is None:
+                    ok = bool(torch.all(cov == 1))
+                else:
+                    ok = bool(torch.equal(cov, want[:cov.numel()]))
+                if not ok:
                     bad.append((tag, key, cov))
         return bad
+
+    def _expected_mask(self) -> Optional[torch.Tensor]:
+        """A count of 1 at each position this forward supplies, 0 elsewhere.
+
+        ``None`` when every position is expected -- the prefill case, kept as
+        a distinct value rather than a full mask so that the ordinary path is
+        byte-for-byte the behaviour it had before decode recording existed.
+        """
+        if self.expected_positions is None or self.seq_len is None:
+            return None
+        mask = torch.zeros(self.seq_len, dtype=torch.int32)
+        for pos in self.expected_positions:
+            if 0 <= int(pos) < self.seq_len:
+                mask[int(pos)] += 1
+        return mask
 
     def _coverage_problems(self) -> list:
         """Keys whose positions were not written exactly once, described."""
         problems = []
+        want = self._expected_mask()
         for tag, key, cov in self._bad_coverage():
-            missing = (cov == 0).nonzero().flatten().tolist()
-            dupes = (cov > 1).nonzero().flatten().tolist()
+            if want is None:
+                missing = (cov == 0).nonzero().flatten().tolist()
+                dupes = (cov > 1).nonzero().flatten().tolist()
+                extra: list = []
+            else:
+                w = want[:cov.numel()]
+                missing = ((cov < w)).nonzero().flatten().tolist()
+                dupes = ((cov > w) & (w > 0)).nonzero().flatten().tolist()
+                # 🔴 Written where nothing was supposed to be. On a decode
+                # step this is the interesting one: it means a row went to a
+                # position this forward does not own, which is precisely the
+                # misalignment that reads downstream as a model difference.
+                extra = ((cov > 0) & (w == 0)).nonzero().flatten().tolist()
             problems.append(
                 f"  {tag}/{key}: seq_len={cov.numel()} "
-                f"missing={missing[:8]} duplicated={dupes[:8]} "
-                f"-- REFUSED, not written")
+                f"expected={'all' if want is None else self.expected_positions} "
+                f"missing={missing[:8]} duplicated={dupes[:8]}"
+                + (f" WROTE-OUTSIDE={extra[:8]}" if extra else "")
+                + " -- REFUSED, not written")
         return problems
 
 

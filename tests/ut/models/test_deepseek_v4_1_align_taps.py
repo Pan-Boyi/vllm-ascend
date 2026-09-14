@@ -73,6 +73,29 @@ def no_recorder(monkeypatch):
 
 # ------------------------------------------------------------------- off
 
+
+class _RecorderDouble:
+    """The parts of ``AlignRecorder`` that the hooks actually call.
+
+    🔴 Copied from ``debug_align.AlignRecorder`` rather than written to suit
+    the test. Five doubles in this file each carried their own subset, and
+    when the flush started stamping the manifest every one of them raised
+    ``AttributeError`` on a call production makes on every forward -- they
+    had been green on an interface that no longer existed.
+
+    Inheriting from one place means the next production method that the
+    hooks call is added once, not five times, and the drift shows up here
+    instead of in twenty-two unrelated failures.
+    """
+
+    #: Prefill records every position; a decode step names the one it owns.
+    expected_positions = None
+
+    def add_manifest(self, **kw):
+        self.manifest = {**getattr(self, "manifest", {}), **kw}
+
+
+
 def test_nothing_is_registered_when_there_is_no_recorder(no_recorder):
     """The whole argument for hooks. Not "the tap returns early" -- there is
     no tap to enter."""
@@ -119,7 +142,7 @@ def test_a_tap_function_is_never_entered_when_off(no_recorder, monkeypatch):
 def with_recorder(monkeypatch):
     calls = []
 
-    class _Recorder:
+    class _Recorder(_RecorderDouble):
         # ⚠️ Carries a seq_len like the real one. Recording is armed per
         # forward on "can this recorder size its buffer", so a double without
         # it disarms every tap and the test then asserts about a run in which
@@ -317,7 +340,7 @@ def prologue_recorder(monkeypatch):
     """A recorder that refuses record() before set_seq_len(), like the real one."""
     state = {"seq_len": None, "calls": [], "order": []}
 
-    class _Recorder:
+    class _Recorder(_RecorderDouble):
         def set_seq_len(self, seq_len):
             state["seq_len"] = seq_len
             state["order"].append("set_seq_len")
@@ -1076,7 +1099,7 @@ def test_the_inline_tap_records_when_armed(monkeypatch, with_recorder):
 
     written = []
 
-    class _Recorder:
+    class _Recorder(_RecorderDouble):
         seq_len = 4
 
         def record_layer(self, *a):
@@ -1401,7 +1424,7 @@ def test_a_prologue_key_is_recorded_once_however_many_writers_there_are():
 
     recorded = []
 
-    class _Recorder:
+    class _Recorder(_RecorderDouble):
         seq_len = 3
 
         def record(self, tag, key, tensor, row_to_pos):
@@ -1444,7 +1467,7 @@ def test_a_key_that_could_not_be_recorded_does_not_consume_its_turn():
 
     recorded = []
 
-    class _Recorder:
+    class _Recorder(_RecorderDouble):
         seq_len = 3
 
         def record(self, tag, key, tensor, row_to_pos):

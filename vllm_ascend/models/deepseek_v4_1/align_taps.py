@@ -504,6 +504,26 @@ _FORWARD_RECORDED: set = set()
 _ARMED = False
 
 
+#: Set by the arming hook when this forward is a first decode step, read by
+#: the flush to stamp the dump. A list rather than a bool so that "no decode
+#: this forward" and "decode, identity unknown" stay distinguishable.
+_DECODE_STEP_THIS_FORWARD: list = []
+
+
+def _report_armed_decode(seq_len: int) -> None:
+    from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
+
+    announce_once(
+        "dsv41_decode_step1_armed",
+        f"DSV4.1 alignment: recording DECODE STEP 1 (seq_len={seq_len}, one "
+        f"row at position {seq_len - 1}). Same key names and same shapes as "
+        "the prefill, so a key-by-key comparison between two requests needs "
+        "no translation. ⚠️ Only position "
+        f"{seq_len - 1} is expected to be written; a key that writes "
+        "anywhere else is refused and named, because a row at the wrong "
+        "position looks right and compares wrong.")
+
+
 def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
     """Fix the sequence length for this forward, or disarm it and say so.
 
@@ -540,6 +560,21 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
     except ValueError as exc:
         _ARMED = False
         _report_disarmed(str(exc))
+        return
+    from vllm_ascend.models.deepseek_v4_1 import decode_step1
+
+    identity = decode_step1.request_identity()
+    if decode_step1.is_first_decode_step(identity, rows, seq_len):
+        # 🔵 The one forward where the two arms are already known to differ.
+        # Recorded with the SAME key names and the SAME [seq_len, ...] shapes
+        # as the prefill, so the single row lands at its own absolute
+        # position and a key-by-key comparison needs no translation.
+        recorder.set_seq_len(seq_len)
+        recorder.expected_positions = [seq_len - 1]
+        decode_step1.note_decode_recorded(identity)
+        _ARMED = True
+        _DECODE_STEP_THIS_FORWARD.append(identity)
+        _report_armed_decode(seq_len)
         return
     if seq_len is not None and rows is not None and rows != seq_len:
         # 🔴 This forward cannot fill the buffer, so it must not open one.
@@ -581,6 +616,7 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
         return
     recorder.set_seq_len(seq_len)
     _ARMED = True
+    decode_step1.note_prefill(identity)
     _report_armed(seq_len)
 
 
@@ -621,6 +657,22 @@ def _flush_and_rotate(_module: torch.nn.Module, _args: tuple,
     from vllm_ascend.models.deepseek_v4_1.moe_router import \
         report_router_tap_coverage
     report_router_tap_coverage()
+    from vllm_ascend.models.deepseek_v4_1 import decode_step1
+
+    decode_step1.report_decode_step1_coverage()
+    # 🔴 Stamped, because a decode dump and a prefill dump carry the same key
+    # names and the same shapes -- which is exactly what makes them
+    # comparable, and exactly what makes them indistinguishable on disk.
+    from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
+
+    _rec = get_recorder()
+    if _rec is not None:
+        _rec.add_manifest(
+            forward_kind=("decode_step_1" if _DECODE_STEP_THIS_FORWARD
+                          else "prefill"),
+            request_identity=(_DECODE_STEP_THIS_FORWARD[-1]
+                              if _DECODE_STEP_THIS_FORWARD else None))
+    _DECODE_STEP_THIS_FORWARD.clear()
     from vllm_ascend.models.deepseek_v4_1.debug_align import rotate_recorder
 
     rotate_recorder()
