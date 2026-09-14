@@ -337,6 +337,18 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         return param_dict
 
     def process_weights_after_loading(self, layer):
+        # 🔵 The routed experts' real path: `expert_dtype == "fp4"` selects
+        # ds_w4a8_moe (configs/fp8_config.py:207-213), which is registered on
+        # *this* subclass -- the base class's version of this method does not
+        # run. Both operators downstream have been shown to use the scale
+        # they are handed faithfully, so if the magnitude is wrong, what is
+        # wrong is what we hand them.
+        from vllm_ascend.quantization.scale_layout_check import (
+            report_scale_bytes, snapshot_scales, verify_scale_layout_preserved)
+
+        _names = ("w13_weight_scale", "w2_weight_scale")
+        _scales_before = snapshot_scales(layer, _names)
+
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
             29,
@@ -359,3 +371,10 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         layer.w2_weight_scale.data = (
             layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
         )
+
+        # Reshape, view and transpose only -- no padding, no broadcast -- so
+        # the byte multiset must come out exactly as it went in.
+        verify_scale_layout_preserved(_scales_before, layer, _names,
+                                      what="ds routed expert scales")
+        report_scale_bytes(layer, _names, where="ds_w4a8 routed experts",
+                           weights=("w13_weight", ))

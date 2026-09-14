@@ -134,3 +134,40 @@ def test_a_broadcast_that_averages_instead_of_copying_is_caught():
     with pytest.raises(ValueError, match="are NEW"):
         slc.verify_scale_layout_preserved(before, layer, ("weight_scale", ),
                                           expanded={"weight_scale": 32})
+
+
+def test_bytes_are_compared_not_decoded_values():
+    """🔴 The mistake this module exists to catch, nearly made by the module.
+
+    The DS scheme declares w13_weight_scale as float8_e8m0fnu and views it as
+    uint8 inside the transform (w4a8_mxfp4.py:329-334, :357-361). A snapshot
+    that converted with .to(int64) would read the *decoded exponent* before
+    and the *stored byte* after, and compare two different quantities.
+    """
+    raw = torch.tensor([119, 121, 124, 120], dtype=torch.uint8)
+    as_e8m0 = raw.view(torch.float8_e8m0fnu)
+    assert torch.equal(slc._as_bytes(as_e8m0), slc._as_bytes(raw))
+    # And the decoded values are nothing like the bytes, which is the point.
+    decoded = as_e8m0.to(torch.float32)
+    assert not torch.equal(decoded.to(torch.int64),
+                           raw.to(torch.int64)), "otherwise this proves nothing"
+
+
+def test_the_ds_scheme_is_the_one_instrumented():
+    """⚠️ ds_w4a8_moe is registered on the SUBCLASS, which overrides
+    process_weights_after_loading. Instrumenting the base class's version --
+    which was one keystroke away -- would have watched a method that does not
+    run on this path, for the fourth time in this investigation."""
+    import inspect
+
+    from vllm_ascend.quantization.methods.w4a8 import w4a8_mxfp4
+
+    ds = w4a8_mxfp4.AscendW4A8MXFPDSDynamicFusedMoEMethod
+    base = w4a8_mxfp4.AscendW4A8MXFPDynamicFusedMoEMethod
+    assert "process_weights_after_loading" in vars(ds), (
+        "the subclass overrides it; if that stops being true the base "
+        "class's version becomes the live one and the instruments move")
+    source = inspect.getsource(ds.process_weights_after_loading)
+    assert "verify_scale_layout_preserved" in source
+    assert "report_scale_bytes" in source
+    assert ds is not base

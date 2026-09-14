@@ -29,6 +29,22 @@ import torch
 _BUCKETS = 256
 
 
+def _as_bytes(data: torch.Tensor) -> torch.Tensor:
+    """The raw bytes of a scale tensor, whatever dtype it is wearing.
+
+    🔴 ``.to(torch.int64)`` would be wrong for the dtype this actually
+    arrives in. The DS scheme declares ``w13_weight_scale`` as
+    ``float8_e8m0fnu`` and views it as uint8 inside the transform
+    (w4a8_mxfp4.py:329-334, :357-361), so a conversion would read the
+    *decoded exponent* on one side and the *stored byte* on the other, and
+    the comparison would be between two different quantities -- the exact
+    mistake this module exists to catch, made by the module itself.
+    """
+    if data.dtype not in (torch.int8, torch.uint8, torch.int32, torch.int64):
+        data = data.view(torch.uint8)
+    return data.detach().reshape(-1).to(torch.int64).cpu()
+
+
 def snapshot_scales(layer, names: tuple[str, ...]) -> dict:
     """The bytes of each named scale, before any layout change."""
     out = {}
@@ -36,7 +52,7 @@ def snapshot_scales(layer, names: tuple[str, ...]) -> dict:
         tensor = getattr(layer, name, None)
         data = getattr(tensor, "data", tensor)
         if isinstance(data, torch.Tensor):
-            out[name] = data.detach().reshape(-1).to(torch.int64).cpu()
+            out[name] = _as_bytes(data)
     return out
 
 
@@ -76,7 +92,7 @@ def verify_scale_layout_preserved(before: dict, layer,
         data = getattr(tensor, "data", tensor)
         if not isinstance(data, torch.Tensor):
             continue
-        now = data.detach().reshape(-1).to(torch.int64).cpu()
+        now = _as_bytes(data)
         pad_count, pad_value = padded.get(name, (0, 0))
         factor = int(expanded.get(name, 1))
 
@@ -146,3 +162,67 @@ def _report_ok(what: str, was: torch.Tensor, now: torch.Tensor,
 
 def reset_reports_for_test() -> None:
     _REPORTED.clear()
+
+
+def report_scale_bytes(layer, names: tuple[str, ...], *, where: str,
+                       weights: tuple[str, ...] = ()) -> None:
+    """The bytes the operator will actually receive, once per name.
+
+    🔴 Read from the parameter as it stands **after** every transform, not
+    from an intermediate: the question is what the operator gets, and every
+    step between here and it is a step that could change the answer.
+
+    The invariant beside this one proves the layout step did not alter the
+    bytes. It cannot say whether they were the right bytes when they arrived,
+    and nothing on this side of the loader can -- that needs the checkpoint's
+    own numbers, measured as 119..122 for w1/w3 (median 121) and 119..124 for
+    w2 (median 120). So the numbers are printed and the comparison is left to
+    a reader who has both.
+
+    ⚠️ A histogram summary rather than a verdict: "all zero" means the scale
+    was never populated, "shifted as a block" means the exponent bias is
+    wrong, and "reshaped distribution" means the rearrangement is -- three
+    different defects that a single pass/fail would flatten into one.
+    """
+    from vllm.logger import logger
+
+    for name in names:
+        key = f"{where}:{name}"
+        if key in _REPORTED:
+            continue
+        tensor = getattr(layer, name, None)
+        data = getattr(tensor, "data", tensor)
+        if not isinstance(data, torch.Tensor):
+            continue
+        _REPORTED.add(key)
+        flat = _as_bytes(data)
+        counts = _histogram(flat)
+        present = counts.nonzero().flatten().tolist()
+        top = sorted(present, key=lambda v: -int(counts[v]))[:6]
+        values = flat.to(torch.float32)
+        logger.info(
+            "DSV4.1 scale bytes at %s %s: shape=%s dtype=%s n=%d "
+            "min=%d median=%d max=%d, %d distinct values, most common "
+            "%s. ⚠️ Compare with the checkpoint's own: w1/w3 119..122 "
+            "(median 121), w2 119..124 (median 120). All zero => never "
+            "populated; shifted as a block => wrong exponent bias; reshaped "
+            "distribution => wrong rearrangement.",
+            where, name, tuple(data.shape), data.dtype, flat.numel(),
+            int(values.min()), int(values.median()), int(values.max()),
+            len(present), [(v, int(counts[v])) for v in top])
+
+    for name in weights:
+        key = f"{where}:{name}"
+        if key in _REPORTED:
+            continue
+        tensor = getattr(layer, name, None)
+        data = getattr(tensor, "data", tensor)
+        if not isinstance(data, torch.Tensor):
+            continue
+        _REPORTED.add(key)
+        sample = data.detach().reshape(-1)[:8].to(torch.int64).cpu().tolist()
+        logger.info(
+            "DSV4.1 packed weight at %s %s: shape=%s dtype=%s, first bytes "
+            "%s. Two 4-bit nibbles per byte while still packed; after "
+            "format_cast this is one value per byte.",
+            where, name, tuple(data.shape), data.dtype, sample)
