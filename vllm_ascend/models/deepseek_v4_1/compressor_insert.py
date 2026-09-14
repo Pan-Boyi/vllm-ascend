@@ -204,11 +204,21 @@ def fused_save_compress_norm_ascend(
                            layer_owning(slot_mapping),
                            query_start_loc=query_start_loc,
                            compress_ratio=compress_ratio)
-    _tap_write_side("fused_save_compress_norm", flat, latent_out, state_cache)
+    # 🔴 The inputs before, the output after. ``latent_out`` is an **output
+    # parameter**: the operator fills it, and the caller hands in a fresh
+    # ``torch.empty`` (compressor.py:273-278). Tapping it before the call
+    # recorded the allocator's leftovers -- and the dangerous half is that the
+    # caching allocator usually returns a recently freed block, so two calls
+    # out of three came back holding the *previous* call's latent and looked
+    # like real values. Measured across three flights: calls #0 and #1 showed
+    # plausible magnitudes and call #2 showed obvious garbage, from the same
+    # slots, every time. None of the three was an observation of anything.
+    _tap_write_side("fused_save_compress_norm", flat, None, state_cache)
     fused_save_compress_norm(
         kv_score, positions, state_cache, flat,
         query_start_loc, token_to_req_indices, rms_norm_weight, rms_norm_eps,
         compress_ratio, latent_out)
+    _tap_output("fused_save_compress_norm", latent_out)
 
 
 _WRITE_CALLS: dict = {}
@@ -259,16 +269,20 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
         #   so a bit-exact comparison counted them as model differences.
         prefix = f"read.compressor.{who}.{index:02d}"
         align_taps.tap_whole(0, f"{prefix}.slots", flat_slots)
-        # ⚠️ `latent` is `torch.empty` (upstream compressor.py:273-278) and is
-        # written only at valid group boundaries, so the rows whose slot is
-        # negative are **uninitialised memory** -- measured as the constant
-        # 5.0097551721019626e+33, which is a recognisable bit pattern and not
-        # a value. Recorded whole rather than masked, because masking would
-        # change the shape and hide which rows those are; the companion
-        # `.slots` says exactly which to drop, and the key's meaning says so
-        # too. Reported once so the log says it as well as the manifest.
+        # ⚠️ `latent` here is an **input** -- the tensor this call will read --
+        # and rows whose slot is negative were never written by whoever
+        # produced it, so they are uninitialised memory.
+        #
+        # 🔴 Do NOT key a detector on a particular value. An earlier version
+        # of this comment named "the constant 5.0097551721019626e+33" from one
+        # flight; measured across three, the residue is a different bit
+        # pattern every time (|max| per row ran 5e33, 8e37, 1.6e38, and one
+        # NaN). It is uninitialised memory, which has no value to recognise --
+        # that is the whole of what is wrong with it. Use the companion
+        # `.slots` key, which says which rows to drop and is true every run.
         _report_uninitialised_rows(who, flat_slots, latent)
-        align_taps.tap_whole(0, f"{prefix}.latent", latent)
+        if latent is not None:
+            align_taps.tap_whole(0, f"{prefix}.latent", latent)
         # 🔴 Correction. This used to be hashed, with a comment saying the
         # hash let the four-rank same-state comparison report a clean zero.
         # That was wrong: hashing a pointer that differs per process gives a
@@ -292,6 +306,26 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
         pass
 
 
+def _tap_output(who: str, latent) -> None:
+    """An output parameter, recorded after the call that fills it.
+
+    Separate from ``_tap_write_side`` and deliberately not merged with it:
+    "what this call was handed" and "what this call produced" are taken at
+    different moments, and one function taking both would have to be told
+    which moment it is in -- a parameter whose wrong value is silent.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
+
+    if not align_taps.alignment_active() or not read_taps.read_tap_layers():
+        return
+    try:
+        index = max(_WRITE_CALLS.get(who, 1) - 1, 0)
+        align_taps.tap_whole(
+            0, f"read.compressor.{who}.{index:02d}.latent_out", latent)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def _report_uninitialised_rows(who: str, flat_slots, latent) -> None:
     """Say how many recorded rows were never written, once per writer.
 
@@ -299,7 +333,7 @@ def _report_uninitialised_rows(who: str, flat_slots, latent) -> None:
     was ever stored, and a comparison that does not know to drop those rows
     reports them as model differences -- which is what happened.
     """
-    if who in _REPORTED_UNINITIALISED:
+    if latent is None or who in _REPORTED_UNINITIALISED:
         return
     try:
         invalid = int((flat_slots.reshape(-1) < 0).sum())

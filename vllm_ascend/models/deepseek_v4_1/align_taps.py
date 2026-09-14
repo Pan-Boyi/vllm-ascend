@@ -110,14 +110,23 @@ KEY_SEMANTICS: dict = {
                  "times the size. Named to match golden's rope.kv.in",
     "read.compressor.*.latent":
         "🔴 an **instrument read-back**, not a model tensor -- hence the "
-        "`read.` prefix. It is the compressor's `latent`, which upstream "
-        "allocates with `torch.empty` (compressor.py:273-278) and fills only "
-        "at valid group boundaries, so every row whose companion `.slots` "
-        "entry is negative is **uninitialised memory**: measured as the "
-        "constant 5.0097551721019626e+33, a recognisable bit pattern that "
-        "looks like a value. ⚠️ Drop those rows using `.slots` before "
-        "comparing anything; a comparison that does not counts them as model "
-        "differences, which is what happened",
+        "`read.` prefix. It is the latent this compressor call was handed, "
+        "recorded before the call. Rows whose companion `.slots` entry is "
+        "negative were never written by whoever produced it and are "
+        "**uninitialised memory**. ⚠️ Do not key a detector on a particular "
+        "value: measured across three flights the residue is a different bit "
+        "pattern each time (per-row |max| ran 5e33, 8e37, 1.6e38, and one "
+        "NaN). There is no value to recognise -- that is the whole of what is "
+        "wrong with it. Use `.slots`, which says which rows to drop and is "
+        "true every run",
+    "read.compressor.*.latent_out":
+        "the latent a compressor call **produced**, recorded after the call. "
+        "🔴 The distinction is not pedantry: `latent_out` is an output "
+        "parameter filled by the operator, so recording it beforehand records "
+        "the allocator's leftovers -- and because the caching allocator "
+        "usually hands back a recently freed block, two calls in three came "
+        "back holding the *previous* call's latent and looked like real "
+        "values. That is the dangerous half; obvious garbage is the safe half",
     "read.compressor.*.slots":
         "the flat destination slots this compressor call was handed, taken "
         "before the operator runs. Also the mask for the `.latent` key above: "
@@ -132,7 +141,16 @@ KEY_SEMANTICS: dict = {
                    "quantisation after the rotation, so unlike golden there "
                    "is no separate quant.window.in/out between this and the "
                    "cache -- this value and the cache row are the same "
-                   "numbers (measured, E_err/E_gold = 1e-6)",
+                   "numbers (measured, E_err/E_gold = 1e-6). ⚠️ **float32**: "
+                   "rope_tail computes in fp32 and the cast to the cache's "
+                   "bf16 happens in the scatter, so this key is the unrounded "
+                   "value and the cache row is its bf16 rounding. 🔴 It is "
+                   "the SLIDING-WINDOW stream on every layer, ratio-2 "
+                   "included -- the same rows as "
+                   "read.write.ori_kv.latent_pre_rope, one stage later. The "
+                   "compressed stream never passes through here, and this "
+                   "side never concatenates the two the way golden's "
+                   "sa_in.kv does",
     "sa_in.q": "the query handed to the sparse-attention operator, after "
                "rope and quantisation, sliced to n_local_heads",
     "sa_in.kv": "🔴 the **pre-RoPE**, post-kv_norm kv -- ✅ measured, not "
@@ -211,6 +229,15 @@ KEY_SEMANTICS: dict = {
     #                   the same stage -- the rotation does not reach it --
     #                   which is what makes "the kv projection is clean,
     #                   0.099% error energy" a real result.
+    "read.write.ori_kv.latent_pre_rope":
+        "🔴 the **sliding-window** stream's row, pre-RoPE: the `kv` argument "
+        "of _fused_qnorm_rope_kv_insert, post-kv_norm, which is what gets "
+        "rotated into the SWA cache. ⚠️ 'latent' here means the MLA latent "
+        "row (512 wide), **not** the compressed-stream latent -- that one is "
+        "read.compressor.*.latent_out and comes from an entirely different "
+        "path (kv_score -> fused_save_compress_norm). The name has misled a "
+        "reader already; kept because renaming mid-investigation costs more "
+        "than it saves, and corrected here instead",
     "read.ori_kv": "rows of the original-stream KV cache: post-RoPE, bf16, "
                    "[448 NoPE | 64 RoPE], addressed block*page+offset. "
                    "The page is taken from THIS tensor's own shape, never "
