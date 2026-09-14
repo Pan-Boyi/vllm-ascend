@@ -184,3 +184,63 @@ def test_the_collapse_window_covers_the_whole_checkpoint_range():
     window = set((collapsed == 134).nonzero().flatten().tolist())
     assert set(range(119, 125)).issubset(window)
     assert len(window) == 96, len(window)
+
+
+def test_the_loaders_half_of_the_contract_is_still_there():
+    """🔵 The contract has two halves and needs both.
+
+    Our half is the parameter dtype, checked above. Upstream's half is the
+    uint8 *view* taken before the copy, at nvidia/model.py:745-754::
+
+        # E8M0 scales are stored as float8_e8m0fnu in checkpoints but the
+        # MoE param is uint8. copy_() would do a numeric conversion
+        # (e.g. 2^-7 -> 0), destroying the raw exponent bytes.
+
+    🔴 If an upstream bump drops that line, our uint8 parameter receives an
+    e8m0 tensor and the copy converts the OTHER way -- 2^-7 becomes 0, so the
+    scales go to zero rather than to a constant 134. Two opposite symptoms,
+    one contract, and neither raises. The parameter-side check cannot see it,
+    because from that side nothing changed.
+
+    ⚠️ Asserted on the file this model actually inherits from
+    (AscendDeepseekV41ForCausalLM defines no load_weights of its own), not on
+    a path that merely looks right.
+    """
+    import pathlib
+
+    from vllm_ascend.models.deepseek_v4_1.model import (
+        AscendDeepseekV41ForCausalLM)
+
+    assert "load_weights" not in vars(AscendDeepseekV41ForCausalLM), (
+        "this test reasons about the inherited loader; if this class grows "
+        "its own load_weights, the reasoning has to be redone")
+
+    import vllm.models.deepseek_v4_1.nvidia.model as upstream_model
+
+    src = pathlib.Path(upstream_model.__file__).read_text()
+    tree = ast.parse(src)
+
+    # 🔴 AST, not a substring window. The first version checked the 400
+    # characters before the view for "float8_e8m0fnu" -- and upstream's
+    # *comment* right above it contains that word, so removing the guard left
+    # the check green. A substring test cannot tell a condition from a
+    # sentence explaining the condition.
+    guards = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        body = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        if "view(torch.uint8)" not in body:
+            continue
+        guards.append(ast.unparse(node.test))
+
+    assert guards, (
+        "upstream's expert-scale uint8 view is gone, or is no longer inside "
+        "an `if`. Our parameter is uint8, so the copy now converts an e8m0 "
+        "tensor the other way and the scales collapse to ZERO rather than to "
+        "134 -- a different symptom of the same broken contract, and nothing "
+        "raises.")
+    assert any("float8_e8m0fnu" in g and "weight_scale" in g for g in guards), (
+        "the uint8 view is no longer conditioned on an e8m0 weight_scale "
+        f"(conditions found: {guards}); applied to anything else it would "
+        "reinterpret unrelated bytes")

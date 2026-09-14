@@ -323,16 +323,30 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """🔴 uint8, like every other scale parameter in this tree.
+        """🔴 uint8, because upstream's loader contract requires it.
 
-        These two were declared ``float8_e8m0fnu``, and they were the only
-        two in the whole quantization tree that were. The loader moves the
-        checkpoint's scale as **raw bytes** (uint8), so a copy into an E8M0
-        parameter is a *value* conversion, not a byte move: every byte in
+        Not inferred any more -- cited. ``nvidia/model.py:745-754`` views the
+        checkpoint's expert scale to uint8 before the copy, and says why::
+
+            # E8M0 scales are stored as float8_e8m0fnu in checkpoints but the
+            # MoE param is uint8. copy_() would do a numeric conversion
+            # (e.g. 2^-7 -> 0), destroying the raw exponent bytes.
+
+        🔵 So the contract has **two halves and needs both**: the loader hands
+        over a uint8 *view*, and the parameter is declared uint8. These two
+        were declared ``float8_e8m0fnu`` -- the only two in the whole
+        quantization tree that were -- which kept upstream's half and broke
+        ours. A copy into an E8M0 parameter is then a *value* conversion
+        rather than a byte move: every byte in
         96..191 rounds to the same power of two and is stored as 134. The
         checkpoint's own bytes are 119..122 for w1/w3 and 119..123 for w2,
         all inside that window, so all 70,778,880 of them collapsed to the
         single value 134 -- scale 2^7 = 128 where 2^-6 was meant.
+
+        ⚠️ Upstream's example is the OTHER direction (an e8m0 source into a
+        uint8 param gives 0); ours was a uint8 view into an e8m0 param giving
+        134. Same defect, two directions, and only one of them was ours --
+        the other is what happens if that view line is ever dropped.
 
         Measured, not reasoned: flight xr_sc2_040330 read min=median=max=134,
         1 distinct value, on both keys; the same instrument in the same
