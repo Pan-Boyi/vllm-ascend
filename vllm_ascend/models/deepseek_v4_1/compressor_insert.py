@@ -242,7 +242,13 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
     """
     from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
 
-    if not align_taps.alignment_active() or not read_taps.read_tap_layers():
+    # 🔴 recording_armed(), not alignment_active(). The second is the env
+    # switch and is true on every decode step too; the first is per forward
+    # and is what decides whether a record reaches a dump. Counting under one
+    # and resetting under the other left the index running process-wide --
+    # measured as 00..03 for one request and 44..47 for the next, the same
+    # tensor under two names in two dumps. Count only when you record.
+    if not align_taps.recording_armed() or not read_taps.read_tap_layers():
         return
     try:
         index = _WRITE_CALLS.get(who, 0)
@@ -316,7 +322,7 @@ def _tap_output(who: str, latent) -> None:
     """
     from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
 
-    if not align_taps.alignment_active() or not read_taps.read_tap_layers():
+    if not align_taps.recording_armed() or not read_taps.read_tap_layers():
         return
     try:
         index = max(_WRITE_CALLS.get(who, 1) - 1, 0)

@@ -79,8 +79,134 @@ def create_ascend_router_for_upstream(**kwargs):
             "different rule than the caller asked for, with no error. The "
             "Ascend factory needs extending before this configuration can run.")
 
-    return create_ascend_fused_moe_router(
+    router = create_ascend_fused_moe_router(
         **{k: v for k, v in kwargs.items() if k in accepted})
+    _report_router_arguments(kwargs, accepted)
+    return _tap_select_experts(router)
+
+
+#: Arguments whose **default is a behaviour**. Each is a value the caller must
+#: set for this model and gets wrong by omission, silently. Two have already
+#: cost a flight in this family -- ``apply_q_norm`` (default True, V4.1 needs
+#: False) and ``swiglu_limit`` (default 0.0 = no clamp) -- so these are
+#: reported with what actually arrived rather than checked against a guess.
+#:
+#: ⚠️ ``routed_scaling_factor`` defaults to 1.0 and this model's config says
+#: 1.5. Static reading says upstream passes it; this line is the runtime
+#: evidence, which static reading is not.
+_BEHAVIOURAL_DEFAULTS = (
+    "top_k", "global_num_experts", "scoring_func", "renormalize",
+    "routed_scaling_factor", "num_fused_shared_experts",
+    "shared_expert_weight", "use_grouped_topk", "num_expert_group",
+    "topk_group",
+)
+
+_REPORTED_ARGUMENTS = False
+
+
+def _report_router_arguments(kwargs: dict, accepted: set) -> None:
+    """The values this router was actually built with, once.
+
+    🔴 Not a check. A check needs a known-right value to compare against, and
+    for half of these nobody has written one down; what was missing was the
+    *reading*. Reported at the factory's exit because that is the one point
+    where the caller's intent and the object that will act on it meet.
+    """
+    global _REPORTED_ARGUMENTS
+    if _REPORTED_ARGUMENTS:
+        return
+    _REPORTED_ARGUMENTS = True
+    from vllm.logger import logger
+
+    seen = {name: kwargs.get(name, "<not passed -- DEFAULT>")
+            for name in _BEHAVIOURAL_DEFAULTS}
+    dropped = sorted(set(kwargs) - accepted)
+    logger.info(
+        "DSV4.1 MoE router built with: %s. Arguments upstream passed that the "
+        "Ascend factory does not take (all at upstream's default, or this "
+        "would have raised): %s.", seen, dropped or "none")
+
+
+def _tap_select_experts(router):
+    """Record the routing decision at the one door both MoE paths use.
+
+    🔴 Why here and not on the gate module. ``moe_gate.out`` was first hooked
+    on ``ffn.gate``, and that hook can never fire on this platform: the fused
+    layer does not call the gate as a module at all, it reads ``gate.weight``
+    and does the matmul itself (ops/fused_moe/fused_moe.py:306-312). "It did
+    not fire this time" and "it can never fire" need different fixes -- wait
+    for the condition, or move the hook -- and only tracing who actually does
+    the work separates them.
+
+    ``select_experts`` is the non-abstract method on ``FusedMoERouter`` that
+    every implementation goes through and that returns ``(topk_weights,
+    topk_ids)``, so one wrapper covers both the mega and the fused path.
+
+    ⚠️ The wrapper also counts its own calls. An absent key has three causes
+    -- no alignment run, this path not taken, the hook attached to something
+    that is never called -- and the third is what bit the gate hook. An
+    attribute test cannot see it; an accounting bit can.
+    """
+    import torch
+
+    original = router.select_experts
+
+    def _select_experts(*args, **kwargs):
+        weights, ids = original(*args, **kwargs)
+        global _ROUTER_CALLS
+        _ROUTER_CALLS += 1
+        try:
+            from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+            if align_taps.alignment_active():
+                layer = align_taps.current_layer()
+                if layer is not None:
+                    # golden's own key names, so the two dumps need no
+                    # mapping: .0 is the normalised top-k weights and .1 the
+                    # expert ids.
+                    align_taps.tap(layer, "moe_gate.out.0", weights,
+                                   align_taps.current_positions())
+                    align_taps.tap(layer, "moe_gate.out.1", ids,
+                                   align_taps.current_positions())
+                else:
+                    _report_no_layer()
+        except Exception:                                    # noqa: BLE001
+            # Instrument. It has already cost this line one flight to let one
+            # of these propagate.
+            pass
+        return weights, ids
+
+    router.select_experts = _select_experts
+    return router
+
+
+_ROUTER_CALLS = 0
+_REPORTED_NO_LAYER = False
+
+
+def router_tap_calls() -> int:
+    """How many times the routing tap has run. Zero is a reading, not a gap."""
+    return _ROUTER_CALLS
+
+
+def reset_router_tap_for_test() -> None:
+    global _ROUTER_CALLS, _REPORTED_ARGUMENTS, _REPORTED_NO_LAYER
+    _ROUTER_CALLS = 0
+    _REPORTED_ARGUMENTS = False
+    _REPORTED_NO_LAYER = False
+
+
+def _report_no_layer() -> None:
+    global _REPORTED_NO_LAYER
+    if _REPORTED_NO_LAYER:
+        return
+    _REPORTED_NO_LAYER = True
+    from vllm.logger import logger
+
+    logger.warning(
+        "DSV4.1 MoE router tap ran outside any decoder layer's forward, so it "
+        "cannot say which layer the routing belongs to and recorded nothing. "
+        "A key under the wrong layer would be worse than an absent one.")
 
 
 def apply_moe_router_patch() -> bool:

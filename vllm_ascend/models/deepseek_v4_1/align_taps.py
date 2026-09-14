@@ -874,11 +874,18 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
 #:   moe.shared.out   the shared expert, which every token goes through and
 #:                    which is added separately (ref/model.py:889-891)
 _MOE_TAPS: tuple[tuple[str, str], ...] = (
-    # 🔵 golden's own key name, so the two dumps need no mapping: the gate
-    # returns (weights, indices) and _flatten_outputs suffixes them, giving
-    # moe_gate.out.0 (F32 [T, topk] weights) and moe_gate.out.1 (I64 [T, topk]
-    # expert ids) -- exactly what golden records.
-    ("gate", "moe_gate.out"),
+    # 🔴 No ("gate", ...) entry, and it is not an oversight. On this platform
+    # the fused layer never calls the gate as a module -- it reads
+    # gate.weight and does the matmul itself
+    # (ops/fused_moe/fused_moe.py:306-312) -- so a hook there can never fire,
+    # on either MoE path. Measured: 160 reconstruction lines across 40 layers
+    # and 4 ranks, zero successful.
+    #
+    # moe_gate.out.0/.1 now come from the router's own select_experts
+    # (moe_router._tap_select_experts), the one non-abstract method every
+    # router implementation goes through. Re-adding an entry here would
+    # record the key twice on the mega path, and a duplicated key is refused
+    # by position coverage.
     ("experts", "moe.experts.out"),
     ("shared_experts", "moe.shared.out"),
 )
@@ -1549,6 +1556,24 @@ def coverage_report(recorded: set[str], golden_dir: str | None) -> dict:
         "expected_count": len(wanted),
         "recorded_count": len(recorded),
     }
+
+
+def recording_armed() -> bool:
+    """Whether **this forward** is one whose tensors will reach a dump.
+
+    🔴 Distinct from :func:`alignment_active`, and conflating them cost a
+    correction. ``alignment_active`` is the env switch: true for the whole
+    server, decode steps included. ``_ARMED`` is per forward, and it is what
+    decides whether a record survives.
+
+    A tap that *counts* under one condition and *resets* under the other is
+    not scoped to anything: measured, the compressor's call index ran
+    00..03 for the first request and 44..47 for the second, because 11 decode
+    steps x 4 layers incremented it while the reset -- which runs only on an
+    armed forward -- never fired for them. The counter has to be gated by the
+    same thing the recording is.
+    """
+    return _ARMED
 
 
 def alignment_active() -> bool:

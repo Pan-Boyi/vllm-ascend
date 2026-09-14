@@ -335,7 +335,7 @@ def test_the_write_side_is_recorded_before_the_operator_runs(monkeypatch):
 
     order = []
     monkeypatch.setattr(
-        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        "vllm_ascend.models.deepseek_v4_1.align_taps.recording_armed",
         lambda: True)
     monkeypatch.setattr(
         "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
@@ -357,7 +357,7 @@ def test_calls_are_numbered_so_a_forward_can_be_ordered(monkeypatch):
 
     keys = []
     monkeypatch.setattr(
-        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        "vllm_ascend.models.deepseek_v4_1.align_taps.recording_armed",
         lambda: True)
     monkeypatch.setattr(
         "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
@@ -399,7 +399,7 @@ def test_a_failing_write_tap_does_not_reach_the_operator(monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(
-        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        "vllm_ascend.models.deepseek_v4_1.align_taps.recording_armed",
         lambda: True)
     monkeypatch.setattr(
         "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
@@ -625,7 +625,7 @@ def test_the_call_index_restarts_each_forward(monkeypatch):
 
     keys = []
     monkeypatch.setattr(
-        "vllm_ascend.models.deepseek_v4_1.align_taps.alignment_active",
+        "vllm_ascend.models.deepseek_v4_1.align_taps.recording_armed",
         lambda: True)
     monkeypatch.setattr(
         "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
@@ -698,3 +698,46 @@ def test_rows_that_were_never_written_are_reported(monkeypatch, caplog):
     ci._report_uninitialised_rows(
         "rope_quant_insert", torch.tensor([1, 2]), torch.zeros(2, 4))
     assert said == []
+
+
+def test_the_index_does_not_advance_on_an_unarmed_forward(monkeypatch):
+    """🔴 The property that was missing, and the reason the fix did not take.
+
+    The tap counted under alignment_active() -- the env switch, true on every
+    decode step -- and reset under _ARMED, which is per forward. So 11 decode
+    steps x 4 layers advanced the index while the reset never fired for them,
+    and the same tensor arrived in two dumps under two names: 00..03 for one
+    request and 44..47 for the next.
+
+    ⚠️ The existing tests could not see this. They patched the gate the code
+    was using, so they were green whichever gate that was. A test that names
+    the condition it is standing in for cannot tell you the condition is the
+    wrong one; only one that exercises the *other* state can.
+    """
+    import vllm_ascend.models.deepseek_v4_1.compressor_insert as ci
+
+    keys = []
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.read_taps.read_tap_layers",
+        lambda: (2, ))
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.tap_whole",
+        lambda layer, key, tensor: keys.append(key))
+    ci.reset_write_taps_for_test()
+
+    # Unarmed: a decode step. Nothing recorded, and nothing counted.
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.recording_armed",
+        lambda: False)
+    for _ in range(44):
+        ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                           torch.zeros(1, 4), torch.zeros(4, 4))
+    assert keys == []
+
+    # Armed: the next recorded forward starts at 00, not at 44.
+    monkeypatch.setattr(
+        "vllm_ascend.models.deepseek_v4_1.align_taps.recording_armed",
+        lambda: True)
+    ci._tap_write_side("rope_quant_insert", torch.tensor([5]),
+                       torch.zeros(1, 4), torch.zeros(4, 4))
+    assert keys[0] == "read.compressor.rope_quant_insert.00.slots"
