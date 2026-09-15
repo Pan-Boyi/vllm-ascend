@@ -397,11 +397,18 @@ def _cu_seqlens_diagnosis(t) -> str:
         return f"\n  (取不到值: {type(exc).__name__}: {exc})"
     bad = [i for i in range(1, len(v)) if v[i] < v[i - 1]]
     head = v if len(v) <= 24 else v[:12] + ["…"] + v[-12:]
-    return (f"\n  cu_seqlens_q = {head}"
-            f"\n  第一处下降在下标 {bad[0]}: {v[bad[0]-1]} -> {v[bad[0]]}"
-            f"  (共 {len(bad)} 处下降, 长度 {len(v)})" if bad else
-            f"\n  cu_seqlens_q = {head}  (没找到下降位 —— 判据和诊断不一致,"
-            f" 这本身是个结论)")
+    # 🔴 在 host 拷贝上把同一个谓词【复算一遍】。设备说"不单调"而 host 说
+    #    "单调",不是两个读数打架而是一条定位:此刻设备侧的读回本身不可信
+    #    (2026-09-15 实测:守卫开火前一秒,两个 tap 刚在 aclnnNonzeroV2 上失败)。
+    #    两侧都说"不单调"才是数据真的有问题。
+    verdict = ("设备侧=不单调 / host侧=不单调  ⇒ 数据确实有问题"
+               if bad else
+               "设备侧=不单调 / host侧=**单调**  ⇒ 🔴 两侧矛盾:"
+               "此刻设备读回不可信,先查这之前有没有算子失败污染了上下文")
+    where = (f"\n  第一处下降在下标 {bad[0]}: {v[bad[0]-1]} -> {v[bad[0]]}"
+             f"  (共 {len(bad)} 处下降, 长度 {len(v)})" if bad else
+             f"\n  (host 侧扫不到任何下降位, 长度 {len(v)})")
+    return f"\n  {verdict}\n  cu_seqlens_q = {head}{where}"
 
 
 def _check_block_table_addresses_this_cache(kwargs: dict[str, Any],
@@ -593,10 +600,19 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
                f"got shape {tuple(cu_seqlens_q.shape)} for {num_requests} requests"
                " (⚠️ 恒真式:num_requests 就是从这个 numel 算出来的)")
-        _check(_device_predicate(torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1])),
-               "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
-               "the values are not non-decreasing, so they are lengths rather "
-               "than a cumulative sum" + _cu_seqlens_diagnosis(cu_seqlens_q))
+        # 🔴 先求值、只在【要抛】的时候才造 detail。
+        #    上一版把 _cu_seqlens_diagnosis(...) 直接写进 _check 的第三个实参,
+        #    而 Python 在调用前会把三个实参**全部**求值 ⇒ 每一次 forward 都做
+        #    一次 host 读回。检查通过时它不打印任何东西,所以这个代价在日志里
+        #    完全看不见 —— 一个只在"没出事"时才付、且永远不会被注意到的代价。
+        _ok_device = _device_predicate(
+            torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1]))
+        if not _ok_device:
+            _check(False,
+                   "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
+                   "the values are not non-decreasing, so they are lengths "
+                   "rather than a cumulative sum"
+                   + _cu_seqlens_diagnosis(cu_seqlens_q))
 
     if layout_kv != "TND":
         for name in ("cu_seqlens_ori_kv", "cu_seqlens_cmp_kv"):

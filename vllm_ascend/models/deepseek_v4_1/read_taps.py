@@ -77,8 +77,45 @@ def read_tap_layers() -> tuple[int, ...]:
     return tuple(dict.fromkeys(out))
 
 
+#: 这个 tap 模块为什么没记东西。**三格，不是一个布尔**：
+#: "捕获期跳过的" / "这层本来就不在 tap 清单里" / "真的记了"
+#: —— dump 里缺一个键时,这三种原因必须能分开读出来,否则
+#: 「仪器被关了」和「这层没什么可记」长得一模一样。
+_READ_GATE: dict = {"recorded": 0, "skipped_under_capture": 0, "not_in_layers": 0}
+
+
+def read_gate_accounting() -> dict:
+    """本模块的覆盖量。无条件可读,包括全零。"""
+    return dict(_READ_GATE)
+
+
 def records_reads(layer_id: int) -> bool:
-    return layer_id in read_tap_layers()
+    """这一层要不要记读侧 —— 捕获期一律不记。
+
+    🔴 为什么门装在这里(2026-09-15):本模块**一个捕获门都没有**,而它做
+    ``int(tensor)``、``tensor.tolist()``、以及 ``flat[flat >= 0]``
+    (布尔掩码 ⇒ 数据依赖形状,底层就是 aclnnNonzeroV2)。图捕获的 warmup 里
+    这些整片非法。
+    审计过全部 16 个顶层函数:三个公开入口 tap_read / tap_cache_read /
+    tap_operator_rows 都在**第一处 host 读回之前**调本函数(148 / 165<183 /
+    295<304),四个无门的私有助手只能从这两个入口到达 ⇒ 门装在这一处就够,
+    不是半个门。
+
+    ⚠️ 代价说清楚:捕获期**不产出读侧 tap**。这不是缺陷而是范围 ——
+    捕获喂的是 dummy 数据,记下来也不代表任何一个真实请求;
+    真实请求走 replay,不在捕获里。
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _READ_GATE["skipped_under_capture"] += 1
+        return False
+    if layer_id in read_tap_layers():
+        _READ_GATE["recorded"] += 1
+        return True
+    _READ_GATE["not_in_layers"] += 1
+    return False
 
 
 def _never_breaks_the_run(fn):
