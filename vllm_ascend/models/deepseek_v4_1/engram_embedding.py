@@ -514,7 +514,9 @@ class AscendStagedEngramEmbedding:
             #    永远没有读者,而"没有读者"和"没有差异"产物一样。
             # 🔴 桶号用 num_tokens(=rows//part_n_hash_cols),不是探针的 dim0。
             _tok = int(indices.shape[0])
-            _lyr = getattr(self, "layer_hash_index", "x")
+            # 🔴 layer_hash_index 在【Engram】上,不在本类上(实测:getattr 取到
+            #    默认值 "x",两层撞同一个键)。本类自己的是 _layer_id。
+            _lyr = getattr(self, "_layer_id", "x")
             graph_probe.adopt(f"engram.L{_lyr}.host_saw", self._dev_probe, _tok)
             graph_probe.adopt(f"engram.L{_lyr}.ids_device",
                               self._dev_ids_stat, _tok)
@@ -781,7 +783,14 @@ def _engram_host_gather(payload) -> None:
     from vllm_ascend.models.deepseek_v4_1.engram_layout import         gather_into_staging
 
     try:
-        weight_table, scale_table, ids_np, host_weight, host_scale, rows = payload
+        # 🔴 按【切片】解包,不按元组长度。2026-09-15 实测代价:我给 payload
+        #    加了第 7 项(探针区)却没改这一行 ⇒
+        #    ValueError('too many values to unpack (expected 6)')
+        #    而这句在 gather_into_staging 【之前】⇒ 那一发 gather 一次都没跑,
+        #    回调报错 1248 次、EXECUTED 0 次,整发数据作废。
+        #    切片解包让"加一项"不再是一次跨文件的 arity 修改。
+        weight_table, scale_table, ids_np, host_weight, host_scale, rows = \
+            payload[:6]
         row_ids = ids_np[:rows]
         if row_ids.dtype != np.int64:
             row_ids = row_ids.astype(np.int64)
