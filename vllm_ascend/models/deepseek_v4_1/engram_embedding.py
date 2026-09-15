@@ -355,6 +355,19 @@ class AscendStagedEngramEmbedding:
                     f"pinned={_t.is_pinned()}; the capture route needs "
                     "dense pinned CPU memory or its async copies are not "
                     "capturable.")
+        # 🔴 5 个 int64 的 probe 区,捕获【前】分配(和别的 pinned 一样):
+        #    [行数, id 之和, 首 id, 末 id, 这是第几次回调]
+        self._pin_probe = torch.empty(5, dtype=torch.int64,
+                                      device="cpu", pin_memory=True)
+        self._pin_probe.zero_()
+        assert self._pin_probe.is_pinned()
+        self._dev_probe = torch.empty(5, dtype=torch.int64,
+                                      device=self._dev_weight.device)
+        # 设备侧的 id 指纹,由捕获链里的 kernel 填(和 host 侧那份对照)
+        self._dev_ids_stat = torch.empty(5, dtype=torch.int64,
+                                         device=self._dev_weight.device)
+        self._dev_ids_stat.zero_()
+        self._pin_probe_np = self._pin_probe.numpy()
         self._pin_ids64_np = self._pin_ids64.numpy()
         self._pin_ids32_np = self._pin_ids32.numpy()
         self._pin_weight_np = self._pin_weight.numpy()
@@ -455,7 +468,8 @@ class AscendStagedEngramEmbedding:
         #    只有捕获期的调用会走到这里（重放不执行 Python），
         #    所以它的上界是 (被捕获的形状数 × warmup 次数)，不随请求增长。
         payload = (weight_table, scale_table, ids_np,
-                   self._pin_weight_np, self._pin_scale_np, rows)
+                   self._pin_weight_np, self._pin_scale_np, rows,
+                   getattr(self, "_pin_probe_np", None))
         _CAPTURED_PAYLOADS.append(payload)
         if len(_CAPTURED_PAYLOADS) == 1:
             # 🔴 与 "callback EXECUTED" 对称的证据行。两条一起才分得开三种去向：
@@ -472,10 +486,38 @@ class AscendStagedEngramEmbedding:
                 rows)
         torch_npu.npu._launch_host_func(stream, _engram_host_gather, payload)
 
+        # 🔴 探针的 H2D 必须排在 weight/scale 【之前】。
+        #    排在之后时,回调只要落在两者之间,探针就会报"host 看到的正是这一步
+        #    的 id",而 weight 已经搬走了上一步的 —— 判据在它要判的那个问题上
+        #    系统性偏绿,而偏松的错会发一张假的安全证明且永不被发现。
+        #    排在前面则错向偏红:探针可能报旧值而 weight 是新的,那会让我们
+        #    多查一次,不会让我们漏掉。
+        if getattr(self, "_dev_probe", None) is not None:
+            self._dev_probe.copy_(self._pin_probe, non_blocking=True)
         self._dev_weight[:rows].copy_(self._pin_weight[:rows],
                                       non_blocking=True)
         self._dev_scale[:rows].copy_(self._pin_scale[:rows],
                                      non_blocking=True)
+        if getattr(self, "_dev_probe", None) is not None:
+            # 设备侧指纹:全是 kernel,会被录进图、每次 replay 重算。
+            # 和 host 侧那 5 个槽位一一对应,可以直接比。
+            self._dev_ids_stat[0] = flat.numel()
+            self._dev_ids_stat[1] = flat.to(torch.int64).sum()
+            self._dev_ids_stat[2] = flat[0].to(torch.int64)
+            self._dev_ids_stat[3] = flat[-1].to(torch.int64)
+            from vllm_ascend.models.deepseek_v4_1 import graph_probe
+            # 🔴 adopt 不是 probe:这里【正在捕获中】,probe() 会在图内存池里
+            #    分配 buffer。两块都是 _allocate_pinned_for_capture 在捕获前
+            #    分配好的,这里只登记。
+            # 🔴 键名必须带【层号】:两个 engram 层都会走到这里,而 adopt 里
+            #    `if key not in _BUFS` 只登记先来的那个 ⇒ 另一层的 buffer
+            #    永远没有读者,而"没有读者"和"没有差异"产物一样。
+            # 🔴 桶号用 num_tokens(=rows//part_n_hash_cols),不是探针的 dim0。
+            _tok = int(indices.shape[0])
+            _lyr = getattr(self, "layer_hash_index", "x")
+            graph_probe.adopt(f"engram.L{_lyr}.host_saw", self._dev_probe, _tok)
+            graph_probe.adopt(f"engram.L{_lyr}.ids_device",
+                              self._dev_ids_stat, _tok)
 
         self._dequantize_staged(rows, out)
 
@@ -745,6 +787,18 @@ def _engram_host_gather(payload) -> None:
             row_ids = row_ids.astype(np.int64)
         gather_into_staging(weight_table, scale_table, row_ids,
                             host_weight[:rows], host_scale[:rows])
+        # 🔴 把【回调实际读到的那批 id】的指纹写出来。这是把"同步"和
+        #    "gather 逻辑"分开的唯一办法:设备侧的 indices 我们能探到,
+        #    回调看到的 id 此前【没有任何产物】—— 而两者不一致正是
+        #    "D2H 的顺序在重放时没保证"会留下的那个痕迹。
+        #    写进 pinned probe 区,由捕获链里的 H2D 带回设备,再被图段探针读走。
+        if len(payload) >= 7 and payload[6] is not None:
+            _pin_probe = payload[6]
+            _pin_probe[0] = int(row_ids.size)
+            _pin_probe[1] = int(row_ids.sum())
+            _pin_probe[2] = int(row_ids[0]) if row_ids.size else -1
+            _pin_probe[3] = int(row_ids[-1]) if row_ids.size else -1
+            _pin_probe[4] = _HOST_GATHER_CALLS[0] + 1   # 本次是第几次回调
         _HOST_GATHER_CALLS[0] += 1
         if _HOST_GATHER_CALLS[0] == 1:
             # 🔴 "回调一次都没被投递" 是这条路最可能的静默失效，而它的产物是

@@ -44,7 +44,7 @@ _WRITES: dict[str, int] = {}
 #: 出错/拒绝的记账。**无条件可读**，包括全零 —— 否则"探针没装上"和
 #: "探针装上了但这一层没差异"读数一样。
 _STATS: dict = {"allocated": 0, "copies": 0, "shape_changed": 0,
-                "alloc_failed": 0, "read": 0, "filtered_other_bucket": 0,
+                "alloc_failed": 0, "read": 0, "filtered_other_bucket": 0, "adopted": 0,
                "call_site_errors": 0}
 
 
@@ -93,6 +93,28 @@ def probe(name: str, x: torch.Tensor) -> None:
     buf.copy_(x)
     _STATS["copies"] += 1
     _WRITES[name] = _WRITES.get(name, 0) + 1
+
+
+def adopt(name: str, buf: torch.Tensor, rows: "int | None" = None) -> None:
+    """认领一块【调用方已经在捕获前分配好】的张量作为探针 buffer。
+
+    🔴 为什么需要它:probe() 会在第一次调用时 empty_like 一块 buffer,
+    而如果那第一次调用发生在【捕获中】(比如 engram 的捕获路线,它本来就
+    只在捕获期执行),那块 buffer 就落进了图内存池,地址不稳 ——
+    正是本模块第一条注释要避免的事。
+    ⇒ 这种场合由调用方在捕获前分配好,这里只登记,不分配、不拷贝。
+    名字里仍带形状桶,规则和 probe() 一致。
+    """
+    # 🔴 桶号必须是【本次 forward 的 token 数】,不是探针自己的 dim0。
+    #    第一版用了 buf.shape[0](=5,探针的槽位数),而 runner 的
+    #    drain(only_rows=num_tokens_padded) 只收 .T{1,2,4,8} ——
+    #    5 永远不在里面 ⇒ 这两个键【每一步都被静默过滤】,
+    #    产物上表现为"键不存在",而键不存在读起来和"两臂没差异"一样。
+    key = f"{name}.T{int(rows if rows is not None else buf.shape[0])}"
+    if key not in _BUFS:
+        _BUFS[key] = buf
+        _STATS["adopted"] = _STATS.get("adopted", 0) + 1
+    _WRITES[key] = _WRITES.get(key, 0) + 1
 
 
 def note_call_site_error() -> None:
