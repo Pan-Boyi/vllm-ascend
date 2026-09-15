@@ -405,6 +405,20 @@ def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
 _GRAPH_PROBE_ON: "bool | None" = None
 
 
+_WAIT_SAS: "bool | None" = None
+
+
+def _wait_sas_enabled() -> bool:
+    """DSV41_WAIT_SAS_METADATA，默认开。设 0 恢复未加等待的行为。"""
+    global _WAIT_SAS
+    if _WAIT_SAS is None:
+        import os as _os
+        _WAIT_SAS = _os.getenv(
+            "DSV41_WAIT_SAS_METADATA", "1").strip() not in (
+                "0", "false", "False", "")
+    return _WAIT_SAS
+
+
 _KV_BLK_WARNED = False
 _PTR_LOGGED = 0
 #: 🔴 失败一次就【永久停用】(2026-09-15)。
@@ -1127,6 +1141,42 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         cmp_residual_kv = (
             compressed_lengths(cmp_req.seq_lens, cmp_ratio)[1]
             if attends_compressed and cmp_req is not None else None)
+
+        # 🔴 等 device-metadata 流把 sas_metadata 写完(2026-09-15)。
+        #
+        # sas_metadata 是算子的 tiling 描述符,由 DeviceMetadataExecutor 在
+        # 【另一条 worker 自有的 NPU 流】上异步填进 sas_metadata_buffer
+        # (device_metadata.py: "Submit device metadata tasks on a worker-owned
+        # NPU stream")。消费者必须调 wait_for_device_metadata 才会插入那道
+        # 跨流等待 —— 这在 FULL cudagraph 下是【唯一】的保证:
+        #   model_runner_v1.py: submit(tasks,
+        #       batch_descriptor if mode == FULL else None)
+        # 传 batch_descriptor 走的是 external event 路径,事件在图外 record、
+        # 在图内 wait,跨多次 replay 复用。不调用它,图里就没有录进这次等待,
+        # 算子可以在 buffer 还在被写时读它。
+        #
+        # 🔴 V4.1 在昇腾侧另起了一个手写的算子调用点(本文件),而
+        # wait_for_device_metadata 在【整个 deepseek_v4_1 目录零调用】——
+        # 对照:dsa_v1.py 2 处、dsa_cp.py 5 处、deepseek_v4(V4.0) 各 2 处。
+        # V4.0 没有这个问题,因为它的消费者都走后端自己的 forward,那里有这一句。
+        #
+        # 症状与之相符:只在 FULL 捕获的 decode 上出现(PIECEWISE 下 attention
+        # 不进图,host 侧顺序还兜得住);间歇;算子【输入逐位相同而输出差约一个
+        # bf16 ULP】(描述符大体正确,只是上一步的内容 ⇒ 分块略不同 ⇒ 归约顺序
+        # 不同);第 0 层与第 1 层属不同 cache group、各有自己的 buffer,
+        # 因而时序不同 —— 实测第 0 层始终逐位相同、第 1 层时对时错。
+        #
+        # 该函数在没有 executor 时自行 return,所以这是一个安全的加法。
+        # 局部导入:本文件其余跨模块引用也都是局部的,避开循环导入。
+        from vllm_ascend.worker.device_metadata import (
+            DeviceMetadataStage, wait_for_device_metadata)
+
+        # 开关只为做单开关 A/B(默认【开】= 正确行为)。关掉就是加这一句之前的
+        # 上游行为,留作阴性臂 —— 缺陷 #1 也是这么验的。
+        _wait_sas = (cmp_req or req).sas_metadata
+        if isinstance(_wait_sas, torch.Tensor) and _wait_sas_enabled():
+            wait_for_device_metadata(DeviceMetadataStage.ATTENTION,
+                                     id(_wait_sas))
 
         # 一次求值,探针和算子看的是同一个对象 —— 分成两个表达式就会分头漂。
         _swa_kv_arg = kv_with_layout_rank(
