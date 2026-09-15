@@ -240,6 +240,7 @@ def fused_save_compress_norm_ascend(
     # plausible magnitudes and call #2 showed obvious garbage, from the same
     # slots, every time. None of the three was an observation of anything.
     _tap_write_side("fused_save_compress_norm", flat, None, state_cache)
+    _tap_inputs("fused_save_compress_norm", kv_score, rms_norm_weight)
     fused_save_compress_norm(
         kv_score, positions, state_cache, flat,
         query_start_loc, token_to_req_indices, rms_norm_weight, rms_norm_eps,
@@ -351,6 +352,37 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
                 "%r. The run continues -- but if this is a capture violation, "
                 "the symptom downstream is 'a few dump keys are missing', not "
                 "an error.", exc)
+
+
+def _tap_inputs(who: str, kv_score, rms_norm_weight) -> None:
+    """算子的【输入】,在调用之前记下。
+
+    🔴 为什么需要(2026-09-15):逐层比对把第一个分歧点定在了 layer_00 的
+    ``read.compressor.*.latent_out``,而同一层的 ``q.wq_b_out`` /
+    ``sa_in.q`` / ``sa_in.kv`` 是**逐位相同**的。于是问题变成
+    "这个算子是【来源】还是【放大器】" —— 而它的主输入 ``kv_score``
+    **从来没有被任何 tap 记过**,所以这个问题在产物层面【无法回答】。
+    输入不同 ⇒ 来源在更前面;输入逐位相同而输出不同 ⇒ 就是这个算子。
+
+    ⚪ 顺带记 rms_norm_weight:它是【静态权重】,两发之间必须逐位相同。
+       它是这一格的阴性对照 —— 如果连它都不同,那不是图模式的问题,
+       是权重加载的问题,而那会把所有其它解释一起推翻。
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
+
+    if not align_taps.recording_armed() or not read_taps.read_tap_layers():
+        return
+    if _skip_under_capture():
+        return
+    try:
+        index = max(_WRITE_CALLS.get(who, 1) - 1, 0)
+        align_taps.tap_whole(
+            0, f"read.compressor.{who}.{index:02d}.in.kv_score", kv_score)
+        align_taps.tap_whole(
+            0, f"read.compressor.{who}.{index:02d}.in.rms_norm_weight",
+            rms_norm_weight)
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 def _tap_output(who: str, latent) -> None:
