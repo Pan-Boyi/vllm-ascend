@@ -3077,6 +3077,14 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
+        # 🔴 在这里武装对齐 recorder,而不是靠挂在模型上的 pre-forward hook：
+        #    图 replay 只做 entry.capture.replay(),模型模块的 Python 不执行,
+        #    hook 一次都不会响。这一行两种模式都跑、每个 rank 都跑,
+        #    且严格早于所有 tap。见 align_taps.arm_for_this_forward 的注释。
+        from vllm_ascend.models.deepseek_v4_1 import align_taps as _align_taps
+
+        _align_taps.arm_for_this_forward()
+
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
             self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)

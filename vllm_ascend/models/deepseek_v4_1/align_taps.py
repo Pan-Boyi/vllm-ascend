@@ -641,7 +641,39 @@ def _report_armed_decode(seq_len: int) -> None:
         "position looks right and compares wrong.")
 
 
-def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
+#: 本次 forward 是否已经由 model_runner 武装过。由 arm_for_this_forward()
+#: 置位、由模型的 pre-forward hook【消费】(置回 False)。
+#: 两者在 eager 下成对出现;图 replay 下只有前者。
+_ARM_DONE = False
+
+
+def arm_for_this_forward() -> None:
+    """从 model_runner 武装 —— 因为模型的 pre-forward hook 在 replay 时不跑。
+
+    🔴 实测判据(2026-09-15,同一份代码两臂)：
+        EAGER=1  dump 164 分片 / 328 MB,答案干净
+        EAGER=0  dump 0 分片,一条 disarm 报告都没有
+    "跑了之后判定不该记"会留下 disarm;什么都没有 ⇒ 武装那一步【根本没跑】。
+    原因在 vllm 的 BreakableCUDAGraphWrapper._replay():它只做
+    ``entry.capture.replay()``,模型模块的 Python(连同挂在上面的 hook)
+    整个不执行。而 ``_model_forward`` 里的 ``run_model()`` 之前是**每一步都跑**的,
+    两种模式都跑,每个 rank 都跑,且严格早于所有 tap —— 正是 recorder 需要的次序。
+
+    ⚠️ 这【不】让图段里的 tap 复活:图段里没有 Python。它只保证
+       eager break 区(DSV4.1 的 _prepare_and_attn_eager)那些 tap 在被调用时
+       recorder 是武装好的。拿到的会是 REF 的一个子集,而子集是范围不是差异 ——
+       比对器用 --expect-subset 把缺的键数出来。
+    """
+    global _ARM_DONE
+    # 🔴 先清再武装。上一次 forward 如果是图 replay,hook 没来消费,标志会
+    #    【留成 True】,于是这一次的 _arm_recording 会在开头直接返回 ——
+    #    第一次 forward 记得好好的,第二次起静默不记,而两者都不报错。
+    _ARM_DONE = False
+    _arm_recording(None, None)
+    _ARM_DONE = True
+
+
+def _arm_recording(_module, _args) -> None:
     """Fix the sequence length for this forward, or disarm it and say so.
 
     🔴 捕获期直接返回:本函数是【每次 forward 前都跑的 hook】,而它在
@@ -668,7 +700,13 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
     not exist on a non-first pipeline rank -- and which is strictly earlier
     than every tap, the ordering the recorder needs.
     """
-    global _ARMED
+    global _ARMED, _ARM_DONE
+
+    if _ARM_DONE:
+        # 本次 forward 已由 model_runner 武装过。**消费掉**标志而不是忽略它 ——
+        # 忽略会让下一次 forward 的 hook 也被跳过,而那一次可能没人替它武装。
+        _ARM_DONE = False
+        return
 
     if _capturing():
         # 捕获期不武装、也不做任何 host 读回。丢的是 dummy 数据。
