@@ -64,6 +64,17 @@ def writer_accounting() -> dict:
     return dict(_WRITERS)
 
 
+#: 这个 tap 有没有拿到它需要的配置。**不是布尔**：把"没配置所以跳过"
+#: 和"配置有、层号算出来了但这层不记读"分成两格，否则 dump 为空时读不出
+#: 是仪器没启动还是这层本来就不该有。
+_TAP_CONFIG: dict = {"tapped": 0, "no_config": 0, "not_recorded": 0}
+
+
+def tap_config_accounting() -> dict:
+    """indexer 读侧 tap 的覆盖量。无条件可读，包括全零。"""
+    return dict(_TAP_CONFIG)
+
+
 def _note_writer(who: str, rows: int) -> None:
     """记下【是哪个写者】记的那个行数，并在每个写者第一次出现时留一条日志。
 
@@ -198,6 +209,26 @@ def unpack_indexer_cache(kv_cache):
 
 class AscendSparseAttnIndexer(SparseAttnIndexer):
     """The Ascend selection path. Everything else is upstream's."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 🔴 上游的 SparseAttnIndexer.__init__ 自己调了 get_current_vllm_config()，
+        # 但只留下了 parallel_config —— 没有 self.vllm_config。读侧 tap 需要
+        # hf_text_config 把 prefix 翻成层号，而【forward 时再去要已经太晚】：
+        # get_current_vllm_config() 只在建模型的那个 context 里有效，之后拿到的
+        # 是一个默认 VllmConfig（不报错，层号会全变成同一个）。
+        # 所以在这里抓 —— 上游在同一个函数里调同一个 getter，作用域是对的。
+        from vllm.config import get_current_vllm_config
+        try:
+            self._tap_hf_text_config = (
+                get_current_vllm_config().model_config.hf_text_config)
+        except Exception as exc:  # 建模型之外构造（单测/探针）时不该炸
+            self._tap_hf_text_config = None
+            from vllm.logger import logger
+            logger.warning(
+                "indexer 读侧 tap 取不到 hf_text_config(%s: %s)；"
+                "该 tap 会被跳过并计入 tap_config_accounting()['no_config']",
+                type(exc).__name__, exc)
 
     def forward_oot(self, hidden_states, q_quant, k, weights):
         if k is not None:
@@ -357,11 +388,19 @@ def _tap_indexer_reads(indexer, req, topk_idxs, seqused_k, cmp_residual_k,
 
     if not align_taps.alignment_active():
         return
-    layer = align_taps.layer_index(
-        indexer.k_cache.prefix,
-        indexer.vllm_config.model_config.hf_text_config)
-    if not read_taps.records_reads(layer):
+    hf_text_config = getattr(indexer, "_tap_hf_text_config", None)
+    if hf_text_config is None:
+        # 🔴 这里【曾经写的是 indexer.vllm_config】—— 那个属性在这个类上
+        # 从来不存在（上游只存了 parallel_config），于是 tap 一被启用就是
+        # AttributeError。它躲过了 eager 那一发，因为 eager 走短上下文路径、
+        # 根本没进 forward_oot：仪器没跑过 ≠ 仪器是好的。
+        _TAP_CONFIG["no_config"] += 1
         return
+    layer = align_taps.layer_index(indexer.k_cache.prefix, hf_text_config)
+    if not read_taps.records_reads(layer):
+        _TAP_CONFIG["not_recorded"] += 1
+        return
+    _TAP_CONFIG["tapped"] += 1
 
     read_taps.tap_read(layer, "indexer.topk_idxs", topk_idxs)
     read_taps.tap_read(layer, "indexer.seqused_k", seqused_k)
