@@ -3100,8 +3100,18 @@ class NPUModelRunner(GPUModelRunner):
             try:
                 from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
 
-                for _nm, _buf, _n in _gp.drain():
+                _drained = _gp.drain()
+                for _nm, _buf, _n in _drained:
                     _align_taps.tap_whole_probe(_nm, _buf, _n)
+                # 🔴 记账要【被读出来】。上一版我加了 shape_changed 却从没打印,
+                #    于是"探针被拒绝"是隐形的,dump 里留着上一道题的残留,
+                #    而比对结果看起来像一个惊人的缺陷。
+                _st = _gp.stats()
+                if _st.get("shape_changed") or _st.get("alloc_failed") \
+                        or _st.get("call_site_errors"):
+                    if not getattr(self, "_gp_warned", False):
+                        self._gp_warned = True
+                        logger.warning("DSV4.1 graph_probe 记账(只报第一次): %s", _st)
             except Exception:                                # noqa: BLE001
                 pass
             # finally:forward 抛异常时也要落盘。“报告不该销毁它所报告的东西”——

@@ -65,6 +65,14 @@ def probe(name: str, x: torch.Tensor) -> None:
     """
     if not isinstance(x, torch.Tensor):
         return
+    # 🔴 按形状分桶(2026-09-15 实测)：一个名字一块 buffer 时,T=8 的请求先来、
+    #    把 buffer 定成 8 行,之后 T=5 的请求形状对不上 ⇒ 被 shape_changed 拒绝
+    #    ⇒ buffer 里一直留着 T=8 那道题的数据,而 dump 照样把它记下来。
+    #    于是"这道题的探针"其实是"上一道题的残留",比出来 absmax=448,
+    #    看起来像一个惊人的缺陷 —— 而它只是两边比的不是同一个东西。
+    #    ⚠️ 守卫本身是对的(它拒绝了、也记了账),坏在【那个账我从没读过】。
+    #    形状进名字,读数的人就不可能把两个形状混着比。
+    name = f"{name}.T{int(x.shape[0])}"
     buf = _BUFS.get(name)
     if buf is None:
         try:
