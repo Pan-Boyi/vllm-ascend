@@ -106,7 +106,7 @@ def _log_ori_sparse_indices(prefix, source, idx, num_tokens, caller=None,
     #    而"环境门"不是"捕获门":DSV41_SAS_DUMP_MAX 一被设上,这个函数就会在
     #    图捕获期做 .item() / (flat == -1) 的 host 读回。默认关着不等于安全,
     #    只等于"还没有人踩到"。
-    if _skip_under_capture():
+    if _skip_under_capture("ori sparse-indices dump"):
         return
     if int(os.environ.get("DSV41_SAS_DUMP_MAX", "0")) <= 0:
         return
