@@ -56,6 +56,36 @@ def _current_forward() -> object | None:
         return None
 
 
+_WRITERS: dict = {}
+
+
+def writer_accounting() -> dict:
+    """谁写过这个 buffer、各写了多少行。无条件可读，包括为空。"""
+    return dict(_WRITERS)
+
+
+def _note_writer(who: str, rows: int) -> None:
+    """记下【是哪个写者】记的那个行数，并在每个写者第一次出现时留一条日志。
+
+    🔴 为什么需要（2026-09-15）：报错只说 "reading 8 rows ... only 5 were written"，
+    而这个 buffer 有【两个写者，两把不同的尺】：
+        forward_oot           记 hidden_states.shape[0]（padded）
+        短上下文 triton 核     记 grid[0]（真实 token 数）
+    我把"写侧记了 5"直接推成了"写侧的张量是 5 行"，中间跳过了"是哪个写者记的"
+    —— 而那一步的答案决定整条归因。⇒ 让写者身份变成一条产物，不再靠排除法。
+    """
+    prev = _WRITERS.get(who)
+    _WRITERS[who] = rows
+    if prev is None:
+        from vllm.logger import logger
+        logger.info(
+            "DSV4.1 indexer selection writer %r marked %d rows (first time). "
+            "Two writers use two different rulers: forward_oot marks the "
+            "padded token count, the short-context triton kernel marks the "
+            "real one. Which of them ran decides how a 'read N wrote M' "
+            "mismatch should be read.", who, rows)
+
+
 def mark_rows_written(buffer, num_rows: int) -> None:
     """Record how many leading rows of ``buffer`` this step actually wrote.
 
@@ -270,6 +300,7 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         flat = topk_idxs.squeeze(1) if topk_idxs.ndim == 3 else topk_idxs
         self.topk_indices_buffer[:num_tokens, :self.topk_tokens] = flat
         mark_rows_written(self.topk_indices_buffer, num_tokens)
+        _note_writer("forward_oot", num_tokens)
 
         return self.topk_indices_buffer
 
@@ -392,6 +423,7 @@ class _MarkingKernelLaunch:
         def _run(buffer, *args, **kwargs):
             result = launch(buffer, *args, **kwargs)
             mark_rows_written(buffer, int(rows))
+            _note_writer("short_context_triton", int(rows))
             return result
 
         return _run
