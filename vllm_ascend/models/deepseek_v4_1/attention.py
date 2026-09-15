@@ -420,20 +420,36 @@ def _tap_attn_output_all_rows(attn, output) -> None:
     """
     from vllm_ascend.models.deepseek_v4_1 import align_taps
 
+    _ATTN_OUT_TAP["called"] += 1
     if not align_taps.alignment_active():
+        _ATTN_OUT_TAP["not_active"] += 1
         return
     try:
         layer = align_taps.layer_index(
             attn.prefix, attn.vllm_config.model_config.hf_text_config)
         align_taps.tap_whole(layer, "attn.sparse_out.all_rows",
                              output[:, :attn.n_local_heads])
-    except Exception:                                        # noqa: BLE001
-        # 仪表不许杀 run。但也不许静默:计一笔。
+        _ATTN_OUT_TAP["recorded"] += 1
+    except Exception as exc:                                 # noqa: BLE001
+        # 🔴 仪表不许杀 run —— 但【只计数不说话】等于静默。
+        #    上一版就是这样:计了 errors 却从来没人打印它,于是
+        #    "tap 没被调到" 和 "tap 每次都抛" 读数完全一样,
+        #    而实际发生的是后者(该键在任何分片里都不存在)。
         _ATTN_OUT_TAP["errors"] += 1
+        if _ATTN_OUT_TAP["errors"] == 1:
+            from vllm.logger import logger
+            logger.warning(
+                "DSV4.1 attn.sparse_out.all_rows tap 失败(只报第一次): "
+                "%s: %s | output.shape=%s n_local_heads=%s prefix=%s",
+                type(exc).__name__, exc,
+                getattr(output, "shape", None),
+                getattr(attn, "n_local_heads", "<无此属性>"),
+                getattr(attn, "prefix", "<无此属性>"))
 
 
 #: 上面那个 tap 的记账。零覆盖和"全都一致"必须分得开。
-_ATTN_OUT_TAP: dict = {"errors": 0}
+_ATTN_OUT_TAP: dict = {"called": 0, "not_active": 0, "recorded": 0,
+                       "errors": 0}
 
 
 def attn_output_tap_accounting() -> dict:
