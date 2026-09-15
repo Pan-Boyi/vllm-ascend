@@ -102,6 +102,12 @@ def _log_ori_sparse_indices(prefix, source, idx, num_tokens, caller=None,
 
     from vllm.logger import logger
 
+    # 🔴 捕获门必须在 env 门【之前】。原来只有下面那道 env 门 ——
+    #    而"环境门"不是"捕获门":DSV41_SAS_DUMP_MAX 一被设上,这个函数就会在
+    #    图捕获期做 .item() / (flat == -1) 的 host 读回。默认关着不等于安全,
+    #    只等于"还没有人踩到"。
+    if _skip_under_capture():
+        return
     if int(os.environ.get("DSV41_SAS_DUMP_MAX", "0")) <= 0:
         return
     if idx is None:
@@ -394,6 +400,44 @@ def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
     except Exception:                                        # noqa: BLE001
         # Instrument. One of these has already cost a flight.
         pass
+
+
+def _tap_attn_output_all_rows(attn, output) -> None:
+    """稀疏注意力算子的输出,记【全部行】—— 含 padding 行。
+
+    🔴 为什么要新开一个(2026-09-15):现有的 ``attn.o_raw`` / ``attn.o_unroped``
+    记在 ``_o_proj()`` 里,而 ``_o_proj`` **不在 eager break 区**(DSV4.1 的
+    break 点是 vllm 侧 attention.py:624 的 ``_prepare_and_attn_eager``)。
+    图 replay 只执行 eager 段的 Python,图段只重放录下的 kernel ⇒
+    那两个键在图模式的 dump 里**一次都没出现过**,而"缺的键"读起来和
+    "没差异"一模一样。
+    ⇒ 于是"分歧是注意力算子产生的,还是 _o_proj/MHC/MoE 产生的"这一刀,
+      在产物层面【从来没落下过】。本函数就是那一刀。
+
+    ⚠️ 用 tap_whole 而不是 tap:后者按 position 散射,而 padding 行的
+       position 是 -1 会被丢掉 —— 而 padding 行正是当前最可疑的东西之一
+       (实测图模式的 kv_score padding 行是 NaN)。要判它就必须记下它。
+    """
+    from vllm_ascend.models.deepseek_v4_1 import align_taps
+
+    if not align_taps.alignment_active():
+        return
+    try:
+        layer = align_taps.layer_index(
+            attn.prefix, attn.vllm_config.model_config.hf_text_config)
+        align_taps.tap_whole(layer, "attn.sparse_out.all_rows",
+                             output[:, :attn.n_local_heads])
+    except Exception:                                        # noqa: BLE001
+        # 仪表不许杀 run。但也不许静默:计一笔。
+        _ATTN_OUT_TAP["errors"] += 1
+
+
+#: 上面那个 tap 的记账。零覆盖和"全都一致"必须分得开。
+_ATTN_OUT_TAP: dict = {"errors": 0}
+
+
+def attn_output_tap_accounting() -> dict:
+    return dict(_ATTN_OUT_TAP)
 
 
 def _tap_what_this_layer_read(attn, kwargs: dict, req, cmp_req) -> None:
@@ -1112,6 +1156,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         _tap_what_this_layer_read(self, kwargs, req, cmp_req)
 
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
+        _tap_attn_output_all_rows(self, output)
 
     def _checked_selection(self, num_tokens: int) -> torch.Tensor:
         """The indexer's selection for these rows, refusing unwritten ones.
