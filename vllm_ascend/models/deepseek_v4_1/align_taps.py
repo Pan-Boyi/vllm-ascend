@@ -462,6 +462,37 @@ def _first_tensor(value: Any) -> torch.Tensor | None:
     return None
 
 
+#: 这个模块为什么没记东西。**四格,不是一个布尔** —— dump 缺键时,
+#: 「捕获期挡住的」「没开对齐」「本次 forward 没武装」必须分得开。
+_ALIGN_GATE: dict = {"skipped_under_capture": 0, "armed": 0,
+                     "not_armed": 0, "hook_skipped_under_capture": 0}
+
+
+def align_gate_accounting() -> dict:
+    """本模块的覆盖量。无条件可读,包括全零。"""
+    return dict(_ALIGN_GATE)
+
+
+def _capturing() -> bool:
+    """当前 stream 是否在图捕获中。
+
+    🔴 为什么整个模块都要问这一句(2026-09-15):align_taps 做
+    ``bool(t.any())``、``int(seq_lens[0])``、``int(starts[-1])`` —— 捕获期
+    对 stream 的同步在任何捕获模式下都非法(107027)。
+    ⚠️ 而**代价为零**:捕获喂的是 dummy 数据,记下来也不代表任何真实请求;
+    真实请求走 replay,而 replay 时 eager break 区(DSV4.1 是
+    ``_prepare_and_attn_eager``,见 vllm 侧 attention.py 的
+    ``@eager_break_during_capture``)是**真的跑 Python 的** ——
+    ``BreakableCUDAGraphCapture.replay()`` 就是 ``for r in self.segments: r()``,
+    而 segments 里混着图段和 ``add_eager`` 记下的 callable。
+    ⇒ 挡住捕获期【不会】让我们丢掉真实数据,只会丢掉 dummy 数据。
+    """
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    return _stream_is_capturing()
+
+
 def _armed_recorder():
     """The recorder, or ``None`` when this forward must not be recorded.
 
@@ -486,8 +517,13 @@ def _armed_recorder():
     """
     from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
 
-    if not _ARMED:
+    if _capturing():
+        _ALIGN_GATE["skipped_under_capture"] += 1
         return None
+    if not _ARMED:
+        _ALIGN_GATE["not_armed"] += 1
+        return None
+    _ALIGN_GATE["armed"] += 1
     return get_recorder()
 
 
@@ -571,6 +607,11 @@ def _report_armed_decode(seq_len: int) -> None:
 def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
     """Fix the sequence length for this forward, or disarm it and say so.
 
+    🔴 捕获期直接返回:本函数是【每次 forward 前都跑的 hook】,而它在
+    L602/603 调 _single_request_seq_len / _single_request_query_rows,
+    两者都做 int(张量) —— 这就是图捕获 warmup 里真正的那堵墙。
+    它不经过 _armed_recorder,所以那道门挡不住它。
+
     🔴 This used to live in the prologue hook and to ``return`` when the length
     could not be determined. The result was recording left half-armed:
     ``set_seq_len`` never ran, every later tap called ``record()``, and the run
@@ -591,6 +632,12 @@ def _arm_recording(_module: torch.nn.Module, _args: tuple) -> None:
     than every tap, the ordering the recorder needs.
     """
     global _ARMED
+
+    if _capturing():
+        # 捕获期不武装、也不做任何 host 读回。丢的是 dummy 数据。
+        _ARMED = False
+        _ALIGN_GATE["hook_skipped_under_capture"] += 1
+        return
 
     from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
 
@@ -1537,6 +1584,9 @@ def _attach(module: torch.nn.Module, layer_id: int, key: str,
             _record(layer_id, key, tensor)
 
     def _post(_mod: torch.nn.Module, _args: tuple, output: Any) -> None:
+        if _capturing():
+            _ALIGN_GATE["hook_skipped_under_capture"] += 1
+            return
         tensor = _first_tensor(output)
         if tensor is not None:
             _record(layer_id, key, tensor)
@@ -1867,6 +1917,9 @@ def alignment_active() -> bool:
     """
     from vllm_ascend.models.deepseek_v4_1.debug_align import get_recorder
 
+    if _capturing():
+        _ALIGN_GATE["skipped_under_capture"] += 1
+        return False
     return get_recorder() is not None
 
 
