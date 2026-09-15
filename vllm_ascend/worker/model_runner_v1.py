@@ -308,6 +308,7 @@ def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
 #: DSV4.1 engram 在 PIECEWISE 捕获下整块不执行的修复开关。
 #: 默认【开】。设为 0 恢复上游原行为(阴性臂用)。
 #: 只在 _should_build_dummy_attn_metadata 里被读,作用域见那里的注释。
+_SL_PTR_LOGGED = 0
 _PIECEWISE_ATTN_META: "bool | None" = None
 _PIECEWISE_ATTN_META_LOGGED: set = set()
 
@@ -3118,6 +3119,46 @@ class NPUModelRunner(GPUModelRunner):
         #    模型模块的 Python 一行都不执行,三个 hook 一次都不会响。
         #    这两处两种模式都跑、每个 rank 都跑,且严格包住所有 tap。
         from vllm_ascend.models.deepseek_v4_1 import align_taps as _align_taps
+
+        # 🔴 请求身份由【这里】供给,不由 attn_metadata 供给(2026-09-15)。
+        #    decode_step1.request_identity() 原来只会扫 attn_metadata 找
+        #    req_metadata.req_ids_tensor —— 那是上游 GPU metadata 的字段,
+        #    AscendDSAReqMetadata 上【不存在】⇒ 身份恒为 None ⇒ decode step-1
+        #    录制从未激活过,而产物上表现为"只有 prefill 的 dump",
+        #    和"decode 本来就没问题"读起来完全一样。
+        #    runner 的 input_batch.req_ids 是同一个请求在 prefill 与 decode
+        #    两次 forward 上都成立的身份,且不依赖任何后端的字段名。
+        #    ⚠️ 只在批里恰好一个请求时给;多个就传 None(说不出就别编)。
+        try:
+            _rids = getattr(getattr(self, "input_batch", None), "req_ids", None)
+            _align_taps.set_request_identity(
+                str(_rids[0]) if _rids is not None and len(_rids) == 1 else None)
+        except Exception:                                    # noqa: BLE001
+            pass
+
+        # 🔴 地址取证(2026-09-15):图内探针读到 seq_lens 全是 1(捕获期值),
+        #    而 eager 实测该张量的指针跨步【稳定】⇒ 不是"每步新张量被烘死"。
+        #    剩下的解释只有一个:捕获期烘进图的那块地址,和服务期 runner
+        #    真正写入的那块,不是同一块。
+        #    attention 里那行只在【捕获期】打(图里 Python 不重放),这里每步都打,
+        #    两个地址在【同一个进程内】直接可比 —— 跨进程比地址是没有意义的。
+        try:
+            global _SL_PTR_LOGGED
+            if _SL_PTR_LOGGED < 10:
+                _SL_PTR_LOGGED += 1
+                _sl = getattr(self, "seq_lens", None)
+                if isinstance(_sl, torch.Tensor):
+                    logger.info(
+                        "DSV4.1 runner 指针 step#%d ntok=%s | self.seq_lens "
+                        "ptr=0x%x shape=%s",
+                        _SL_PTR_LOGGED,
+                        model_inputs.get("input_ids").shape[0]
+                        if isinstance(model_inputs, dict)
+                        and isinstance(model_inputs.get("input_ids"),
+                                       torch.Tensor) else "?",
+                        _sl.data_ptr(), tuple(_sl.shape))
+        except Exception:                                    # noqa: BLE001
+            pass
 
         _align_taps.begin_forward(model_inputs)
 

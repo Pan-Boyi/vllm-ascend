@@ -405,6 +405,21 @@ def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
 _GRAPH_PROBE_ON: "bool | None" = None
 
 
+_KV_BLK_WARNED = False
+_PTR_LOGGED = 0
+#: 🔴 失败一次就【永久停用】(2026-09-15)。
+#: 第一版每个 forward 抛 4 次 aclnnIndexSelect。停用不是因为证明了它有害 ——
+#: 我一度据一次输出变化断定是它干的,核时间线后发现【那个失败探针在稳定的
+#: 那一发里就已经存在】,归因不成立,已撤回。
+#: 停用的理由是另一条:每步抛 4 次异常的仪器,其"无害"从来没有被证明过,
+#: 而它要服务的正是一个【间歇性】缺陷 —— 在这种场合,未经证明的仪器开销
+#: 本身就是一个无法排除的备选解释。把它压到每进程一次,这个备选就消失了。
+_KV_BLK_OK = True
+#: 算子标量的取值集合。按【取值】去重而不是按次数 —— 我们要的是
+#: "出现过哪几组",出现次数在这里没有信息。
+_SCALAR_SEEN: set = set()
+
+
 def _graph_probe_on() -> bool:
     """图段内探针的开关 —— **整轮恒定**，捕获和重放必须读到同一个值。
 
@@ -1044,6 +1059,25 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # them is what makes that a lookup instead of a bisection.
         from vllm_ascend.models.deepseek_v4_1 import align_taps
 
+        # 🔴 图内探针版的 sa_in.q / sa_in.kv(2026-09-15)。
+        #    上面那句注释说得对:sa_in.* 是"算子错"和"算子上游错"的分界。
+        #    但它挂在 align_taps 上,而图 replay 不跑 Python ⇒ 图模式下这两个键
+        #    从来不存在,那条分界线在图里根本画不出来。
+        #    copy kernel 版本会被录进图、每次 replay 执行。
+        #    只装层 0/1:decode 的第一个分歧点在 L01.attn.ret,而 L01.mhc_pre.x
+        #    逐位相同 —— 要切的就是这两层之间的这一段。
+        if _graph_probe_on():
+            try:
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
+                _l = align_taps.layer_index(
+                    self.prefix, self.vllm_config.model_config.hf_text_config)
+                if _l in (0, 1):
+                    _gp.probe(f"L{_l:02d}.sa_in.q", q)
+                    _gp.probe(f"L{_l:02d}.sa_in.kv", kv)
+            except Exception:                                # noqa: BLE001
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
+                _gp.note_call_site_error()
+
         if align_taps.alignment_active():
             tap_layer = align_taps.layer_index(
                 self.prefix, self.vllm_config.model_config.hf_text_config)
@@ -1094,12 +1128,186 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             compressed_lengths(cmp_req.seq_lens, cmp_ratio)[1]
             if attends_compressed and cmp_req is not None else None)
 
+        # 一次求值,探针和算子看的是同一个对象 —— 分成两个表达式就会分头漂。
+        _swa_kv_arg = kv_with_layout_rank(
+            self._unwrap_cache(self.swa_cache_layer.kv_cache),
+            plan.layout_kv)
+
+        # 🔴 图内探针:算子【除 q/kv 之外】读的全部东西(2026-09-15)。
+        #    decode 步 1 上 sa_in.q / sa_in.kv 两臂逐位相同而 attn.o_raw 不同
+        #    ⇒ 差异只能来自这里:KV cache 的历史内容,或寻址/描述它的元数据。
+        #    ⚠️ 每个探针的第 0 维都 reshape 成 1:drain() 按本次 forward 的
+        #       token 数过滤桶(decode=1),第 0 维不是 1 的键会被【静默丢掉】,
+        #       而键不存在和两臂无差异读起来一模一样。
+        if _graph_probe_on():
+            try:
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
+                _l = align_taps.layer_index(
+                    self.prefix, self.vllm_config.model_config.hf_text_config)
+                if _l in (0, 1):
+                    from vllm.logger import logger as _lg
+                    _p = f"L{_l:02d}.kvsrc"
+
+                    # 🔴 地址取证(2026-09-15)。图里 seq_lens 读到的是捕获期的
+                    #    全 1,而 block_table / slot_mapping / sas_metadata 全部
+                    #    刷新正常。两种解释修法完全不同:
+                    #      (a) seq_lens 每步是【新张量】⇒ 图烘死了捕获期那一个
+                    #      (b) 地址稳定但内容没刷新
+                    #    连续几步打指针就能分开,而同一行里的 block_table 是
+                    #    已知刷新正常的【阳性对照】—— 没有它,指针"看起来没变"
+                    #    也可能只是分配器复用。
+                    global _PTR_LOGGED
+                    if _PTR_LOGGED < 12:
+                        _PTR_LOGGED += 1
+                        # ⚠️ 只打【host 侧属性】。第一版在这里写了
+                        #    int(req.seq_lens[0]) —— 那是一次同步 D2H,塞在模型
+                        #    forward 里。DP=4 下一个 rank 多同步一次就把集合通信
+                        #    拖散,实测整发死于
+                        #    rtDeviceSynchronizeWithTimeout task timeout +
+                        #    HCCL watchdog。值本来就有探针在采,这里只要地址。
+                        _lg.info(
+                            "DSV4.1 指针 L%02d step#%d tokens=%s | "
+                            "seq_lens ptr=0x%x shape=%s | block_table ptr=0x%x "
+                            "| slot_mapping ptr=%s | qsl ptr=0x%x",
+                            _l, _PTR_LOGGED, int(q.shape[0]),
+                            req.seq_lens.data_ptr(),
+                            tuple(req.seq_lens.shape),
+                            req.block_table.data_ptr(),
+                            hex(req.slot_mapping.data_ptr())
+                            if isinstance(getattr(req, "slot_mapping", None),
+                                          torch.Tensor) else "无",
+                            req.query_start_loc.data_ptr())
+
+                    def _flat1(t, n):
+                        """取前 n 个元素,【定长】补到 n,形状恒为 (1, n)。
+
+                        🔴 为什么必须定长(2026-09-15,这个坑今天第三次):
+                        第一版是 f[:min(n, numel)].reshape(1, -1) —— 长度随
+                        本次 forward 变。prefill 的 seq_lens 有 8 个元素、
+                        decode 只有 1 个,而两者【写同一个键】(第 0 维恒为 1,
+                        桶号一样)。buffer 被先到的 prefill 定成 (1,8),
+                        decode 的 (1,1) 形状不符 ⇒ graph_probe 按设计拒绝拷贝
+                        并记 shape_changed ⇒ 产物里留下的是【上一次的残值】。
+                        我据此读出"图里 seq_lens=1、eager=7",当成了重大发现,
+                        而那只是两臂的 buffer 被不同的历史填过。
+                        ⚠️ 记账当时就报了 shape_changed=8,我读到了那个数,
+                           但没有把它和这个键联系起来。定长之后这条路被堵死。
+                        """
+                        f = t.reshape(-1)
+                        k = min(n, f.numel())
+                        out = torch.zeros(n, dtype=f.dtype, device=f.device)
+                        out[:k] = f[:k]
+                        return out.reshape(1, n)
+
+                    # 🔴 覆盖量进键名(2026-09-15)。
+                    #    第一版 sas_metadata 只取前 64 个元素,而这个 blob 是
+                    #    DSA_METADATA_BUFFER_SIZE=1024 的定长布局 ——
+                    #    覆盖 6.25%,却在比对表里印成"逐位相同"。
+                    #    描述符里随步变化的字段如果在 64 之后,那条绿灯是零覆盖。
+                    #    ⇒ ① 取满;② 把【真实元素数】写进键名:宽度一旦变化
+                    #      就是两个不同的键,不可能再拿不同宽度的东西比出相同。
+                    def _pb(name, t, width):
+                        _gp.probe(f"{_p}.{name}.n{int(t.numel())}",
+                                  _flat1(t, width))
+
+                    _pb("block_table", req.block_table, 256)
+                    _pb("seq_lens", req.seq_lens, 16)
+                    _pb("query_start_loc", req.query_start_loc, 16)
+                    _sas = getattr(req, "sas_metadata", None)
+                    if isinstance(_sas, torch.Tensor):
+                        # 取满 1024 —— 这是算子的 tiling 描述符,
+                        # 也是 GPU 分支完全没有的那一层。
+                        _pb("sas_metadata", _sas, 1024)
+                    _sm = getattr(req, "slot_mapping", None)
+                    if isinstance(_sm, torch.Tensor):
+                        _pb("slot_mapping", _sm, 16)
+                    if isinstance(self.attn_sink, torch.Tensor):
+                        _pb("attn_sink", self.attn_sink, 64)
+                    # 算子真正会去读的那几行 KV:按本请求 block_table 的头两个
+                    # block 取出来。这是唯一能回答"两臂读到的字节是否相同"的探针 ——
+                    # 其余几个只回答"寻址是否相同"。
+                    # 🔴 单独一个 try:它在图捕获下会抛(实测 call_site_errors=4,
+                    #    而 kv_blocks 是这段的最后一句 ⇒ 前面的键都落了盘)。
+                    #    放在同一个 try 里的话,它一抛就把后面的探针全带走,
+                    #    而"键不存在"读起来和"两臂没差异"一样。
+                    #    ⚠️ 只计数不说话 ⇒ "从没调用"和"每次都抛"产物相同。
+                    #    所以这里把异常文本打出来,一次就够。
+                    global _KV_BLK_OK, _KV_BLK_WARNED
+                    # 🔴 用【原始】cache,不用 kv_with_layout_rank 之后的视图:
+                    #    后者不连续,reshape(-1) 会失败。第一版加了
+                    #    is_contiguous() 守卫 —— 它把这个探针【静默跳过】了,
+                    #    产物上表现为"键缺席",而缺席读起来和"两臂没差异"一样。
+                    #    这是今天第三次栽在"守卫拒绝了但没人读那个账"上。
+                    _raw_kv = self._unwrap_cache(self.swa_cache_layer.kv_cache)
+                    if not (_KV_BLK_OK and isinstance(_raw_kv, torch.Tensor)
+                            and _raw_kv.is_contiguous()):
+                        if not _KV_BLK_WARNED:
+                            _KV_BLK_WARNED = True
+                            _lg.warning(
+                                "DSV4.1 kv_blocks 探针【跳过】(只报一次): "
+                                "ok=%s 是张量=%s 连续=%s —— 这个键会缺席,"
+                                "而缺席不构成'两臂无差异'的证据",
+                                _KV_BLK_OK, isinstance(_raw_kv, torch.Tensor),
+                                getattr(_raw_kv, "is_contiguous",
+                                        lambda: "n/a")())
+                    else:
+                        try:
+                            # 扁平索引:4 维 index_select 在 A5 上走 AsStrided,
+                            # 51613x32x1x512 的 tiling 直接失败
+                            # ("The output element is out of input range")。
+                            # 一维视图上按偏移取,不触发那条路。
+                            _per = _raw_kv[0].numel()
+                            _b0 = req.block_table.reshape(-1)[:1].long() * _per
+                            _idx = _b0 + torch.arange(
+                                4096, device=_raw_kv.device, dtype=torch.long)
+                            _gp.probe(
+                                f"{_p}.kv_blocks",
+                                _raw_kv.reshape(-1).index_select(
+                                    0, _idx).reshape(1, -1))
+                        except Exception as _exc:            # noqa: BLE001
+                            _gp.note_call_site_error()
+                            _KV_BLK_OK = False    # 只失败这一次,之后不再尝试
+                            if not _KV_BLK_WARNED:
+                                _KV_BLK_WARNED = True
+                                _lg.warning(
+                                    "DSV4.1 kv_blocks 探针失败(只报第一次): %r "
+                                    "kv.shape=%s kv.dtype=%s bt.shape=%s "
+                                    "bt.dtype=%s", _exc,
+                                    tuple(_swa_kv_arg.shape),
+                                    _swa_kv_arg.dtype,
+                                    tuple(req.block_table.shape),
+                                    req.block_table.dtype)
+
+                    # 🔴 算子参数里【不是张量】的那一批(2026-09-15)。
+                    #    它们是 Python 标量 ⇒ 捕获那一刻求值一次,之后每次
+                    #    replay 用的都是【捕获期】的值,永远不再重算。
+                    #    ori_win_* 来自每层各自的 SWA metadata 条目,所以
+                    #    "层 0 恰好对、层 1 不对"在这里是可能的 ——
+                    #    而这正是我们看到的不对称。
+                    #    图臂打的是捕获期的值,eager 臂打的是服务期的值,
+                    #    两者对比就是判据。按取值去重,只打新组合。
+                    _sig = (_l, int(q.shape[0]), bool(attends_compressed),
+                            float(cmp_ratio) if cmp_ratio is not None else None,
+                            req.ori_win_left, req.ori_win_right,
+                            None if ori_topk_length is None else "有",
+                            None if ori_sparse_indices is None else
+                            tuple(ori_sparse_indices.shape))
+                    if _sig not in _SCALAR_SEEN:
+                        _SCALAR_SEEN.add(_sig)
+                        _lg.info(
+                            "DSV4.1 算子标量 L%02d: tokens=%s attends_cmp=%s "
+                            "cmp_ratio=%s ori_win=[%s,%s] ori_topk=%s "
+                            "ori_idx=%s  ← replay 永远用捕获期这一组",
+                            _l, _sig[1], _sig[2], _sig[3], _sig[4], _sig[5],
+                            _sig[6], _sig[7])
+            except Exception:                                # noqa: BLE001
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
+                _gp.note_call_site_error()
+
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
             num_requests=req.query_start_loc.numel() - 1,
-            swa_kv_cache=kv_with_layout_rank(
-                self._unwrap_cache(self.swa_cache_layer.kv_cache),
-                plan.layout_kv),
+            swa_kv_cache=_swa_kv_arg,
             swa_block_table=req.block_table,
             cu_seqlens_q=req.query_start_loc,
             seqused_kv=req.seq_lens,
@@ -1404,6 +1612,23 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             align_taps.tap(tap_layer, "attn.o_raw",
                            o[:, :self.n_local_heads], positions)
 
+        # 🔴 图内探针:算子原始输出。align_taps 的 attn.o_raw 在图段里不执行
+        #    (图 replay 不跑 Python),所以图模式下那个键从来不存在 ——
+        #    而"键不存在"和"两臂没差异"读起来一模一样。
+        #    这里用 copy kernel 版本,它会被录进图、每次 replay 都执行。
+        if _graph_probe_on():
+            try:
+                from vllm_ascend.models.deepseek_v4_1 import (align_taps as _at,
+                                                             graph_probe as _gp)
+                _l = _at.layer_index(self.prefix,
+                                     self.vllm_config.model_config.hf_text_config)
+                if _l in (0, 1):
+                    _gp.probe(f"L{_l:02d}.attn.o_raw",
+                              o[:, :self.n_local_heads])
+            except Exception:                                # noqa: BLE001
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
+                _gp.note_call_site_error()
+
         o = inverse_rope_from_cos_sin_cache(o, positions, cos_sin_cache,
                                             self.rope_head_dim)
 
@@ -1467,9 +1692,14 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                                                              graph_probe)
                 _lyr = align_taps.layer_index(
                     self.prefix, self.vllm_config.model_config.hf_text_config)
-                if _lyr == 0:
-                    graph_probe.probe("L00.o_proj.in.o_unroped", o)
-                    graph_probe.probe("L00.o_proj.out.wo_b", _out)
+                # 🔴 扩到第 1 层(2026-09-15):decode 的第一个分歧点是
+                #    L01.attn.ret,而它的输入 L01.mhc_pre.x 逐位相同 ⇒ 分歧在
+                #    第 1 层 attention 【内部】。只有第 0 层有切分点的话,
+                #    这一段整体是黑的。名字带层号,第 0 层的键名不变,
+                #    历史产物仍然可比。
+                if _lyr in (0, 1):
+                    graph_probe.probe(f"L{_lyr:02d}.o_proj.in.o_unroped", o)
+                    graph_probe.probe(f"L{_lyr:02d}.o_proj.out.wo_b", _out)
             except Exception:                                # noqa: BLE001
                 from vllm_ascend.models.deepseek_v4_1 import graph_probe
                 graph_probe.note_call_site_error()

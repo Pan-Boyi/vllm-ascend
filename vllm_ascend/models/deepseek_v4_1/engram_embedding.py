@@ -364,7 +364,7 @@ class AscendStagedEngramEmbedding:
         self._dev_probe = torch.empty(5, dtype=torch.int64,
                                       device=self._dev_weight.device)
         # 设备侧的 id 指纹,由捕获链里的 kernel 填(和 host 侧那份对照)
-        self._dev_ids_stat = torch.empty(5, dtype=torch.int64,
+        self._dev_ids_stat = torch.empty(6, dtype=torch.int64,
                                          device=self._dev_weight.device)
         self._dev_ids_stat.zero_()
         self._pin_probe_np = self._pin_probe.numpy()
@@ -471,7 +471,20 @@ class AscendStagedEngramEmbedding:
                    self._pin_weight_np, self._pin_scale_np, rows,
                    getattr(self, "_pin_probe_np", None))
         _CAPTURED_PAYLOADS.append(payload)
-        if len(_CAPTURED_PAYLOADS) == 1:
+        # 🔴 打【前 12 次】而不是只打第一次(2026-09-15)。
+        #    要判的是:服务期还会不会有新的提交 —— 也就是
+        #    "启动时没被捕获的形状(比如 prefill)会不会在服务期触发 _capture,
+        #     而那一次的输出【是要返回给真实请求的】"。
+        #    只打第一次的话,这个问题在产物层面答不了:
+        #    启动期提交和服务期提交产生的日志【一模一样】(都没有)。
+        if len(_CAPTURED_PAYLOADS) <= 12:
+            from vllm.logger import logger
+            logger.info(
+                "engram host gather SUBMIT #%d rows=%d layer=%s "
+                "(若本行时间戳晚于 'Graph capturing finished',说明服务期仍在捕获,"
+                "而那一次 forward 的 engram 是空的)",
+                len(_CAPTURED_PAYLOADS), rows, getattr(self, "_layer_id", "?"))
+        if False:
             # 🔴 与 "callback EXECUTED" 对称的证据行。两条一起才分得开三种去向：
             #   无 SUBMITTED              ⇒ 这两层根本没走到捕获路径
             #   有 SUBMITTED 无 EXECUTED  ⇒ 录进去了但没被投递，或图没被重放
@@ -501,10 +514,27 @@ class AscendStagedEngramEmbedding:
         if getattr(self, "_dev_probe", None) is not None:
             # 设备侧指纹:全是 kernel,会被录进图、每次 replay 重算。
             # 和 host 侧那 5 个槽位一一对应,可以直接比。
+            # 🔴 每个【桶】一块 stat buffer(2026-09-15 实测必须):
+            #    桶标签 .T{n} 是【捕获期 Python】算的,而内容是【最后一次
+            #    replay】写的 —— 两个不同的时刻。一块 buffer 被 T1(decode)
+            #    和 T8(prefill) 两张图共用时,.T8 标签下装的其实是最后一次
+            #    decode 的值,而读数的人会当成 prefill 的。
+            #    每桶一块之后,标签和内容就出自同一张图。
+            _bkt = int(indices.shape[0])
+            if not hasattr(self, "_bucket_stats"):
+                self._bucket_stats = {}
+            if _bkt not in self._bucket_stats:
+                self._bucket_stats[_bkt] = torch.empty(
+                    6, dtype=torch.int64, device=self._dev_weight.device)
+            self._dev_ids_stat = self._bucket_stats[_bkt]
             self._dev_ids_stat[0] = flat.numel()
             self._dev_ids_stat[1] = flat.to(torch.int64).sum()
             self._dev_ids_stat[2] = flat[0].to(torch.int64)
             self._dev_ids_stat[3] = flat[-1].to(torch.int64)
+            # 槽 4/5 与 eager 侧逐项对齐:num_tokens 与 hash 列数。
+            # 行数(槽 0)= num_tokens × 列数,三者能互相校验。
+            self._dev_ids_stat[4] = indices.shape[0]
+            self._dev_ids_stat[5] = indices.shape[1] if indices.ndim > 1 else -1
             from vllm_ascend.models.deepseek_v4_1 import graph_probe
             # 🔴 adopt 不是 probe:这里【正在捕获中】,probe() 会在图内存池里
             #    分配 buffer。两块都是 _allocate_pinned_for_capture 在捕获前
@@ -578,6 +608,35 @@ class AscendStagedEngramEmbedding:
         # sync point, and the way to remove it is to hash on the host from the
         # token ids the runner already holds, rather than to make it faster.
         row_ids = indices.reshape(-1).to("cpu", torch.int64).numpy()
+
+        # 🔴 eager 侧的同名指纹。捕获路线那边已有 engram.L*.ids_device,
+        #    但那条路【只在捕获期】走 ⇒ eager 臂没有这个键 ⇒ 两臂比不了。
+        #    而"这批 id 在图下和 eager 下是不是同一批"正是当前唯一还开着的
+        #    假设(engram_hashes 从没被任何 tap 记录过)。
+        #    槽位与捕获路线【逐项对齐】:行数/id之和/首id/末id/第几次调用。
+        if _graph_probe_on_eager():
+            try:
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe
+                # 🔴 必须写进【同一块持久 buffer】,不能每次新建。
+                #    adopt 里是 `if key not in _BUFS`,每次新建 tensor 只会
+                #    登记第一次那个;而捕获路线用的是持久的 _dev_ids_stat、
+                #    每次覆盖 ⇒ 一个记【首次】一个记【末次】,
+                #    比出来的差异是仪表的,不是被测对象的。实测踩中。
+                if getattr(self, "_eager_ids_stat", None) is None:
+                    self._eager_ids_stat = torch.empty(
+                        6, dtype=torch.int64, device=out.device)
+                st = self._eager_ids_stat
+                st[0] = int(row_ids.size)
+                st[1] = int(row_ids.sum())
+                st[2] = int(row_ids[0]) if row_ids.size else -1
+                st[3] = int(row_ids[-1]) if row_ids.size else -1
+                st[4] = int(indices.shape[0])          # num_tokens
+                st[5] = int(indices.shape[1]) if indices.ndim > 1 else -1
+                graph_probe.adopt(
+                    f"engram.L{getattr(self, '_layer_id', 'x')}.ids_device",
+                    st, int(indices.shape[0]))
+            except Exception:                                # noqa: BLE001
+                graph_probe.note_call_site_error()
 
         from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
 
@@ -769,6 +828,23 @@ def _ensure_subscribe_report(stream) -> None:
         if "107011" not in str(exc):
             raise
     _REPORT_SUBSCRIBED.add(key)
+
+
+_EAGER_PROBE_ON = None
+
+
+def _graph_probe_on_eager() -> bool:
+    """eager 侧指纹的开关 —— 和捕获侧同一个 env,整轮恒定。
+
+    ⚪ 这里不需要"捕获期必须打开"那条约束(eager 本来就不在捕获里),
+       但仍然缓存:两臂必须由【同一个开关】控制,否则比的是两套仪表。
+    """
+    global _EAGER_PROBE_ON
+    if _EAGER_PROBE_ON is None:
+        import os as _os
+        _EAGER_PROBE_ON = _os.environ.get(
+            "VLLM_ASCEND_DSV41_GRAPH_PROBE", "0") not in ("", "0", "false")
+    return _EAGER_PROBE_ON
 
 
 def _engram_host_gather(payload) -> None:

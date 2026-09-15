@@ -646,6 +646,21 @@ def _report_armed_decode(seq_len: int) -> None:
 _INNER_MODULE = None
 
 
+def set_request_identity(ident: "str | None") -> None:
+    """把本次 forward 的请求身份从 model_runner 递进来。
+
+    🔴 为什么不让 decode_step1 自己去 attn_metadata 里找(2026-09-15 实测)：
+    它原来找的是 ``req_metadata.req_ids_tensor``,那是上游 GPU metadata 的字段;
+    ``AscendDSAReqMetadata`` 上没有这个字段 ⇒ 身份恒为 None ⇒ ``_SEEN_PREFILL``
+    永远是空集 ⇒ decode step-1 一次都没被录过。而产物上看到的是"只有 prefill
+    的 dump" —— 和"decode 没有差异"一模一样。
+    ⇒ 问生产的解析链:runner 手上的 ``input_batch.req_ids`` 不依赖任何后端字段名。
+    """
+    from vllm_ascend.models.deepseek_v4_1 import decode_step1
+
+    decode_step1.set_runtime_identity(ident)
+
+
 def begin_forward(model_inputs: dict) -> None:
     """从 model_runner 武装 —— 因为模型的 pre-forward hook 在 replay 时不跑。
 
