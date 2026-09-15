@@ -402,6 +402,24 @@ def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
         pass
 
 
+_GRAPH_PROBE_ON: "bool | None" = None
+
+
+def _graph_probe_on() -> bool:
+    """图段内探针的开关 —— **整轮恒定**，捕获和重放必须读到同一个值。
+
+    缓存住,不是省时间:如果它在捕获期和重放期可能取到不同的值,
+    那句 copy 就会"录进图了但不该执行"或"该执行却没录进去",
+    两种都产生一个自洽而错误的 dump。
+    """
+    global _GRAPH_PROBE_ON
+    if _GRAPH_PROBE_ON is None:
+        import os as _os
+        _GRAPH_PROBE_ON = _os.environ.get(
+            "VLLM_ASCEND_DSV41_GRAPH_PROBE", "0") not in ("", "0", "false")
+    return _GRAPH_PROBE_ON
+
+
 def _tap_attn_output_all_rows(attn, output) -> None:
     """稀疏注意力算子的输出,记【全部行】—— 含 padding 行。
 
@@ -1436,14 +1454,23 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         #    写在 Python 里的 tap 在这里【一次都不会响】——整段在图里。
         #    只装 layer 0：分歧就诞生在它内部（layer_00 的注意力输出逐位相同，
         #    layer_01 的 sa_in 已差 0.26）。
-        try:
-            from vllm_ascend.models.deepseek_v4_1 import align_taps, graph_probe
-            if align_taps.alignment_active():
+        # 🔴 这里的门必须和 tap 的门【方向相反】。
+        #    tap 要在捕获期【关掉】(它做 host 读回,捕获期非法)；
+        #    探针必须在捕获期【打开】—— 那句 copy 只有被录进图,replay 才会执行。
+        #    第一版我把它放在 align_taps.alignment_active() 后面,而那道门包含
+        #    _IN_DUMMY_RUN，图捕获正是在 _dummy_run 里发生的 ⇒ 捕获期直接跳过
+        #    ⇒ kernel 从没进图 ⇒ replay 什么都不做,dump 里没有 probe 分片。
+        #    ⇒ 改用一个【整轮恒定】的 env 开关:捕获和重放读到的是同一个值。
+        if _graph_probe_on():
+            try:
+                from vllm_ascend.models.deepseek_v4_1 import (align_taps,
+                                                             graph_probe)
                 _lyr = align_taps.layer_index(
                     self.prefix, self.vllm_config.model_config.hf_text_config)
                 if _lyr == 0:
                     graph_probe.probe("L00.o_proj.in.o_unroped", o)
                     graph_probe.probe("L00.o_proj.out.wo_b", _out)
-        except Exception:                                    # noqa: BLE001
-            pass
+            except Exception:                                # noqa: BLE001
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe
+                graph_probe.note_call_site_error()
         return _out

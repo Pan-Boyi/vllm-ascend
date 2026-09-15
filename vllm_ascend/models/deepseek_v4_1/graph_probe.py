@@ -44,7 +44,8 @@ _WRITES: dict[str, int] = {}
 #: 出错/拒绝的记账。**无条件可读**，包括全零 —— 否则"探针没装上"和
 #: "探针装上了但这一层没差异"读数一样。
 _STATS: dict = {"allocated": 0, "copies": 0, "shape_changed": 0,
-                "alloc_failed": 0, "read": 0}
+                "alloc_failed": 0, "read": 0,
+               "call_site_errors": 0}
 
 
 def stats() -> dict:
@@ -86,6 +87,11 @@ def probe(name: str, x: torch.Tensor) -> None:
     _WRITES[name] = _WRITES.get(name, 0) + 1
 
 
+def note_call_site_error() -> None:
+    """调用点自己出错(取层号失败等)。和 probe() 内部的失败分开记。"""
+    _STATS["call_site_errors"] = _STATS.get("call_site_errors", 0) + 1
+
+
 def drain() -> "list[tuple[str, torch.Tensor, int]]":
     """把这一轮写过的探针读出来：(名字, buffer, 本轮写入次数)。
 
@@ -93,12 +99,19 @@ def drain() -> "list[tuple[str, torch.Tensor, int]]":
     两种模式都跑。写入次数一并交出去，因为"读到的是最后一次写入"这件事
     必须对读数的人可见。
     """
+    # 🔴 遍历 _BUFS，不是 _WRITES。
+    #    `_WRITES[name] += 1` 这句本身就是【图段里的 Python】——
+    #    copy kernel 会重放，这个计数器不会。第一版按 _WRITES 找本轮写过谁,
+    #    于是 replay 时它永远是空的 ⇒ 探针一个都读不出来,
+    #    而症状和"探针没装上"完全一样。
+    #    ⇒ buffer 是捕获期分配、整轮存在的,它才是可靠的清单。
     out = []
-    for name, n in _WRITES.items():
-        buf = _BUFS.get(name)
-        if buf is not None:
-            out.append((name, buf, n))
-            _STATS["read"] += 1
+    for name, buf in _BUFS.items():
+        # 写入次数在 replay 下【拿不到】(那行 Python 不执行)，
+        # 所以交出去的是 -1 而不是 0 —— 0 会被读成"这一轮没写过"。
+        n = _WRITES.get(name, -1)
+        out.append((name, buf, n))
+        _STATS["read"] += 1
     _WRITES.clear()
     return out
 

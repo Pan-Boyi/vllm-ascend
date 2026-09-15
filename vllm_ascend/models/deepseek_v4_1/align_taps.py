@@ -679,7 +679,10 @@ def tap_whole_probe(name: str, buf, writes: int) -> None:
     recorder = _armed_recorder()
     if recorder is None:
         return
-    recorder.record_whole("probe", f"{name}.writes={writes}", buf)
+    # writes=-1 表示【本轮的写入次数不可知】：图 replay 下那句计数是
+    # 图段里的 Python，不执行。不可知和 0 必须分开写，否则会被读成"没写过"。
+    tag = "unknown" if writes < 0 else str(writes)
+    recorder.record_whole("probe", f"{name}.writes={tag}", buf)
 
 
 def end_forward() -> None:
