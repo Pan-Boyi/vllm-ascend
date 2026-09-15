@@ -253,6 +253,22 @@ def per_token_compressed_slots(
     blocks = block_table.to(torch.int64)[req_of_token, safe_index]
 
     flat = blocks * page + (state % page)
+    # 🔴 ``blocks >= 0`` 分不出【padding 请求行】和【真的 0 号块】（2026-09-15 核实）：
+    #      model_runner_v1.py:3347  slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+    #      model_runner_v1.py:3348  blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+    #    ⚠️ 那两行上方的注释写的是 "Fill unused with -1" —— 它只描述了【第一行】，
+    #      而第二行填的是 0。而 0 是一个**真块号** ⇒ 「没有」被默认值写成了「有」。
+    #    ⇒ 图 replay 时，padding token 的 pos 是上一步的残值（:1523/:1530 只写前缀），
+    #      req_of_token 会落到 padding 行，取到 block 0，而这里判它有效。
+    #
+    # ⚫ 但本函数里【没有】可用来修正它的按 token 的有效性信号：
+    #      · slot_mapping 的值不能用 —— ratio>1 时压缩组的 slot_mapping 从没被填过
+    #        （dsa_v1.py:1298 的分支），本函数只用它的 shape/dtype 是对的
+    #      · positions 的 padding 位是残值，不是 -1
+    #      · 真实请求数是 host 侧整数，捕获那一刻就被烤死
+    #    ⇒ 修法只能在【上游】：要么 block_table 的 padding 行填 -1，要么额外传一个
+    #      按 token 的真实掩码。那是 worker 的共享代码（所有模型共用），不在本线地界
+    #      ⇒ 只记录，不擅改。
     keep = publishes & addressable & (blocks >= 0)
     slots = torch.where(keep, flat, torch.full_like(flat, SKIP_SLOT))
     return slots.to(slot_mapping.dtype), layer_names

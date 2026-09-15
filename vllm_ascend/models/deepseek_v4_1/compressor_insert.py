@@ -43,6 +43,32 @@ import torch
 PROCESS_LOCAL = ".process_local"
 
 
+_CAP_SKIP = {"ran": 0, "skipped_under_capture": 0}
+_TAP_SWALLOWED = {"count": 0, "first": None}
+
+
+def capture_skip_accounting() -> dict:
+    """无条件可读，包括全为零。"""
+    return dict(_CAP_SKIP)
+
+
+def tap_swallow_accounting() -> dict:
+    """仪表吞掉了几次异常、第一次是什么。无条件可读。"""
+    return dict(_TAP_SWALLOWED)
+
+
+def _skip_under_capture() -> bool:
+    """捕获期跳过并记账 —— 跳过和"没什么可记的"必须分得开。"""
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _CAP_SKIP["skipped_under_capture"] += 1
+        return True
+    _CAP_SKIP["ran"] += 1
+    return False
+
+
 def rope_quant_insert_ascend(
     latent: torch.Tensor,
     positions: torch.Tensor,
@@ -250,6 +276,12 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
     # tensor under two names in two dumps. Count only when you record.
     if not align_taps.recording_armed() or not read_taps.read_tap_layers():
         return
+    # 🔴 那道门是【env 门】，不是【捕获门】。开着 dump 再开图，这条路会走到
+    #    debug_align.py 的 ``t.cpu().contiguous()`` —— 捕获期非法的 host 读回；
+    #    而本文件的 ``except Exception: pass`` 会把那个异常吞掉
+    #    ⇒ 症状伪装成"dump 里少了几个键"，不是 107027。
+    if _skip_under_capture():
+        return
     try:
         index = _WRITE_CALLS.get(who, 0)
         _WRITE_CALLS[who] = index + 1
@@ -306,10 +338,19 @@ def _tap_write_side(who: str, flat_slots, latent, cache) -> None:
         align_taps.tap_whole(
             0, f"{prefix}.cache_id{PROCESS_LOCAL}",
             torch.tensor([(raw * 0x9E3779B1) & 0xFFFFFFFF], dtype=torch.int64))
-    except Exception:                                        # noqa: BLE001
+    except Exception as exc:                                 # noqa: BLE001
         # Instrument. It has already cost one flight to let one of these
         # propagate; it will not cost a second.
-        pass
+        # 🔴 但不再【静默】：一个会吞掉"捕获被打断"的仪表比没有仪表更贵。
+        _TAP_SWALLOWED["count"] += 1
+        if _TAP_SWALLOWED["count"] == 1:
+            _TAP_SWALLOWED["first"] = repr(exc)
+            from vllm.logger import logger
+            logger.warning(
+                "compressor_insert tap swallowed an exception (first time): "
+                "%r. The run continues -- but if this is a capture violation, "
+                "the symptom downstream is 'a few dump keys are missing', not "
+                "an error.", exc)
 
 
 def _tap_output(who: str, latent) -> None:
@@ -323,6 +364,12 @@ def _tap_output(who: str, latent) -> None:
     from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
 
     if not align_taps.recording_armed() or not read_taps.read_tap_layers():
+        return
+    # 🔴 那道门是【env 门】，不是【捕获门】。开着 dump 再开图，这条路会走到
+    #    debug_align.py 的 ``t.cpu().contiguous()`` —— 捕获期非法的 host 读回；
+    #    而本文件的 ``except Exception: pass`` 会把那个异常吞掉
+    #    ⇒ 症状伪装成"dump 里少了几个键"，不是 107027。
+    if _skip_under_capture():
         return
     try:
         index = max(_WRITE_CALLS.get(who, 1) - 1, 0)
