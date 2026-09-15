@@ -3077,21 +3077,26 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
-        # 🔴 在这里武装对齐 recorder,而不是靠挂在模型上的 pre-forward hook：
-        #    图 replay 只做 entry.capture.replay(),模型模块的 Python 不执行,
-        #    hook 一次都不会响。这一行两种模式都跑、每个 rank 都跑,
-        #    且严格早于所有 tap。见 align_taps.arm_for_this_forward 的注释。
+        # 🔴 对齐 recorder 的【武装 / 取 positions / 落盘】三件事都在这里驱动,
+        #    而不是挂在模型模块上做 hook：图 replay 只做 entry.capture.replay(),
+        #    模型模块的 Python 一行都不执行,三个 hook 一次都不会响。
+        #    这两处两种模式都跑、每个 rank 都跑,且严格包住所有 tap。
         from vllm_ascend.models.deepseek_v4_1 import align_taps as _align_taps
 
-        _align_taps.arm_for_this_forward()
+        _align_taps.begin_forward(model_inputs)
 
-        if self.enable_enpu:
-            # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-            hidden_states = run_model()
-        else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        try:
+            if self.enable_enpu:
+                # The soft segmentation scenario requires event.record first, then event.wait
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+                hidden_states = run_model()
+            else:
+                hidden_states = run_model()
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        finally:
+            # finally:forward 抛异常时也要落盘。“报告不该销毁它所报告的东西”——
+            # 一次失败的 forward 正是最需要那份 dump 的时候。
+            _align_taps.end_forward()
 
         return hidden_states
 

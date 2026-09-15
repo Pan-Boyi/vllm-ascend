@@ -641,13 +641,12 @@ def _report_armed_decode(seq_len: int) -> None:
         "position looks right and compares wrong.")
 
 
-#: 本次 forward 是否已经由 model_runner 武装过。由 arm_for_this_forward()
-#: 置位、由模型的 pre-forward hook【消费】(置回 False)。
-#: 两者在 eager 下成对出现;图 replay 下只有前者。
-_ARM_DONE = False
+#: 装 tap 时记下的内层模型。model_runner 驱动 begin/end 时要用它按名字
+#: 取 positions,而 runner 不该知道"内层"是哪一个模块。
+_INNER_MODULE = None
 
 
-def arm_for_this_forward() -> None:
+def begin_forward(model_inputs: dict) -> None:
     """从 model_runner 武装 —— 因为模型的 pre-forward hook 在 replay 时不跑。
 
     🔴 实测判据(2026-09-15,同一份代码两臂)：
@@ -664,13 +663,17 @@ def arm_for_this_forward() -> None:
        recorder 是武装好的。拿到的会是 REF 的一个子集,而子集是范围不是差异 ——
        比对器用 --expect-subset 把缺的键数出来。
     """
-    global _ARM_DONE
-    # 🔴 先清再武装。上一次 forward 如果是图 replay,hook 没来消费,标志会
-    #    【留成 True】,于是这一次的 _arm_recording 会在开头直接返回 ——
-    #    第一次 forward 记得好好的,第二次起静默不记,而两者都不报错。
-    _ARM_DONE = False
+    if _INNER_MODULE is None:
+        return
     _arm_recording(None, None)
-    _ARM_DONE = True
+    _capture_positions(_INNER_MODULE, (), model_inputs)
+
+
+def end_forward() -> None:
+    """本次 forward 的落盘。和 begin_forward 成对,由 model_runner 驱动。"""
+    if _INNER_MODULE is None:
+        return
+    _flush_and_rotate(_INNER_MODULE, (), None)
 
 
 def _arm_recording(_module, _args) -> None:
@@ -700,13 +703,7 @@ def _arm_recording(_module, _args) -> None:
     not exist on a non-first pipeline rank -- and which is strictly earlier
     than every tap, the ordering the recorder needs.
     """
-    global _ARMED, _ARM_DONE
-
-    if _ARM_DONE:
-        # 本次 forward 已由 model_runner 武装过。**消费掉**标志而不是忽略它 ——
-        # 忽略会让下一次 forward 的 hook 也被跳过,而那一次可能没人替它武装。
-        _ARM_DONE = False
-        return
+    global _ARMED
 
     if _capturing():
         # 捕获期不武装、也不做任何 host 读回。丢的是 dummy 数据。
@@ -1039,11 +1036,18 @@ def install_alignment_taps(model: torch.nn.Module) -> list:
     # cannot leave the last one visible to the next.
     # Before the positions capture and before every tap: nothing records
     # until the buffer can be sized.
-    handles.append(inner.register_forward_pre_hook(_arm_recording))
-    handles.append(inner.register_forward_pre_hook(_capture_positions,
-                                                   with_kwargs=True))
-    # And after everything, where "this request's tensors are all in" is true.
-    handles.append(inner.register_forward_hook(_flush_and_rotate))
+    # 🔴 这三个【不再装成 hook】(2026-09-15)。它们挂在模型模块上,而图 replay
+    #    只做 entry.capture.replay() —— 模型模块的 Python 一行都不执行,
+    #    三个 hook 一次都不会响:武装不了、positions 取不到、更不会落盘。
+    #    实测:图模式 dump 0 分片,而【一条 disarm 报告都没有】——
+    #    "判定不该记"会留痕,"根本没跑"不会。
+    #    改由 model_runner 在 run_model() 前后驱动 begin_forward/end_forward,
+    #    那两处两种模式都跑、每个 rank 都跑。
+    #    ⚠️ 刻意做成【单一路径】而不是"hook + runner 双保险":双路径需要一个
+    #       配对标志来去重,而那个标志我今天已经写错过一次(图模式下没人消费它,
+    #       于是第二次 forward 起静默不记,且不报错)。一条路就没有配对可错。
+    global _INNER_MODULE
+    _INNER_MODULE = inner
     # Counted apart from the positions capture, which always registers. Using
     # len(handles) would have made the "nothing was tapped" branch below
     # unreachable -- a guard that cannot fire, which is worse than none
