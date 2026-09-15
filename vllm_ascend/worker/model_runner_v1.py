@@ -3094,6 +3094,16 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = run_model()
                 self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
         finally:
+            # 🔴 先把【图段内探针】读出来，再落盘。探针是图里的一条 copy kernel,
+            #    replay 时照常执行;而这里的 Python 每步都跑、两种模式都跑。
+            #    这是目前唯一能看见图段内部的通路。
+            try:
+                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
+
+                for _nm, _buf, _n in _gp.drain():
+                    _align_taps.tap_whole_probe(_nm, _buf, _n)
+            except Exception:                                # noqa: BLE001
+                pass
             # finally:forward 抛异常时也要落盘。“报告不该销毁它所报告的东西”——
             # 一次失败的 forward 正是最需要那份 dump 的时候。
             _align_taps.end_forward()

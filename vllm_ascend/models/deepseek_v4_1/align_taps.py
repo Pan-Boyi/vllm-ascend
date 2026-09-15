@@ -669,6 +669,19 @@ def begin_forward(model_inputs: dict) -> None:
     _capture_positions(_INNER_MODULE, (), model_inputs)
 
 
+def tap_whole_probe(name: str, buf, writes: int) -> None:
+    """图段内探针的落盘入口。
+
+    ⚠️ 名字里带 ``.writes=N``:读到的是【最后一次写入】,而同名探针可能被
+    多层/多步写过。把 N 摆在键名里,读数的人就看得见分母 ——
+    不摆出来的话,"只有一个写者"这个前提会被默认成立。
+    """
+    recorder = _armed_recorder()
+    if recorder is None:
+        return
+    recorder.record_whole("probe", f"{name}.writes={writes}", buf)
+
+
 def end_forward() -> None:
     """本次 forward 的落盘。和 begin_forward 成对,由 model_runner 驱动。"""
     if _INNER_MODULE is None:

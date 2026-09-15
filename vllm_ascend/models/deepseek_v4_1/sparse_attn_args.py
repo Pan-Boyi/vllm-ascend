@@ -774,6 +774,15 @@ def _report_compressed_arguments(kwargs: dict[str, Any]) -> None:
     reads" is exactly the kind of input that changes the output without
     changing anything that looks wrong.
     """
+    # 🔴 捕获门在最前面。本函数在【生产路径上无条件被调用】
+    #    (build_sparse_flash_mla_kwargs 的结尾)，而它按形状打印诊断 ——
+    #    "飞过几发没炸"不是它捕获安全的证据，只是还没踩到。
+    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
+        _stream_is_capturing
+
+    if _stream_is_capturing():
+        _DEVICE_PRED["skipped_under_capture"] += 1
+        return
     if not kwargs.get("attends_compressed", "cmp_kv" in kwargs):
         return
 

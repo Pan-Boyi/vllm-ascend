@@ -1431,4 +1431,19 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # quantisation is not optional here. Dequantising both matrices to bf16
         # and multiplying leaves 1.8e-2 relative error on a single layer,
         # against 3.5e-5 for a real block-scaled fp8 GEMM.
-        return self.wo_b(z.reshape(num_tokens, -1))
+        _out = self.wo_b(z.reshape(num_tokens, -1))
+        # 🔴 图段内的探针：这一句 copy 是 kernel，会被录进图、每次 replay 都执行。
+        #    写在 Python 里的 tap 在这里【一次都不会响】——整段在图里。
+        #    只装 layer 0：分歧就诞生在它内部（layer_00 的注意力输出逐位相同，
+        #    layer_01 的 sa_in 已差 0.26）。
+        try:
+            from vllm_ascend.models.deepseek_v4_1 import align_taps, graph_probe
+            if align_taps.alignment_active():
+                _lyr = align_taps.layer_index(
+                    self.prefix, self.vllm_config.model_config.hf_text_config)
+                if _lyr == 0:
+                    graph_probe.probe("L00.o_proj.in.o_unroped", o)
+                    graph_probe.probe("L00.o_proj.out.wo_b", _out)
+        except Exception:                                    # noqa: BLE001
+            pass
+        return _out
