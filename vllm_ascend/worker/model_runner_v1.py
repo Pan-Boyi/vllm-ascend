@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict, deque
@@ -302,6 +303,41 @@ def get_tp_context(drafter):
 def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     """Count NaNs without the unsupported NPU ``sum(dtype=...)`` overload."""
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
+
+
+#: DSV4.1 engram 在 PIECEWISE 捕获下整块不执行的修复开关。
+#: 默认【开】。设为 0 恢复上游原行为(阴性臂用)。
+#: 只在 _should_build_dummy_attn_metadata 里被读,作用域见那里的注释。
+_PIECEWISE_ATTN_META: "bool | None" = None
+_PIECEWISE_ATTN_META_LOGGED: set = set()
+
+
+def _piecewise_dummy_attn_meta_enabled() -> bool:
+    global _PIECEWISE_ATTN_META
+    if _PIECEWISE_ATTN_META is None:
+        raw = os.getenv("DSV41_PIECEWISE_ATTN_META", "1").strip()
+        _PIECEWISE_ATTN_META = raw not in ("0", "false", "False", "")
+    return _PIECEWISE_ATTN_META
+
+
+def _log_piecewise_attn_meta_once(built: bool) -> None:
+    """把"这一发到底走了哪条"变成产物。
+
+    🔴 不这么做的话,"修好了"和"开关没生效"在日志里长得一模一样 ——
+    两边都只是安静地跑完。每种取值各记一次,分母可见。
+    """
+    key = bool(built)
+    if key in _PIECEWISE_ATTN_META_LOGGED:
+        return
+    _PIECEWISE_ATTN_META_LOGGED.add(key)
+    try:
+        logger.info(
+            "DSV4.1 PIECEWISE 捕获的 dummy attn_metadata: 构建=%s "
+            "(DSV41_PIECEWISE_ATTN_META=%s)。构建=False 时 engram prologue "
+            "在捕获期不执行 ⇒ 不进图 ⇒ replay 永不执行。",
+            key, os.getenv("DSV41_PIECEWISE_ATTN_META", "1"))
+    except BaseException:                                    # noqa: BLE001
+        pass
 
 
 class ExecuteModelState(NamedTuple):
@@ -3682,7 +3718,48 @@ class NPUModelRunner(GPUModelRunner):
         """
         # If force_attention is True, we always capture attention, Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
-        return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
+        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            return True
+
+        # 🔴 DSV4.1 engram 在 PIECEWISE 捕获下【整块不执行】(2026-09-15 定位)
+        #
+        # 上游在 PIECEWISE 捕获时不建 attn_metadata,理由是注意力被 splitting_ops
+        # 切出了图、在图外 eager 跑,metadata 用不着。对注意力这是对的。
+        # 但 DSV4.1 的 model.forward 里,engram 的 prologue 拿
+        # `isinstance(attn_metadata, dict)` 当执行闸:
+        #
+        #   vllm/models/deepseek_v4_1/nvidia/model.py:648
+        #   if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
+        #       engram_hashes = self.engram_hash(...)        # n-gram hash 两条 kernel
+        #       for layer ...: engram.prepare_embeddings(...) # 189 GiB 表的 host gather
+        #
+        # 捕获期 attn_metadata=None ⇒ 这一整块【在捕获时没执行】⇒ 它的 kernel
+        # 【没有被录进图】⇒ replay 时永不执行 ⇒ engram 层一直读 warmup 那次
+        # 留在 _dev_weight/_dev_scale 里的 embedding,与本次请求无关。
+        #
+        # 实测产物(xr_hash_graph_120807, 四 rank 四道题):
+        #   prologue.engram_hashes 图内探针 四题逐位相同 = 全零 token 的 hash
+        #   prologue.input_ids     图内探针 四题逐位相同 = [0]*8
+        #   同一份 probe.safetensors 里 22 个 decoder-layer 探针四题全不同
+        #   ⇒ 探针机制本身在 replay 下工作正常,冻结的是被测对象。
+        #   engram.Lx.ids_device 载荷 num_tokens=1 ⇒ 最后一次真正执行是
+        #   decode 形状的 FULL 捕获(日志里 decode,FULL 与 mixed,PIECEWISE 各 6 次)。
+        # 症状:第 0 层(无 engram)逐位等于 eager;L01.pre_engram.residual 相同
+        #      而 L01.post_engram.residual 差 0.427/0.628/0.649/0.673。
+        #
+        # ⚠️ 作用域:缺陷的范围是【任何 PIECEWISE 捕获】,不是 breakable 独有 ——
+        #    执行闸是模型里的 `isinstance(attn_metadata, dict)`,它不认捕获实现。
+        #    所以这里不按 breakable 收窄(收窄了就是判据比缺陷还窄)。
+        #    FULL 与 NONE 一字不改;关掉开关就是上游原行为,留给 A/B 做阴性臂。
+        if (
+            not is_profile
+            and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+            and _piecewise_dummy_attn_meta_enabled()
+        ):
+            _log_piecewise_attn_meta_once(True)
+            return True
+        _log_piecewise_attn_meta_once(False)
+        return False
 
     @torch.inference_mode()
     def _dummy_run(
@@ -3847,7 +3924,13 @@ class NPUModelRunner(GPUModelRunner):
         # reading. Mirrors upstream gpu_model_runner._dummy_run.
         with self.synchronize_input_prep():
             # Build attention metadata for dummy_run
-            if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
+            # 🔴 一次求值,两处共用。填 127 的那句在这个分支【里面】,而复位
+            #    原本挂在 force_attention 上 —— 放宽本分支却不动复位,会留下
+            #    "positions 停在 127 且无人复位"这个原本不存在的组合,
+            #    也就是在一次改动里偷偷塞进第二个变量。
+            built_dummy_attn_meta = self._should_build_dummy_attn_metadata(
+                force_attention, is_profile, cudagraph_runtime_mode)
+            if built_dummy_attn_meta:
                 if create_mixed_batch:
                     raise NotImplementedError(
                         "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
@@ -3872,6 +3955,39 @@ class NPUModelRunner(GPUModelRunner):
                         if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                         else max_query_len
                     )  # type: ignore[assignment]
+                    # 🔴 实验开关(2026-09-15):捕获期喂给算子的 KV 长度。
+                    #
+                    # 为什么怀疑它:图与 eager 在【输入逐位相同】的前提下,
+                    # 第 1 层 attention 的输出差一个 bf16 ULP(中位恰好 1 ULP,
+                    # 25% 元素受影响),而 eager 跨两次独立启动【逐位相同】——
+                    # 算子是确定的,差别只能来自执行调度。而调度(分块/workspace)
+                    # 是在 launch 时按当时的 seqused_kv 规划的,捕获期那次规划
+                    # 被烘进图,replay 不再重规划。捕获期 decode 的 max_query_len
+                    # 是 1,真实请求是 7 —— 为长度 1 规划的分块去处理 7 个 KV,
+                    # 归约顺序自然与 eager 不同。
+                    #
+                    # 判据是【二值】的:改这个值,若图模式的输出跟着变,
+                    # 就证明分块确实按捕获期长度烘死;若一点不变,这条假设作废。
+                    # 🔴 实测结果(2026-09-15,两发都崩,记在这里免得下一个人重烧):
+                    #    取 128 → 捕获期 aicore 越界,device error type 3 (507011);
+                    #    取 8   → 同样崩。
+                    #    原因是 dummy 的 block_table / slot_mapping 只按
+                    #    max_query_len 个 token 备好,单独把 seq_lens 抬上去
+                    #    就让算子读到没分配的槽位。要让这个实验成立,必须连带
+                    #    把 dummy 的寻址一起改一致 —— 那是另一件事,还没做。
+                    #    ⇒ 现在【开了就会崩】。留着是因为它记录了一条已排除的路,
+                    #      不是因为它能用。
+                    # ⚠️ 只在捕获期生效,推理路径一字不动;不设＝原行为。
+                    _cap_sl = os.getenv("DSV41_CAPTURE_SEQ_LEN", "").strip()
+                    if is_graph_capturing and _cap_sl:
+                        try:
+                            seq_lens = int(_cap_sl)
+                            logger.info(
+                                "DSV4.1 捕获期 seq_lens 覆盖为 %d "
+                                "(原值 %s, num_tokens=%s) —— 实验开关",
+                                seq_lens, max_query_len, num_tokens)
+                        except ValueError:
+                            pass
 
                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
                 self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
@@ -4055,7 +4171,7 @@ class NPUModelRunner(GPUModelRunner):
             if not is_profile and self.dynamic_eplb:
                 self.eplb_updator.forward_end(self.eplb_heat_collection_status)
             self._finalize_dump_data(dump=False)
-            if self.use_compress and force_attention:
+            if self.use_compress and built_dummy_attn_meta:
                 self.positions.fill_(0)
                 self._dsa_positions_cpu_buf.fill_(0)
             return hidden_states, hidden_states
