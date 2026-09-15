@@ -44,7 +44,7 @@ _WRITES: dict[str, int] = {}
 #: 出错/拒绝的记账。**无条件可读**，包括全零 —— 否则"探针没装上"和
 #: "探针装上了但这一层没差异"读数一样。
 _STATS: dict = {"allocated": 0, "copies": 0, "shape_changed": 0,
-                "alloc_failed": 0, "read": 0,
+                "alloc_failed": 0, "read": 0, "filtered_other_bucket": 0,
                "call_site_errors": 0}
 
 
@@ -100,7 +100,7 @@ def note_call_site_error() -> None:
     _STATS["call_site_errors"] = _STATS.get("call_site_errors", 0) + 1
 
 
-def drain() -> "list[tuple[str, torch.Tensor, int]]":
+def drain(only_rows: "int | None" = None) -> "list[tuple[str, torch.Tensor, int]]":
     """把这一轮写过的探针读出来：(名字, buffer, 本轮写入次数)。
 
     由 model_runner 在 ``run_model()`` 之后调用 —— 那里的 Python 每步都跑，
@@ -113,8 +113,18 @@ def drain() -> "list[tuple[str, torch.Tensor, int]]":
     #    于是 replay 时它永远是空的 ⇒ 探针一个都读不出来,
     #    而症状和"探针没装上"完全一样。
     #    ⇒ buffer 是捕获期分配、整轮存在的,它才是可靠的清单。
+    # 🔴 只交出【本次 forward 那个桶】(2026-09-15)。
+    #    分桶解决了"形状混着比",但没解决"归属":图模式下 T8 桶既可能是
+    #    T=8 那道题的 prefill,也可能是 T=5 被 padding 到 8 —— 最后写入者胜。
+    #    而一次 forward 里探针写的就是这一个桶,这个请求的落盘也发生在同一次
+    #    forward 结束时 ⇒ 按桶过滤,归属就自动是对的,不需要再加任何机制。
+    #    only_rows=None 表示不过滤(单测/eager 早期路径)。
     out = []
     for name, buf in _BUFS.items():
+        if only_rows is not None and not name.endswith(f".T{int(only_rows)}"):
+            _STATS["filtered_other_bucket"] = \
+                _STATS.get("filtered_other_bucket", 0) + 1
+            continue
         # 写入次数在 replay 下【拿不到】(那行 Python 不执行)，
         # 所以交出去的是 -1 而不是 0 —— 0 会被读成"这一轮没写过"。
         n = _WRITES.get(name, -1)

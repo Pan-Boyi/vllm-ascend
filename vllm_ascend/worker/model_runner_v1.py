@@ -3100,7 +3100,7 @@ class NPUModelRunner(GPUModelRunner):
             try:
                 from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
 
-                _drained = _gp.drain()
+                _drained = _gp.drain(only_rows=num_tokens_padded)
                 for _nm, _buf, _n in _drained:
                     _align_taps.tap_whole_probe(_nm, _buf, _n)
                 # 🔴 记账要【被读出来】。上一版我加了 shape_changed 却从没打印,
