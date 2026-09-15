@@ -380,6 +380,30 @@ def _check(condition: bool, operator_message: str, detail: str = "") -> None:
         + (f"\n  {detail}" if detail else ""))
 
 
+def _cu_seqlens_diagnosis(t) -> str:
+    """把【它长什么样】接在报错后面 —— 判据要给诊断,不要只报一个是非。
+
+    🔴 2026-09-15：这一条在图捕获的 warmup 里拦下了一次,而报错只说了
+    "not non-decreasing"。于是"是哪一位下降的"只能靠读 model_runner 的
+    padding 代码去推 —— 推了三个分支都自洽,一个都不能证实。
+    值就在手边,不打出来是白白扔掉唯一的证据。
+
+    ⚠️ 只在【已经要抛异常】的路径上调用:它做 host 读回,捕获期非法。
+       而能走到这里就说明我们不在捕获期(捕获期 _device_predicate 直接放行)。
+    """
+    try:
+        v = t.detach().to("cpu").tolist()
+    except Exception as exc:                       # 读不回来也要说清是读不回来
+        return f"\n  (取不到值: {type(exc).__name__}: {exc})"
+    bad = [i for i in range(1, len(v)) if v[i] < v[i - 1]]
+    head = v if len(v) <= 24 else v[:12] + ["…"] + v[-12:]
+    return (f"\n  cu_seqlens_q = {head}"
+            f"\n  第一处下降在下标 {bad[0]}: {v[bad[0]-1]} -> {v[bad[0]]}"
+            f"  (共 {len(bad)} 处下降, 长度 {len(v)})" if bad else
+            f"\n  cu_seqlens_q = {head}  (没找到下降位 —— 判据和诊断不一致,"
+            f" 这本身是个结论)")
+
+
 def _check_block_table_addresses_this_cache(kwargs: dict[str, Any],
                                             cache_group_key=None,
                                             owner_key=None) -> None:
@@ -561,13 +585,18 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
         cu_seqlens_q = kwargs.get("cu_seqlens_q")
         _check(cu_seqlens_q is not None,
                "layout_q=TND requires cu_seqlens_q, cumulative, length T+1")
+        # ⚠️ 这一条【区分力为零】,留着只是为了在 num_requests 改成别的来源时能响:
+        #    唯一的调用点把 num_requests 算作 query_start_loc.numel()-1,
+        #    于是 numel()==num_requests+1 是个恒真式。它看起来像长度检查,
+        #    而它永远不会拦下任何东西 —— 不随被测量变化的校验位比读不到更糟。
         _check(cu_seqlens_q.ndim == 1 and cu_seqlens_q.numel() == num_requests + 1,
                "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
-               f"got shape {tuple(cu_seqlens_q.shape)} for {num_requests} requests")
+               f"got shape {tuple(cu_seqlens_q.shape)} for {num_requests} requests"
+               " (⚠️ 恒真式:num_requests 就是从这个 numel 算出来的)")
         _check(_device_predicate(torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1])),
                "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
                "the values are not non-decreasing, so they are lengths rather "
-               "than a cumulative sum")
+               "than a cumulative sum" + _cu_seqlens_diagnosis(cu_seqlens_q))
 
     if layout_kv != "TND":
         for name in ("cu_seqlens_ori_kv", "cu_seqlens_cmp_kv"):
