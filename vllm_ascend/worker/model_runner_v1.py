@@ -3670,6 +3670,48 @@ class NPUModelRunner(GPUModelRunner):
         profile_cpp: bool = False,
         skip_gdn_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 🔴 对齐 tap 在 _dummy_run 全程关闭。dummy 批次的 seq_lens 和
+        #    positions 来自两个来源,在真实请求里一致、在这里不一致,
+        #    于是 recorder 会被武装成错的尺寸并在 record() 时越界。
+        #    见 align_taps.dummy_run_scope 的注释。
+        from vllm_ascend.models.deepseek_v4_1 import align_taps as _align_taps
+
+        with _align_taps.dummy_run_scope():
+            return self._dummy_run_inner(
+                num_tokens=num_tokens,
+                with_prefill=with_prefill,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                force_attention=force_attention,
+                uniform_decode=uniform_decode,
+                is_profile=is_profile,
+                create_mixed_batch=create_mixed_batch,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=skip_eplb,
+                remove_lora=remove_lora,
+                is_graph_capturing=is_graph_capturing,
+                num_active_loras=num_active_loras,
+                profile_seq_lens=profile_seq_lens,
+                profile_cpp=profile_cpp,
+                skip_gdn_state_update=skip_gdn_state_update)
+
+    def _dummy_run_inner(
+        self,
+        num_tokens: int,
+        with_prefill: bool = False,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+        force_attention: bool = False,
+        uniform_decode: bool = False,
+        is_profile: bool = False,
+        create_mixed_batch: bool = False,
+        allow_microbatching: bool = True,
+        skip_eplb: bool = False,
+        remove_lora: bool = True,
+        is_graph_capturing: bool = False,
+        num_active_loras: int = 0,
+        profile_seq_lens: int | None = None,
+        profile_cpp: bool = False,
+        skip_gdn_state_update: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
         # If cudagraph_mode.decode_mode() == FULL and

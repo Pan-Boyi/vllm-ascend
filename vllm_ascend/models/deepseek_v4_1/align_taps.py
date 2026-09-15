@@ -473,6 +473,40 @@ def align_gate_accounting() -> dict:
     return dict(_ALIGN_GATE)
 
 
+#: 这个 forward 背后【有没有一个真实请求】。由 model_runner 的 _dummy_run
+#: 全程置位。_dummy_run 包括 profile、warmup 和图捕获三种,它们喂的都是
+#: 构造出来的批次。
+_IN_DUMMY_RUN = False
+
+
+def dummy_run_scope():
+    """_dummy_run 的整个时长内把 tap 关掉。
+
+    🔴 为什么光有捕获门不够(2026-09-15 实测)：图捕获前面还有一步 **warmup**,
+    那时 stream 还没开始捕获,``_stream_is_capturing()`` 正确地返回 False,
+    于是门放行 —— 然后 dummy 批次把 recorder 武装成了错的尺寸：
+        set_seq_len(1)  # 来自 dummy 的 seq_lens
+        record(...)     # 而 row_to_pos 里有 127
+        IndexError: index 127 is out of bounds for dimension 0 with size 1
+    两个来源在真实请求里一致,只有 dummy run 会把它们劈开。
+    ⚠️ eager 模式没有 _warmup_and_capture 这一步,所以这堵墙【只在图模式下存在】,
+       而它看起来像一个普通的越界 bug。
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _scope():
+        global _IN_DUMMY_RUN
+        prev = _IN_DUMMY_RUN
+        _IN_DUMMY_RUN = True
+        try:
+            yield
+        finally:
+            _IN_DUMMY_RUN = prev
+
+    return _scope()
+
+
 def _capturing() -> bool:
     """当前 stream 是否在图捕获中。
 
@@ -490,7 +524,10 @@ def _capturing() -> bool:
     from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
         _stream_is_capturing
 
-    return _stream_is_capturing()
+    # 🔴 两个条件,不是一个。捕获期非法(107027);dummy run 合法但【无意义且有害】
+    #    —— 它会用构造出来的形状武装 recorder。名字仍叫 _capturing 是因为
+    #    调用点问的其实是同一件事："这一次 forward 该不该记"。
+    return _IN_DUMMY_RUN or _stream_is_capturing()
 
 
 def _armed_recorder():
