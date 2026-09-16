@@ -406,6 +406,7 @@ _GRAPH_PROBE_ON: "bool | None" = None
 
 
 _WAIT_SAS: "bool | None" = None
+_WAIT_SAS_LOGGED = False
 
 
 def _wait_sas_enabled() -> bool:
@@ -1174,6 +1175,38 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # 开关只为做单开关 A/B(默认【开】= 正确行为)。关掉就是加这一句之前的
         # 上游行为,留作阴性臂 —— 缺陷 #1 也是这么验的。
         _wait_sas = (cmp_req or req).sas_metadata
+        # 🔴 把"这一句到底有没有【真的做事】"变成产物(2026-09-16)。
+        #    wait_for_device_metadata 在没有 executor 时自行 return ——
+        #    "修好了"和"这条通路压根没启用"产出完全相同的结果。
+        #    今天已经因为分不开这两者误判过一次,这里当场记下来。
+        #    纯 host 侧读取,不碰设备(指针日志那次同步 D2H 拖垮过一整发)。
+        global _WAIT_SAS_LOGGED
+        if not _WAIT_SAS_LOGGED:
+            _WAIT_SAS_LOGGED = True
+            try:
+                # 🔴 logger 和层号都必须在【本块内】自己取:
+                #    第一版直接用了 _lg / _l,而那两个定义在
+                #    `if _graph_probe_on():` 块【里面】—— 在这里是 NameError,
+                #    又被下面那个 except BaseException 静默吞掉,
+                #    产物上表现为"自检一行没打",和"通路没启用"读数一样。
+                from vllm.logger import logger as _slg
+                from vllm.forward_context import (get_forward_context,
+                                                  is_forward_context_available)
+                _ex = (getattr(get_forward_context(),
+                               "device_metadata_executor", None)
+                       if is_forward_context_available() else "无 forward ctx")
+                _slg.info(
+                    "DSV4.1 sas 等待自检 %s: 开关=%s 是张量=%s "
+                    "executor=%s in_flight=%s ⇒ 这一句%s",
+                    self.prefix, _wait_sas_enabled(),
+                    isinstance(_wait_sas, torch.Tensor), _ex is not None
+                    and _ex != "无 forward ctx",
+                    getattr(_ex, "submission_in_flight", "n/a"),
+                    "真的插了跨流等待" if (_ex is not None
+                                   and _ex != "无 forward ctx") else
+                    "是【空操作】—— 异步通路没启用,本开关证明不了任何事")
+            except BaseException:                            # noqa: BLE001
+                pass
         if isinstance(_wait_sas, torch.Tensor) and _wait_sas_enabled():
             wait_for_device_metadata(DeviceMetadataStage.ATTENTION,
                                      id(_wait_sas))
