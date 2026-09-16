@@ -1086,7 +1086,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
                 _l = align_taps.layer_index(
                     self.prefix, self.vllm_config.model_config.hf_text_config)
-                if _l in (0, 1):
+                if _l in (0, 1, 2):
                     _gp.probe(f"L{_l:02d}.sa_in.q", q)
                     _gp.probe(f"L{_l:02d}.sa_in.kv", kv)
             except Exception:                                # noqa: BLE001
@@ -1227,7 +1227,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
                 _l = align_taps.layer_index(
                     self.prefix, self.vllm_config.model_config.hf_text_config)
-                if _l in (0, 1):
+                if _l in (0, 1, 2):
                     from vllm.logger import logger as _lg
                     _p = f"L{_l:02d}.kvsrc"
 
@@ -1306,6 +1306,35 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                         _pb("slot_mapping", _sm, 16)
                     if isinstance(self.attn_sink, torch.Tensor):
                         _pb("attn_sink", self.attn_sink, 64)
+                    # 🔴 压缩流的全部参数(2026-09-16)。
+                    #    实测:第 2 层 sa_in.q / sa_in.kv 逐位相同而 attn.o_raw
+                    #    差 rel_l2=5.2e-01(不是 ULP,是完全不同的结果),
+                    #    而第 0/1 层逐位相同 —— 它们的 compress_ratios 是 0,
+                    #    整组压缩流参数全是 None。所以差异只能来自这一组。
+                    #    每个都定长补零并把真实元素数写进键名。
+                    _pb("cmp_ratio_t",
+                        torch.tensor([float(cmp_ratio or 0)]), 1)
+                    _pb("attends_cmp",
+                        torch.tensor([1 if attends_compressed else 0]), 1)
+                    for _nm, _t in (("cmp_block_table", cmp_block_table),
+                                    ("cmp_residual_kv", cmp_residual_kv),
+                                    ("cmp_selection", cmp_selection),
+                                    ("ori_sparse_indices", ori_sparse_indices),
+                                    ("ori_topk_length", ori_topk_length)):
+                        if isinstance(_t, torch.Tensor):
+                            _pb(_nm, _t, 256)
+                    _scmp = (cmp_req.seqused_cmp_kv
+                             if attends_compressed and cmp_req is not None
+                             else None)
+                    if isinstance(_scmp, torch.Tensor):
+                        _pb("seqused_cmp_kv", _scmp, 16)
+                    if cmp_req is not None and isinstance(
+                            getattr(cmp_req, "sas_metadata", None),
+                            torch.Tensor):
+                        _pb("cmp_sas_metadata", cmp_req.sas_metadata, 1024)
+                    if isinstance(cmp_kv, torch.Tensor) and cmp_kv.is_contiguous():
+                        _pb("cmp_kv_head", cmp_kv, 4096)
+
                     # 算子真正会去读的那几行 KV:按本请求 block_table 的头两个
                     # block 取出来。这是唯一能回答"两臂读到的字节是否相同"的探针 ——
                     # 其余几个只回答"寻址是否相同"。
@@ -1705,7 +1734,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                                                              graph_probe as _gp)
                 _l = _at.layer_index(self.prefix,
                                      self.vllm_config.model_config.hf_text_config)
-                if _l in (0, 1):
+                if _l in (0, 1, 2):
                     _gp.probe(f"L{_l:02d}.attn.o_raw",
                               o[:, :self.n_local_heads])
             except Exception:                                # noqa: BLE001
@@ -1780,7 +1809,7 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 #    第 1 层 attention 【内部】。只有第 0 层有切分点的话,
                 #    这一段整体是黑的。名字带层号,第 0 层的键名不变,
                 #    历史产物仍然可比。
-                if _lyr in (0, 1):
+                if _lyr in (0, 1, 2):
                     graph_probe.probe(f"L{_lyr:02d}.o_proj.in.o_unroped", o)
                     graph_probe.probe(f"L{_lyr:02d}.o_proj.out.wo_b", _out)
             except Exception:                                # noqa: BLE001

@@ -74,6 +74,20 @@ else:
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
+#: num_compressed_tokens 取证的打印计数(列表以便闭包内自增)
+_DSA_NCT_LOGGED = [0]
+_SEQUSED_CMP_PERSIST = [None]
+
+
+def _seqused_cmp_persist_enabled() -> bool:
+    """DSV41_PERSIST_SEQUSED_CMP,默认开。设 0 恢复每次 build 新分配的旧行为。"""
+    if _SEQUSED_CMP_PERSIST[0] is None:
+        import os as _os
+        _SEQUSED_CMP_PERSIST[0] = _os.getenv(
+            "DSV41_PERSIST_SEQUSED_CMP", "1").strip() not in (
+                "0", "false", "False", "")
+    return bool(_SEQUSED_CMP_PERSIST[0])
+
 
 
 # --- 一次性取证仪器（#48）：把 descriptor blob 原样落盘并当场解码 ---------------
@@ -1124,6 +1138,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # +1 holds the FIA dummy request inserted by mixed-batch padding.
         self.qli_seqused_k: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
         self.qli_cmp_residual_k: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
+        # 🔴 seqused_cmp_kv 的常驻缓冲区(2026-09-16)。
+        #    原本是 build() 里 torch.div(...) 现算的【新张量】,发布到
+        #    req.seqused_cmp_kv 上、由 V4.1 手写的算子调用点直接传给 SparseFlashMla。
+        #    FULL cudagraph 把捕获期那个临时张量的地址烘进图,replay 时算子读到的
+        #    永远是捕获期的值(decode 捕获 seq_len=1 ⇒ 1//2 = 0,即压缩流一个都不读)。
+        #    ⚠️ 尺寸必须跟上面两块【同一个公式】:第一版我写的是裸 max_num_reqs,
+        #       而那正是上面这段注释明确否决掉的写法(FULL decode 图会把请求数
+        #       padding 到超过 max_num_seqs,再加一个 FIA dummy 请求)。
+        #       放在这里而不是另起一处,就是为了让它和被论证过的那个公式绑在一起,
+        #       将来改公式时不会只改一半。
+        self.seqused_cmp_kv_buffer: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
@@ -1682,8 +1707,39 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 # nothing to send and reached the host precheck with
                 # "has_cmp_kv ... requires seqused_cmp_kv" -- a value that
                 # already existed, one frame away, and was not carried.
-                seqused_cmp_kv = torch.div(
-                    lens, ratio, rounding_mode="floor").to(torch.int32)
+                # 🔴 原地写进常驻缓冲区,发布【视图】(2026-09-16)。
+                #    从 dim 0 起切片 ⇒ 视图的 data_ptr 恒等于缓冲区基址,
+                #    图里烘死的是这个稳定地址;而 build() 每步都在 runner 的 Python
+                #    里跑,于是每步把新值填进去,replay 读到的就是新值。
+                #    实测(按请求身份配对 + writes 标记确认归属):
+                #      改之前 L02.kvsrc.seqused_cmp_kv  FULL=[0]  PIECEWISE=[3]
+                #      (3 = seq_len 7 // ratio 2;0 是 decode 捕获期的 1//2)
+                #      同一次 forward 上 seq_lens / block_table / slot_mapping /
+                #      sas_metadata(1024 全比) / cmp_selection / q / kv 全部逐位相同,
+                #      只有这一个值不同,而 attn.o_raw 差 rel_l2=5.2e-01。
+                #    ⚠️ 开关只为做单开关 A/B,默认开;设 0 恢复旧行为作阴性臂。
+                _cmp_len = torch.div(lens, ratio, rounding_mode="floor")
+                if _seqused_cmp_persist_enabled():
+                    _n = int(_cmp_len.shape[0])
+                    _buf = self.seqused_cmp_kv_buffer
+                    if _n <= _buf.shape[0]:
+                        _buf[:_n].copy_(_cmp_len.to(torch.int32))
+                        seqused_cmp_kv = _buf[:_n]
+                    else:
+                        # 🔴 fail-closed。第一版这里退回"每步新分配"并只打一条
+                        #    warn —— 那是 fail-open:在该拦的那一刻放行,而放行后的
+                        #    症状和根本没修一模一样(FULL 下读捕获期的陈旧值),
+                        #    于是这条 warn 会淹没在日志里,没人会把输出错误联系到它。
+                        #    判据出错的方向不对称:偏严会被下一次运行发现,
+                        #    偏松发的是一张假的安全证明。所以这里直接炸。
+                        raise RuntimeError(
+                            f"DSV4.1 seqused_cmp_kv 常驻缓冲区不够大: 需要 {_n}, "
+                            f"容量 {int(_buf.shape[0])}。这块 buffer 必须覆盖 FULL "
+                            f"decode 图 padding 之后的请求数(见同处 qli_* 的尺寸"
+                            f"公式)。退回每步新分配会让 FULL 图读到捕获期的陈旧"
+                            f"压缩长度,那正是本缓冲区要修的缺陷 —— 不能静默放行。")
+                else:
+                    seqused_cmp_kv = _cmp_len.to(torch.int32)
                 sas_mask_kwargs["seqused_cmp_kv"] = seqused_cmp_kv
 
         if self._device_metadata_enabled:
@@ -1750,6 +1806,30 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_actual_reqs = num_reqs
             else:
                 num_compressed_tokens = self._num_compressor_metadata_rows(num_reqs)
+            # 🔴 取证(2026-09-16):这条 `if full_graph_mode` 是 FULL 与 PIECEWISE
+            #    之间【字面意义上的岔路】,而它的门控 compressor_ratio > 1 正好把
+            #    层 0/1 排除在外 —— 与实测的分歧起点完全重合:
+            #      FULL vs PIECEWISE 在同一次 decode forward 上,
+            #      L00/L01 全部激活值逐位相同,L02.ret.residual 起 rel_l2=4.3e-01。
+            #    两个分支的公式是同一个(_num_compressor_metadata_rows:1224-1225),
+            #    唯一的差别是 padded(num_input_tokens) 还是 actual(num_actual_tokens)。
+            #    所以判据很简单:把两个值都算出来,看它们是否相等。
+            #    纯 host 侧整数运算,那个函数是纯的(两行算术),多调一次无副作用。
+            try:
+                _alt = self._num_compressor_metadata_rows(num_reqs)
+                if _alt != num_compressed_tokens or _DSA_NCT_LOGGED[0] < 8:
+                    _DSA_NCT_LOGGED[0] += 1
+                    from vllm.logger import logger as _nlg
+                    _nlg.info(
+                        "DSV4.1 num_compressed_tokens 取证 %s: full_graph=%s "
+                        "ratio=%s num_reqs=%s padded=%s actual=%s | "
+                        "FULL分支=%s else分支=%s %s",
+                        layer_name, full_graph_mode, self.compressor_ratio,
+                        num_reqs, common_attn_metadata.num_input_tokens,
+                        self.num_actual_tokens, num_compressed_tokens, _alt,
+                        "🔴 两者不同" if _alt != num_compressed_tokens else "相同")
+            except BaseException:                            # noqa: BLE001
+                pass
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
             slot_mapping = None
         else:
