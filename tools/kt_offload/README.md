@@ -47,7 +47,14 @@ VLLM_ASCEND_DSV41_EXPERT_COUNT="$OUT" \
 python3 tools/kt_offload/expert_count_report.py "$OUT"                    # 单份：判据 + [40,384] + 每层 top-100
 python3 tools/kt_offload/expert_count_report.py "$OUT_A" --compare "$OUT_B"  # 两份 top-100 逐层重合度
 ```
-- **判据**（逐 rank、逐层、逐 bucket）：`counts.sum() == tokens × 6`，任何一格不满足退出码 1。
+- **判据**（任何一条不满足退出码 1）：
+  1. 和判据（逐 rank、逐层、逐 bucket）：`counts.sum() == tokens × 6`。它只证明"每行数了 6 次"，
+     **对数错了哪几行没有区分力**——数别的 rank 的行，和照样对。
+  2. 身份判据（逐层、逐 bucket、rank 两两）：两个都有 token 的 rank，其 `[384]` 计数不能完全相同，相同则点名那对 rank。
+     ALLGATHER 切片 bug（每个 rank 都数 rank0 的行）的指纹就是各 rank 计数相同；UT 里旧切片喂 4 个 rank 时
+     判据 1 仍绿、判据 2 变红。输出里另有各 rank 的 token 数和"比较了多少格、多少格有重复"的摘要；
+     比较格数为 0（只有一个 rank 有数据）时身份判据零覆盖，会给警告。
+     ⚠️ 真实负载下两个 rank 同一步路由完全相同几乎不可能；若报红，先看是不是同一批请求被复制发到了多个 rank。
   各层 token 数应一致（每层路由同一批 token）；`skipped` 与 `steps` 原样打印，覆盖量和结论一起报。
   另核：4 个 rank 文件都在（`rank0..rank3`），`skipped` 里 `allgather rows ...` 这类原因应为 0 或极少。
 - 产物 `$OUT/expert_counts_total.pt` 可以直接给 `kt_offload_config.frequency_table_path`：

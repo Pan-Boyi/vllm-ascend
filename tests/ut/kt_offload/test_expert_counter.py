@@ -246,3 +246,38 @@ def test_report_output_feeds_frequency_placement(counter, tmp_path):
     _t.save({"counts": tot, "tokens": {}}, tmp_path / "expert_counts_total.pt")
     freq = load_frequency_table(str(tmp_path / "expert_counts_total.pt"))
     assert tuple(freq.shape) == (40, 384) and _t.equal(freq, tot["all"])
+
+
+def _allgather_run(counter, monkeypatch, tmp_path, old_slicing: bool):
+    """4 DP ranks, one ALLGATHER step per layer: every rank sees the same 4x8 gathered rows."""
+    for rank in range(4):
+        monkeypatch.setattr(ec, "_S", None)
+        monkeypatch.setattr(ec.os, "getpid", lambda r=rank: 2000 + r)
+        counter.rank, counter.dp = rank, 4
+        # old bug: rows treated as local -> slice from row 0 on every rank
+        counter.gathered = (False, None) if old_slicing else (True, 8)
+        counter.split = (4, 6)
+        for layer in range(ec.N_LAYERS):
+            ec.record(_layer(layer), _ids(32, seed=500 + layer), False)  # same gathered rows on all ranks
+        ec.dump()
+    return _load_report()
+
+
+@pytest.mark.parametrize("old_slicing", [True, False])
+def test_identity_criterion_discriminates_allgather_slicing(counter, monkeypatch, tmp_path, old_slicing):
+    rep = _allgather_run(counter, monkeypatch, tmp_path, old_slicing)
+    # sum criterion alone (identity check disabled): green in both arms -> no discriminating power
+    monkeypatch.setattr(rep, "identity_check", lambda names, ranks: 0)
+    _, _, bad_sum_only = rep.load(str(tmp_path))
+    assert bad_sum_only == 0
+    rep2 = _load_report()
+    _, _, bad = rep2.load(str(tmp_path))
+    assert bad == (1 if old_slicing else 0)
+
+
+def test_identity_criterion_names_the_ranks(counter, monkeypatch, tmp_path, capsys):
+    rep = _allgather_run(counter, monkeypatch, tmp_path, old_slicing=True)
+    rep.load(str(tmp_path))
+    out = capsys.readouterr().out
+    assert "计数完全相同的 rank 对" in out and "rank0_pid2000.pt" in out and "rank3_pid2003.pt" in out
+    assert "比较了 80 个" in out  # 40 layers x 2 buckets, all 4 ranks have tokens
