@@ -3996,39 +3996,6 @@ class NPUModelRunner(GPUModelRunner):
                         if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                         else max_query_len
                     )  # type: ignore[assignment]
-                    # 🔴 实验开关(2026-09-15):捕获期喂给算子的 KV 长度。
-                    #
-                    # 为什么怀疑它:图与 eager 在【输入逐位相同】的前提下,
-                    # 第 1 层 attention 的输出差一个 bf16 ULP(中位恰好 1 ULP,
-                    # 25% 元素受影响),而 eager 跨两次独立启动【逐位相同】——
-                    # 算子是确定的,差别只能来自执行调度。而调度(分块/workspace)
-                    # 是在 launch 时按当时的 seqused_kv 规划的,捕获期那次规划
-                    # 被烘进图,replay 不再重规划。捕获期 decode 的 max_query_len
-                    # 是 1,真实请求是 7 —— 为长度 1 规划的分块去处理 7 个 KV,
-                    # 归约顺序自然与 eager 不同。
-                    #
-                    # 判据是【二值】的:改这个值,若图模式的输出跟着变,
-                    # 就证明分块确实按捕获期长度烘死;若一点不变,这条假设作废。
-                    # 🔴 实测结果(2026-09-15,两发都崩,记在这里免得下一个人重烧):
-                    #    取 128 → 捕获期 aicore 越界,device error type 3 (507011);
-                    #    取 8   → 同样崩。
-                    #    原因是 dummy 的 block_table / slot_mapping 只按
-                    #    max_query_len 个 token 备好,单独把 seq_lens 抬上去
-                    #    就让算子读到没分配的槽位。要让这个实验成立,必须连带
-                    #    把 dummy 的寻址一起改一致 —— 那是另一件事,还没做。
-                    #    ⇒ 现在【开了就会崩】。留着是因为它记录了一条已排除的路,
-                    #      不是因为它能用。
-                    # ⚠️ 只在捕获期生效,推理路径一字不动;不设＝原行为。
-                    _cap_sl = os.getenv("DSV41_CAPTURE_SEQ_LEN", "").strip()
-                    if is_graph_capturing and _cap_sl:
-                        try:
-                            seq_lens = int(_cap_sl)
-                            logger.info(
-                                "DSV4.1 捕获期 seq_lens 覆盖为 %d "
-                                "(原值 %s, num_tokens=%s) —— 实验开关",
-                                seq_lens, max_query_len, num_tokens)
-                        except ValueError:
-                            pass
 
                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
                 self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
