@@ -53,6 +53,12 @@ def _probe() -> str:
 _ORIG_RUN = _real_sp.run
 
 
+def _as_bytes(x) -> bytes:
+    if x is None:
+        return b""
+    return x.encode("utf-8", "replace") if isinstance(x, str) else bytes(x)
+
+
 def _is_bishengir(cmd) -> bool:
     return isinstance(cmd, (list, tuple)) and bool(cmd) and str(cmd[0]).endswith("bishengir-compile")
 
@@ -63,10 +69,11 @@ def _run(cmd, *args, **kwargs):
         return _ORIG_RUN(cmd, *args, **kwargs)
     check = kwargs.pop("check", False)
     r = _ORIG_RUN(cmd, *args, **kwargs)
-    # FIXME: raises TypeError for text=True callers with empty stderr (triton-ascend's
-    # `bishengir-compile --help` capability probes), which catch it and report False.
-    out = (r.stderr or b"") + (r.stdout or b"")
-    if r.returncode != 0 and _MARK in out:
+    # Leave successful calls untouched and normalise to bytes before matching:
+    # triton-ascend's capability probes run `bishengir-compile --help` with
+    # text=True, and any exception here would make them report False and change
+    # the compile options.
+    if r.returncode != 0 and _MARK in _as_bytes(r.stderr) + _as_bytes(r.stdout):
         name = os.path.basename(str(cmd[1])) if len(cmd) > 1 else "?"
         logger.warning("bishengir-compile could not create its temp dir (pid=%d, input=%s): %s",
                        os.getpid(), name, _probe())
