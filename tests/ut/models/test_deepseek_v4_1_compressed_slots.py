@@ -369,3 +369,17 @@ def test_ratio_one_has_no_reader_to_protect():
     branch on COMPRESS_RATIO == 2, so no divisibility is required."""
     compressed_slots._RING_SHAPES_CHECKED.clear()
     compressed_slots.require_ring_capacity_divides(7, 1)
+
+
+def test_the_rebuild_reproduces_the_measured_mapping(ctx):
+    """Flight-22, layer 2, T=5, ratio 2, one request, block 84, page 128.
+
+    Upstream would produce [-1, 10752, -1, 10753, -1]:
+    position 1 closes state 0 (84 * 128 + 0) and position 3 closes state 1.
+    What the builder published instead was [10752, 10753, -1, 0, 0].
+    """
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32))
+    slots, layer = compressed_slots.per_token_compressed_slots(
+        handed, torch.arange(5), 2)
+    assert slots.tolist() == [-1, 10752, -1, 10753, -1]
+    assert layer == ("c2", )

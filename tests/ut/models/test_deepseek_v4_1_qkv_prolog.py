@@ -283,3 +283,14 @@ def test_the_weightless_norm_is_not_on_the_q_path_at_all():
               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     assert "rms_norm_weightless" not in called, (
         "V4.1 passes apply_q_norm=False; a norm here is V4.0's behaviour")
+
+
+def test_a_negative_slot_leaves_the_cache_unchanged():
+    """-1 means "do not write": the row is routed to slot 0 but writes back
+    the value already there, so slot 0 keeps its contents."""
+    cache = torch.full((2, 4, HEAD_DIM), 7.0)
+    rows = torch.ones(3, HEAD_DIM)
+    scatter_rows(cache, rows, torch.tensor([-1, 3, -1]), 4)
+    flat = cache.view(-1, HEAD_DIM)
+    assert torch.all(flat[3] == 1.0)
+    assert torch.all(flat[0] == 7.0), "slot 0 was overwritten by a skipped row"

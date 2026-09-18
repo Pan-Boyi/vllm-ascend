@@ -73,3 +73,9 @@ def test_the_checkpoint_still_arms_this_path():
         "this checkpoint no longer carries a vision tower, so "
         "DeepseekV41Config leaves is_mm_prefix_lm False, the runner builds no "
         "mm_req_doc_ranges, and the condition this guards is unreachable")
+
+
+def test_absent_or_empty_is_false():
+    """No mm ranges, or an empty dict, never selects the vision path."""
+    assert mm_ranges_have_spans(None) is False
+    assert mm_ranges_have_spans({}) is False
