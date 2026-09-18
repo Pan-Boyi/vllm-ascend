@@ -90,12 +90,13 @@
 
 | # | 内容 | 卡 | 判据 | 状态 |
 |---|---|---|---|---|
-| M0a | kt 分支摘 c81fa24 + 05a78ed；构建 wheel 到私有目录（`CPUINFER_PARALLEL=48`，不装全局） | 否 | `__cpu_variant__=avx512_bf16`；DSV4.1 scale 全表无 0 字节 | ⬜ 等用户 push + 批准 |
+| M0a | kt 分支摘 c81fa24 + 05a78ed；构建 wheel 到私有目录（不装全局） | 否 | `__cpu_variant__=avx512_bf16`；DSV4.1 scale 全表无 0 字节 | 🟡 agent 进行中 |
 | M0b | 纯 CPU 单测：一层 DSV4.1 kt MXFP4 vs torch 参考，带变异对照 | 否 | rel err 在 bf16 地板内；变异臂必须红 | ⬜ |
 | M0c | 找 integration：GSM8K 路由 topk 频率（每层）；clean 多卡性能基线补测 | 他们的卡 | 两份产物落盘 | ⬜ |
 | M1 | vLLM 集成 eager（`--enforce-eager`）：掩码/加载/分流/加回。先单层小用例，再整网 | 1 | 单层 vs NPU 全专家一致；整网 GSM8K 50 题冒烟 | ⬜ |
 | M2 | 图模式 FULL_AND_PIECEWISE + host-func 节点 | 1 | eager vs graph 逐 token 一致；无 10701x | ⬜ |
-| M3 | 性能：侧流、提前一层下发、频率放置、线程/NUMA 调优 | 1 | bs=1 / bs=32 数字，各配多卡基线 | ⬜ |
+| M3 | 性能（**目标 bs=1 延迟**）：侧流、提前一层下发、频率放置、线程/NUMA 调优 | 1 | bs=1 ms/tok（bs=32 附带），配多卡基线 | ⬜ |
+| P | **NPU 算子耗时分布**（用户要求）：服务拉起后 profiler 采 decode 稳态，按算子类型聚合 device 时间 + host-func/空隙；M2 起每个里程碑各采一次，M3 优化前后对比 | 1 | 分算子表（总时长/次数/占比）+ device-busy 与空隙占比；预热后采，多步取中位 | ⬜ |
 | M4 | 精度：GSM8K 1319 全量 graph，口径同基线（thinking 关、贪心、max4096） | 1 | 逐题配对，对 96.97% 在噪声内 | ⬜ |
 
 ## 5. 边界（不碰）
@@ -118,13 +119,14 @@
 
 | # | 问题 | 状态 |
 |---|---|---|
-| D1 | 用哪张卡（0-3 integration 服务；4-7 被别的容器占） | ⬜ |
-| D2 | 能否与 integration 四卡服务同机并存（见 §2，账面看可以，需实测） | ⬜ |
-| D3 | kt push 目标 = origin(wenxuewuhd/ktransformers-AK)？push 后可否直接摘两个提交 | ⬜ |
-| D4 | M3 优化目标：bs=1 延迟 vs bs=32 吞吐 | ⬜ |
+| D1 | 用哪张卡（0-3 integration 服务；4-7 被别的容器占） | ⏸ 用户：到拉服务时再定 |
+| D2 | 能否与 integration 四卡服务同机并存（见 §2，账面看可以，需实测） | ✅ 用户：必要时经 flash_dev 协调卡与时段 |
+| D3 | kt push 目标 = origin(wenxuewuhd/ktransformers-AK)？push 后可否直接摘两个提交 | ✅ origin；用户已推 dsv41_vllm_offload_dev(105359b) |
+| D4 | M3 优化目标：bs=1 延迟 vs bs=32 吞吐 | ✅ 先 bs=1 延迟 |
 
 ## 变更记录
 
 - 2026-09-18：建档。调研完成（两个 agent + flash_dev / dsv41-model / dsv4_a5_single_card 回复）；
   ktransformers 分支建好；§2 更正：engram 与 integration 共享，并存时增量只有专家 ≈195 GiB。
 - 2026-09-18：§2 加 NUMA 放置决定（专家两节点均分，engram 不动；单节点放不下两者）。
+- 2026-09-18：用户定 D2/D3/D4（卡到时再定；并存经 flash_dev 协调；origin 已推；先 bs=1）；新增 P 项 NPU 算子耗时分布；启动 M0a/M0b、M1 设计。
