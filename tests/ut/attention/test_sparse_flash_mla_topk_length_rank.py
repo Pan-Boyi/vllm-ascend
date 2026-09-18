@@ -1,6 +1,6 @@
 """`*_topk_length` must carry the leading shape of the table it describes.
 
-Measured 2026-09-13, first request that reached the operator on the c18 arm::
+Observed on the first request that reached the operator::
 
     EZ0011: Parameter ori_topk_length of SparseFlashMla has incorrect
             shape dim 1. It should be 2.

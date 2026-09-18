@@ -126,10 +126,17 @@ def test_every_attribute_forward_reads_is_stored_at_construction():
         else:
             read.add(node.attr)
 
-    # Methods are read through self too and are defined, not assigned.
+    # Methods are read through self too and are defined, not assigned; so are
+    # class attributes (e.g. the backend_cls ClassVar).
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             assigned.add(node.name)
+    for node in tree.body[0].body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assigned.add(node.target.id)
+        elif isinstance(node, ast.Assign):
+            assigned.update(t.id for t in node.targets
+                            if isinstance(t, ast.Name))
 
     # Names the base class provides are legitimately read without assignment
     # here. dir() is not enough: most of them are instance attributes set in

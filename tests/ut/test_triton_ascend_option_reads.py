@@ -6,7 +6,7 @@ multiply and sum in the Torch reference". On CUDA and ROCm that flag reaches the
 Ascend backend it is a dataclass field and nothing else: declared once, loaded nowhere. Passing it
 raises no error and changes no code, so the numerical intent in that comment is silently absent.
 
-⚠️ This test is NOT here because that is a bug. It is here because it decides a downstream
+This test is NOT here because that is a bug. It is here because it decides a downstream
 question. Today the flag is inert, so the kernel's multiply-add may be contracted to an FMA, which
 makes the result *more* accurate than the Torch reference rather than less -- the consequence is
 that this operator cannot be compared bit-for-bit against a CUDA/Torch golden, and dsv41-golden's

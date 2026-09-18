@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A scale parameter holds bytes, so it must be declared as bytes.
 
-🔴 The defect this pins cost the whole MoE output at every layer. The DS
+The defect this pins cost the whole MoE output at every layer. The DS
 w4a8 MoE scheme declared its two expert scale parameters ``float8_e8m0fnu``
 while every other scale parameter in the tree is ``uint8``. The loader moves
 the checkpoint's scale as raw bytes, so a copy into an E8M0 parameter is a
@@ -10,7 +10,7 @@ the same power of two and lands on 134. The checkpoint's own bytes are
 119..122 (w1/w3) and 119..123 (w2) -- all inside that window -- so all
 70,778,880 of them collapsed to one value.
 
-⚠️ Both dtypes are one byte wide and every shape matched, which is why
+Both dtypes are one byte wide and every shape matched, which is why
 nothing downstream complained: the declaration turned a byte move into an
 arithmetic one without changing anything that gets checked.
 """
@@ -28,11 +28,11 @@ _QUANT = _ROOT / "quantization"
 def _mx_block_scale_params():
     """Every MX block-scale parameter declared with ``torch.empty``.
 
-    🔴 Found by walking the AST rather than by listing the names I know: a
+    Found by walking the AST rather than by listing the names I know: a
     hand-written list cannot show the row it is missing, and the defect here
     was exactly one entry nobody had thought to look at.
 
-    ⚠️ Two conditions, and both are load-bearing -- my first version used
+    Two conditions, and both are load-bearing -- my first version used
     only "the name contains scale" and failed on seven parameters that are
     *correctly* float:
 
@@ -80,7 +80,7 @@ def _mx_block_scale_params():
 def _survives_a_byte_copy(dtype_src: str) -> bool:
     """Run the loader's copy through this dtype and see if the bytes live.
 
-    🔴 Behavioural, not a restatement. The first version of this asserted
+    Behavioural, not a restatement. The first version of this asserted
     ``dtype == "torch.uint8"``, which is a rule about how we spell things,
     wearing the failure message of a rule about what happens to the bytes --
     and the two come apart: ``int8`` is byte-exact through ``copy_`` (two's
@@ -89,7 +89,7 @@ def _survives_a_byte_copy(dtype_src: str) -> bool:
     [0,1,119,120,127,128,134,191,200,255] unchanged; float8_e8m0fnu and
     float8_e4m3fn do not.
 
-    ⚠️ A criterion that restates the convention is green for every *new* way
+    A criterion that restates the convention is green for every *new* way
     of breaking it. This one names no dtype, so a third byte-destroying
     dtype fails it without anyone having thought of that dtype first.
     """
@@ -127,7 +127,7 @@ def test_every_mx_block_scale_survives_the_loaders_copy():
 def test_the_criterion_accepts_what_is_actually_safe_and_rejects_what_is_not():
     """The criterion's own discriminating power, pinned.
 
-    🔴 Without this, "every entry passed" and "the check cannot fail" read
+    Without this, "every entry passed" and "the check cannot fail" read
     the same. It also pins kernel's correction: int8 belongs on the safe
     side, so that nobody later "fixes" it back out on a bad memory.
     """
@@ -172,7 +172,7 @@ def test_the_conversion_that_actually_happened():
 def test_the_collapse_window_covers_the_whole_checkpoint_range():
     """Why not one byte survived.
 
-    ⚠️ The reason this produced a single value rather than a few is that the
+    The reason this produced a single value rather than a few is that the
     checkpoint's entire range sits inside one power-of-two bucket. Stated as
     a property so it stays true if the checkpoint's range moves.
     """
@@ -187,7 +187,7 @@ def test_the_collapse_window_covers_the_whole_checkpoint_range():
 
 
 def test_the_loaders_half_of_the_contract_is_still_there():
-    """🔵 The contract has two halves and needs both.
+    """The contract has two halves and needs both.
 
     Our half is the parameter dtype, checked above. Upstream's half is the
     uint8 *view* taken before the copy, at nvidia/model.py:745-754::
@@ -196,13 +196,13 @@ def test_the_loaders_half_of_the_contract_is_still_there():
         # MoE param is uint8. copy_() would do a numeric conversion
         # (e.g. 2^-7 -> 0), destroying the raw exponent bytes.
 
-    🔴 If an upstream bump drops that line, our uint8 parameter receives an
+    If an upstream bump drops that line, our uint8 parameter receives an
     e8m0 tensor and the copy converts the OTHER way -- 2^-7 becomes 0, so the
     scales go to zero rather than to a constant 134. Two opposite symptoms,
     one contract, and neither raises. The parameter-side check cannot see it,
     because from that side nothing changed.
 
-    ⚠️ Asserted on the file this model actually inherits from
+    Asserted on the file this model actually inherits from
     (AscendDeepseekV41ForCausalLM defines no load_weights of its own), not on
     a path that merely looks right.
     """
@@ -220,7 +220,7 @@ def test_the_loaders_half_of_the_contract_is_still_there():
     src = pathlib.Path(upstream_model.__file__).read_text()
     tree = ast.parse(src)
 
-    # 🔴 AST, not a substring window. The first version checked the 400
+    # AST, not a substring window. The first version checked the 400
     # characters before the view for "float8_e8m0fnu" -- and upstream's
     # *comment* right above it contains that word, so removing the guard left
     # the check green. A substring test cannot tell a condition from a

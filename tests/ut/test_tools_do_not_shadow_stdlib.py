@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """``tools/`` must not shadow a stdlib module that start-up needs.
 
-🔴 Structural, not incidental. Running ``python tools/<x>.py`` puts
+Structural, not incidental. Running ``python tools/<x>.py`` puts
 ``tools/`` at ``sys.path[0]``, so a package in there outranks the standard
 library. ``tools/bisect/`` shadows the stdlib ``bisect``, which ``random``
 imports, which ``tempfile`` imports, which ``torch`` imports -- the script
 dies before its first statement.
 
-⚠️ This has bitten twice. A per-script guard at the top of each file relies
+This has bitten twice. A per-script guard at the top of each file relies
 on remembering, and remembering is what already failed; so the check lives
 here, where a new directory trips it without anyone having to recall the
 rule.
 
-🔴 And the second time it cost more than a broken run: the L0 gate's own
+And the second time it cost more than a broken run: the L0 gate's own
 red-first verification ran both arms and got exit 1 from each. The
 broken-version arm looked exactly like the gate correctly refusing, and it
 was the gate being dead -- a dead instrument impersonating its own negative
@@ -66,13 +66,13 @@ def test_no_tools_package_shadows_a_startup_stdlib_module():
 def test_every_tools_script_that_imports_torch_strips_its_own_directory():
     """The scripts that must survive the grandfathered shadow.
 
-    🔴 Walked as an AST, not searched as text, and that is not fussiness.
+    Walked as an AST, not searched as text, and that is not fussiness.
     The first version used ``text.find("import torch")`` -- and the comment
     this file's own fix added, which *explains* the deferred ``import
     torch``, contains that literal earlier in the file than the fix itself.
     So the check failed on a file it had just been used to repair.
 
-    ⚠️ Third time today that a substring check met a sentence about the thing
+    Third time today that a substring check met a sentence about the thing
     it was looking for: once made a check falsely red, once falsely green,
     once this. A substring cannot tell a statement from prose describing a
     statement; the parser can.

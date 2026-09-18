@@ -1,27 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Registry entry point for DeepSeek-V4.1-Flash on Ascend.
 
-Deliberately thin. V4.0's Ascend port forks upstream's model into a 1352-line
-file; this one subclasses upstream's and lets the platform differences be
-handled where they actually are -- the attention class selector, three
-construction-site rebinds, and one compiler flag, all applied when this
-package is imported.
-
-That choice is about which failure mode is preferred, not about effort. A
-rebind that drifts fails loudly: the name disappears, ``apply_all`` raises and
-says which one. A forked model file that drifts produces numbers that are
-quietly different from upstream's, which is the failure this port has spent
-the most time chasing.
-
-The architecture string in the checkpoint is ``DeepseekV41ForCausalLM``, which
-upstream maps to its *multimodal* wrapper -- a vision tower and aligner built
-unconditionally, with the language model underneath. That is upstream's
-structure and it is inherited as is.
-
-Importing this module runs the package ``__init__``, which applies the
-platform patches. That ordering is the whole reason the patches live in the
-package rather than in the model registry: there is no path that reaches the
-model without them.
+Subclasses upstream's model instead of forking it; the platform differences
+(attention class selection, construction-site rebinds and one compiler flag)
+are applied when this package is imported, so there is no path that reaches
+the model without them. A drifted rebind fails loudly, a drifted fork would
+not.
 """
 
 from __future__ import annotations
@@ -35,78 +19,21 @@ from vllm_ascend.models.deepseek_v4_1.platform_patches import (
 class AscendDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
     """DeepSeek-V4.1-Flash on Ascend.
 
-    Upstream's class, reached after the platform patches have been applied.
-    The constructor checks that they were, because the alternative is a model
-    that builds successfully out of CUDA-selected parts and fails much later,
-    somewhere that says nothing about why.
+    The constructor checks that the platform patches are in force; otherwise
+    the model would build out of CUDA-selected parts and fail much later.
     """
 
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         _assert_patches_applied()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
-        # 🔴 The alignment taps' only production call site. Without it the
-        # hooks are never registered, and the symptom is not "no hooks" -- the
-        # six inline taps in attention.py still run, reach record() before any
-        # set_seq_len(), and raise, so the dump comes back empty and the cause
-        # is two inferences away. That happened twice.
-        #
-        # Here rather than in the runner because this is the one place that
-        # sees the built model and belongs to this line. It returns an empty
-        # list and registers nothing when no dump directory is set, so the
-        # off case is unchanged by construction.
-        from vllm_ascend.models.deepseek_v4_1.align_taps import \
-            install_alignment_taps
-
-        self._alignment_tap_handles = install_alignment_taps(self)
-        # Independent of the recorder: the trace answers "where did two
-        # identical requests stop agreeing", which needs no golden dump and
-        # no fixed sequence length. Default off, and off registers no hooks.
-        from vllm_ascend.models.deepseek_v4_1.layer_trace import \
-            install_layer_trace
-
-        install_layer_trace(self)
-
-    def compute_logits(self, hidden_states):
-        """Upstream's, with the result recorded.
-
-        🔴 An override rather than a forward hook, and on **this** class.
-        ``compute_logits`` is not a module ``forward``, so there is no hook to
-        register; and the runner reaches it through wrappers
-        (``aclgraph_utils.py:274`` delegates to ``original_model``), so a tap
-        installed on whatever ``self.model`` happens to be would be one
-        wrapper away from where the call lands. Every path ends here.
-
-        ⚠️ Recorded **after** the call returns. Reading before it would
-        capture the previous invocation's tensor -- in range, correctly
-        shaped, and wrong, which is the failure mode that looks least like
-        one.
-
-        ⚫ ``compute_logits_local`` is deliberately not tapped: the runner
-        calls ``compute_logits`` (model_runner.py:577, model_runner_v1.py:
-        2553/2564), and tapping the other one would produce a key that is
-        always absent while looking installed.
-        """
-        logits = super().compute_logits(hidden_states)
-        from vllm_ascend.models.deepseek_v4_1.logits_tap import record_logits
-
-        record_logits(logits)
-        return logits
-
 
 def _assert_patches_applied() -> None:
     """Refuse to build out of upstream's CUDA-selected parts.
 
-    Each of these is silent when missing, in its own way: an unpatched
-    selector builds the CUDA attention class, an unpatched engram table asks
-    for 188.83 GiB of device memory, and an unpatched compiler flag aborts the
-    process rather than raising when the first ratio-2 kernel is compiled.
-
-    This reads the bindings themselves rather than the list ``apply_all``
-    returned. The distinction is the whole point: that list records what was
-    true once, at import, and the failure being guarded against is precisely
-    something re-importing an upstream module afterwards and restoring its
-    original names -- which leaves the list saying everything is fine.
+    Reads the live bindings rather than the list ``apply_all`` returned: an
+    upstream module re-imported afterwards would restore its original names
+    while that list still reports success.
     """
     import importlib
 

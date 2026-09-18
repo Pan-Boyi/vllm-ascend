@@ -18,16 +18,6 @@ import pytest
 from vllm_ascend.attention.dsa_v1 import mm_ranges_have_spans
 
 
-@pytest.fixture
-def spans_required(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "1")
-
-
-@pytest.fixture
-def spans_not_required(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "0")
-
-
 TEXT_ONLY_ONE_REQUEST = {0: []}
 TEXT_ONLY_FOUR_REQUESTS = {0: [], 1: [], 2: [], 3: []}
 ONE_IMAGE_AMONG_FOUR = {0: [], 1: [(12, 40)], 2: [], 3: []}
@@ -42,38 +32,23 @@ def test_the_shape_that_caused_this_is_true_as_a_dict():
 
 @pytest.mark.parametrize("ranges", [TEXT_ONLY_ONE_REQUEST,
                                     TEXT_ONLY_FOUR_REQUESTS])
-def test_no_spans_is_not_a_vision_batch(spans_required, ranges):
+def test_no_spans_is_not_a_vision_batch(ranges):
     assert mm_ranges_have_spans(ranges) is False
 
 
 @pytest.mark.parametrize("ranges", [ONE_IMAGE_AMONG_FOUR,
                                     {0: [(0, 3)]},
                                     {7: [(1, 2), (9, 20)]}])
-def test_one_real_span_anywhere_is_a_vision_batch(spans_required, ranges):
+def test_one_real_span_anywhere_is_a_vision_batch(ranges):
     assert mm_ranges_have_spans(ranges) is True
 
 
-def test_absent_or_empty_is_false_regardless_of_the_switch(
-        spans_not_required):
-    """The pre-existing behaviour for these two, unchanged by the switch."""
+def test_absent_or_empty_is_false():
     assert mm_ranges_have_spans(None) is False
     assert mm_ranges_have_spans({}) is False
 
 
-def test_the_switch_is_off_by_default(monkeypatch):
-    """Default off, so an A/B can attribute a launch to this change alone."""
-    monkeypatch.delenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS",
-                       raising=False)
-    assert mm_ranges_have_spans(TEXT_ONLY_ONE_REQUEST) is True
-
-
-def test_off_reproduces_the_old_condition_exactly(spans_not_required):
-    """Otherwise the A arm is not the behaviour we measured."""
-    for ranges in (None, {}, TEXT_ONLY_ONE_REQUEST, ONE_IMAGE_AMONG_FOUR):
-        assert mm_ranges_have_spans(ranges) is bool(ranges)
-
-
-def test_a_non_mapping_is_reported_rather_than_reinterpreted(spans_required):
+def test_a_non_mapping_is_reported_rather_than_reinterpreted():
     """A list of range lists would have no .values(); guessing its shape here
     is how a gate starts meaning something different from what it says."""
     assert mm_ranges_have_spans([[], []]) is True
@@ -84,8 +59,7 @@ def test_the_checkpoint_still_arms_this_path():
 
     Read from the checkpoint rather than asserted as a remembered 32: the
     trigger is "a multimodal checkpoint serving a text-only request", and if
-    the checkpoint stops being multimodal the trigger is gone and the reason
-    for the switch changes.
+    the checkpoint stops being multimodal the trigger is gone.
     """
     import json
     import pathlib
@@ -98,5 +72,4 @@ def test_the_checkpoint_still_arms_this_path():
     assert vision.get("num_hidden_layers", 0) > 0, (
         "this checkpoint no longer carries a vision tower, so "
         "DeepseekV41Config leaves is_mm_prefix_lm False, the runner builds no "
-        "mm_req_doc_ranges, and the condition this switch guards is "
-        "unreachable -- revisit why the switch exists")
+        "mm_req_doc_ranges, and the condition this guards is unreachable")

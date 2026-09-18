@@ -5,14 +5,13 @@ Upstream's ``SparseAttnIndexer`` computes the MQA logit matrix, masks it, and
 takes a per-row top-k in three separable CUDA steps. Ascend has no separable
 version: every indexer operator in ``csrc/torch_binding.cpp`` fuses logits and
 top-k into one call and returns only indices (``return_value=1`` adds the top-k
-*values*, not the matrix). That single difference decides most of what follows.
+*values*, not the matrix).
 
-What V4.1 hands us is narrow, and narrower than V4.0's:
+What V4.1 hands us:
 
-* ``k`` is the literal ``None`` and ``skip_k_cache_insert`` the literal ``True``
-  (``vllm/models/deepseek_v4_1/attention.py:820-825`` and ``:1116``), because
-  the layer has already written the indexer K cache itself. So there is no
-  cache-insert half to implement here; this reads the cache and selects.
+* ``k`` is ``None`` and ``skip_k_cache_insert`` is ``True``, because the layer
+  has already written the indexer K cache itself; this reads the cache and
+  selects.
 * ``q_quant`` arrives already quantised, with the per-token q scale **folded
   into weights** on the FP8 path -- so the operator's mandatory
   ``query_dequant_scale`` is ones, not a dropped argument. See
@@ -28,8 +27,7 @@ import torch
 from vllm_ascend.attention.dsa_attn_kv_plan import qli_v2_quant_mode
 
 #: What the V4.1 checkpoint calls the two-level candidate filter's knobs.
-#: Read from the config at runtime rather than assumed: in the checkpoint we
-#: serve they are set (source layer 20, 2048 blocks of 8), not absent.
+#: Read from the config at runtime: the released checkpoint sets them.
 CANDIDATE_FIELDS = ("candidate_source_layer_id", "candidate_topk_blocks",
                     "candidate_block_size")
 
@@ -45,17 +43,11 @@ def candidate_mask_is_vacuous(max_seq_len: int, compress_ratio: int,
     that set before taking their row top-k. It is a semantic filter, not a
     speed knob -- a masked-out token cannot be selected.
 
-    It is also, at short context, a filter that filters nothing.
-    ``select_candidate_blocks`` takes ``min(topk_blocks, nblocks)``
-    (``vllm/model_executor/kernels/attention/dsa/candidate_blocks.py:179``), so
-    when the row has no more blocks than the budget, every block is published
-    and the mask leaves the row alone. The causal bound the same kernel applies
-    is already applied by the Ascend operator (``mask_mode=3``).
-
-    Which is why this returns a criterion rather than a policy: with
-    ``max_model_len`` 8192 and ratio 1 a row is 1024 blocks against a budget of
-    2048, and skipping the filter is exact. At 16385 it stops being exact, and
-    nothing about the run would look different.
+    At short context it filters nothing: ``select_candidate_blocks`` takes
+    ``min(topk_blocks, nblocks)``, so when a row has no more blocks than the
+    budget every block is published and the mask is a no-op. The causal bound
+    the same kernel applies is already applied by the Ascend operator
+    (``mask_mode=3``).
     """
     if candidate_topk_blocks <= 0 or candidate_block_size <= 0:
         return True
@@ -70,11 +62,8 @@ def assert_candidate_mask_is_vacuous(max_seq_len: int, compress_ratio: int,
                                      where: str) -> None:
     """Refuse to select top-k while a candidate mask would have changed it.
 
-    Running anyway is the failure this exists to prevent: no operator errors,
-    the shapes are right, the dtype is right, and the selected tokens are drawn
-    from the whole context instead of the published blocks. The output of a
-    top-k is a set, and a set that is wrong by a few members reads as a small
-    numeric difference downstream. Refusing is the only signal available.
+    Running anyway would silently draw the selection from the whole context
+    instead of the published blocks.
     """
     if candidate_mask_is_vacuous(max_seq_len, compress_ratio,
                                  candidate_topk_blocks, candidate_block_size):
@@ -100,17 +89,10 @@ def _query_dequant_scale(q_quant, q_scale, num_tokens: int, num_heads: int,
                          device, dtype: torch.dtype) -> torch.Tensor:
     """The scale the operator requires, including when nothing scaled it.
 
-    ``query_dequant_scale`` is a mandatory positional in the operator schema
-    (``csrc/torch_binding.cpp:3439-3455``), but V4.1's FP8 path does not have
-    one to give: ``fused_indexer_q_rope_quant`` folds the per-token q scale
-    into ``weights`` and returns ``index_q_scale = None``, and the Ascend
-    replacement in ``indexer_q.py`` folds it the same way. Since the logit is
-    linear in that scale -- ``sum_h w_h * q_s * k_s * (q_int . k_int)`` --
-    folding into ``w_h`` and passing ones here is exact, not an approximation.
-
-    Passing the operator a scale of ones when the fold did *not* happen would
-    be silently wrong, which is why this is a function with a reason rather
-    than a ``torch.ones`` at the call site.
+    ``query_dequant_scale`` is mandatory in the operator schema, but V4.1's
+    FP8 path folds the per-token q scale into ``weights`` (upstream and
+    ``indexer_q.py`` alike) and passes ``None``. The logit is linear in that
+    scale, so passing ones after the fold is exact.
     """
     if q_scale is not None:
         return q_scale
@@ -138,19 +120,14 @@ def select_topk(
     ``op`` exists so the argument assembly can be tested without a device; it
     defaults to the real operator.
 
-    ``cmp_ratio`` is passed explicitly from the layer. V4.0 compresses by 4
-    throughout and the surrounding code has 4 baked in in several places; V4.1
-    carries 0, 1 and 2, and 0 means "no compression", for which the operator's
-    identity is 1 rather than 0.
+    ``cmp_ratio`` comes from the layer: V4.1 carries 0, 1 and 2, and 0 ("no
+    compression") is passed to the operator as 1.
     """
     if op is None:
         op = torch.ops._C_ascend.npu_quant_lightning_indexer_v2
     if max(compress_ratio, 1) == 1 and cmp_residual_k is not None:
-        # The operator's own cross-parameter rule, checked here rather than
-        # trusted to compressed_lengths: this is the last point before the
-        # call, and a caller that built the residual itself would otherwise
-        # reach the operator's refusal with no idea which of its arguments
-        # the ratio made illegal.
+        # The operator's own cross-parameter rule, checked here to give a
+        # clearer error than the operator's tiling refusal.
         raise ValueError(
             f"cmp_ratio is 1 (layer ratio {compress_ratio}) and "
             f"cmp_residual_k was supplied as {tuple(cmp_residual_k.shape)}. "
@@ -167,9 +144,8 @@ def select_topk(
             key_dequant_scale.dtype),
         key_dequant_scale=key_dequant_scale,
         topk=index_topk,
-        # The mode fixes both the q/k dtype and the scale dtype, and the kernel
-        # validates only the former -- a plausible-looking wrong mode runs and
-        # returns garbage. Derived from the tensors in hand, never defaulted.
+        # The kernel validates only the q/k dtype of the mode, so a wrong
+        # mode runs and returns garbage; derive it from the tensors in hand.
         quant_mode=qli_v2_quant_mode(key_cache.dtype, key_dequant_scale.dtype),
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=seqused_k,
@@ -193,52 +169,15 @@ def compressed_lengths(seq_lens: torch.Tensor,
     the original length against ``cmp_ratio``. Both have to be computed from
     the same ratio the call passes, and that ratio has to be the layer's.
 
-    This is a second implementation of something that already exists, and that
-    is a debt, not a design. ``AscendDSAMetadataBuilder`` computes exactly these
-    two tensors -- correctly, for any ratio -- and then declines to publish them
-    behind ``if self.compressor_ratio == 4:``
-    (``vllm_ascend/attention/dsa_v1.py``). V4.1 carries 1 and 2 and never 4, so
-    nothing reaches us. Widening that gate is the smaller change and the better
-    one; it was not taken because there is no cheap way to test V4.0 for the
-    regression it could cause, not because two implementations is preferable.
-
-    TRIGGER to merge these into one: a usable V4.0 regression test, or a third
-    consumer of the same computation. Whichever comes first.
-
-    ⚠️ 2026-09-13: the third consumer arrived -- the ``sparse_flash_mla`` call
-    needs the same residual, because the operator requires it ("Cmp_residual_kv
-    is required when cmp_mask_mode=3 and cmp_ratio != 1"). It was served by
-    calling *this* function rather than by widening the gate, so there is still
-    one implementation and ``dsa_v1.py`` was not touched.
-
-    That leaves the widening open, and the reason it was deferred has since
-    narrowed: ``qli_cu_seqlens_q`` and ``qli_seqused_k`` are read only by
-    ``models/deepseek_v4/indexer.py``, and V4.0 never runs ratio 2, so
-    ``== 4`` -> ``not in (0, 1)`` provably changes nothing at ratio 0, 1 or 4.
-    That is an argument, not a test, which is why it is written here instead
-    of acted on. TRIGGER unchanged: a usable V4.0 regression test.
-
-    That ``== 4`` is itself the shape this codebase keeps producing -- a literal
-    standing in for a value that is actually a function of the layer. It reads
-    as a fact about the operator and it is a fact about DeepSeek-V4.
+    ``AscendDSAMetadataBuilder`` computes the same two tensors but publishes
+    them only for compression ratio 4 (V4.0); V4.1 carries 1 and 2, so they
+    are computed here. The ``sparse_flash_mla`` call reuses this function.
     """
     ratio = max(compress_ratio, 1)
     lens = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
     seqused_k = torch.div(lens, ratio, rounding_mode="floor").to(torch.int32)
     if ratio == 1:
-        # 🔴 The operator refuses a residual at this ratio, in its own words:
-        #
-        #     Invalid_Argument(EZ0037): Parameter cmp_residual_k of
-        #     QuantLightningIndexerV2 is invalid. Reason: Cmp_ratio is 1 or
-        #     sparse_mode is 0, cmp_residual_k must be null.
-        #
-        # and the arithmetic agrees: lens % 1 is zero for every request, so
-        # the tensor carries no information. But zero is not null -- an
-        # all-zeros int32 tensor is still a tensor, and the check is on
-        # presence, not on content. This is where a "harmless" value is worse
-        # than no value: it looks like data and is refused as an argument.
-        #
-        # Reaches every ratio-0 layer too, because the call passes
-        # max(ratio, 1) and 0 becomes 1 here as well.
+        # The operator requires cmp_residual_k to be null (not zeros) at
+        # ratio 1 (EZ0037). Ratio 0 reaches here too, as max(ratio, 1).
         return seqused_k, None
     return seqused_k, torch.remainder(lens, ratio).to(torch.int32)

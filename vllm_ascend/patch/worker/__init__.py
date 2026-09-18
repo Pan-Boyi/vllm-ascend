@@ -63,4 +63,4 @@ import vllm_ascend.patch.worker.patch_v2.patch_dspark  # noqa
 
 # only patch routed experts capture in main2main.
 import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
-import vllm_ascend.patch.worker.patch_triton_compile_retry  # noqa  (DSV4.1 编译故障取证+重试)
+import vllm_ascend.patch.worker.patch_triton_compile_retry  # noqa  (retry transient bishengir-compile temp-dir failures)

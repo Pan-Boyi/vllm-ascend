@@ -47,14 +47,8 @@ def bind_kv_cache(
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
 
-    # kv_cache_groups is accepted and not used. Upstream added it to pass to
-    # share_replayssm_ring_trackers, which is Mamba/SSM state sharing and has
-    # no counterpart on this path. Accepting it is not cosmetic: upstream's
-    # vllm/v1/worker/gpu/attn_utils.py passes it by keyword, so a signature
-    # without it is a TypeError at that call site rather than an ignored
-    # argument. The DeepSeek-V4 family branch in the Ascend model runner binds
-    # its caches directly and never reaches that call, which is why this went
-    # unnoticed -- the failure is real and simply not on our path yet.
+    # kv_cache_groups is accepted (upstream passes it by keyword) but unused:
+    # it feeds Mamba/SSM ring-tracker sharing, which has no counterpart here.
     del kv_cache_groups
 
 

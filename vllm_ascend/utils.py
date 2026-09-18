@@ -327,13 +327,8 @@ def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:
     if not os.path.exists(vendor_path):
         return
     # CANN cannot load an operator package through a symlinked vendor
-    # directory: the kernel binaries resolve, but the OpDef/SoC config lookup
-    # silently misses and every custom op dies at execution time with
-    #     Execution_Error(EZ1009): Failed to execute operator <Op>_0.
-    #     Reason: 1.SoC version ascend950 verification failed. ...
-    # which reads like a missing kernel rather than a path problem.
-    # Handing CANN the resolved path fixes it; realpath is a no-op when the
-    # vendor directory is real, so this cannot change the non-symlink case.
+    # directory: the OpDef/SoC lookup misses and every custom op fails at
+    # execution with EZ1009 ("SoC version ... verification failed").
     vendor_path = os.path.realpath(vendor_path)
     _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_path)
 
@@ -1246,17 +1241,11 @@ def has_layer_idx(model_instance: torch.nn.Module) -> bool:
 
 
 def is_deepseek_v4_family(hf_config) -> bool:
-    """Whether this is DeepSeek V4 or one of its descendants.
+    """Whether this is DeepSeek V4 or a descendant (V4.1 reports
+    ``deepseek_v41`` / ``deepseek_v41_text``).
 
-    V4.1 reports ``deepseek_v41`` (and ``deepseek_v41_text`` for the text
-    config), so an equality test against ``deepseek_v4`` silently excludes it:
-    the branch guarded by such a test does not run, and nothing says so. The
-    speculative-decode path already matched by prefix
-    (``llm_base_proposer.py``); this is the same test, named once.
-
-    Deliberately not applied to ``model_version`` comparisons. Upstream's V4.1
-    attention spec sets ``model_version="deepseek_v4"`` itself, so those
-    equalities are already correct and widening them would break the match.
+    Not for ``model_version`` comparisons: V4.1 specs already set
+    ``model_version="deepseek_v4"``.
     """
     model_type = getattr(hf_config, "model_type", None)
     return isinstance(model_type, str) and model_type.startswith("deepseek_v4")

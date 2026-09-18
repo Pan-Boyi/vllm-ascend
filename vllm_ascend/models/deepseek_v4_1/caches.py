@@ -66,47 +66,18 @@ def stated_stream_ratio(cache) -> int | None:
 
 
 class AscendCompressorStateBackend(CompressorBackend):
-    """Upstream's compressor backend, plus the one method Ascend needs.
+    """Upstream's compressor backend, plus ``get_kv_cache_shape``.
 
-    🔴 这个类【曾经】继承 ``AscendDSABackend``，docstring 开头写的是"它只为一个
-    继承来的方法而存在"（``get_kv_cache_shape``）。那句话是错的，而且错在一个
-    **grep 看不见**的地方：它还继承了 ``get_builder_cls``，于是环组被塞了一个
-    ``AscendDSAMetadataBuilder``，而那个 builder 第一件事就是读
-    ``kv_cache_spec.storage_block_size`` —— ``CircularBufferSpec`` 没有这个属性。
-    2026-09-11 第十六次起飞就死在
-    ``AttributeError: 'CircularBufferSpec' object has no attribute 'storage_block_size'``。
-    环根本不做 attention：它的读写是 compressor 自己的 Triton kernel，
-    上游为它配的是 ``CompressorMetadataBuilder``（算环槽位映射）。
-    **为了借一个方法去继承 DSA backend，把那个类的其余部分一起带了过来。**
+    Based on ``CompressorBackend`` rather than a DSA backend so the ring keeps
+    upstream's ``CompressorMetadataBuilder``; a DSA builder would read
+    ``storage_block_size``, which ``CircularBufferSpec`` does not have. The
+    Ascend runner's reshape path calls ``get_kv_cache_shape``, which
+    ``CompressorBackend`` lacks.
 
-    ⇒ 正确的基类是上游的 ``CompressorBackend``：它定义了 ``get_name`` /
-    ``get_supported_kernel_block_sizes`` / ``get_supported_head_sizes`` /
-    ``get_builder_cls``，唯独没有 ``get_kv_cache_shape`` —— ``AttentionBackend``
-    也没有，那是只有具体 backend 才实现的方法。而昇腾 runner 的通用 attention
-    分支在 reshape 时会调它，所以在本平台上，状态 cache 会在 KV cache 建立阶段、
-    任何一次前向之前就以 AttributeError 失败。⇒ 这里只补那一个方法。
-
-    ⚠️ ``get_kv_cache_shape`` 的维序必须是 ``(B, N, H, C)``，头维在 **-2**，
-    和主 MLA / indexer K 同一个约定。
-
-    🔴 我一度把它改成 ``(B, H, N, C)``，理由是上游
-    ``CompressorStateCache.bind_kv_cache`` 做 ``kv_cache.squeeze(1)``、
-    注释写 ``[B, H=1, N, C] -> [B, N, C]``。**那个理由整条不成立**：
-    昇腾这条路根本不调用每层的 ``bind_kv_cache`` ——
-    ``model_runner_v1.py:4292-4313`` 对 V4 家族是**直接赋**
-    ``static_forward_context[name].kv_cache = bind_value(kv_cache)``。
-    上游那三处 ``squeeze(1)`` 在本平台是死代码，改声明去迎合它不生效。
-    而真正读这个形状的是 ``deepseek_v4_1/kv_binding.py`` 的 ``bind_value``，
-    它按 ``HEAD_AXIS = -2`` 找头维：``(B, H, N, C)`` 下 ``shape[-2]`` 是环容量 8，
-    不是 1 ⇒ 它认不出这个布局，**退回 list 包装**，而
-    ``compressor.py:268`` 直接把它喂给 kernel，期待三维 tensor。
-    ⇒ 症状是下一帧的类型错，不是这里的形状错。
-
-    ⚪ 这条是 dsv41-model 用实跑数据纠正的，不是推理：
-       ``bind_value((B,H=1,N=8,C)) -> list``；``bind_value((B,N=8,H=1,C)) -> Tensor``。
-    ⚪ 值得记住的是**为什么我的判据拦不住**：H=1 时两种维序的字节和 stride
-       完全相同，没有任何一条形状断言能区分它们 ——
-       能区分的只有"谁在读这个形状、他从哪一轴找头"。
+    The shape is ``(B, N, H, C)`` with the head axis at -2, as for the main
+    MLA and indexer caches: ``kv_binding.bind_value`` locates the head axis
+    there, and the Ascend runner binds V4 caches through it rather than
+    through upstream's per-layer ``bind_kv_cache``.
     """
 
     @staticmethod
@@ -121,7 +92,7 @@ class AscendCompressorStateBackend(CompressorBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
-        # [B, N, H, C]：头维在 -2，bind_value 就是从那一轴找它的。
+        # Head axis at -2, where bind_value looks for it.
         return num_blocks, block_size, num_kv_heads, head_size
 
 
@@ -185,18 +156,7 @@ class AscendEngramEmbedding(AscendStagedEngramEmbedding,
     """Upstream's engram table, never allocated and never registered.
 
     The mixin comes first so its ``__init__`` and ``_storage`` win the MRO.
-
-    This is the class that decides whether the model loads at all. Upstream's
-    constructor allocates the whole shard before anything else gets a say, and
-    at TP=1 the hash-column sharding degenerates so each rank wants a full
-    copy: 188.83 GiB per rank, 755.3 GiB across four. The first real launch
-    died exactly there.
-
-    How it died is the part worth keeping: ``rtsMallocHost ... out of memory``.
-    The banned pinned-host path was stopped by the host being too small, not
-    by any rule of ours. A larger machine would have let it through and then
-    run the registration that took an NPU down. So the interception here is at
-    construction, and it raises.
+    See ``engram_embedding`` for why the table is not allocated.
     """
 
 
@@ -240,16 +200,9 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
 
         storage_block_size = DSV4_BLOCK_SIZES[
             vllm_config.cache_config.block_size][0][0]
-        # max(ratio, 1): ratio 0 means "no compression", i.e. one state per
-        # token, not zero states per page.
-        #
-        # This is the only interception point, not a tidiness fix. A block size
-        # of 0 does not fail: select_common_block_size looks for a supported
-        # size that divides the request, and `0 % n == 0` holds for every n, so
-        # the first candidate -- the largest -- matches. Measured: 0 resolves
-        # to 256 on C2, 512 on C4, 128 on the base backend. The planner then
-        # allocates that page. Nothing raises; the only symptom is a page size
-        # nobody asked for.
+        # Ratio 0 means one state per token. A block size of 0 would not
+        # fail: select_common_block_size treats 0 as divisible by every
+        # supported size and silently picks the largest.
         states_ratio = max(self.compress_ratio, 1)
         return AscendMLAAttentionSpec(
             block_size=storage_block_size * states_ratio,
@@ -270,60 +223,20 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
         """Pick the backend whose supported block sizes contain this layer's.
 
         V4.1's index-source layers carry ratios 1 and 2 only. Ratio 1 needs
-        [.., 128] and the SWA backend already lists it; ratio 2 needs 256 and
-        no existing class covers [64, 128, 256], so it refuses rather than
-        borrowing the nearest one.
+        [.., 128], which the SWA backend lists; ratio 2 needs [64, 128, 256],
+        which only the C2 backend covers.
         """
-        from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
+        from vllm_ascend.attention.dsa_v1 import (AscendDSAC2Backend,
+                                                  AscendDSASWABackend)
 
         if self.compress_ratio <= 1:
             return AscendDSASWABackend
         if self.compress_ratio == 2:
-            backend = _optional_c2_backend()
-            if backend is not None:
-                return backend
-            raise NotImplementedError(
-                f"AscendDSAC2Backend is not importable from "
-                f"vllm_ascend.attention.dsa_v1 in this tree ({_c2_absence()}). "
-                "compress_ratio 2 needs supported kernel block sizes "
-                "[64, 128, 256] and no other class covers all three. Do not "
-                "reuse AscendDSAC4Backend: it accepts this layer at cache "
-                "block sizes 64 and 128 and only refuses at 32, so the "
-                "default configuration would run with the planner and the "
-                "operator disagreeing about the page size, silently.")
+            # Not C4: it accepts ratio 2 at cache block sizes 64 and 128 and
+            # only refuses at 32, leaving planner and operator disagreeing
+            # about the page size.
+            return AscendDSAC2Backend
         raise NotImplementedError(
             f"indexer compress_ratio {self.compress_ratio} has no Ascend "
             "backend; V4.1's index-source layers carry 1 and 2.")
 
-
-def _optional_c2_backend():
-    """The ratio-2 backend, if it has landed yet."""
-    try:
-        from vllm_ascend.attention.dsa_v1 import AscendDSAC2Backend
-    except ImportError:
-        return None
-    return AscendDSAC2Backend
-
-
-def _c2_absence() -> str:
-    """Why it is missing, in the two words that decide who fixes it.
-
-    "Unsupported" and "not merged into the tree you are running" are the same
-    ImportError and want opposite responses. Saying only the first cost a
-    launch: the class existed, on a branch, and the message sent everyone
-    looking for work that was already done.
-    """
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["git", "log", "--all", "--oneline", "-1", "-S",
-             "class AscendDSAC2Backend", "--", "vllm_ascend/attention/dsa_v1.py"],
-            capture_output=True, text=True, timeout=10)
-    except Exception:  # git absent, not a checkout, anything
-        return "could not check whether it exists elsewhere"
-    found = out.stdout.strip()
-    if not found:
-        return "no commit in this repository ever added it"
-    return (f"it exists on another branch -- {found} -- and is not merged "
-            "into the tree you are running")

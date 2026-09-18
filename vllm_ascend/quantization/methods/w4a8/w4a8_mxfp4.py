@@ -323,43 +323,12 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
-        """🔴 uint8, because upstream's loader contract requires it.
+        """Declare the E8M0 scales as uint8, not float8_e8m0fnu.
 
-        Not inferred any more -- cited. ``nvidia/model.py:745-754`` views the
-        checkpoint's expert scale to uint8 before the copy, and says why::
-
-            # E8M0 scales are stored as float8_e8m0fnu in checkpoints but the
-            # MoE param is uint8. copy_() would do a numeric conversion
-            # (e.g. 2^-7 -> 0), destroying the raw exponent bytes.
-
-        🔵 So the contract has **two halves and needs both**: the loader hands
-        over a uint8 *view*, and the parameter is declared uint8. These two
-        were declared ``float8_e8m0fnu`` -- the only two in the whole
-        quantization tree that were -- which kept upstream's half and broke
-        ours. A copy into an E8M0 parameter is then a *value* conversion
-        rather than a byte move: every byte in
-        96..191 rounds to the same power of two and is stored as 134. The
-        checkpoint's own bytes are 119..122 for w1/w3 and 119..123 for w2,
-        all inside that window, so all 70,778,880 of them collapsed to the
-        single value 134 -- scale 2^7 = 128 where 2^-6 was meant.
-
-        ⚠️ Upstream's example is the OTHER direction (an e8m0 source into a
-        uint8 param gives 0); ours was a uint8 view into an e8m0 param giving
-        134. Same defect, two directions, and only one of them was ours --
-        the other is what happens if that view line is ever dropped.
-
-        Measured, not reasoned: flight xr_sc2_040330 read min=median=max=134,
-        1 distinct value, on both keys; the same instrument in the same
-        flight read attn.wq_b at 114..117, which is bit-for-bit the range in
-        the checkpoint file. The layout invariant passed on the expert
-        scales, so the collapse was already there before any transform.
-
-        ⚠️ Nothing downstream wanted E8M0: ``process_weights_after_loading``
-        immediately does ``.view(torch.uint8)`` on both, so the operator was
-        always handed uint8. The declaration was the only thing that
-        differed -- and a dtype that is *narrower in meaning but identical in
-        width* changes a byte move into an arithmetic one without changing a
-        single shape, which is why nothing downstream complained.
+        The loader views the checkpoint scale as uint8 before copying it in
+        (vllm ``nvidia/model.py``), so the copy is a byte move only if the
+        parameter is uint8 too. Into an E8M0 parameter the copy becomes a value
+        conversion that collapses the exponents to a single value.
         """
         param_dict = {}
         param_dict["w13_weight_scale"] = torch.empty(
@@ -375,18 +344,6 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         return param_dict
 
     def process_weights_after_loading(self, layer):
-        # 🔵 The routed experts' real path: `expert_dtype == "fp4"` selects
-        # ds_w4a8_moe (configs/fp8_config.py:207-213), which is registered on
-        # *this* subclass -- the base class's version of this method does not
-        # run. Both operators downstream have been shown to use the scale
-        # they are handed faithfully, so if the magnitude is wrong, what is
-        # wrong is what we hand them.
-        from vllm_ascend.quantization.scale_layout_check import (
-            report_scale_bytes, snapshot_scales, verify_scale_layout_preserved)
-
-        _names = ("w13_weight_scale", "w2_weight_scale")
-        _scales_before = snapshot_scales(layer, _names)
-
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
             29,
@@ -409,10 +366,3 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         layer.w2_weight_scale.data = (
             layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
         )
-
-        # Reshape, view and transpose only -- no padding, no broadcast -- so
-        # the byte multiset must come out exactly as it went in.
-        verify_scale_layout_preserved(_scales_before, layer, _names,
-                                      what="ds routed expert scales")
-        report_scale_bytes(layer, _names, where="ds_w4a8 routed experts",
-                           weights=("w13_weight", ))

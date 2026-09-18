@@ -19,7 +19,6 @@
 
 import logging
 import math
-import os
 import sys
 import time
 from collections import defaultdict, deque
@@ -202,6 +201,7 @@ from vllm_ascend.utils import (
     get_c_env,
     get_kv_cache_tensor_layers,
     global_stream,
+    is_deepseek_v4_family,
     is_hidden_state_cache_spec,
     is_score_encoder_cache_manager,
     kv_cache_spec_uses_sparse_sfa_c8,
@@ -210,7 +210,8 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
     weak_ref_tensor,
-    weak_ref_tensors, is_deepseek_v4_family)
+    weak_ref_tensors,
+)
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataExecutor,
@@ -305,42 +306,6 @@ def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
 
 
-#: DSV4.1 engram 在 PIECEWISE 捕获下整块不执行的修复开关。
-#: 默认【开】。设为 0 恢复上游原行为(阴性臂用)。
-#: 只在 _should_build_dummy_attn_metadata 里被读,作用域见那里的注释。
-_SL_PTR_LOGGED = 0
-_PIECEWISE_ATTN_META: "bool | None" = None
-_PIECEWISE_ATTN_META_LOGGED: set = set()
-
-
-def _piecewise_dummy_attn_meta_enabled() -> bool:
-    global _PIECEWISE_ATTN_META
-    if _PIECEWISE_ATTN_META is None:
-        raw = os.getenv("DSV41_PIECEWISE_ATTN_META", "1").strip()
-        _PIECEWISE_ATTN_META = raw not in ("0", "false", "False", "")
-    return _PIECEWISE_ATTN_META
-
-
-def _log_piecewise_attn_meta_once(built: bool) -> None:
-    """把"这一发到底走了哪条"变成产物。
-
-    🔴 不这么做的话,"修好了"和"开关没生效"在日志里长得一模一样 ——
-    两边都只是安静地跑完。每种取值各记一次,分母可见。
-    """
-    key = bool(built)
-    if key in _PIECEWISE_ATTN_META_LOGGED:
-        return
-    _PIECEWISE_ATTN_META_LOGGED.add(key)
-    try:
-        logger.info(
-            "DSV4.1 PIECEWISE 捕获的 dummy attn_metadata: 构建=%s "
-            "(DSV41_PIECEWISE_ATTN_META=%s)。构建=False 时 engram prologue "
-            "在捕获期不执行 ⇒ 不进图 ⇒ replay 永不执行。",
-            key, os.getenv("DSV41_PIECEWISE_ATTN_META", "1"))
-    except BaseException:                                    # noqa: BLE001
-        pass
-
-
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -370,42 +335,19 @@ class NPUModelRunner(GPUModelRunner):
         # _allocate_kv_cache_tensors which accesses self.use_compress.
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None) if model_config else None
-        # 🔴 必须两个对象都看。V4.1 的 config 有多模态外壳:
-        #      顶层 model_type=deepseek_v41,只有 architectures/vision_config/text_config...
-        #      compress_ratios（43 条）在 text_config 里，【顶层没有】。
-        #    原来只判 hf_config ⇒ V4.1 上 use_compress 恒 False,
-        #    于是 _uses_page_strided_kv_layout 恒 False、整条 compressed KV 布局
-        #    静默不启用,所有 DSV4 层掉进给别的模型写的通用 (K,V) 二元组通路。
-        #    V4.0 没有外壳,所以这条在 V4.0 上一直是对的 —— 是"到 V4.1 才退化",
-        #    不是"一直坏的",两者在 V4.0 的日志里长得一模一样。
-        #    ⚠️ 这个开关有 11 处读取点(seq_lens 同步 / positions buffer /
-        #       强制 attention / KV 分配 ...),翻转它是一次改 11 个判断
-        #       ⇒ 把取值和来源打出来,别让它再当一个没人看见的默认值。
+        # Multimodal wrappers (e.g. DeepSeek-V4.1) keep compress_ratios in the
+        # text config only, so check it before the top-level config.
         text_config = getattr(model_config, "hf_text_config", None) if model_config else None
-        _compress_src = None
-        for _name, _cfg in (("hf_text_config", text_config), ("hf_config", hf_config)):
-            if _cfg is not None and hasattr(_cfg, "compress_ratios"):
-                _compress_src = _name
-                break
-        self.use_compress = _compress_src is not None
-        logger.info_once(
-            "use_compress=%s（compress_ratios 来自 %s）", self.use_compress,
-            _compress_src or "两个 config 都没有", scope="local",
+        self.use_compress = any(
+            cfg is not None and hasattr(cfg, "compress_ratios") for cfg in (text_config, hf_config)
         )
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
-        # vLLM #56078 ("Unify XD-RoPE into M-RoPE and derive the channel
-        # count") removed GPUModelRunner.uses_xdrope_dim / .xdrope_positions
-        # and folded XD-RoPE models into the M-RoPE path, where
-        # mrope_positions is now sized by ModelConfig.mrope_num_dims instead
-        # of a hardcoded 3. Feature-detect rather than version-gate: both the
-        # pre- and post-#56078 trees report VLLM_VERSION 0.28.1.
-        #
-        # 0 is the faithful value on the new API -- an XD-RoPE model now
-        # reports uses_mrope=True, so every `elif self.uses_xdrope_dim > 0`
-        # below is dead code there, exactly as upstream intends.
+        # vLLM #56078 folded XD-RoPE into M-RoPE and dropped uses_xdrope_dim.
+        # Feature-detect (both sides report the same VLLM_VERSION); 0 is exact
+        # there since XD-RoPE models now report uses_mrope=True.
         if not hasattr(self, "uses_xdrope_dim"):
             self.uses_xdrope_dim = 0
 
@@ -3114,86 +3056,13 @@ class NPUModelRunner(GPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
-        # 🔴 对齐 recorder 的【武装 / 取 positions / 落盘】三件事都在这里驱动,
-        #    而不是挂在模型模块上做 hook：图 replay 只做 entry.capture.replay(),
-        #    模型模块的 Python 一行都不执行,三个 hook 一次都不会响。
-        #    这两处两种模式都跑、每个 rank 都跑,且严格包住所有 tap。
-        from vllm_ascend.models.deepseek_v4_1 import align_taps as _align_taps
-
-        # 🔴 请求身份由【这里】供给,不由 attn_metadata 供给(2026-09-15)。
-        #    decode_step1.request_identity() 原来只会扫 attn_metadata 找
-        #    req_metadata.req_ids_tensor —— 那是上游 GPU metadata 的字段,
-        #    AscendDSAReqMetadata 上【不存在】⇒ 身份恒为 None ⇒ decode step-1
-        #    录制从未激活过,而产物上表现为"只有 prefill 的 dump",
-        #    和"decode 本来就没问题"读起来完全一样。
-        #    runner 的 input_batch.req_ids 是同一个请求在 prefill 与 decode
-        #    两次 forward 上都成立的身份,且不依赖任何后端的字段名。
-        #    ⚠️ 只在批里恰好一个请求时给;多个就传 None(说不出就别编)。
-        try:
-            _rids = getattr(getattr(self, "input_batch", None), "req_ids", None)
-            _align_taps.set_request_identity(
-                str(_rids[0]) if _rids is not None and len(_rids) == 1 else None)
-        except Exception:                                    # noqa: BLE001
-            pass
-
-        # 🔴 地址取证(2026-09-15):图内探针读到 seq_lens 全是 1(捕获期值),
-        #    而 eager 实测该张量的指针跨步【稳定】⇒ 不是"每步新张量被烘死"。
-        #    剩下的解释只有一个:捕获期烘进图的那块地址,和服务期 runner
-        #    真正写入的那块,不是同一块。
-        #    attention 里那行只在【捕获期】打(图里 Python 不重放),这里每步都打,
-        #    两个地址在【同一个进程内】直接可比 —— 跨进程比地址是没有意义的。
-        try:
-            global _SL_PTR_LOGGED
-            if _SL_PTR_LOGGED < 10:
-                _SL_PTR_LOGGED += 1
-                _sl = getattr(self, "seq_lens", None)
-                if isinstance(_sl, torch.Tensor):
-                    logger.info(
-                        "DSV4.1 runner 指针 step#%d ntok=%s | self.seq_lens "
-                        "ptr=0x%x shape=%s",
-                        _SL_PTR_LOGGED,
-                        model_inputs.get("input_ids").shape[0]
-                        if isinstance(model_inputs, dict)
-                        and isinstance(model_inputs.get("input_ids"),
-                                       torch.Tensor) else "?",
-                        _sl.data_ptr(), tuple(_sl.shape))
-        except Exception:                                    # noqa: BLE001
-            pass
-
-        _align_taps.begin_forward(model_inputs)
-
-        try:
-            if self.enable_enpu:
-                # The soft segmentation scenario requires event.record first, then event.wait
-                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-                hidden_states = run_model()
-            else:
-                hidden_states = run_model()
-                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-        finally:
-            # 🔴 先把【图段内探针】读出来，再落盘。探针是图里的一条 copy kernel,
-            #    replay 时照常执行;而这里的 Python 每步都跑、两种模式都跑。
-            #    这是目前唯一能看见图段内部的通路。
-            try:
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
-
-                _drained = _gp.drain(only_rows=num_tokens_padded)
-                for _nm, _buf, _n in _drained:
-                    _align_taps.tap_whole_probe(_nm, _buf, _n)
-                # 🔴 记账要【被读出来】。上一版我加了 shape_changed 却从没打印,
-                #    于是"探针被拒绝"是隐形的,dump 里留着上一道题的残留,
-                #    而比对结果看起来像一个惊人的缺陷。
-                _st = _gp.stats()
-                if _st.get("shape_changed") or _st.get("alloc_failed") \
-                        or _st.get("call_site_errors"):
-                    if not getattr(self, "_gp_warned", False):
-                        self._gp_warned = True
-                        logger.warning("DSV4.1 graph_probe 记账(只报第一次): %s", _st)
-            except Exception:                                # noqa: BLE001
-                pass
-            # finally:forward 抛异常时也要落盘。“报告不该销毁它所报告的东西”——
-            # 一次失败的 forward 正是最需要那份 dump 的时候。
-            _align_taps.end_forward()
+        if self.enable_enpu:
+            # The soft segmentation scenario requires event.record first, then event.wait
+            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            hidden_states = run_model()
+        else:
+            hidden_states = run_model()
+            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
 
         return hidden_states
 
@@ -3762,90 +3631,14 @@ class NPUModelRunner(GPUModelRunner):
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             return True
 
-        # 🔴 DSV4.1 engram 在 PIECEWISE 捕获下【整块不执行】(2026-09-15 定位)
-        #
-        # 上游在 PIECEWISE 捕获时不建 attn_metadata,理由是注意力被 splitting_ops
-        # 切出了图、在图外 eager 跑,metadata 用不着。对注意力这是对的。
-        # 但 DSV4.1 的 model.forward 里,engram 的 prologue 拿
-        # `isinstance(attn_metadata, dict)` 当执行闸:
-        #
-        #   vllm/models/deepseek_v4_1/nvidia/model.py:648
-        #   if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
-        #       engram_hashes = self.engram_hash(...)        # n-gram hash 两条 kernel
-        #       for layer ...: engram.prepare_embeddings(...) # 189 GiB 表的 host gather
-        #
-        # 捕获期 attn_metadata=None ⇒ 这一整块【在捕获时没执行】⇒ 它的 kernel
-        # 【没有被录进图】⇒ replay 时永不执行 ⇒ engram 层一直读 warmup 那次
-        # 留在 _dev_weight/_dev_scale 里的 embedding,与本次请求无关。
-        #
-        # 实测产物(xr_hash_graph_120807, 四 rank 四道题):
-        #   prologue.engram_hashes 图内探针 四题逐位相同 = 全零 token 的 hash
-        #   prologue.input_ids     图内探针 四题逐位相同 = [0]*8
-        #   同一份 probe.safetensors 里 22 个 decoder-layer 探针四题全不同
-        #   ⇒ 探针机制本身在 replay 下工作正常,冻结的是被测对象。
-        #   engram.Lx.ids_device 载荷 num_tokens=1 ⇒ 最后一次真正执行是
-        #   decode 形状的 FULL 捕获(日志里 decode,FULL 与 mixed,PIECEWISE 各 6 次)。
-        # 症状:第 0 层(无 engram)逐位等于 eager;L01.pre_engram.residual 相同
-        #      而 L01.post_engram.residual 差 0.427/0.628/0.649/0.673。
-        #
-        # ⚠️ 作用域:缺陷的范围是【任何 PIECEWISE 捕获】,不是 breakable 独有 ——
-        #    执行闸是模型里的 `isinstance(attn_metadata, dict)`,它不认捕获实现。
-        #    所以这里不按 breakable 收窄(收窄了就是判据比缺陷还窄)。
-        #    FULL 与 NONE 一字不改;关掉开关就是上游原行为,留给 A/B 做阴性臂。
-        if (
-            not is_profile
-            and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-            and _piecewise_dummy_attn_meta_enabled()
-        ):
-            _log_piecewise_attn_meta_once(True)
-            return True
-        _log_piecewise_attn_meta_once(False)
-        return False
+        # Models may gate graph-captured work on attn_metadata being present
+        # (DeepSeek-V4.1 runs its engram prologue only when it is a dict).
+        # Anything skipped at capture is never replayed, so PIECEWISE capture
+        # needs the dummy metadata too.
+        return not is_profile and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
 
     @torch.inference_mode()
     def _dummy_run(
-        self,
-        num_tokens: int,
-        with_prefill: bool = False,
-        cudagraph_runtime_mode: CUDAGraphMode | None = None,
-        force_attention: bool = False,
-        uniform_decode: bool = False,
-        is_profile: bool = False,
-        create_mixed_batch: bool = False,
-        allow_microbatching: bool = True,
-        skip_eplb: bool = False,
-        remove_lora: bool = True,
-        is_graph_capturing: bool = False,
-        num_active_loras: int = 0,
-        profile_seq_lens: int | None = None,
-        profile_cpp: bool = False,
-        skip_gdn_state_update: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 🔴 对齐 tap 在 _dummy_run 全程关闭。dummy 批次的 seq_lens 和
-        #    positions 来自两个来源,在真实请求里一致、在这里不一致,
-        #    于是 recorder 会被武装成错的尺寸并在 record() 时越界。
-        #    见 align_taps.dummy_run_scope 的注释。
-        from vllm_ascend.models.deepseek_v4_1 import align_taps as _align_taps
-
-        with _align_taps.dummy_run_scope():
-            return self._dummy_run_inner(
-                num_tokens=num_tokens,
-                with_prefill=with_prefill,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                force_attention=force_attention,
-                uniform_decode=uniform_decode,
-                is_profile=is_profile,
-                create_mixed_batch=create_mixed_batch,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=skip_eplb,
-                remove_lora=remove_lora,
-                is_graph_capturing=is_graph_capturing,
-                num_active_loras=num_active_loras,
-                profile_seq_lens=profile_seq_lens,
-                profile_cpp=profile_cpp,
-                skip_gdn_state_update=skip_gdn_state_update)
-
-    def _dummy_run_inner(
         self,
         num_tokens: int,
         with_prefill: bool = False,
@@ -3965,10 +3758,8 @@ class NPUModelRunner(GPUModelRunner):
         # reading. Mirrors upstream gpu_model_runner._dummy_run.
         with self.synchronize_input_prep():
             # Build attention metadata for dummy_run
-            # 🔴 一次求值,两处共用。填 127 的那句在这个分支【里面】,而复位
-            #    原本挂在 force_attention 上 —— 放宽本分支却不动复位,会留下
-            #    "positions 停在 127 且无人复位"这个原本不存在的组合,
-            #    也就是在一次改动里偷偷塞进第二个变量。
+            # Reused by the positions reset below, which must follow the same
+            # condition that filled them.
             built_dummy_attn_meta = self._should_build_dummy_attn_metadata(
                 force_attention, is_profile, cudagraph_runtime_mode)
             if built_dummy_attn_meta:
@@ -4258,14 +4049,8 @@ class NPUModelRunner(GPUModelRunner):
                     return
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
-            # Model construction itself needs the CUDA->NPU substitutions, not
-            # just the runner around it. DeepSeek-V4.1 builds three
-            # torch.cuda.Stream objects in its decoder stack
-            # (vllm/models/deepseek_v4_1/nvidia/model.py), unconditionally and
-            # before any platform check, and torch.cuda.Stream raises outright
-            # here rather than degrading. The wrapper already covers
-            # super().__init__ and the graph wrapper below; this is the third
-            # place that needs it, and the only one reached at load time.
+            # Some models (e.g. DeepSeek-V4.1) create torch.cuda.Stream objects
+            # at construction time, which raises on NPU without the wrapper.
             with _torch_cuda_wrapper():
                 self.model: nn.Module = get_model(vllm_config=self.vllm_config)
             for name, _ in self.model.named_parameters():
@@ -4418,30 +4203,6 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        # 🔴 这一段整整三分多钟【一行日志都不打】。2026-09-11 第十八/十九次起飞
-        #    就死在这个窗口里:主机匿名内存从 2.8 GiB 线性涨到 223 GiB
-        #    (0.55 GiB/s,不收敛),而日志里看不出它走到哪一步。
-        #    「卡住了」「在慢慢做」「在漏内存」三者在静默的日志里完全一样。
-        #    ⇒ 每一步都报 耗时 + 本进程 RssAnon,让下一次一眼看出是哪一步。
-        import time as _t
-
-        def _rss_anon_gib() -> float:
-            try:
-                with open("/proc/self/status") as f:
-                    for line in f:
-                        if line.startswith("RssAnon:"):
-                            return int(line.split()[1]) / 1048576
-            except OSError:
-                pass
-            return float("nan")
-
-        _t0 = _t.monotonic()
-
-        def _step(name: str) -> None:
-            logger.info("initialize_kv_cache[%s] +%.1fs RssAnon=%.1f GiB",
-                        name, _t.monotonic() - _t0, _rss_anon_gib())
-
-        _step("进入")
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
@@ -4449,17 +4210,14 @@ class NPUModelRunner(GPUModelRunner):
         self.may_add_encoder_only_layers_to_kv_cache_config()
         apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config)
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        _step("分组/计划完成")
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
-        _step("attn backend 就绪")
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # K3's packed layout keeps Mamba specs inside UniformType groups, so the
         # old first-spec scan over attn_groups cannot recognize them.
         self.need_accepted_tokens = kv_cache_config.has_mamba_layers
 
         self.may_reinitialize_input_batch(kv_cache_config)
-        _step("input batch 就绪")
         if self.sparse_kv_offload_enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config,
@@ -4467,7 +4225,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.sparse_kv_offload_config,
             )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        _step("kv cache tensors 就绪")
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4544,11 +4301,8 @@ class NPUModelRunner(GPUModelRunner):
                     key=lambda name: (extract_dsv4_layer_index(
                         self.model_config.hf_text_config, name), name)):
                 self.kv_caches.append(kv_caches[layer_name])
-            # V4.1's consumers are upstream's methods, which read the cache as
-            # a tensor -- .numel() on it, and an assert on shape[1:]. The list
-            # the V4.0 path needs is wrong for them, and so is upstream's own
-            # squeeze(1): the head axis is at index 2 here, and squeeze on a
-            # non-unit dimension is a silent no-op. See deepseek_v4_1.kv_binding.
+            # V4.1 layers read kv_cache as a tensor rather than the V4.0 list;
+            # see deepseek_v4_1.kv_binding.
             from vllm_ascend.models.deepseek_v4_1.kv_binding import (
                 bind_value, is_v41)
 
@@ -4604,20 +4358,11 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _mla_split_is_applicable(self, layer_name: str, kv_cache_spec: AttentionSpec) -> bool:
-        """这一层能不能按 MLA 的 nope/rope 拆成两个逻辑张量。
+        """Whether this layer can be split into MLA nope/rope tensors.
 
-        🔴 判据是【这一层本身是不是 MLA 注意力层】，不是它的 spec 类型。
-        拆分要用的 ``kv_lora_rank`` / ``qk_rope_head_dim`` 只长在 ``MLAAttention``
-        上；spec 是不是 ``AscendMLAAttentionSpec`` 说明不了这件事 ——
-        V4.1 的 indexer K cache（``AscendDeepseekV41IndexerCache``）用的正是
-        ``AscendMLAAttentionSpec``，而它压根不是 MLA：它是一路 K（外加一段 scale），
-        没有 nope/rope 可分。
-
-        2026-09-11 第二十六次起飞：层 20 的 indexer compress_ratio=1，
-        于是满足了调用点那个 ``ratio == 1`` 的条件、走进拆分分支，
-        撞上 ``TypeError: Expected MLAAttention layer ... got
-        AscendDeepseekV41IndexerCache``。⇒ 那条 TypeError 报的是症状，
-        真正缺的是【调用之前没有检查前提】。
+        Decided by the layer, not the spec: the split needs kv_lora_rank /
+        qk_rope_head_dim from MLAAttention, while DeepSeek-V4.1's indexer
+        K cache also uses AscendMLAAttentionSpec but has no nope/rope parts.
         """
         if not isinstance(kv_cache_spec, AscendMLAAttentionSpec):
             return False
@@ -5271,9 +5016,8 @@ class NPUModelRunner(GPUModelRunner):
                     if (
                         isinstance(current_kv_cache_spec, AscendMLAAttentionSpec)
                         and get_kv_cache_compression_ratio(current_kv_cache_spec) == 1
-                        # ⚠️ 前提：这一层真的是 MLA 注意力层。indexer 的 K cache 同样用
-                        #    AscendMLAAttentionSpec、ratio 也可以是 1，但它没有
-                        #    nope/rope 可分 —— 它由下面 scale_dim != 0 那一支处理。
+                        # Indexer K caches share this spec and ratio but are not MLA
+                        # layers; they are handled by the scale_dim branch below.
                         and self._mla_split_is_applicable(layer_name, current_kv_cache_spec)
                     ):
                         k_dim, v_dim = self._get_attention_kv_cache_dims(
@@ -5464,71 +5208,42 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         _raw = kv_cache_raw_tensors[layer_name]
                         if isinstance(_raw, torch.Tensor):
-                            # 单张量。DSV4 的 shared-tuple planner 给【每一层】一段连续切片
-                            # （descriptor 的 block_stride 就等于该层的 page_size_bytes），
-                            # 所以在这条模型上"单张量"是常态，(K, V) 二元组才是例外：
-                            # compressor 的环、以及主 MLA / indexer 的层都走这里。
-                            #
-                            # 🔴 绝不能直接对它做 `k, v = _raw` 解包。那【不会】快速失败：
-                            #    Python 先走 Tensor.__iter__ → unbind(0)，把 dim0 上每个切片
-                            #    都造成一个新张量对象，【然后】才抛 "too many values to unpack"。
-                            #    这里 dim0 = num_blocks*page_size ≈ 10.7 亿 ⇒ 它要先造十亿个对象。
-                            #    2026-09-11 第十八/十九次起飞就死在这里：主机匿名内存
-                            #    以 0.55 GiB/s 线性涨到 223 GiB、整机 OOM，
-                            #    而那三分半日志里一个字都没有 —— 一个 arity 错误伪装成了内存泄漏。
-                            #    有界复现见 build_artifacts/repro/repro_tensor_unpack_trap.py。
-                            #
-                            # 形状用 backend 声明的那个，且【不】做 use_hybrid_blocks 的分块：
-                            # planner 是按 spec.block_size 的整页排的布，再按 kernel block size
-                            # 切一次会和已经落地的分配对不上。
+                            # Planners that give each layer one contiguous slice (the
+                            # DSV4 shared-tuple planner) hand over a single tensor.
+                            # Never tuple-unpack it: Tensor.__iter__ unbinds dim0 into
+                            # ~1e9 objects before the arity error is raised.
+                            # No use_hybrid_blocks split: the planner laid out whole
+                            # pages of spec.block_size.
                             page = current_kv_cache_spec.page_size_bytes
                             if _raw.numel() % page != 0:
                                 raise NotImplementedError(
-                                    f"{layer_name} 的 raw kv cache {_raw.numel()} 字节不是 "
-                                    f"page_size_bytes={page} 的整数倍")
+                                    f"{layer_name}: raw kv cache of {_raw.numel()} bytes is not "
+                                    f"a multiple of page_size_bytes={page}")
                             single_num_blocks = _raw.numel() // page
                             assert single_num_blocks >= kv_cache_config.num_blocks, (
-                                f"{layer_name} 只有 {single_num_blocks} 块，"
-                                f"少于 kv_cache_config.num_blocks={kv_cache_config.num_blocks}")
-                            # 🔴 形状里的块内 token 数必须【从页大小推出来】，
-                            #    不能直接用 spec.block_size。
-                            #    V4.1 的 kv-source 层有 tokens_per_state（ratio 2 或 1）:
-                            #    一页装的是 block_size // tokens_per_state 个 state，
-                            #    也就是 AscendMLAAttentionSpec 的 storage_block_size。
-                            #    用逻辑 block_size 会让形状的元素数正好是字节数 ⇒
-                            #    view 之后差一个 itemsize 倍
-                            #    （实测 "shape [32922,128,1,512] is invalid for input of
-                            #     size 1078788096"，正好 2 倍，因为 bf16）。
-                            #    ⇒ 形状必须描述【真正分配下去的那些字节】。
+                                f"{layer_name} has {single_num_blocks} blocks, fewer than "
+                                f"kv_cache_config.num_blocks={kv_cache_config.num_blocks}")
+                            # States per block come from the page size, not
+                            # spec.block_size: layers with tokens_per_state > 1 store
+                            # block_size // tokens_per_state states per page.
                             per_state = (current_kv_cache_spec.num_kv_heads
                                          * current_kv_cache_spec.head_size
                                          * get_dtype_size(current_kv_cache_spec.dtype))
                             if per_state <= 0 or page % per_state != 0:
                                 raise NotImplementedError(
-                                    f"{layer_name} 的 page_size_bytes={page} 不是每个 state "
-                                    f"{per_state} 字节的整数倍（heads="
+                                    f"{layer_name}: page_size_bytes={page} is not a multiple of "
+                                    f"the {per_state}-byte state (heads="
                                     f"{current_kv_cache_spec.num_kv_heads} head_size="
                                     f"{current_kv_cache_spec.head_size} dtype="
-                                    f"{current_kv_cache_spec.dtype}）")
+                                    f"{current_kv_cache_spec.dtype})")
                             storage_block = page // per_state
-                            # spec 自己说得出来的话，两者必须一致 —— 不一致是真不一致，
-                            # 不能让推导出来的那个悄悄盖过去。
-                            # ⚠️ 已知会不一致的一类：页里每个 state 还带一段 scale
-                            #    （indexer 的 k_cache：page 16896 = 128 × (128×1 + 1×4)，
-                            #     上面那个只按 head_size×itemsize 的推导会给出 132 而不是 128）。
-                            #    那类 spec 走的是 page-strided / indexer 的专用分支，不该到这里；
-                            #    真到了这里就说明路由错了 ⇒ 当场报，不要用推导值凑一个能跑的形状。
+                            # A mismatch means the spec carries extra per-state bytes
+                            # (e.g. indexer scales) and was routed here by mistake.
                             declared = getattr(current_kv_cache_spec, "storage_block_size", None)
                             if declared is not None and declared != storage_block:
                                 raise NotImplementedError(
-                                    f"{layer_name} 的 storage_block_size 声明是 {declared}，"
-                                    f"但按 page_size_bytes={page} 推出来是 {storage_block}")
-                            if storage_block != current_kv_cache_spec.block_size:
-                                logger.info_once(
-                                    "%s 的块内 state 数按页大小推为 %d（逻辑 block_size=%d，"
-                                    "spec %s）", layer_name, storage_block,
-                                    current_kv_cache_spec.block_size,
-                                    type(current_kv_cache_spec).__name__, scope="local")
+                                    f"{layer_name}: declared storage_block_size={declared}, but "
+                                    f"page_size_bytes={page} implies {storage_block}")
                             single_shape = attn_backend.get_kv_cache_shape(
                                 single_num_blocks,
                                 storage_block,
@@ -5541,16 +5256,17 @@ class NPUModelRunner(GPUModelRunner):
                                 want *= _d
                             if want != typed.numel():
                                 raise NotImplementedError(
-                                    f"{layer_name} 形状 {tuple(single_shape)} 要 {want} 个元素，"
-                                    f"而这段 cache 按 {current_kv_cache_spec.dtype} 只有 "
-                                    f"{typed.numel()} 个（{_raw.numel()} 字节 / page {page}）")
+                                    f"{layer_name}: shape {tuple(single_shape)} needs {want} "
+                                    f"elements, but the cache holds {typed.numel()} "
+                                    f"{current_kv_cache_spec.dtype} elements "
+                                    f"({_raw.numel()} bytes, page {page})")
                             kv_caches[layer_name] = typed.view(single_shape)
                             continue
                         if len(_raw) != 2:
                             raise NotImplementedError(
-                                f"{layer_name}（spec {type(current_kv_cache_spec).__name__}）的 "
-                                f"raw kv cache 是长度 {len(_raw)} 的 {type(_raw).__name__}，"
-                                "这条通路只处理 (K, V) 二元组。")
+                                f"{layer_name} (spec {type(current_kv_cache_spec).__name__}): "
+                                f"raw kv cache is a {type(_raw).__name__} of length {len(_raw)}; "
+                                "this path only handles (K, V) pairs.")
                         raw_k_tensor, raw_v_tensor = _raw  # type: ignore
                         sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     assert raw_k_tensor is not None
@@ -6296,11 +6012,8 @@ def _torch_cuda_wrapper():
         torch.cuda.mem_get_info = torch.npu.mem_get_info
         torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
         torch.cuda.CUDAGraph = torch.npu.NPUGraph
-        # Models that size a Triton grid from the device (e.g. DeepSeek-V4.1's
-        # engram lookup) call this; on NPU the CUDA entry point asserts
-        # "Torch not compiled with CUDA enabled". _NPUDeviceProperties exposes
-        # multi_processor_count (56, the vector core count), so the grid gets a
-        # meaningful parallel-unit count rather than a crash.
+        # Used to size Triton grids (e.g. DeepSeek-V4.1 engram); the CUDA entry
+        # point asserts on NPU.
         torch.cuda.get_device_properties = torch.npu.get_device_properties
         breakable_cudagraph.weak_ref_tensor = weak_ref_tensor
         breakable_cudagraph.weak_ref_tensors = weak_ref_tensors

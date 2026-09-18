@@ -15,13 +15,13 @@ Three sources agree, and two of them are in this repository:
   config                 topk_method = "noaux_tc", the routing this bias
                          belongs to
 
-🔴 The ungrouped branch used the biased scores as the weights. The bias was
+The ungrouped branch used the biased scores as the weights. The bias was
 wired, passed, and applied -- to the wrong thing. That is harder to find than
 a missing bias, because every "is the bias connected?" check answers yes; the
 question has to be "does it reach the weights?", which is the thing it must
 NOT do.
 
-⚠️ Found by reading the sibling branch in the same file. Two branches doing
+Found by reading the sibling branch in the same file. Two branches doing
 the same job differ only where one of them is wrong, so the difference is
 itself a specification.
 """
@@ -54,7 +54,7 @@ def _reference(logits, bias, top_k, renormalize, scale):
 
 
 def test_the_bias_does_not_reach_the_weights():
-    """🔴 The defect. A bias large enough to change the selection, so that
+    """The defect. A bias large enough to change the selection, so that
     "selection moved" and "weights moved" are separately visible -- a small
     bias would hide half of it."""
     torch.manual_seed(0)
@@ -72,7 +72,7 @@ def test_the_bias_does_not_reach_the_weights():
 
 
 def test_the_bias_did_change_the_selection_in_that_test():
-    """⚠️ Otherwise the test above passes on a bias too small to matter, and
+    """Otherwise the test above passes on a bias too small to matter, and
     proves nothing about the half it exists for."""
     torch.manual_seed(0)
     logits = torch.randn(4, 8)
@@ -86,7 +86,7 @@ def test_the_bias_did_change_the_selection_in_that_test():
                                   torch.tensor([2.0, 0., 0., 0., 0., 0., 0., -2.])])
 @pytest.mark.parametrize("renormalize", [True, False])
 def test_the_two_branches_agree(bias, renormalize):
-    """🔵 The check that actually prevents a recurrence.
+    """The check that actually prevents a recurrence.
 
     The grouped branch was right and the ungrouped one was wrong for the same
     input. Making disagreement between them fail turns "one of the two got

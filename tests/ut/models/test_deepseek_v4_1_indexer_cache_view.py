@@ -51,7 +51,7 @@ def test_the_formula_is_not_written_as_todays_numbers():
 # ------------------------------------------------- the layout, by round trip
 
 def test_each_token_reads_back_its_own_values_and_its_own_scale():
-    """🔴 The test that separates the two readings.
+    """The test that separates the two readings.
 
     Marks are written at the byte offsets the operator's kernel computes:
 

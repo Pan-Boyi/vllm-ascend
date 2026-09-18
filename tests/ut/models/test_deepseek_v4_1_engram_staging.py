@@ -260,8 +260,7 @@ def test_verify_staged_content_refuses_a_changed_table(checkpoint, stage):
     msg = str(exc.value)
     assert TENSOR in msg
     assert "fingerprint changed" in msg
-    # and it has to name the mechanism, or the reader looks for a disk fault
-    assert "PROT_WRITE" in msg
+    assert "Re-stage" in msg
 
 
 def test_verify_staged_content_refuses_an_empty_expectation(stage):

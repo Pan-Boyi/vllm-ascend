@@ -1036,7 +1036,7 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
     def test_token_combine_keeps_router_weights_in_fp32(self):
         """Mirror of the AllGather assertion; see that docstring for why this is a fingerprint.
 
-        ⚠️ This arm has no on-hardware measurement behind it: ALLTOALL is unreachable in the
+        This arm has no on-hardware measurement behind it: ALLTOALL is unreachable in the
         DSV4.1/A5 config (needs world_size > num_experts_per_tok = 6, ours is 4). The unit test
         is the only thing holding it, which is exactly why it should not be a tolerance check.
         """

@@ -1,5 +1,4 @@
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
@@ -8,7 +7,6 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.logger import logger
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
@@ -74,108 +72,6 @@ else:
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
-_SEQUSED_CMP_PERSIST = [None]
-
-
-def _seqused_cmp_persist_enabled() -> bool:
-    """DSV41_PERSIST_SEQUSED_CMP,默认开。设 0 恢复每次 build 新分配的旧行为。"""
-    if _SEQUSED_CMP_PERSIST[0] is None:
-        import os as _os
-        _SEQUSED_CMP_PERSIST[0] = _os.getenv(
-            "DSV41_PERSIST_SEQUSED_CMP", "1").strip() not in (
-                "0", "false", "False", "")
-    return bool(_SEQUSED_CMP_PERSIST[0])
-
-
-
-# --- 一次性取证仪器（#48）：把 descriptor blob 原样落盘并当场解码 ---------------
-# 判据是 blob 本身，不是摘要：摘要相同的两份 blob 可以在任何一位上不同。
-_SAS_DUMP_N = 0
-_SAS_DUMP_MAX = int(os.environ.get("DSV41_SAS_DUMP_MAX", "0"))
-_SAS_DUMP_DIR = os.environ.get("DSV41_SAS_DUMP_DIR", "")
-_SAS_KEYS_SEEN: set = set()
-
-
-def _dump_sas_metadata(builder, layer_name, blob, query_start_loc, seq_lens,
-                       max_seqlen_q, max_seqlen_kv, cached):
-    """Save the sparse-attention descriptor verbatim, with its provenance.
-
-    The blob is what the operator derives its tiling from; the call it is paired
-    with is validated against nothing. A disagreement is not rejected -- it
-    surfaces as an aicore exception with tilingKey 0 and every core failing at
-    once. So the artifact has to be the full int32[1024], not a summary, and it
-    has to say which run / layer / call it came from or it cannot be compared
-    against anything.
-    """
-    global _SAS_DUMP_N
-    if _SAS_DUMP_MAX <= 0 or _SAS_DUMP_N >= _SAS_DUMP_MAX or not _SAS_DUMP_DIR:
-        return
-    _SAS_DUMP_N += 1
-    n = _SAS_DUMP_N
-    try:
-        os.makedirs(_SAS_DUMP_DIR, exist_ok=True)
-        host = blob.detach().to("cpu", torch.int32).contiguous()
-        vals = host.tolist()
-        qsl = query_start_loc.detach().cpu().tolist() if query_start_loc is not None else None
-        sl = seq_lens.detach().cpu().tolist() if seq_lens is not None else None
-        sq = (builder.seqused_q.detach().cpu().tolist()
-              if getattr(builder, "seqused_q", None) is not None
-              and builder.seqused_q.numel() else None)
-        import json
-        rec = {
-            "这是什么的现场": "生产侧 SparseFlashMla 的 descriptor(sas_metadata) 原始 blob",
-            "第几次调用": n,
-            "cache_key(layer_name)": layer_name,
-            "来自缓存": bool(cached),
-            "device_metadata_enabled": bool(getattr(builder, "_device_metadata_enabled", None)),
-            "compressor_ratio": getattr(builder, "compressor_ratio", None),
-            "cache_group_key": getattr(builder, "cache_group_key", None),
-            "blob_len": len(vals),
-            "blob_int32": vals,
-            "cu_seqlens_q": qsl,
-            "seq_lens": sl,
-            "seqused_q": sq,
-            "max_seqlen_q": int(max_seqlen_q) if not isinstance(max_seqlen_q, torch.Tensor) else int(max_seqlen_q.item()),
-            "max_seqlen_kv": int(max_seqlen_kv) if not isinstance(max_seqlen_kv, torch.Tensor) else int(max_seqlen_kv.item()),
-        }
-        # 当场解码自查：边界数 / 步长 / 末值。三项都报，包括符合的。
-        big = [v for v in vals if v > 100]
-        diffs = [big[i + 1] - big[i] for i in range(len(big) - 1)]
-        rec["解码_大于100的值个数"] = len(big)
-        rec["解码_边界数"] = max(len(big) - 1, 0)
-        rec["解码_步长集合"] = sorted(set(diffs))
-        rec["解码_首值"] = big[0] if big else None
-        rec["解码_末值"] = big[-1] if big else None
-        # blob 反解出"它是按多少 token 建的"。报数，不报布尔 ——
-        # 一个数可以拿去找来源，一个布尔不能。两式不吻合时两个都报，
-        # 不吻合本身就是信息。
-        nseg = len(big)              # 段边界个数
-        if diffs:
-            sd = sorted(diffs)
-            med = sd[len(sd) // 2]
-            rec["解码_步长中位数"] = med
-            rec["T_implied_按步长"] = med * 28
-        else:
-            rec["解码_步长中位数"] = None
-            rec["T_implied_按步长"] = None
-        rec["T_implied_按末值"] = (
-            round(big[-1] * 28 / nseg) if big and nseg else None)
-        rec["解码_非零个数"] = sum(1 for v in vals if v != 0)
-        rec["解码_非零最大下标"] = max((i for i, v in enumerate(vals) if v != 0), default=-1)
-        f = os.path.join(_SAS_DUMP_DIR, f"sas_metadata_call{n}_{layer_name}.json")
-        with open(f, "w") as fh:
-            json.dump(rec, fh, ensure_ascii=False, indent=1)
-        logger.info(
-            "【SAS-DUMP #%d】%s cached=%s device_built=%s -> %s | 边界数=%s 步长=%s 首=%s 末=%s | "
-            "🔴T_implied 按步长=%s 按末值=%s | R=%s max_seqlen_q=%s",
-            n, layer_name, cached,
-            getattr(builder, "_device_metadata_enabled", None), f,
-            rec["解码_边界数"], rec["解码_步长集合"], rec["解码_首值"],
-            rec["解码_末值"], rec["T_implied_按步长"], rec["T_implied_按末值"],
-            (len(sl) if sl is not None else None), rec["max_seqlen_q"],
-        )
-    except Exception as e:  # 取证失败不能顺带打死这一发
-        logger.warning("【SAS-DUMP #%d】落盘失败(不致命): %r", n, e)
 CompressorMetadataOutput: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 _DSV4_DSA_OVERLAP_STREAM = None
@@ -309,27 +205,14 @@ def _dsa_layout_kv(vllm_config: VllmConfig) -> str:
 def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int:
     """Map a layer's configured ratio onto the operator's ``cmp_ratio``.
 
-    These are two different quantities and conflating them has already cost
-    once. The configured ratio comes from ``compress_ratios`` and is 0 on
-    layers with no compressed stream; the operator's parameter describes the
-    stream it is being handed and **must be greater than zero** -- sparse_flash_mla
-    rejects 0 outright with "Cmp_ratio must be greater than 0", measured on A5.
-
-    So a layer without a compressed stream reports 1 here and simply does not
-    supply one; the operator ignores the value in that case. Returning 0 to
-    mean "none" was rejected for all of layers 20..39, which carry ratio 1.
-
-    Everything outside the A5 BF16 plan keeps V4.0's mapping untouched.
+    The configured ratio is 0 on layers with no compressed stream, while
+    sparse_flash_mla rejects 0 ("Cmp_ratio must be greater than 0"). So the
+    A5 BF16 plan reports 1 for ratio <= 1 and simply supplies no compressed
+    stream where there is none. Ratio 2 is passed through: CANN 9.2 accepts
+    it together with the sliding window (see sparse_attn_args).
     """
     if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
         return 1
-    if compress_ratio == 2:
-        from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-            c2_window_mode
-        if c2_window_mode() == "ratio1":
-            # V4.1 ratio-2 layers in the operator's sliding-window configuration;
-            # see sparse_attn_args.c2_window_mode.
-            return 1
     return max(compress_ratio, 1)
 
 
@@ -343,10 +226,8 @@ def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
     """Does this layer's attention read a compressed stream?
 
     Asked at three places that must agree -- whether to pass the compressed
-    cumulative lengths, whether to supply the stream itself, and whether the
-    mask may be sliding-window-only. Splitting one question across three
-    comparisons is how two of them stayed on V4.0's answer while the third was
-    fixed.
+    cumulative lengths, whether to supply the stream itself, and which mask
+    the original stream gets.
 
     It is deliberately *not* the same question as "does this layer own a
     compressed cache". V4.1 has four source layers and thirty-eight that attend
@@ -360,16 +241,9 @@ def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
     a config that names its source layers has the V4.1 topology whatever it
     calls itself.
     """
-    # hf_config, and measured rather than assumed: the checkpoint's JSON nests
-    # these fields under text_config, but DeepseekV41Config -- the custom
-    # config class vLLM loads -- exposes them at the top level, and
-    # get_hf_text_config returns that same object (hf_text_config is
-    # hf_config). Both spellings therefore find kv_source_layer_ids here.
-    #
-    # This was briefly "fixed" to prefer hf_text_config on the theory that the
-    # field was invisible and the V4.1 branch was silently degrading. It was
-    # not: the predicate has been returning V4.1's answer all along. Recorded
-    # because the JSON's shape makes the wrong story very plausible.
+    # hf_config: the checkpoint's JSON nests these fields under text_config,
+    # but DeepseekV41Config exposes them at the top level, and
+    # get_hf_text_config returns that same object.
     model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
     declares_sources = getattr(hf_config, "kv_source_layer_ids", None) is not None
@@ -488,7 +362,7 @@ class AscendDSAC2Backend(AscendDSABackend):
     scheduler tokens, and those three numbers are exactly what
     ``select_common_block_size`` is handed.
 
-    ⚠️ The derivation only runs when the caller leaves ``storage_block_size``
+    The derivation only runs when the caller leaves ``storage_block_size``
     unset. A caller that passes it explicitly escapes the convention, and this
     list would then be wrong for that caller -- so pass ``block_size`` already
     multiplied and let the spec derive the rest, as every DSV4 site does.
@@ -615,19 +489,14 @@ class AscendDSAReqMetadata:
     #: Not optional in practice whenever indices are supplied. The operator
     #: reads ``oriSparseBlockCount = hasOriTopkLength ? Min(length, width) :
     #: width`` -- so omitting it declares the *whole row* valid, and a row
-    #: padded with -1 then sends the kernel to gather at those slots. Measured
-    #: single-variable on the bench: the same index table crashes at the
-    #: declared full width and passes at its true length. ``Min`` only guards
-    #: "declared more than the table is wide"; it cannot guard "declared more
-    #: than was written", because nothing downstream knows that number.
+    #: padded with -1 then sends the kernel to gather at those slots.
     #:
-    #: Carried from whoever built the table, never recounted at the call site:
-    #: both builders already compute it (the per-row count of their ``visible``
-    #: mask) and both used to discard it.
+    #: Carried from whoever built the table (the per-row count of its
+    #: ``visible`` mask), never recounted at the call site.
     ori_topk_length: torch.Tensor | None = None
     #: Compressed-stream length per request, ``seq_lens // cmp_ratio``, int32.
     #:
-    #: ⚠️ Not ``cu_cmp_seqlen_list``. That one is cumulative and is what V4.0
+    #: Not ``cu_cmp_seqlen_list``. That one is cumulative and is what V4.0
     #: sends as the operator's ``cu_seqlens_cmp_kv`` under layout TND; this is
     #: one value per request and is what ``seqused_cmp_kv`` means under a
     #: paged layout. They differ in length by exactly one, which is the only
@@ -671,7 +540,7 @@ class AscendDSAMetadata:
     tokens_per_state: int = 1
 
     # Names upstream's DeepSeek-V4.1 indexer reads straight off this object
-    # (vllm/models/deepseek_v4_1/attention.py:1153, :1181). Ascend keeps the
+    # (vllm/models/deepseek_v4_1/attention.py). Ascend keeps the
     # per-request payload one level down, in req_metadata, so without these the
     # V4.1 layer fails with an AttributeError before reaching any operator.
     # Added rather than rearranged: nothing in this tree branches on their
@@ -844,60 +713,37 @@ def mm_ranges_have_spans(mm_ranges) -> bool:
     ``mm_req_doc_ranges`` is ``{req_index: [(start, end), ...]}`` and the
     runner builds it for **every** request whenever the checkpoint is a
     mm-prefix LM, appending nothing when a request carries no image
-    (``model_runner_v1.py:3386-3409``). A text-only request on V4.1-Flash
+    (``model_runner_v1.py``). A text-only request on V4.1-Flash
     therefore arrives as ``{0: []}`` -- a truthy dict of empty lists.
 
-    Testing the dict rather than its contents is what put every text-only
-    prefill through the bidirectional-vision index path. Measured on this
-    checkpoint: ``vision_config.num_hidden_layers = 32`` so
-    ``DeepseekV41Config`` sets ``vision_n_layers = 32``, ``vision_max_n_token
-    = 1024`` and ``is_mm_prefix_lm = True``. V4.0 never saw it because a
-    text-only V4.0 checkpoint has ``vision_n_layers = 0``, which zeroes
-    ``max_image_tokens`` and short-circuits the same condition one term
-    earlier. The distinguishing fact here is that the *model* is multimodal
-    while the *request* is not.
+    Testing the dict rather than its contents would put every text-only
+    prefill through the bidirectional-vision index path. V4.0 never meets
+    this because a text-only V4.0 checkpoint has ``vision_n_layers = 0``,
+    which zeroes ``max_image_tokens``; V4.1-Flash is multimodal
+    (``is_mm_prefix_lm``) while the request is not.
 
-    What the vision path then produces is not garbage -- with no spans it is
-    exactly the causal sliding window, written in full and padded with -1. It
-    is still the wrong configuration: an explicit index list puts the operator
-    in ori-only sparse mode (mask 0, window bounds disabled) and makes the
-    index width ``sliding_window + vision_max_n_token`` = 1152, where plain
-    sliding window would have passed mask 4 and no list at all.
-
-    ⚠️ This stops text-only requests from *entering* the vision index path. It
-    does not fix that path, and a genuine image request still takes it -- a
-    configuration that has never completed a single forward. The kernel bench
-    has run ``mask 0 / win -1 / ori-only`` only with ``indices=None``; a
-    non-empty ``[T, 1, 1152]`` index list has never been passed to the
-    operator by anyone. Recording that here because "fixed" would otherwise be
-    remembered as "the vision index path works", and its actual state is
-    "never verified, merely no longer reached by text".
-
-    Behind a switch, default off, so that this and the kv-cache-spec change
-    can be attributed separately: two mechanisms enabled in one launch cannot
-    be told apart by whether it crashes.
+    The vision path is the wrong configuration for such a request: an
+    explicit index list puts the operator in ori-only sparse mode (mask 0,
+    window bounds disabled) with an index width of ``sliding_window +
+    vision_max_n_token``, where plain sliding window passes mask 4 and no
+    list at all.
     """
     if not mm_ranges:
         return False
-    from vllm_ascend import envs
-
-    if envs.VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS != "1":
-        return True
     values = getattr(mm_ranges, "values", None)
     if values is None:
         # Not a mapping. Fall back to the container's own truthiness rather
-        # than guessing at a shape; the switch is about empty *span lists*.
+        # than guessing at a shape.
         return True
     has_spans = any(bool(ranges) for ranges in values())
     if not has_spans:
         from vllm_ascend.models.deepseek_v4_1.switch_log import announce_once
 
-        # Announced from where the branch is taken, not from where the value
-        # is parsed: parsing happens whether or not this is ever reached.
+        # Announced from where the branch is taken.
         announce_once(
             "mm_ranges_require_spans",
-            "MM_RANGES_REQUIRE_SPANS=1 excluded a request whose multimodal "
-            "ranges hold no span, so it takes no vision index path.")
+            "a request whose multimodal ranges hold no span takes no vision "
+            "index path.")
     return has_spans
 
 
@@ -993,11 +839,8 @@ def _add_ori_topk_length(attn_kwargs: dict, req_metadata) -> None:
     -1 padding. The builders here already produce the count for both index
     kinds, so this is carrying a number that exists rather than deriving one.
 
-    ⚠️ This call site is shared with V4.0, so it is a behaviour change there
-    too: V4.0 was also sending index lists with no length, and its tables come
-    from these same two builders with the same -1 padding. Left absent when
-    the metadata carries none, so a caller that predates the field is
-    unchanged rather than refused.
+    Shared with V4.0, whose tables come from the same builders with the same
+    -1 padding. Left absent when the metadata carries none.
     """
     length = getattr(req_metadata, "ori_topk_length", None)
     if length is not None:
@@ -1084,28 +927,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.common_ratio_to_sas_metadata: dict | None = None
         self.seq_lens: torch.Tensor = None
 
-        # 🔴 Reading this first is not enough, and switching it on proved it:
-        # ``compressor_ratio`` itself has two jobs. Below it names the stream
-        # (attends_compressed_stream, the mask decisions), but it also feeds
-        # ``tokens_per_state`` at :1168 and :1681, which
-        # ``AscendDSAMetadata.block_size`` multiplies the storage page by at
-        # :596. So redirecting this reader moved the page size as well: a
-        # ratio-2 layer reported block_size 64 against a (55737, 32, 512)
-        # cache. The field is never *itself* arithmetic -- but the variable it
-        # was routed into is, and stating the first was not a check on the
-        # second. Reviving VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO means splitting
-        # this into two names, not turning it back on.
-        #
         # The layer's configured stream ratio, when a spec states one. It is
         # consulted first because it is the only field here that can hold 0:
         # both fallbacks below are page divisors, which clamp 0 to 1 and make
         # a pure-sliding-window layer look like one with a compressed stream.
+        # The fallback chain is V4.0's, where the page divisor and the stream
+        # ratio coincide.
         #
-        # ⚠️ The fallback chain is V4.0's and is kept only because there the
-        # two coincide -- V4.0's compress_ratio divides the page *and* names
-        # the stream, so reading one for the other is exact. It is not a
-        # general substitution, and a third model should state the field
-        # rather than inherit this chain.
+        # ``compressor_ratio`` also feeds ``tokens_per_state``, which
+        # ``AscendDSAMetadata.block_size`` multiplies the storage page by, so
+        # changing what it reads changes the page size too. Reviving
+        # VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO means splitting it into two names.
         #
         # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
         stated = getattr(kv_cache_spec, "stream_compress_ratio", None)
@@ -1143,16 +975,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # +1 holds the FIA dummy request inserted by mixed-batch padding.
         self.qli_seqused_k: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
         self.qli_cmp_residual_k: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
-        # 🔴 seqused_cmp_kv 的常驻缓冲区(2026-09-16)。
-        #    原本是 build() 里 torch.div(...) 现算的【新张量】,发布到
-        #    req.seqused_cmp_kv 上、由 V4.1 手写的算子调用点直接传给 SparseFlashMla。
-        #    FULL cudagraph 把捕获期那个临时张量的地址烘进图,replay 时算子读到的
-        #    永远是捕获期的值(decode 捕获 seq_len=1 ⇒ 1//2 = 0,即压缩流一个都不读)。
-        #    ⚠️ 尺寸必须跟上面两块【同一个公式】:第一版我写的是裸 max_num_reqs,
-        #       而那正是上面这段注释明确否决掉的写法(FULL decode 图会把请求数
-        #       padding 到超过 max_num_seqs,再加一个 FIA dummy 请求)。
-        #       放在这里而不是另起一处,就是为了让它和被论证过的那个公式绑在一起,
-        #       将来改公式时不会只改一半。
+        # V4.1's seqused_cmp_kv, persistent for the same reason and sized by
+        # the same formula as the qli_* buffers.
         self.seqused_cmp_kv_buffer: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
@@ -1382,44 +1206,26 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         it surfaced as an aicore exception with tilingKey 0 and every core
         failing at once.
 
-        V4.1 needs different values on two of its three configurations. A layer
-        whose original stream is selected by an explicit index list is in the
-        operator's "ori-only sparse mode", which requires both mask modes at 0
-        and the window bounds at -1; so does a layer attending a compressed
-        stream. Only window-bounds-without-indices is sliding-window mode.
+        V4.1 passes the values its call site derives: a layer whose original
+        stream is selected by an explicit index list is in the operator's
+        "ori-only sparse mode" (mask mode 0, window bounds -1); every other
+        layer is sliding-window mode.
         """
-        # Keyed on the compression ratio alone. That assumes two cache groups
-        # with the same ratio can share one descriptor, and nothing checks the
-        # assumption -- an unchecked implication and a verified equivalence
-        # look the same in the source. The descriptor encodes a per-core split
-        # of the query tokens, so what it really depends on is query_start_loc,
-        # max_seqlen_q and the head count; those happen to be identical across
-        # groups within one build, which is why this is safe today rather than
-        # by construction. The dict is a local rebuilt every
-        # _build_attention_metadata, so nothing survives a forward.
-        # 入口日志：按键去重，每个 layer_name 只打一次。
-        # 「dump 里没有」和「从没建过」是两件事 —— dump 有采样上限，这行没有。
-        if _SAS_DUMP_MAX > 0 and layer_name not in _SAS_KEYS_SEEN:
-            _SAS_KEYS_SEEN.add(layer_name)
-            logger.info("【SAS-ENTRY】_build_sas_metadata 首次见到键 %s "
-                        "(group=%s builder.compressor_ratio=%s buffer_id=%s)",
-                        layer_name, getattr(self, "cache_group_key", None),
-                        getattr(self, "compressor_ratio", None),
-                        id(getattr(self, "sas_metadata_buffer", None)))
+        # Keyed on the compression ratio alone, which assumes cache groups
+        # with the same ratio can share one descriptor. The descriptor encodes
+        # a per-core split of the query tokens (query_start_loc, max_seqlen_q,
+        # head count), which is identical across groups within one build. The
+        # dict is rebuilt every _build_attention_metadata.
         sas_metadata = metadata_cache.get(layer_name)
-        _sas_was_cached = sas_metadata is not None
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
             index_topk = self.model_config.hf_config.index_topk
             validate_compress_ratio(self.compressor_ratio, layer_name,
                                     get_dsa_attn_kv_plan(self.vllm_config))
-            from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-                c2_window_mode
             cmp_ratio = (
                 _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
-                if self.compressor_ratio <= 1
-                or (self.compressor_ratio == 2 and c2_window_mode() != "0")
+                if self.compressor_ratio <= 1 or self.compressor_ratio == 2
                 else 4
                 if self.compressor_ratio == 4
                 else 128
@@ -1465,9 +1271,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
             metadata_cache[layer_name] = sas_metadata
 
-        _dump_sas_metadata(self, layer_name, sas_metadata, query_start_loc,
-                           seq_lens, max_seqlen_q, max_seqlen_kv,
-                           cached=_sas_was_cached)
         self.sas_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = sas_metadata
         return self.sas_metadata_buffer
 
@@ -1662,11 +1465,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # an aicore exception with tilingKey 0 and every core failing at once.
         #
         # An empty dict leaves V4.0's hard-coded values in place. V4.1 computes
-        # them from the same facts its call site uses, so the two cannot drift:
-        # an explicit index list puts the operator in ori-only sparse mode,
-        # which takes mask mode 0 and no window bounds, and so does a
-        # compressed stream. Only window-bounds-without-indices is sliding
-        # window.
+        # them with the same functions its call site uses, so the two cannot
+        # drift.
         sas_mask_kwargs: dict = {}
         seqused_cmp_kv = None
         if is_deepseek_v41_text(self.model_config.hf_text_config):
@@ -1676,25 +1476,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
             attends_cmp = attends_compressed_stream(self.compressor_ratio,
                                                     self.vllm_config)
-            # The same two functions the call site uses, on the same two
-            # candidate tensors. Previously this recomputed the predicate from
-            # its own expression; the two agreed, which hid that they were two
-            # sources. They are one now, so a precedence change moves both.
             ori_indices = select_ori_sparse_indices(
                 attends_cmp, vision_swa_indices, dspark_swa_indices)
-            # The same cmp_ratio the call will pass, so the descriptor and
-            # the call cannot disagree about whether a window is allowed.
-            descriptor_cmp_ratio = _dsa_swa_only_cmp_ratio(
-                self.compressor_ratio, self.vllm_config)
-            plain_window = is_plain_sliding_window(attends_cmp, ori_indices,
-                                                   descriptor_cmp_ratio)
+            plain_window = is_plain_sliding_window(ori_indices)
             sas_mask_kwargs = {
-                # The mode, from the same function the call site uses. It was
-                # spelled here as "4 if plain_window else 0", which is the
-                # two-configuration reading -- and the third configuration,
-                # no indices with a compressed stream, silently took the 0.
-                "ori_mask_mode": ori_mask_mode_for(attends_cmp, ori_indices,
-                                                   descriptor_cmp_ratio),
+                "ori_mask_mode": ori_mask_mode_for(ori_indices),
                 "ori_win_left": ori_win_left if plain_window else -1,
                 "ori_win_right": ori_win_right if plain_window else -1,
                 "has_cmp_kv": attends_cmp,
@@ -1711,43 +1497,23 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     self.model_config.hf_config.index_topk)
                 # Computed once and published on the req metadata below, so
                 # the descriptor and the call cannot hold different numbers.
-                # It used to be computed here only: the call site then had
-                # nothing to send and reached the host precheck with
-                # "has_cmp_kv ... requires seqused_cmp_kv" -- a value that
-                # already existed, one frame away, and was not carried.
-                # 🔴 原地写进常驻缓冲区,发布【视图】(2026-09-16)。
-                #    从 dim 0 起切片 ⇒ 视图的 data_ptr 恒等于缓冲区基址,
-                #    图里烘死的是这个稳定地址;而 build() 每步都在 runner 的 Python
-                #    里跑,于是每步把新值填进去,replay 读到的就是新值。
-                #    实测(按请求身份配对 + writes 标记确认归属):
-                #      改之前 L02.kvsrc.seqused_cmp_kv  FULL=[0]  PIECEWISE=[3]
-                #      (3 = seq_len 7 // ratio 2;0 是 decode 捕获期的 1//2)
-                #      同一次 forward 上 seq_lens / block_table / slot_mapping /
-                #      sas_metadata(1024 全比) / cmp_selection / q / kv 全部逐位相同,
-                #      只有这一个值不同,而 attn.o_raw 差 rel_l2=5.2e-01。
-                #    ⚠️ 开关只为做单开关 A/B,默认开;设 0 恢复旧行为作阴性臂。
-                _cmp_len = torch.div(lens, ratio, rounding_mode="floor")
-                if _seqused_cmp_persist_enabled():
-                    _n = int(_cmp_len.shape[0])
-                    _buf = self.seqused_cmp_kv_buffer
-                    if _n <= _buf.shape[0]:
-                        _buf[:_n].copy_(_cmp_len.to(torch.int32))
-                        seqused_cmp_kv = _buf[:_n]
-                    else:
-                        # 🔴 fail-closed。第一版这里退回"每步新分配"并只打一条
-                        #    warn —— 那是 fail-open:在该拦的那一刻放行,而放行后的
-                        #    症状和根本没修一模一样(FULL 下读捕获期的陈旧值),
-                        #    于是这条 warn 会淹没在日志里,没人会把输出错误联系到它。
-                        #    判据出错的方向不对称:偏严会被下一次运行发现,
-                        #    偏松发的是一张假的安全证明。所以这里直接炸。
-                        raise RuntimeError(
-                            f"DSV4.1 seqused_cmp_kv 常驻缓冲区不够大: 需要 {_n}, "
-                            f"容量 {int(_buf.shape[0])}。这块 buffer 必须覆盖 FULL "
-                            f"decode 图 padding 之后的请求数(见同处 qli_* 的尺寸"
-                            f"公式)。退回每步新分配会让 FULL 图读到捕获期的陈旧"
-                            f"压缩长度,那正是本缓冲区要修的缺陷 —— 不能静默放行。")
-                else:
-                    seqused_cmp_kv = _cmp_len.to(torch.int32)
+                # Written into a persistent buffer and published as a view
+                # starting at dim 0: FULL graphs bake in the tensor address,
+                # so a fresh tensor per build would leave replays reading the
+                # capture-time lengths.
+                cmp_len = torch.div(lens, ratio, rounding_mode="floor")
+                n = int(cmp_len.shape[0])
+                buf = self.seqused_cmp_kv_buffer
+                if n > buf.shape[0]:
+                    # A fresh-tensor fallback would silently reintroduce the
+                    # stale-length defect under FULL graphs.
+                    raise RuntimeError(
+                        f"DSV4.1 seqused_cmp_kv buffer too small: need {n}, "
+                        f"capacity {int(buf.shape[0])}. It must cover the "
+                        "request count after FULL decode graph padding (same "
+                        "sizing as the qli_* buffers).")
+                buf[:n].copy_(cmp_len.to(torch.int32))
+                seqused_cmp_kv = buf[:n]
                 sas_mask_kwargs["seqused_cmp_kv"] = seqused_cmp_kv
 
         if self._device_metadata_enabled:
@@ -2867,12 +2633,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             attn_kwargs["ori_sparse_indices"] = swa_req_metadata.vision_swa_indices
             _add_ori_topk_length(attn_kwargs, swa_req_metadata)
 
-        # NOTE(dsv41): ratio <= 1 means "no compressed stream" for V4.0, but
-        # V4.1 gives layers 20..39 ratio 1 to mean "compressed, pooling
-        # disabled" -- a compressed stream that this branch would skip. Which
-        # operator mode those layers are meant to use is still open, so the
-        # V4.0 reading is kept rather than guessed at; validate_compress_ratio
-        # does not catch this because ratio 1 is a legitimate V4.0 value.
+        # DSpark indices apply only to layers without a compressed stream
+        # (the same precedence as sparse_attn_args.select_ori_sparse_indices).
         if not attends_compressed:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices

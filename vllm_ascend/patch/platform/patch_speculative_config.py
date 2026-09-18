@@ -2,6 +2,7 @@ from dataclasses import replace
 
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
+
 from vllm_ascend.utils import is_deepseek_v4_family
 
 _orig_post_init = SpeculativeConfig.__post_init__

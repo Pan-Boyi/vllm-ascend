@@ -14,7 +14,7 @@ been written, and stopped a launch. It was reading its own bookkeeping bit
 rather than the object it judges, and the bit had one writer while the object
 had two.
 
-⚠️ The two paths are chosen **per ratio group**, not per request: with
+The two paths are chosen **per ratio group**, not per request: with
 index_topk=512 the ratio-2 layers take the short circuit below 1026 tokens and
 the ratio-1 layers below 513, so a single request can run some layers down each
 path. Any statement about "the layers" that does not say which group it means
@@ -95,7 +95,7 @@ def _functions_passing_the_buffer(source: str) -> set[str]:
 
 
 def test_upstream_has_exactly_the_writers_this_line_accounts_for():
-    """🔴 The test that makes a third writer cost a test run, not a flight."""
+    """The test that makes a third writer cost a test run, not a flight."""
     found = _functions_passing_the_buffer(_upstream_attention_source())
     assert found, (
         "no function in upstream's V4.1 attention passes topk_indices_buffer "
@@ -160,7 +160,7 @@ def test_the_wrapper_records_the_rows_the_grid_covers():
 
 
 def test_the_count_comes_from_the_grid_not_from_a_parallel_argument():
-    """⚠️ The grid *is* the written range: the kernel's row index is
+    """The grid *is* the written range: the kernel's row index is
     ``tl.program_id(0)``. Taking the count from anywhere else is a second
     source that can disagree with what ran."""
     inner = _FakeJITFunction()
@@ -219,7 +219,7 @@ def test_the_patch_binds_the_wrapper_over_upstreams_name():
 
 
 def test_applying_it_twice_does_not_wrap_the_wrapper():
-    """⚠️ Importing the package applies the patch, so this has to unwrap
+    """Importing the package applies the patch, so this has to unwrap
     first. Without that the first call here returns False for the reason the
     test is checking for, and the assertion passes while proving nothing."""
     import importlib
@@ -269,7 +269,7 @@ class _Ctx:
 def warnings_from_vllm():
     """Records from vllm's logger, which does not propagate to pytest's.
 
-    ⚠️ The stock log fixture came back empty while the warning was plainly in
+    The stock log fixture came back empty while the warning was plainly in
     the captured stdout -- an empty record list reads exactly like "nothing
     was logged", which is the opposite of what happened.
     """
@@ -303,7 +303,7 @@ def test_a_count_from_this_forward_is_returned(monkeypatch):
 
 def test_a_count_from_an_earlier_forward_is_reported(monkeypatch,
                                                     warnings_from_vllm):
-    """🔴 The discriminating case. A bare integer reads the same whether the
+    """The discriminating case. A bare integer reads the same whether the
     rows were written a microsecond ago or eight steps ago, and those are
     opposite answers about whether the buffer holds this step's selection."""
     from vllm_ascend.models.deepseek_v4_1 import sparse_indexer

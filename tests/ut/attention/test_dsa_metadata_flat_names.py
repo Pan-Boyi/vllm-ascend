@@ -272,17 +272,15 @@ def test_the_descriptor_and_the_call_agree_on_the_mask_triple():
     builder = inspect.getsource(dsa_v1.AscendDSAMetadataBuilder)
     # Descriptor side: mode 4 only when plain sliding window.
     assert '"ori_mask_mode": ori_mask_mode_for(' in builder, (
-        "the descriptor spells the mode itself again. It was written as "
-        '"4 if plain_window else 0" -- the two-configuration reading -- and '
-        "the third configuration, no indices with a compressed stream, "
-        "silently took the 0, which is NO_MASK.")
+        "the descriptor spells the mode itself again instead of asking the "
+        "call site's function")
     # Call side: the same predicate object, not a copy of its text. Pinning
     # the expression was pinning a spelling -- it went red for a change that
     # kept the invariant and moved both sides together, which is the one
     # outcome this test should stay quiet for.
     assert "is_plain_sliding_window(" in builder
-    assert sparse_attn_args.is_plain_sliding_window(True, object()) is False
-    assert sparse_attn_args.is_plain_sliding_window(False, object()) is False
+    assert sparse_attn_args.is_plain_sliding_window(object()) is False
+    assert sparse_attn_args.is_plain_sliding_window(None) is True
     # One source: the builder asks the predicate rather than restating it.
     assert "plain_window = is_plain_sliding_window(" in builder
     assert "select_ori_sparse_indices(" in builder, (

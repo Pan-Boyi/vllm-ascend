@@ -219,58 +219,14 @@ def test_lookup_refuses_a_sharded_configuration():
         layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
 
 
-def test_the_kernel_resolves_and_takes_the_agreed_interface():
+def test_the_kernel_takes_the_agreed_interface():
     import inspect
 
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        _staged_dequant_launcher
+    from vllm_ascend.ops.triton.engram_dequant_staging import launch
 
-    launch = _staged_dequant_launcher()
     params = inspect.signature(launch).parameters
     assert list(params)[:3] == ["staging_weight", "staging_scale", "out"]
     assert "dim" in params and "quant_block" in params
-
-
-def test_the_binding_records_the_kernels_verification_status():
-    """Binding is not endorsing, so the status is written down next to it.
-
-    The arithmetic is settled on the CPU against golden's rows. The kernel has
-    run -- the Triton compile cache holds two compilations of it, and Triton
-    only compiles at first launch. Its file header still claims otherwise,
-    which is exactly what produced the wrong conclusion here on first reading:
-    an artefact settles this, a comment does not.
-    """
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        _staged_dequant_launcher
-
-    doc = _staged_dequant_launcher.__doc__
-    assert "arithmetic is settled" in doc
-    assert "has run on hardware" in doc
-    assert "stale" in doc
-    assert "compile cache is" in doc
-
-
-def test_the_resolver_prefers_a_real_package_location():
-    """It lives under a directory named for the design it replaced. When it
-    moves somewhere sane this keeps working without an edit."""
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        _KERNEL_LOCATIONS
-
-    assert _KERNEL_LOCATIONS[0][1] is None, "the package path must be tried first"
-    assert _KERNEL_LOCATIONS[0][0].startswith("vllm_ascend.")
-
-
-def test_an_unresolvable_kernel_says_what_is_already_done(monkeypatch):
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
-
-    monkeypatch.setattr(mod, "_KERNEL_LOCATIONS",
-                        (("nowhere.at.all", None),
-                         ("also_nowhere", "/nonexistent/path.py")))
-    with pytest.raises(RuntimeError) as exc:
-        mod._staged_dequant_launcher()
-    msg = str(exc.value)
-    assert "already\nin HBM" in msg or "already in HBM" in msg
-    assert "nowhere.at.all" in msg and "/nonexistent/path.py" in msg
 
 
 # -- the log line that became untrue -----------------------------------------
@@ -330,88 +286,6 @@ def test_the_replacement_line_says_what_actually_happened():
     source = inspect.getsource(AscendStagedEngramEmbedding.__init__)
     assert "0 bytes pinned per rank" in source
     assert "does not happen" in source
-
-
-# -- the torch route, used to attribute a compiler abort ----------------------
-
-
-def test_torch_dequant_matches_an_independent_computation():
-    """The kernel's arithmetic, checked against a separate expression.
-
-    Not a refactor of the same lines: the reference below multiplies by
-    2**(byte-127) explicitly, while the implementation bit-casts the byte into
-    the exponent field. Those agreeing is the point -- it is the same trick
-    verified two ways.
-    """
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        dequantize_staged_torch
-
-    rows, dim, qb = 4, 64, 32
-    torch.manual_seed(5)
-    values = (torch.randn(rows, dim) * 3).to(torch.float8_e4m3fn)
-    weight_u8 = values.view(torch.uint8)
-    # ue8m0 exponents around 1.0, avoiding the extremes
-    scale_u8 = torch.randint(120, 134, (rows, dim // qb), dtype=torch.uint8)
-
-    out = torch.zeros(rows, dim, dtype=torch.bfloat16)
-    dequantize_staged_torch(weight_u8, scale_u8, out, quant_block=qb)
-
-    factors = torch.pow(2.0, scale_u8.to(torch.float32) - 127.0)
-    expected = (values.to(torch.float32).view(rows, dim // qb, qb)
-                * factors.unsqueeze(-1)).view(rows, dim).to(torch.bfloat16)
-    torch.testing.assert_close(out, expected)
-
-
-def test_each_scale_covers_its_own_block_only():
-    """The broadcast, checked positionally.
-
-    A scale applied to the wrong block is the failure that produced maxdiff 28
-    on this data with no error raised, so it is checked by construction rather
-    than by a tolerance.
-    """
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        dequantize_staged_torch
-
-    rows, dim, qb = 2, 64, 32
-    ones = torch.ones(rows, dim, dtype=torch.float8_e4m3fn).view(torch.uint8)
-    scale_u8 = torch.tensor([[127, 128], [129, 127]], dtype=torch.uint8)
-
-    out = torch.zeros(rows, dim, dtype=torch.float32)
-    dequantize_staged_torch(ones, scale_u8, out, quant_block=qb)
-
-    assert torch.all(out[0, :32] == 1.0)    # 2**0
-    assert torch.all(out[0, 32:] == 2.0)    # 2**1
-    assert torch.all(out[1, :32] == 4.0)    # 2**2
-    assert torch.all(out[1, 32:] == 1.0)
-
-
-def test_a_scale_buffer_of_the_wrong_width_is_refused():
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        dequantize_staged_torch
-
-    with pytest.raises(ValueError, match="scale buffer is"):
-        dequantize_staged_torch(
-            torch.zeros(4, 64, dtype=torch.uint8),
-            torch.zeros(4, 4, dtype=torch.uint8),      # should be 2
-            torch.zeros(4, 64), quant_block=32)
-
-
-def test_the_switch_is_off_by_default_and_selects_the_torch_route():
-    """It is a bisection instrument, not a fallback: the kernel does one pass
-    where this materialises several intermediates."""
-    import vllm_ascend.envs as envs
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
-
-    assert envs.VLLM_ASCEND_DSV41_ENGRAM_DEQUANT_TORCH == "0"
-    assert not mod.envs_dsv41_engram_dequant_torch()
-
-    import inspect
-    source = inspect.getsource(mod.AscendStagedEngramEmbedding._dequantize_staged)
-    assert "envs_dsv41_engram_dequant_torch()" in source
-    assert source.index("envs_dsv41_engram_dequant_torch()") < source.index(
-        "_staged_dequant_launcher()"), (
-        "the switch must be checked before the kernel is even resolved -- "
-        "resolving it imports the module whose compilation is under suspicion")
 
 
 def test_staging_is_allocated_at_construction_not_on_first_lookup():
@@ -496,9 +370,8 @@ def test_an_unmatched_row_count_refuses_and_shows_the_table():
 
 
 def test_both_construction_time_hooks_are_called():
-    """The family, enumerated: two methods documented "after construction",
-    both wired in the same place. Grown from failures this list was one short
-    for two launches running."""
+    """Every buffer and binding that must precede capture is wired into
+    construction."""
     import inspect
 
     from vllm_ascend.models.deepseek_v4_1 import engram_embedding as mod
@@ -506,6 +379,7 @@ def test_both_construction_time_hooks_are_called():
     body = inspect.getsource(mod.AscendStagedEngramEmbedding
                              ._allocate_staging_at_construction)
     assert "allocate_staging(" in body
+    assert "_allocate_pinned_for_capture(" in body
     assert "bind_staged_tables(" in body
 
 
@@ -565,45 +439,22 @@ def test_a_flat_buffer_of_the_wrong_length_is_refused():
 
 # ------------------------------------------------ the wall, named in its frame
 
-def test_lookup_under_capture_says_who_is_incompatible():
-    """🔴 The error that arrives without this names the wrong layer.
-
-    ``rtMemcpy: operation not permitted when a stream is capturing``, raised
-    from ``copy_between_host_and_device_opapi``, reads as a driver or
-    torch_npu problem. The actual subject is this line's host gather, which
-    replaced a device-resident triton lookup because the tables do not fit in
-    HBM on A5.
-    """
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
-
+def test_capture_without_pinned_buffers_is_refused():
+    """The capture route needs the pinned buffers allocated before capture."""
     import unittest.mock as mock
 
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+
+    layer = _Lookup(_tables())
+    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
     with mock.patch.object(engram_embedding, "_stream_is_capturing",
                            return_value=True):
-        with pytest.raises(RuntimeError) as excinfo:
-            engram_embedding._refuse_under_capture(7)
-    message = str(excinfo.value)
-    assert "host gather" in message
-    assert "enforce-eager" in message, (
-        "the message says what is wrong and not what to do about it; the "
-        "reader is mid-launch")
-    assert "7 tokens" in message
-
-
-def test_no_capture_is_not_refused():
-    """Two arms. The guard has to be able to stay quiet -- every token this
-    line has produced came through here with capture off."""
-    import unittest.mock as mock
-
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
-
-    with mock.patch.object(engram_embedding, "_stream_is_capturing",
-                           return_value=False):
-        engram_embedding._refuse_under_capture(7)
+        with pytest.raises(RuntimeError, match="pinned capture buffers"):
+            layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
 
 
 def test_an_unavailable_predicate_does_not_refuse():
-    """⚠️ The third state is permissive on purpose. A predicate that cannot
+    """The third state is permissive on purpose. A predicate that cannot
     be asked must not stop a server that works today; the cost of a wrong
     "no" is the CANN error we already get, the cost of a wrong "yes" is a
     server that will not start."""
@@ -645,15 +496,15 @@ def test_the_predicate_exists_on_this_platform():
 
 
 def test_lookup_asks_before_it_copies():
-    """Placement, not presence: the refusal has to come before the D2H, or
-    the CANN error wins the race and the attribution never prints."""
+    """The capture check has to come before the synchronising D2H, which
+    capture rejects."""
     import inspect
 
     from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
         AscendStagedEngramEmbedding
 
     body = inspect.getsource(AscendStagedEngramEmbedding.lookup)
-    guard_at = body.index("_refuse_under_capture")
+    guard_at = body.index("_stream_is_capturing()")
     copy_at = body.index('.to("cpu"')
     assert guard_at < copy_at, (
         "the capture check sits after the synchronising copy, so the copy "
@@ -663,7 +514,7 @@ def test_lookup_asks_before_it_copies():
 # ------------------------------ the host staging buffer is reused every forward
 
 def test_the_host_staging_buffer_is_one_buffer_reused(monkeypatch):
-    """🔴 The property that makes the copy's timing matter.
+    """The property that makes the copy's timing matter.
 
     ``_host_weight`` is allocated once at construction and rewritten by every
     forward. If the H2D issued from it can still be in flight when the next
@@ -678,137 +529,3 @@ def test_the_host_staging_buffer_is_one_buffer_reused(monkeypatch):
     assert layer._host_weight is first, (
         "a fresh buffer per forward would remove the hazard entirely; this "
         "test exists to say that is not what happens")
-
-
-def test_the_copy_is_non_blocking_by_default(monkeypatch):
-    """Today's behaviour, pinned so the change is one variable."""
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
-
-    monkeypatch.delenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", raising=False)
-    assert engram_embedding._blocking_h2d() is False
-
-
-def test_the_switch_makes_it_wait(monkeypatch):
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "1")
-    assert engram_embedding._blocking_h2d() is True
-
-
-def test_waiting_actually_synchronises(monkeypatch):
-    """⚠️ non_blocking=False orders the copy on the stream; what this needs is
-    for it to have drained before the host bytes are rewritten. The
-    synchronise is the part that establishes that, so it is asserted rather
-    than left implied by the flag."""
-    import unittest.mock as mock
-
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "1")
-    layer = _Lookup(_tables())
-    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
-    with mock.patch.object(engram_embedding, "_synchronize_current_stream") \
-            as sync:
-        layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
-    assert sync.called
-
-
-def test_no_synchronise_when_the_switch_is_off(monkeypatch):
-    import unittest.mock as mock
-
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
-
-    monkeypatch.delenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", raising=False)
-    layer = _Lookup(_tables())
-    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
-    with mock.patch.object(engram_embedding, "_synchronize_current_stream") \
-            as sync:
-        layer.lookup(torch.zeros(2, 24, dtype=torch.int32), out=None)
-    assert not sync.called
-
-
-# --------------------------------- the rungs, separated after the first flight
-
-def test_the_modes_are_separate_rungs(monkeypatch):
-    """🔴 "block" and "sync" are two different claims.
-
-    non_blocking=False orders the copy on the stream; the synchronise is what
-    establishes that it has *drained* before the host bytes are rewritten.
-    Bundling them into one flag meant the first flight changed two things,
-    and it died somewhere neither of them is.
-    """
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
-
-    for mode, blocking, double in (("", False, False), ("0", False, False),
-                                   ("block", True, False),
-                                   ("sync", True, False),
-                                   ("double", False, True)):
-        monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", mode)
-        assert ee._blocking_h2d() is blocking, mode
-        assert ee._double_buffered() is double, mode
-
-
-def test_one_is_still_what_the_first_flight_used(monkeypatch):
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "1")
-    assert ee._h2d_mode() == "sync"
-
-
-def test_a_typo_is_refused_rather_than_silently_off(monkeypatch):
-    """⚠️ Falling back to the default would make the experiment read as
-    'the change had no effect'."""
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "blocking")
-    with pytest.raises(ValueError, match="not one of"):
-        ee._h2d_mode()
-
-
-def test_sync_is_scoped_to_the_stream_not_the_device():
-    """🔴 The first version called torch.npu.synchronize() -- a device-wide
-    host block inside the forward of a model running EP=4 collectives. That
-    flight died in libccl_kernel.so, in the MoE all-to-all, without entering
-    the copy at all. Whether the sync caused it is not established; that the
-    instrument was far broader than what it needed to wait for is."""
-    import inspect
-
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
-
-    body = inspect.getsource(ee._synchronize_current_stream)
-    assert "current_stream" in body
-    assert "stream.synchronize()" in body
-
-
-def test_double_buffering_alternates_and_changes_no_timing(monkeypatch):
-    """The one remedy that adds nothing to the forward.
-
-    No wait and no synchronise, so it cannot desynchronise ranks -- which
-    makes the hypothesis testable without the test being able to break
-    collectives on its own.
-    """
-    from vllm_ascend.models.deepseek_v4_1 import engram_embedding as ee
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", "double")
-    layer = _Lookup(_tables())
-    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
-
-    seen = []
-    for _ in range(4):
-        weight, _scale = layer._staging_host_views(2)
-        seen.append(weight.ctypes.data)
-    assert seen[0] != seen[1], "both forwards gathered into the same bytes"
-    assert seen[0] == seen[2] and seen[1] == seen[3], "not alternating"
-    assert ee._blocking_h2d() is False, (
-        "double buffering is not supposed to make anything wait")
-
-
-def test_without_double_buffering_it_is_one_buffer(monkeypatch):
-    """Two arms: the hazard has to be present when the switch is off, or the
-    switch is testing nothing."""
-    monkeypatch.delenv("VLLM_ASCEND_DSV41_ENGRAM_BLOCKING_H2D", raising=False)
-    layer = _Lookup(_tables())
-    layer.allocate_staging(LAYOUT, max_tokens=8, device="cpu")
-
-    seen = [layer._staging_host_views(2)[0].ctypes.data for _ in range(3)]
-    assert len(set(seen)) == 1

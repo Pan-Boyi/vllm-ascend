@@ -40,24 +40,19 @@ class AscendFp8Config(Fp8Config):
 
     @classmethod
     def from_config(cls, config: dict) -> "AscendFp8Config":
-        # ``Fp8Config.from_config`` keeps only the keys the generic block-wise scheme understands and
-        # drops the rest, so by the time a mis-dispatched DeepSeek V4 checkpoint reaches
-        # ``get_quant_method`` there is nothing left to recognise it by: the routed experts simply come
-        # out FP8 instead of MXFP4, roughly doubling the weights (~296 GB -> ~592 GB) with no error
-        # anywhere. Catch it here, while the raw checkpoint dict is still in hand.
+        # ``Fp8Config.from_config`` drops the keys it does not understand, so a mis-dispatched DeepSeek
+        # V4 checkpoint is only recognisable here, while the raw dict is still in hand. Past this
+        # point its MXFP4 routed experts would silently be served as FP8 at twice the memory.
         expert_dtype = config.get("expert_dtype")
         if expert_dtype is not None and expert_dtype != "fp8":
             raise ValueError(
-                f"This checkpoint declares `quantization_config.expert_dtype={expert_dtype!r}`, so its "
-                f"routed experts are not plain block-wise FP8, yet it was dispatched to the generic "
-                f"Ascend FP8 path. That path would quantize the experts to FP8 anyway and roughly "
-                f"double their memory footprint. It should have been claimed by "
-                f"AscendDeepseekV4FP8Config instead -- check that its `override_quantization_method` "
-                f"recognises this checkpoint's model_type."
+                f"Checkpoint declares `quantization_config.expert_dtype={expert_dtype!r}` but was "
+                f"dispatched to the generic Ascend FP8 path, which would serve its routed experts as FP8. "
+                f"It should be claimed by AscendDeepseekV4FP8Config; check that its "
+                f"`override_quantization_method` recognises this checkpoint's model_type."
             )
-        # ``scale_fmt: ue8m0`` marks DeepSeek-native e8m0 scales; the generic HF fp8 scheme stores
-        # float32 ``weight_scale_inv`` instead. Landing here with e8m0 scales is not fatal on its own,
-        # but it is a strong hint that a DeepSeek checkpoint missed its dispatch, so say so out loud.
+        # ``scale_fmt: ue8m0`` marks DeepSeek-native scales (generic HF fp8 stores float32
+        # ``weight_scale_inv``). Not fatal, but a strong hint of a missed dispatch.
         if config.get("scale_fmt") == "ue8m0":
             logger.warning(
                 "Serving a checkpoint with `scale_fmt: ue8m0` through the generic Ascend FP8 path "
@@ -146,19 +141,16 @@ class AscendDeepseekV4FP8Config(DeepseekV4FP8Config):
         super().__init__(*args, **kwargs)
         self.quant_description = {}
 
-    # DeepSeek ships each V4 revision under its own model_type ("deepseek_v4", "deepseek_v41", plus the
-    # "..._text" text-only towers). Match the family prefix rather than one exact name -- upstream's
-    # exact ``model_type == "deepseek_v4"`` test is precisely what let V4.1 regress unnoticed.
+    # Each V4 revision has its own model_type ("deepseek_v4", "deepseek_v41", "..._text" towers), so
+    # match the family prefix rather than one exact name.
     _DS_V4_FAMILY_PREFIX = "deepseek_v4"
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
         """Claim DeepSeek V4-family native FP8 checkpoints.
 
-        Upstream ``DeepseekV4FP8Config.override_quantization_method``
-        (``vllm/models/deepseek_v4/quant_config.py``) hard-codes ``model_type == "deepseek_v4"``, so
-        DeepSeek-V4.1-Flash -- which ships as ``deepseek_v41`` -- was never claimed and fell through to
-        the generic ``AscendFp8Config``, turning the MXFP4 routed experts into FP8 ones.
+        Upstream claims only the exact model_type ``deepseek_v4``; other revisions (e.g. ``deepseek_v41``)
+        would otherwise fall through to ``AscendFp8Config`` and serve MXFP4 experts as FP8.
         """
         claimed = super().override_quantization_method(hf_quant_cfg, user_quant, hf_config=hf_config)
         if claimed is not None:
@@ -170,9 +162,8 @@ class AscendDeepseekV4FP8Config(DeepseekV4FP8Config):
         if model_type.startswith(cls._DS_V4_FAMILY_PREFIX):
             return "deepseek_v4_fp8"
 
-        # Structural fallback, for a revision that renames itself out of the "deepseek_v4*" prefix:
-        # DeepSeek-native checkpoints carry e8m0 scales and name their expert dtype, and the generic HF
-        # fp8 scheme emits neither.
+        # Structural fallback for a revision outside the "deepseek_v4*" prefix: DeepSeek-native
+        # checkpoints carry e8m0 scales and an expert dtype; generic HF fp8 has neither.
         if (
             "deepseek" in model_type.lower()
             and hf_quant_cfg.get("scale_fmt") == "ue8m0"

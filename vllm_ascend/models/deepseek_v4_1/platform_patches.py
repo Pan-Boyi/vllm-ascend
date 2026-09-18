@@ -118,7 +118,7 @@ def rebind_upstream_classes() -> list[str]:
                 "repointed the site builds upstream's class, which on Ascend "
                 "means a kv-cache spec the runner cannot reshape, a backend "
                 "with no get_kv_cache_shape, or -- for the engram table -- an "
-                "attempt to hold 188.83 GiB in device memory.")
+                "attempt to allocate the whole table.")
         replacement = getattr(caches, ascend_name)
         if getattr(module, upstream_name) is replacement:
             continue
@@ -190,23 +190,9 @@ def apply_all() -> list[str]:
     from vllm_ascend.models.deepseek_v4_1.attn_selector import \
         apply_attn_selector_patch
 
-    # Before anything here imports an upstream model module. Every rebind below
-    # reaches into vllm.models.deepseek_v4_1.nvidia.model, which transitively
-    # imports V4.0's model module, which does
-    #
-    #     from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
-    #
-    # -- a from-import, so the name is frozen into that module's namespace at
-    # import time. vllm_ascend's platform patch replaces the *module attribute*,
-    # which does nothing for a name already bound elsewhere. Importing these
-    # modules first therefore pins the upstream factory permanently, and the
-    # Ascend MoE router is never installed: the first launch to reach the MoE
-    # died at topk_softplus_sqrt, a CUDA entry point, with the Ascend
-    # equivalents present and unused.
-    #
-    # Idempotent -- it is an import of an already-imported module in the normal
-    # case. It is here rather than left to the caller because the ordering is a
-    # property of what this function does, not of who calls it.
+    # Must run before any rebind below imports upstream's model module, which
+    # from-imports FusedMoEFactory; importing it first would freeze the CUDA
+    # factory there and the Ascend MoE router would never be installed.
     _apply_platform_patches_first()
 
     applied = []
@@ -245,22 +231,16 @@ def apply_all() -> list[str]:
     if apply_indexer_k_store_patch():
         applied.append("indexer_k_norm_rope_store")
 
-    # The compressor's latent publish. Not a Triton concern: upstream's
-    # function is fine, it is the slot mapping that arrives in the other form.
-    # A5 with a bf16 KV cache formats slots as (block, offset); upstream reads
-    # slot_mapping.numel() as the token count and the kernel divides a flat
-    # slot by its own block length, so the paired form is 2T tokens of
-    # nonsense -- caught by upstream's own assertion, as a bare AssertionError.
+    # The compressor's latent publish: with a bf16 KV cache the slot mapping
+    # arrives as (block, offset) pairs, which upstream reads as 2T flat slots.
     from vllm_ascend.models.deepseek_v4_1.compressor_insert import \
         apply_compressor_insert_patch
 
     if apply_compressor_insert_patch():
         applied.append("rope_quant_insert")
 
-    # The selection buffer's second writer. The short-context path fills it
-    # with a triton kernel and returns index_q=None, so indexer_op -- and the
-    # bookkeeping in forward_oot -- never runs. Without this the reader cannot
-    # tell a written buffer from an untouched one.
+    # The selection buffer's second writer: the short-context path fills it
+    # with a Triton kernel and skips the row accounting done in forward_oot.
     from vllm_ascend.models.deepseek_v4_1.sparse_indexer import \
         apply_short_context_accounting_patch
 

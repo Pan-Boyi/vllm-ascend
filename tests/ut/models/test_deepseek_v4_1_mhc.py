@@ -71,22 +71,6 @@ def test_post_uses_the_ascend_operator_and_adapts_the_shapes():
     assert out.shape == (T, HC, D), "the batch axis must come back off"
 
 
-def test_post_falls_back_to_torch_when_asked(monkeypatch):
-    """The A/B switch. They compute the same expression, and "the same
-    expression" has been wrong here before, so the comparison stays available."""
-    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
-
-    # Patch the accessor rather than the envs module: envs resolves names
-    # through __getattr__, so setattr on it installs a real attribute that
-    # shadows the lookup and outlives the test.
-    monkeypatch.setattr(mhc, "envs_dsv41_mhc_post_torch", lambda: True)
-
-    T, HC, D = 5, 4, 8
-    args = (torch.randn(T, D), torch.randn(T, HC, D),
-            torch.randn(T, HC, 1), torch.randn(T, HC, HC))
-    torch.testing.assert_close(mhc.mhc_post_ascend(*args), mhc_post_torch(*args))
-
-
 @pytest.mark.parametrize("x_shape,res_shape", [
     ((1, 5, 8), (5, 4, 8)),      # x already batched
     ((5, 8), (1, 5, 4, 8)),      # residual already batched

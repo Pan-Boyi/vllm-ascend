@@ -11,12 +11,10 @@ function rather than a method, subclassing the decoder layer cannot replace it.
 So the name is rebound in the module's globals, which is where the call looks
 it up.
 
-The alternative -- forking upstream's ``model.py`` -- was rejected as the
-*riskier* option, not merely the slower one. A hijack that drifts fails loudly:
-the attribute disappears or its signature changes and
-``test_upstream_selector_contract`` goes red. A forked model file that drifts
-produces numbers that are quietly different, which is the failure mode this
-port has spent the most time on.
+Rebinding rather than forking upstream's ``model.py``: if upstream drifts, the
+attribute disappears or its signature changes and
+``test_upstream_selector_contract`` goes red, whereas a forked model file
+would drift silently.
 """
 
 from __future__ import annotations

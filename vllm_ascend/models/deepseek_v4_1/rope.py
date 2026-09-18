@@ -9,15 +9,10 @@ error:
 **The parameters differ per layer.** Layers whose ``compress_ratios`` entry is 0
 use ``rope_theta`` with no YaRN scaling; every other layer uses
 ``compress_rope_theta`` *with* YaRN. Building one table and using it everywhere
-reproduces neither. Verified against the CPU golden dumps: with the right
-parameters all three smoke layers come back bit-exact, and with the wrong ones
-relative error is 3.4e-1 (layer 0), 3.7e-1 (layer 1) and 4.8e-1 (layer 2).
+reproduces neither.
 
 **The pairing is GPT-J style**, i.e. interleaved ``(x[0::2], x[1::2])`` rather
-than split-half. Rotation preserves the norm of each pair, which identifies the
-convention without reference to the angles: under interleaved pairing the pair
-norms of golden's pre- and post-rotation dumps agree to 3.8e-3 (bf16 rounding);
-under split-half they disagree by a factor of 82.
+than split-half, as in the reference implementation.
 """
 
 from __future__ import annotations
@@ -87,50 +82,12 @@ def inverse_rope_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return out.copy_(torch.view_as_real(z * conj).flatten(-2))
 
 
-def inverse_rope_attention_output(
-    o: torch.Tensor,
-    config,
-    layer_id: int,
-    seq_len: int | None = None,
-) -> torch.Tensor:
-    """Undo RoPE on an attention output's trailing dimensions.
-
-    ``o`` is ``[batch, seq, heads, head_dim]``. Returned as a fresh tensor; the
-    leading ``NOPE_HEAD_DIM`` dimensions are copied through unchanged.
-    """
-    if o.shape[-1] != NOPE_HEAD_DIM + ROPE_HEAD_DIM:
-        raise ValueError(
-            f"expected head_dim {NOPE_HEAD_DIM + ROPE_HEAD_DIM}, got "
-            f"{o.shape[-1]}; the nope/rope split is not what this assumes")
-
-    base, use_yarn = rope_params_for_layer(config, layer_id)
-    freqs = build_freqs_cis(ROPE_HEAD_DIM, seq_len or o.shape[1], base, use_yarn)
-    out = o.clone()
-    inverse_rope_(out[..., -ROPE_HEAD_DIM:], freqs.to(o.device))
-    return out
-
-
-#: Why this is torch and not ``inplace_partial_rotary_mul``, which exists on
-#: this platform and looks like an exact fit.
-#:
-#: Its ``partial_slice`` attribute is declared and never read -- it appears
-#: twice in the whole operator, both times in a declaration, and the tiling
-#: reads only the mode. Passing [448, 512] and [448, 64] do the same thing:
-#: nothing, silently. The rotation covers all of ``D``, so handing it a 512-wide
-#: head would rotate the 448 NoPE dimensions too.
-#:
-#: Rotating only the tail would mean passing a 4-D *view* of ``x[..., 448:512]``
-#: to an in-place operator, on non-contiguous memory, which nobody has tried.
-#: The cos/sin would also need widening from 32 frequencies to 64, because the
-#: operator requires their ``D`` to equal ``x``'s.
-#:
-#: So it is available and it is not a drop-in. This path is bit-exact against
-#: golden today; the operator is a performance question for later, with a
-#: measurable answer and three untested steps in front of it.
-#:
-#: ``interleave`` is confirmed to be the GPT-J pairing (the kernel does
-#: ``i ^ 1``), and the inverse is the forward rotation with ``sin`` negated --
-#: both worth keeping for whoever picks this up.
+#: Torch rather than ``inplace_partial_rotary_mul``: that operator's
+#: ``partial_slice`` attribute is never read, so it rotates all of ``D`` and
+#: would rotate the 448 NoPE dimensions too. Rotating only the tail would need
+#: a non-contiguous 4-D view passed to an in-place operator and cos/sin widened
+#: to 64. Its ``interleave`` mode is the GPT-J pairing, and the inverse is the
+#: forward rotation with ``sin`` negated.
 
 
 def inverse_rope_from_cos_sin_cache(

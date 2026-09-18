@@ -1,53 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The staging-buffer convention, defined once.
+"""The engram staging-buffer convention, defined once.
 
-The engram tables are 188.83 GiB and cannot be reached from the device
-directly -- see the deprecation note in ``engram_gather`` for what happened
-when we tried. Instead the CPU gathers the rows a step needs out of a
-read-only mapping, writes them into a small staging buffer, and one H2D copy
-puts that buffer in HBM. The kernel then reads HBM, contiguously, with no
-indirection at all: no hash ids, no vocabulary offset, no scale gather.
+The engram tables do not fit in device memory. The CPU gathers the rows a step
+needs from a read-only mapping into a small staging buffer, one H2D copy puts
+it in HBM, and the kernel reads it contiguously (no hash ids, no vocabulary
+offset, no scale gather).
 
-That trade removes one silent failure and introduces another, and this module
-exists because of the second one. The CPU writes rows in an order the device
-recomputes from its program id. If the two disagree, **both sides still handle
-well-formed data** -- the bytes are valid, they are simply paired with the
-wrong token -- so nothing raises and the only symptom is that accuracy is off.
-The convention therefore lives in exactly one place, and both sides import it
-rather than each restating it.
+The CPU writes rows in an order the device recomputes from its program id. If
+the two disagree the data is still well-formed, only paired with the wrong
+token, so nothing raises. The convention therefore lives here and both sides
+use it.
 
-The shape of the rows is taken from the model config and then checked against
-the staged files, which is the same fact arriving by two routes: the config
-says 384,006,168 rows of 256, and the file is 98,305,579,008 bytes, which is
-that product exactly. A mismatch means one of them is describing a different
-checkpoint.
-
-.. note:: What this change cost in evidence, as distinct from in code.
-
-    "Scales must be read contiguously and broadcast, never gathered by
-    ``cols // QUANT_BLOCK``" used to rest on a cross-check: the same bytes read
-    through two different address spaces had to agree, and the defective form
-    was wrong in both. On this path the kernel only ever reads HBM, so **that
-    second arm no longer exists**. The conclusion is unchanged -- the indexed
-    form is wrong on HBM too, which is one of the measured cells -- but it is
-    now carried by fewer independent observations than it was.
-
-    Converting the host arm into a test of the CPU gather does not restore it.
-    That is a useful new test of a different property; it says nothing about
-    the kernel. Recorded because a narrowed support and an unchanged conclusion
-    read identically a week later, and nothing fails when evidence goes stale.
-
-.. note:: ``n_hash_cols`` is 24 and has three independent sources, but the
-    kernel has only been measured at 8.
-
-    ``engram_n_heads`` is 8; ``n_hash_cols`` is 24. They are different
-    quantities and the config names only the first, so taking ``n_heads``
-    directly is the natural mistake. The value 24 is confirmed by
-    ``(max_ngram_size - 1) * n_heads``, by the staged tables' row arithmetic,
-    and by the shape of golden's dumped ``engram_hash_ids``. The kernel is
-    parameterised over it, but its verification ran at 8 -- so 24, the value
-    production uses, is covered by derivation and not by measurement.
-
+``n_hash_cols`` is ``(max_ngram_size - 1) * n_heads`` (24), not
+``engram_n_heads`` (8).
 """
 
 from __future__ import annotations
@@ -85,13 +50,11 @@ class EngramLayout:
     def from_config(cls, config) -> "EngramLayout":
         """Derive the layout from the model config.
 
-        ``n_hash_cols`` is ``(max_ngram_size - 1) * n_heads``: a position is
-        hashed as one n-gram per size from 2 up to the maximum, each split over
-        the heads, and every (size, head) pair owns a column.
+        ``n_hash_cols`` is ``(max_ngram_size - 1) * n_heads``: one n-gram per
+        size from 2 up to the maximum, each split over the heads.
 
-        The quantisation block is derived from the shapes rather than named in
-        the config -- ``dim // n_scales`` -- so it is checked against the files
-        below rather than assumed.
+        The quantisation block is not in the config; ``validate_against_files``
+        checks it against the staged scale files.
         """
         dim = int(config.engram_head_dim)
         return cls(
@@ -110,9 +73,8 @@ class EngramLayout:
     def row_index(self, token_index: int, hash_col: int) -> int:
         """Where a (token, hash column) pair lives in the staging buffer.
 
-        The single definition. The CPU writes here; the kernel recomputes the
-        same value from its program id. Anything that restates this arithmetic
-        somewhere else is the bug this module exists to prevent.
+        The single definition: the CPU writes here and the kernel recomputes
+        the same value from its program id.
         """
         return token_index * self.n_hash_cols + hash_col
 
@@ -129,17 +91,10 @@ class EngramLayout:
     def assert_head_sharding_is_degenerate(self, local_heads: int,
                                            total_heads: int,
                                            head_start: int) -> None:
-        """``row_index`` is only that simple because TP=1 degenerates sharding.
+        """``row_index`` assumes every rank owns all hash columns (TP=1).
 
-        Upstream shards the hash columns across tensor-parallel ranks, and this
-        port runs TP=1, where every rank owns all of them. The row numbering
-        above silently means something else the moment that stops being true --
-        and it would keep producing well-formed output.
-
-        This is the several-th time a parameterised upstream mechanism has
-        degenerated under TP=1. The difference here is that we are *relying* on
-        the degenerate case rather than merely noticing it, which is why it is
-        pinned rather than commented.
+        Under sharding it would return valid row numbers for the wrong rows,
+        so this refuses instead.
         """
         if not (local_heads == total_heads == self.n_hash_cols
                 and head_start == 0):
@@ -155,11 +110,9 @@ class EngramLayout:
 
     def validate_against_files(self, stage_dir: str,
                                file_name) -> None:
-        """Check the config's shapes against the staged files' actual sizes.
+        """Check the config's shapes against the staged files' sizes.
 
-        The same fact by two routes. ``file_name(tensor_name)`` maps a table to
-        its staged path; passing it in keeps this module free of the naming
-        convention, which belongs to the staging code.
+        ``file_name(tensor_name)`` maps a table to its staged file name.
         """
         problems = []
         for layer_id, rows in zip(self.layer_ids, self.num_embeddings):
@@ -188,15 +141,11 @@ class EngramLayout:
                 "error anywhere.")
 
 
-#: Threads for the gather. Measured on this host (256 cores) against the real
-#: 98 GiB table, one layer of an 8192-token chunk: 1 thread 14.75ms, 4 2.28ms,
-#: 8 1.39ms, 16 1.27ms, 32 2.37ms. It is latency-bound on random reads into
-#: resident tmpfs, so it scales well until it stops; past 16 it gets worse, so
-#: this is a measured optimum rather than a core count.
+#: Threads for the gather. It is latency-bound on random reads; 16 was the
+#: measured optimum, more threads got slower.
 GATHER_THREADS = 16
 
-#: Below this many rows the pool costs more than it saves (a 256-token decode
-#: step is 6144 rows and takes 0.22ms single-threaded, for both layers).
+#: Below this many rows the thread pool costs more than it saves.
 GATHER_THREAD_THRESHOLD = 16384
 
 
@@ -205,26 +154,14 @@ def gather_into_staging(weight_table, scale_table, row_ids,
                         threads: int = GATHER_THREADS) -> None:
     """Copy the rows a step needs into the staging buffers.
 
-    ``row_ids[r]`` is the table row wanted at staging row ``r``, and ``r`` is
-    ``layout.row_index(token, hash_col)`` -- the caller builds ``row_ids`` in
-    that order and the kernel recomputes ``r`` from its program id. Neither
-    side may restate that arithmetic; both take it from ``EngramLayout``.
-
-    ``weight_table`` and ``scale_table`` are read-only views of the staged
-    tables. Read-only is the point: it is what the previous design could not
-    have, and it is what makes a stray write impossible rather than guarded.
-
-    No de-duplication. Hash ids repeat, so a row wanted by several tokens is
-    copied several times; the measured costs assume that. De-duplicating would
-    add an index indirection back, which is the kind of thing this design was
-    reached by removing, so it needs its own measurement before being worth it.
+    ``row_ids[r]`` is the table row wanted at staging row ``r``, where ``r`` is
+    ``layout.row_index(token, hash_col)``. No de-duplication: repeated ids are
+    copied repeatedly, which keeps the row count a function of the token count
+    (the capture route relies on that).
     """
     import numpy as np
 
-    # Written out rather than chained: `a != b != c` is `(a != b) and
-    # (b != c)`, which is true only when the two buffers disagree with each
-    # other -- exactly the case that cannot happen here, so the chained form
-    # passed everything.
+    # Not chained: `a != b != c` would pass when both buffers agree.
     if (row_ids.shape[0] != out_weight.shape[0]
             or row_ids.shape[0] != out_scale.shape[0]):
         raise ValueError(

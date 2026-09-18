@@ -7,18 +7,12 @@ Upstream dispatches this on a blacklist::
     elif is_xpu():           ...xpu
     else:                    ...triton
 
-Ascend is neither, so it falls into the Triton branch, and triton-ascend
-aborts compiling it -- an MLIR assertion in InterleaveOptimization.cpp about a
-deinterleave offset, which is abort() rather than an exception: all four
-workers vanished in the same second with exit code None, no traceback, nothing
-in dmesg. The kernel was identified from a half-written Triton cache entry.
+Ascend falls into the Triton branch, and triton-ascend aborts compiling it
+(an MLIR assertion in InterleaveOptimization.cpp -- ``abort()``, not an
+exception), so this takes an equivalent torch route.
 
-That makes three of this family, and the rule after the first two was to stop
-trying to catch them and take an equivalent route.
-
-This is a transcription of the FP8 branch of upstream's kernel, not a
-rederivation of it. Four details would have been wrong if derived, and each is
-silent:
+This transcribes the FP8 branch of upstream's kernel. Four details are silent
+if wrong:
 
 * the rotation covers the **trailing** ``2 * half_rot_dim`` of the head, with
   the NoPE part ahead of it;
@@ -39,9 +33,8 @@ from __future__ import annotations
 
 import torch
 
-#: e4m3fn's largest finite value. Upstream picks 224.0 for e4m3fnuz on gfx942;
-#: that dtype does not arise here, and guessing which one applies is exactly
-#: the kind of silent factor-of-two this file exists to avoid.
+#: e4m3fn's largest finite value (upstream's 224.0 is for e4m3fnuz on gfx942,
+#: which does not arise here).
 FP8_MAX = 448.0
 
 #: Upstream's floor before the scale is taken, so an all-zero head does not
@@ -122,10 +115,8 @@ def fused_indexer_q_rope_quant_ascend(
     return q_fp8, weights_out
 
 
-#: Where upstream's V4.1 attention module holds the name. The call site is
-#: ``attention.py:1201`` and it reads this module's own globals, so rebinding
-#: the attribute lands whenever it is done -- the same property that made the
-#: MoE router hook work and the FusedMoEFactory one not.
+#: Where upstream's V4.1 attention module holds the name. The call site reads
+#: that module's globals, so rebinding the attribute reaches it.
 _TARGET_MODULE = "vllm.models.deepseek_v4_1.attention"
 _TARGET_NAME = "fused_indexer_q_rope_quant"
 

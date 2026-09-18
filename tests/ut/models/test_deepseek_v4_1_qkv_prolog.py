@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """The decomposed prolog, checked against the contract rather than the name.
 
-The contract is stated in deepseek_v4/cpu/cpu_sparse.py:427 for the same fused
-op: the Q side does per-head weight-free RMSNorm then GPT-J RoPE; the KV side
-does RoPE only, because kv arrives already normed. Each of those three facts is
-one the operator's name would have got wrong, so each has a test.
+V4.1's attention path calls the shared fused op with ``apply_q_norm=False``:
+the q side is RoPE only, and the kv side is RoPE only because kv arrives
+already normed. The weight-free norm helper is the op's ``apply_q_norm=True``
+branch and must not be on the V4.1 path.
 """
 
 import pytest
 import torch
 
-from vllm_ascend.models.deepseek_v4_1.qkv_prolog import \
-    rms_norm_weightless as qkv_prolog_rms
 from vllm_ascend.models.deepseek_v4_1.qkv_prolog import (qnorm_rope_kv_insert,
                                                           rms_norm_weightless,
                                                           rope_tail,
@@ -131,8 +129,9 @@ def test_kv_is_not_normed_here():
         "the context rows were rescaled; kv must not be normed here")
 
 
-def test_a_negative_slot_is_skipped_not_clamped():
-    """-1 means "do not write". Clamping would put the row in slot 0."""
+def test_a_negative_slot_leaves_slot_zero_unchanged():
+    """-1 means "do not write". The row is clamped to slot 0 but writes back
+    the value already there."""
     cache = torch.full((2, 4, HEAD_DIM), 7.0)
     rows = torch.ones(3, HEAD_DIM)
     scatter_rows(cache, rows, torch.tensor([-1, 3, -1]), 4)
@@ -148,12 +147,7 @@ def test_an_all_skipped_batch_writes_nothing():
 
 
 def test_the_block_offset_form_writes_where_the_pair_says():
-    """On A5 with a bf16 KV cache this is the default form, not an alternative.
-
-    dsa_v1.py:782 picks flat only when FP8_ATTENTION is available *and* bf16 KV
-    is off -- the configuration we do not run. This used to be refused, which
-    was right while nothing supported it and wrong as a permanent answer.
-    """
+    """On A5 with a bf16 KV cache this is the default form."""
     cache = torch.zeros(3, 4, HEAD_DIM)
     rows = torch.arange(2, dtype=torch.float32).reshape(2, 1).expand(2, HEAD_DIM)
     pairs = torch.tensor([[2, 3], [1, 0]], dtype=torch.int64)
@@ -196,72 +190,6 @@ def test_an_unrecognised_slot_shape_is_still_refused():
                      torch.zeros((2, 3), dtype=torch.int64), 4)
 
 
-def test_which_form_ran_is_logged_audibly(caplog):
-    """Both forms are legal and neither errors when read as the other, so the
-    only way to know which one ran is that it says so -- *in the output*.
-
-    The first version of this line used logging.getLogger(__name__), which
-    emits nothing once vLLM has configured logging. It ran for two launches and
-    left no trace, and "the instrument is silent" looks exactly like "the path
-    was not taken". So this asserts on vllm.logger's own logger, which is what
-    the other 125 files in the tree use.
-    """
-    import logging
-
-    from vllm.logger import logger as vllm_logger
-
-    from vllm_ascend.models.deepseek_v4_1 import qkv_prolog
-
-    qkv_prolog._LOGGED_SLOT_FORMS.clear()
-    # The handler is attached to vLLM's logger directly: it does not propagate
-    # to root, so caplog's default capture sees nothing -- which is the same
-    # silence this test exists to rule out.
-    records = []
-
-    class _Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record.getMessage())
-
-    handler = _Capture()
-    vllm_logger.addHandler(handler)
-    try:
-        scatter_rows(torch.zeros(2, 4, HEAD_DIM), torch.ones(1, HEAD_DIM),
-                     torch.tensor([[1, 2]], dtype=torch.int64), 4)
-    finally:
-        vllm_logger.removeHandler(handler)
-    assert any("(block, offset)" in m for m in records), records
-
-
-def test_the_path_evidence_logs_do_not_use_a_bare_module_logger():
-    """A silent instrument proves nothing, and proves it quietly.
-
-    vLLM configures logging; logging.getLogger(__name__) produces no output
-    afterwards. 125 files in this tree import vllm.logger and 11 do not. The
-    ones that matter here are the lines whose whole purpose is to show that a
-    path executed.
-    """
-    import ast
-    import inspect
-
-    from vllm_ascend.models.deepseek_v4_1 import qkv_prolog
-
-    # Parsed, not grepped: this module's own comment explains why not to use a
-    # bare module logger, and a text search matches that explanation. A check
-    # that its own prose can fail is a check about spelling, not about calls.
-    tree = ast.parse(inspect.getsource(qkv_prolog))
-    bare = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "getLogger"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "logging"
-    ]
-    assert not bare, (
-        f"{len(bare)} bare logging.getLogger call(s); vLLM configures logging "
-        "and these emit nothing afterwards")
-    assert "from vllm.logger import logger" in inspect.getsource(qkv_prolog)
-
-
 def test_the_rows_land_where_the_slots_say():
     cache = torch.zeros(3, 4, HEAD_DIM)
     rows = torch.arange(2, dtype=torch.float32).reshape(2, 1).expand(2, HEAD_DIM)
@@ -297,173 +225,48 @@ def test_the_prolog_does_not_mutate_kv():
     torch.testing.assert_close(kv, before)
 
 
-# ------------------------------- the chain points between attn.in and sa_in.q
-
-def test_the_pre_rope_value_is_offered_to_the_caller():
-    """🔴 Three operations sit between q's projection and sa_in.q, and any of
-    them can be the wrong one.
-
-        q.wq_b_out   after wq_b, before any norm
-        q.pre_rope   after the weight-free per-head RMSNorm   <- this one
-        sa_in.q      after the GPT-J rotation
-
-    Without the middle value, "sa_in.q differs" names a three-operation
-    segment and costs a bisection per flight. The tap is a caller-supplied
-    callable because this module has no layer identity and the caller does.
-    """
-    seen = {}
-    q = torch.randn(3, 2, 8, dtype=torch.bfloat16)
-    kv = torch.randn(3, 8, dtype=torch.bfloat16)
-    cos_sin = torch.zeros(16, 4, dtype=torch.float32)
-    cos_sin[:, :2] = 1.0
-
-    out = qnorm_rope_kv_insert(
-        q=q, kv=kv, positions=torch.arange(3),
-        cos_sin_cache=cos_sin, swa_kv_cache=torch.zeros(2, 4, 8),
-        slot_mapping=torch.tensor([0, 1, 2], dtype=torch.int32),
-        eps=1e-6, rope_head_dim=4,
-        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
-
-    assert set(seen) == {"rope.q.in", "rope.kv.out"}
-    # ⚠️ This used to assert the value was `rms_norm_weightless(q)`, and it
-    # was green -- because it was written from the implementation rather than
-    # from the contract, and the implementation was running V4.0's norm. A
-    # test that states what the code does cannot go red when the code is
-    # wrong; it testifies for the defect instead.
-    #
-    # The contract: the rotation's input is the projected query, and only the
-    # slice the rotation touches (the leading dims pass through and are
-    # already in sa_in.q).
-    torch.testing.assert_close(seen["rope.q.in"].to(torch.float32),
-                               q[..., -4:].to(torch.float32))
-    assert seen["rope.q.in"].shape == (3, 2, 4)
-    assert out.shape == (3, 2, 8)
-
-
-def test_the_rotation_still_happens_on_the_tapped_value():
-    """The tap must observe the value the next step consumes, not a copy that
-    the next step then ignores -- an instrument that reads a dead branch is
-    the failure this module has already had once."""
-    q = torch.randn(2, 1, 8, dtype=torch.bfloat16)
-    cos_sin = torch.zeros(8, 4, dtype=torch.float32)
-    cos_sin[:, :2] = 0.5
-    cos_sin[:, 2:] = 0.25
-    seen = {}
-    out = qnorm_rope_kv_insert(
-        q=q, kv=torch.randn(2, 8, dtype=torch.bfloat16),
-        positions=torch.arange(2), cos_sin_cache=cos_sin,
-        swa_kv_cache=torch.zeros(2, 4, 8),
-        slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
-        eps=1e-6, rope_head_dim=4,
-        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
-    nope = 8 - 4
-    # The tapped slice is the rotation's input; the rotation changed it.
-    assert not torch.allclose(out[..., nope:].to(torch.float32),
-                              seen["rope.q.in"].to(torch.float32))
-    # And the leading dims the tap deliberately omits did pass through
-    # untouched -- which is both why omitting them loses nothing and why the
-    # q path must carry no norm: a norm would change them too.
-    torch.testing.assert_close(out[..., :nope].to(torch.float32),
-                               q[..., :nope].to(torch.float32),
-                               rtol=2e-2, atol=2e-2)
-
-
-def test_no_tap_is_the_default_and_changes_nothing():
-    q = torch.randn(2, 1, 8, dtype=torch.bfloat16)
-    kv = torch.randn(2, 8, dtype=torch.bfloat16)
-    cos_sin = torch.zeros(8, 4, dtype=torch.float32)
-    cos_sin[:, :2] = 1.0
-    args = dict(positions=torch.arange(2), cos_sin_cache=cos_sin,
-                slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
-                eps=1e-6, rope_head_dim=4)
-    a = qnorm_rope_kv_insert(
-        q=q, kv=kv, swa_kv_cache=torch.zeros(2, 4, 8), **args)
-    b = qnorm_rope_kv_insert(
-        q=q, kv=kv, swa_kv_cache=torch.zeros(2, 4, 8),
-        tap=lambda key, tensor: None, **args)
-    assert torch.equal(a, b)
-
-
-def test_the_post_rope_kv_is_offered_and_is_what_reaches_the_cache():
-    """🔴 The key the kv path did not have.
-
-    sa_in.kv is this function's *argument*, which upstream's contract keeps
-    unrotated ("kv is unchanged; attention reads kv solely via
-    swa_kv_cache"), so over the rope slice it sits a stage below golden's key
-    of the same name -- and a difference there has the exact signature of a
-    missing rotation. Measured on flight-24 that it is a stage mismatch and
-    not a missing rotation; this key is what makes the slice comparable
-    again.
-    """
-    seen = {}
-    kv = torch.randn(3, 8, dtype=torch.bfloat16)
-    cache = torch.zeros(2, 4, 8, dtype=torch.bfloat16)
-    cos_sin = torch.zeros(16, 4, dtype=torch.float32)
-    cos_sin[:, :2] = 0.5
-    cos_sin[:, 2:] = 0.25
-    slots = torch.tensor([0, 1, 2], dtype=torch.int32)
-
-    qnorm_rope_kv_insert(
-        q=torch.randn(3, 1, 8, dtype=torch.bfloat16), kv=kv,
-        positions=torch.arange(3), cos_sin_cache=cos_sin,
-        swa_kv_cache=cache, slot_mapping=slots, eps=1e-6, rope_head_dim=4,
-        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
-
-    # It is the rotated kv, not the argument.
-    assert not torch.allclose(seen["rope.kv.out"][:, -4:].to(torch.float32),
-                              kv[:, -4:].to(torch.float32))
-    # And it is what landed in the cache -- the whole point of the key.
-    for t in range(3):
-        torch.testing.assert_close(
-            cache[0, t].to(torch.float32),
-            seen["rope.kv.out"][t].to(torch.float32), rtol=1e-2, atol=1e-2)
-
-
 # ----------------------------- the q path applies no norm of its own (A-2)
 
 def test_the_q_path_rotates_the_projected_query_with_no_norm_of_its_own():
-    """🔴 A-2. V4.1 passes apply_q_norm=False; this decomposition did not.
+    """V4.1 passes apply_q_norm=False to the shared fused op.
 
-    The fused op is shared by both models and its signature ends
-    ``bool apply_q_norm=True`` (csrc/libtorch_stable/torch_bindings.cpp:441).
-    V4.0 omits the argument and gets the norm; V4.1 passes False at every one
-    of its call sites (deepseek_v4_1/attention.py:881, :901). This module was
-    transcribed from V4.0's description of the same op
-    (deepseek_v4/cpu/cpu_sparse.py:426, "Q side does per-head weight-free
-    RMSNorm + GPT-J RoPE") and carried the default over with it.
-
-    The reference agrees, read directly rather than taken second-hand
-    (dsv41_golden/ref/model.py:770-772)::
-
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-
-    Nothing between wq_b and the rotation.
+    The reference implementation agrees (inference/model.py,
+    Attention.forward: wq_b then apply_rotary_emb, with no norm in between).
     """
-    seen = {}
     torch.manual_seed(0)
     # Rows with very different magnitudes: a per-row norm collapses them and
-    # a correct path does not, so the two outcomes are far apart rather than
-    # a few ULP apart.
+    # a correct path does not, so the two outcomes are far apart.
     q = torch.randn(3, 2, 8, dtype=torch.bfloat16)
     q[0] *= 8.0
     q[2] *= 0.125
     cos_sin = torch.zeros(16, 4, dtype=torch.float32)
-    cos_sin[:, :2] = 1.0
+    cos_sin[:, :2] = 0.5
+    cos_sin[:, 2:] = 0.25
+    positions = torch.arange(3)
 
-    qnorm_rope_kv_insert(
+    out = qnorm_rope_kv_insert(
         q=q, kv=torch.randn(3, 8, dtype=torch.bfloat16),
-        positions=torch.arange(3), cos_sin_cache=cos_sin,
+        positions=positions, cos_sin_cache=cos_sin,
         swa_kv_cache=torch.zeros(2, 4, 8, dtype=torch.bfloat16),
         slot_mapping=torch.tensor([0, 1, 2], dtype=torch.int32),
-        eps=1e-6, rope_head_dim=4,
-        tap=lambda key, tensor: seen.__setitem__(key, tensor.clone()))
+        eps=1e-6, rope_head_dim=4)
 
-    # What enters the rotation is the projected query itself.
-    torch.testing.assert_close(seen["rope.q.in"].to(torch.float32),
-                               q[..., -4:].to(torch.float32),
-                               rtol=1e-2, atol=1e-2)
+    from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
+
+    cos, sin = cos_sin_for_slice(cos_sin, positions, 4)
+    expect = rope_tail(q, cos, sin, 4).to(q.dtype)
+    torch.testing.assert_close(out, expect)
+
+
+def test_padded_rows_beyond_the_slot_mapping_are_dropped():
+    """Under graph mode rows are padded to the capture size while the slot
+    mapping has the real token count; row i goes to slot i."""
+    cache = torch.full((2, 4, HEAD_DIM), 7.0)
+    rows = torch.arange(4, dtype=torch.float32).reshape(4, 1).expand(4, HEAD_DIM)
+    scatter_rows(cache, rows.contiguous(), torch.tensor([5, -1]), 4)
+    flat = cache.view(-1, HEAD_DIM)
+    assert torch.all(flat[5] == 0.0)
+    assert torch.all(flat[0] == 7.0)
 
 
 def test_the_weightless_norm_is_not_on_the_q_path_at_all():

@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Every constraint sparse_flash_mla states about itself, checked on CPU.
 
-The twelve rules below were measured on card 7 under CANN 9.2.0-beta.2 as the
-operator's own rejection text (build_artifacts/KERNEL_LINE_SNAPSHOT_20260911.md
-section 3). On a card they arrive one at a time, each costing a launch and a
-round trip; here they arrive together, in 30ms, with no card involved.
+The rules are the operator's own rejection text (CANN 9.2). On a card they
+arrive one at a time, each costing a launch; here they arrive together.
 
 Each rule gets two tests where it can: that a violation is caught, and that the
 valid form passes. A validator that rejected everything would satisfy the first
@@ -50,8 +48,7 @@ def _ori_only(**overrides):
         cmp_ratio=1,
         ori_win_left=127,
         ori_win_right=0,
-        # Window-only layers pass mask mode 4; a layer attending a compressed
-        # stream passes 0. See dsa_v1's ori_mask_mode selection.
+        # Without an explicit index list every layer is mask mode 4.
         ori_mask_mode=4,
         cmp_mask_mode=0,
     )
@@ -163,11 +160,21 @@ def test_q_head_dim_must_be_512(q):
         _validate(_ori_only(), torch.zeros(NUM_TOKENS, NUM_HEADS, 448))
 
 
-def test_a_compressed_stream_must_disable_both_bounds(q):
-    """Half-disabled counts as windowed: one bound left set is still a window."""
+def test_window_bounds_need_a_window_capable_ratio(q):
+    """Half-disabled counts as windowed: one bound left set is still a window.
+    The operator documents cmp_ratio 1 for SWA mode, and CANN 9.2 also accepts
+    2; any other ratio with a bound set is refused."""
     for left, right in ((127, -1), (-1, 0), (127, 0)):
         with pytest.raises(ValueError, match="SWA mode|ori_win_left = ori_win_right"):
-            _validate(_with_compressed(ori_win_left=left, ori_win_right=right), q)
+            _validate(_with_compressed(cmp_ratio=4, ori_win_left=left,
+                                       ori_win_right=right), q)
+
+
+def test_a_ratio_two_compressed_layer_may_keep_its_window(q):
+    """V4.1 layers 2..19: mode 4 with bounds 127/0 at cmp_ratio 2."""
+    ok = _with_compressed(cmp_ratio=2, ori_win_left=127, ori_win_right=0,
+                          ori_mask_mode=4)
+    assert _validate(ok, q) is not None
 
 
 def test_the_mask_mode_rule_records_how_its_signal_was_found(q):
@@ -193,9 +200,10 @@ def test_the_mask_mode_rule_records_how_its_signal_was_found(q):
     assert _validate(_ori_only(ori_mask_mode=4), q) is not None
 
 
-def test_a_windowed_layer_may_not_also_carry_a_compressed_stream(q):
+def test_a_windowed_layer_at_another_ratio_is_refused(q):
     with pytest.raises(ValueError, match="SWA mode requires cmp_ratio = 1"):
-        _validate(_with_compressed(ori_win_left=127, ori_win_right=0), q)
+        _validate(_with_compressed(cmp_ratio=4, ori_win_left=127,
+                                   ori_win_right=0), q)
 
 
 def test_cmp_ratio_zero_is_never_legal_at_this_boundary(q):
@@ -227,11 +235,8 @@ def test_a_paged_compressed_stream_without_lengths_is_left_to_the_adapter(q):
 def test_cmp_residual_kv_is_one_value_per_request_not_kv_data(q):
     """Despite the name. The operator's own words: 'incorrect shape dim 3.
     It should be 1'."""
-    # ⚠️ These two were passing for the wrong reason until 2026-09-13: at
-    # cmp_ratio=1 with a compressed stream the *window* check fired first,
-    # and a bare `pytest.raises(ValueError)` was satisfied by it. The match=
-    # string is what makes the assertion about the residual rather than about
-    # whichever check happens to be first.
+    # match= keeps the assertion about the residual rather than about
+    # whichever check happens to fire first.
     with pytest.raises(ValueError, match="It should be 1"):
         _validate(_with_compressed(cmp_ratio=1,
                                    cmp_residual_kv=torch.zeros(NUM_REQUESTS, 8, 512)), q)
@@ -294,9 +299,9 @@ def test_a_window_only_layer_keeps_its_bounds_and_mask_mode_4():
     assert "cmp_kv" not in built and "cmp_mask_mode" not in built
 
 
-def test_a_compressed_layer_disables_its_bounds():
-    """Not a preference -- the operator rejects bounds alongside a compressed
-    stream."""
+def test_a_ratio_two_compressed_layer_keeps_its_window():
+    """The reference semantics: the 128-token window plus the ratio-2 causal
+    compressed entries. CANN 9.2 accepts mode 4 with bounds at cmp_ratio 2."""
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
         build_sparse_flash_mla_kwargs
 
@@ -305,8 +310,8 @@ def test_a_compressed_layer_disables_its_bounds():
         cmp_kv=torch.zeros(4, 8, 1, HEAD_DIM),
         cmp_block_table=torch.zeros(NUM_REQUESTS, 2, dtype=torch.int32),
         seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32)))
-    assert built["ori_mask_mode"] == 0
-    assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1)
+    assert built["ori_mask_mode"] == 4
+    assert (built["ori_win_left"], built["ori_win_right"]) == (127, 0)
     assert built["cmp_mask_mode"] == 3
 
 
@@ -489,18 +494,19 @@ def test_window_bounds_without_indices_stay_sliding_window():
     assert kwargs["ori_win_left"] == 127
 
 
-def test_a_compressed_stream_is_mode_zero_too_but_for_another_reason():
-    """Two configurations share a value and not a cause; naming the constant
-    after either one is how the first version went wrong."""
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import NO_MASK_MODE
+def test_a_compressed_stream_without_indices_is_sliding_window():
+    """Mode 0 is NO_MASK; without an index list only the window masks the
+    original stream."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+        SLIDING_WINDOW_MASK_MODE
 
     kwargs = _built(attends_compressed=True, ori_sparse_indices=None,
                     cmp_kv=torch.zeros(2, 32, 1, 512, dtype=torch.bfloat16),
                     cmp_block_table=torch.zeros((3, 4), dtype=torch.int32),
                     seqused_cmp_kv=torch.ones(3, dtype=torch.int32),
                     cmp_ratio=2)
-    assert kwargs["ori_mask_mode"] == NO_MASK_MODE
-    assert kwargs["ori_win_left"] == -1
+    assert kwargs["ori_mask_mode"] == SLIDING_WINDOW_MASK_MODE
+    assert kwargs["ori_win_left"] == 127
 
 
 def _tables(num_blocks=8, block=128, max_id=3, longest=256):
@@ -576,7 +582,7 @@ def test_the_bounds_come_from_the_tensor_not_a_configured_value():
 # --------------------------------------------- two modes asked for at once
 
 def test_ori_indices_with_a_compressed_stream_are_refused():
-    """🔴 EZ0027, in this frame instead of in the operator.
+    """EZ0027, in this frame instead of in the operator.
 
     ori_sparse_indices does not add to whatever mode the call is in -- it
     selects SWA ("ori_sparse_indices is only supported in SWA mode"), and SWA
@@ -596,9 +602,8 @@ def test_ori_indices_with_a_compressed_stream_are_refused():
         _check_modes_are_not_both_requested(kwargs)
     message = str(excinfo.value)
     assert "only supported in SWA mode" in message
-    assert "MM_RANGES_REQUIRE_SPANS" in message, (
-        "the message names the rule and not the switch that most likely "
-        "produced it; the reader is mid-launch")
+    assert "select_ori_sparse_indices" in message, (
+        "the message names the rule but not where the indices come from")
 
 
 def test_ori_indices_alone_are_fine():
@@ -628,10 +633,8 @@ def test_a_call_with_neither_is_fine():
 
 
 def test_the_operators_own_rules_are_recorded_with_their_provenance():
-    """⚠️ These were read out of the operator's host library, not inferred
-    from the one error we hit. Pinning the provenance here because the next
-    contradiction in this family will be resolved by re-reading that file,
-    and a rule with no source is a rule nobody can re-check."""
+    """These were read out of the operator's host library; the provenance is
+    pinned so the rules can be re-checked against it."""
     import inspect
 
     from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args
@@ -646,13 +649,8 @@ def test_the_operators_own_rules_are_recorded_with_their_provenance():
 
 
 def test_the_builder_actually_runs_the_two_mode_check():
-    """⚠️ Placement, not presence.
-
-    Mutation-tested: removing the call from the validator left every direct
-    test of the guard green. A guard nothing on the production path invokes
-    is the same shape as install_alignment_taps, which had twelve callers and
-    all of them tests.
-    """
+    """Placement, not presence: removing the call from the validator leaves
+    every direct test of the guard green."""
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
         build_sparse_flash_mla_kwargs
 
@@ -670,123 +668,37 @@ def test_the_builder_actually_runs_the_two_mode_check():
         ))
 
 
-# ------------------------------- what masks the original stream when nothing does
+# ------------------------------- what masks the original stream
 
-def test_indices_present_is_never_sliding_window(monkeypatch):
-    """Both sides of the switch. An index list supplies the masking itself,
-    so the window bounds have nothing left to say either way."""
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-        is_plain_sliding_window
-
-    for value in ("0", "1"):
-        monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES",
-                           value)
-        assert is_plain_sliding_window(True, object()) is False
-        assert is_plain_sliding_window(False, object()) is False
-
-
-def test_by_default_a_compressed_layer_still_sends_no_mask(monkeypatch):
-    """🔴 Today's behaviour, stated so the change is one variable.
-
-    38 of V4.1's 40 layers attend a compressed stream, so this is the default
-    on almost the whole model: ori_mask_mode 0 (NO_MASK) with the window
-    bounds at -1 and, since the mm-ranges switch, no index list either --
-    nothing masking the original stream at all.
-    """
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-        is_plain_sliding_window
-
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-        ori_mask_mode_for
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "0")
-    assert is_plain_sliding_window(True, None) is False
-    assert ori_mask_mode_for(True, None) == 0, "NO_MASK, on 38 of 40 layers"
-    assert is_plain_sliding_window(False, None) is True
-
-
-def test_with_the_switch_a_compressed_layer_becomes_causal(monkeypatch):
-    """⚠️ 3, not 4. Mode 4 was the first guess and the operator rules it out
-    for these layers -- "SWA mode requires cmp_ratio=1", and layers 2..19
-    carry 2. This line's own host check already encoded that rule and refused
-    the mode-4 attempt: the guard was right and the hypothesis was mine."""
+def test_indices_present_is_never_sliding_window():
+    """An index list supplies the masking itself (ori-only sparse mode)."""
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-        is_plain_sliding_window, ori_mask_mode_for)
+        NO_MASK_MODE, is_plain_sliding_window, ori_mask_mode_for)
 
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
-    assert ori_mask_mode_for(True, None) == 3
-    # and still not sliding window, so no window bounds are sent -- which is
-    # what "Non-sliding-window modes require ori_win_left=ori_win_right=-1"
-    # demands of mode 3.
-    assert is_plain_sliding_window(True, None) is False
-    # A layer with no compressed stream is untouched: it was already masked.
-    assert ori_mask_mode_for(False, None) == 4
+    assert is_plain_sliding_window(object()) is False
+    assert ori_mask_mode_for(object()) == NO_MASK_MODE
 
 
-def test_the_switch_reaches_the_mask_triple(monkeypatch):
+def test_no_indices_is_always_sliding_window():
+    """Every V4.1 layer without an index list takes the window, whether or
+    not it also attends a compressed stream."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
+        SLIDING_WINDOW_MASK_MODE, is_plain_sliding_window, ori_mask_mode_for)
+
+    assert is_plain_sliding_window(None) is True
+    assert ori_mask_mode_for(None) == SLIDING_WINDOW_MASK_MODE
+
+
+@pytest.mark.parametrize("cmp_ratio", [1, 2])
+def test_the_window_reaches_the_call_on_compressed_layers(cmp_ratio):
+    """Placement: mode and both bounds move together. A mode-4 call with the
+    bounds at -1 is refused ("The value of attn_mask cannot be nullptr when
+    the mask_mode=4"), and a mode-0 call with real bounds is refused too."""
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
         build_sparse_flash_mla_kwargs
 
-    """Placement: the predicate is what the builder keys the whole triple on,
-    so the switch has to move mask mode and both window bounds together. A
-    mode-4 call with the bounds still at -1 is refused ("The value of
-    attn_mask cannot be nullptr when the mask_mode=4"), and a mode-0 call with
-    real bounds is refused too ("Non-sliding-window modes require
-    ori_win_left=ori_win_right=-1")."""
-    compressed = dict(
-        cmp_ratio=2,
-        attends_compressed=True,
-        cmp_kv=torch.zeros(4, 32, 1, HEAD_DIM),
-        cmp_block_table=torch.zeros(NUM_REQUESTS, 4, dtype=torch.int32),
-        seqused_cmp_kv=torch.tensor([2, 3, 2], dtype=torch.int32),
-        cmp_residual_kv=torch.zeros(NUM_REQUESTS, dtype=torch.int32),
-    )
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
-    built = build_sparse_flash_mla_kwargs(**_common(**compressed))
-    assert built["ori_mask_mode"] == 3
-    assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1), (
-        "mode 3 is a non-sliding-window mode, and the operator requires both "
-        "bounds at -1 there")
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "0")
-    built = build_sparse_flash_mla_kwargs(**_common(**compressed))
-    assert built["ori_mask_mode"] == 0, (
-        "today's default: NO_MASK on a layer whose original stream has "
-        "neither a window nor an index list")
-    assert (built["ori_win_left"], built["ori_win_right"]) == (-1, -1)
-
-
-# --------------- the window is allowed on half of the compressed layers
-
-def test_a_ratio_one_layer_gets_its_window_back(monkeypatch):
-    """🔵 Twenty of the thirty-eight unmasked layers are entitled to the real
-    window, not a bare causal mask.
-
-    The operator's rule is "SWA mode requires cmp_ratio=1", and
-    _dsa_swa_only_cmp_ratio sends 1 for every layer whose configured ratio is
-    0 or 1 -- which is layers 20..39. Treating all thirty-eight the same was
-    the first shape of this fix and it would have thrown sliding_window=128
-    away on the half entitled to it.
-    """
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-        is_plain_sliding_window, ori_mask_mode_for)
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
-    assert ori_mask_mode_for(True, None, cmp_ratio=1) == 4
-    assert is_plain_sliding_window(True, None, cmp_ratio=1) is True
-    # ...and a ratio-2 layer still cannot have one.
-    assert ori_mask_mode_for(True, None, cmp_ratio=2) == 3
-    assert is_plain_sliding_window(True, None, cmp_ratio=2) is False
-
-
-def test_the_ratio_one_window_reaches_the_call(monkeypatch):
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-        build_sparse_flash_mla_kwargs
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
     built = build_sparse_flash_mla_kwargs(**_common(
-        cmp_ratio=1,
+        cmp_ratio=cmp_ratio,
         attends_compressed=True,
         cmp_kv=torch.zeros(4, 32, 1, HEAD_DIM),
         cmp_block_table=torch.zeros(NUM_REQUESTS, 4, dtype=torch.int32),
@@ -796,63 +708,9 @@ def test_the_ratio_one_window_reaches_the_call(monkeypatch):
     assert (built["ori_win_left"], built["ori_win_right"]) == (127, 0)
 
 
-def test_the_switch_off_is_unchanged_everywhere(monkeypatch):
-    """Two arms. With the switch off both ratios still send NO_MASK, so the
-    flight measures one variable."""
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
-        ori_mask_mode_for
-
-    monkeypatch.delenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES",
-                       raising=False)
-    assert ori_mask_mode_for(True, None, cmp_ratio=1) == 0
-    assert ori_mask_mode_for(True, None, cmp_ratio=2) == 0
-
-
-# ------------------------------------- runtime evidence, not an assertion
-
-def test_the_histogram_records_what_was_actually_sent(monkeypatch):
-    """🔴 An experiment whose only observable is "the variable was set"
-    cannot tell "the branch did not run" from "the branch ran and did not
-    help" -- and those have opposite next steps."""
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-        mask_mode_histogram, ori_mask_mode_for, reset_mask_mode_histogram)
-
-    reset_mask_mode_histogram()
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES", "1")
-    for _ in range(18):
-        ori_mask_mode_for(True, None, cmp_ratio=2)
-    for _ in range(20):
-        ori_mask_mode_for(True, None, cmp_ratio=1)
-    for _ in range(2):
-        ori_mask_mode_for(False, None, cmp_ratio=1)
-
-    assert mask_mode_histogram() == {
-        "mode=3,cmp_ratio=2": 18,
-        "mode=4,cmp_ratio=1": 22,
-    }
-    reset_mask_mode_histogram()
-
-
-def test_the_histogram_shows_the_switch_off_shape(monkeypatch):
-    from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
-        mask_mode_histogram, ori_mask_mode_for, reset_mask_mode_histogram)
-
-    reset_mask_mode_histogram()
-    monkeypatch.delenv("VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES",
-                       raising=False)
-    for _ in range(38):
-        ori_mask_mode_for(True, None, cmp_ratio=2)
-    assert mask_mode_histogram() == {"mode=0,cmp_ratio=2": 38}, (
-        "38 layers on NO_MASK is the shape the switch is supposed to change; "
-        "if a flight shows this with the switch on, the branch never ran")
-    reset_mask_mode_histogram()
-
-
 def test_seqused_cmp_kv_is_held_to_its_rank_as_well_as_its_count(q):
-    """⚠️ The count alone does not pin the rank: a [1, 1] tensor has one
-    element too. cu_seqlens_q and cmp_residual_kv have had both checks from
-    the start; this one had only the count, and "two of the three parameters
-    are checked" is the shape that produced the last three defects here."""
+    """The count alone does not pin the rank: a [1, 1] tensor has one
+    element too."""
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
         validate_sparse_flash_mla_args
 
@@ -878,9 +736,7 @@ def test_the_rank_message_names_where_the_value_should_come_from(q):
 
 
 def test_a_cumulative_array_is_still_named_as_one(q):
-    """The check that has been running since 00cda201c: every production run
-    that reached layer 39 has already passed it, which is why a cumulative
-    array cannot be what is being sent."""
+    """num_requests + 1 values is named as the cumulative array it is."""
     from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
         validate_sparse_flash_mla_args
 
@@ -891,23 +747,8 @@ def test_a_cumulative_array_is_still_named_as_one(q):
         validate_sparse_flash_mla_args(kwargs, q, NUM_REQUESTS)
 
 
-def test_the_message_reads_the_switch_instead_of_asserting_it(monkeypatch):
-    """🔴 A sentence naming a runtime fact has to read it.
-
-    This message used to end with "MM_RANGES_REQUIRE_SPANS is off" as a plain
-    constant. Flight xr_eager_140615 died here and the switch's real state
-    could not be recovered from any artifact: the message asserted "off", the
-    provenance carried no env lines, and nothing else logged it. So the one
-    line that spoke about the switch was the one line that could not be
-    trusted about it.
-
-    ⚠️ Both values get a next action. With the switch ON the vision builder
-    is already blocked, so "set it to 1" would send someone to set something
-    that is already set -- a gap that does not raise, it just produces "this
-    one needs a human".
-    """
-    import torch
-
+def test_the_two_mode_refusal_names_the_runtime_values():
+    """The runtime values are what localise the call."""
     from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args as saa
 
     kwargs = {
@@ -915,22 +756,7 @@ def test_the_message_reads_the_switch_instead_of_asserting_it(monkeypatch):
         "cmp_mask_mode": 3,
         "cmp_ratio": 2,
     }
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "0")
-    with pytest.raises(ValueError) as off:
-        saa._check_modes_are_not_both_requested(dict(kwargs))
-    assert "is OFF" in str(off.value)
-    assert "one-variable test" in str(off.value)
-
-    monkeypatch.setenv("VLLM_ASCEND_DSV41_MM_RANGES_REQUIRE_SPANS", "1")
-    with pytest.raises(ValueError) as on:
-        saa._check_modes_are_not_both_requested(dict(kwargs))
-    assert "is ON" in str(on.value)
-    assert "NOT the source" in str(on.value), (
-        "with the switch on, the message must not send anyone to set it")
-    assert "one-variable test" not in str(on.value)
-
-    # The runtime values stay in both, since they are what localises the call.
-    for exc in (off, on):
-        assert "cmp_mask_mode=3" in str(exc.value)
-        assert "cmp_ratio=2" in str(exc.value)
+    with pytest.raises(ValueError) as exc:
+        saa._check_modes_are_not_both_requested(kwargs)
+    assert "cmp_mask_mode=3" in str(exc.value)
+    assert "cmp_ratio=2" in str(exc.value)

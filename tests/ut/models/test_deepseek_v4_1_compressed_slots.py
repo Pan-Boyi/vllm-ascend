@@ -7,8 +7,6 @@ V4.1's writers index it *per token*. Read per token, the dense mapping writes
 the second compressed entry, never the first, and sends a later token to a
 slot belonging to whoever holds block 0.
 
-Every constant in :func:`test_the_rebuild_reproduces_the_measured_mapping`
-came off a flight, not off this file.
 """
 
 import pytest
@@ -46,12 +44,8 @@ class _Ctx:
 @pytest.fixture
 def ctx(monkeypatch):
     compressed_slots.reset_for_test()
-    # 🔴 Pinned, not assumed. The check stands down under graph capture, and
-    # torch.npu.is_current_stream_capturing is a module attribute another
-    # test can leave patched -- which it does: these tests passed alone and
-    # ten of them silently stopped raising in the full run, because the
-    # criterion had quietly stood down. An instrument that can be switched
-    # off by something outside the test has to be switched on by the test.
+    # Pinned: the check stands down under graph capture, and another test can
+    # leave torch.npu.is_current_stream_capturing patched.
     monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: False)
     holder = {"ctx": _Ctx()}
 
@@ -88,8 +82,8 @@ def _dense(num_tokens, ratio, num_reqs, blocks, page):
 
 # ------------------------------------------------- the rebuild is upstream's
 
-def test_the_rebuild_reproduces_the_measured_mapping(ctx):
-    """Flight-22, layer 2, T=5, ratio 2, one request, block 84, page 128.
+def test_the_rebuild_reproduces_upstreams_mapping(ctx):
+    """T=5, ratio 2, one request, block 84, page 128.
 
     Upstream would produce [-1, 10752, -1, 10753, -1]:
     position 1 closes state 0 (84 * 128 + 0) and position 3 closes state 1.
@@ -168,7 +162,7 @@ def test_the_rebuilt_mapping_passes(ctx):
                                                  (17, 3), (64, 7)])
 def test_length_cannot_tell_the_two_apart_but_the_valid_rows_can(
         ctx, num_tokens, num_reqs):
-    """🔴 The negative control for the criterion we did *not* use.
+    """The negative control for the criterion we did *not* use.
 
     Both mappings are T rows of int32 in the same value range, so a check on
     "how many rows" passes both -- at every batch shape. The dense mapping's
@@ -202,7 +196,7 @@ def test_length_cannot_tell_the_two_apart_but_the_valid_rows_can(
 
 def test_containment_not_equality_so_padding_is_not_an_error(ctx):
     """A boundary row may legitimately be -1; a non-boundary row may not be
-    valid. Equality would turn ordinary padding into a refused flight."""
+    valid. Equality would turn ordinary padding into a refused run."""
     slots = torch.tensor([-1, 10752, -1, -1, -1], dtype=torch.int32)
     compressed_slots.check_per_token(slots, torch.arange(5), 2, "w", ("c2", ))
 
@@ -212,59 +206,10 @@ def test_ratio_one_has_no_boundary_to_violate(ctx):
     compressed_slots.check_per_token(slots, torch.arange(4), 1, "w", ("c1", ))
 
 
-# ------------------------------------- the criterion is also the instrument
-
-def _announcements(monkeypatch):
-    lines = []
-
-    class _Logger:
-        @staticmethod
-        def info(fmt, *args):
-            lines.append(fmt % args)
-
-    import vllm.logger
-    monkeypatch.setattr(vllm.logger, "logger", _Logger)
-    return lines
-
-
-def test_passing_is_announced_once_per_site(ctx, monkeypatch):
-    """🔴 Silence has to mean something.
-
-    "No exception" is true both when a writer's mapping is right and when the
-    writer never ran at all -- and the indexer half of this fix has no
-    runtime coverage to distinguish them. So the check speaks when it passes,
-    once per (consumer, layer, ratio), and a flight's log answers "did both
-    writers run, and on which layers" without a new tap.
-    """
-    lines = _announcements(monkeypatch)
-    slots = torch.tensor([-1, 10752, -1, 10753, -1], dtype=torch.int32)
-    for _ in range(3):
-        compressed_slots.check_per_token(slots, torch.arange(5), 2,
-                                         "rope_quant_insert", ("layer_02", ))
-    assert len(lines) == 1
-    assert "consumer=rope_quant_insert" in lines[0]
-    assert "layers=1:[layer_02]" in lines[0]
-    assert "ratio=2" in lines[0]
-
-    compressed_slots.check_per_token(slots, torch.arange(5), 2,
-                                     "indexer_k_store", ("indexer_layer", ))
-    assert len(lines) == 2, "a second consumer is a second site"
-    assert "consumer=indexer_k_store" in lines[1]
-
-
-def test_a_writer_that_never_runs_announces_nothing(ctx, monkeypatch):
-    """The half of the reading that makes the other half worth having."""
-    lines = _announcements(monkeypatch)
-    compressed_slots.check_per_token(
-        torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2,
-        "rope_quant_insert", ("layer_02", ))
-    assert len(lines) == 1
-    assert not [line for line in lines if "indexer_k_store" in line]
-
+# ------------------------------------------------------------- the budget
 
 def test_the_budget_is_per_site_not_global(ctx, monkeypatch):
     """A busy consumer must not spend the budget of a quiet one."""
-    _announcements(monkeypatch)
     slots = torch.tensor([-1, 0], dtype=torch.int32)
     for _ in range(compressed_slots.CHECK_LIMIT + 4):
         compressed_slots.check_per_token(slots, torch.arange(2), 2, "busy",
@@ -279,7 +224,6 @@ def test_a_spent_budget_stops_checking(ctx, monkeypatch):
     """Stated rather than discovered: past the budget the check is silent on
     failure too, because it reads index sets back to the host and cannot run
     every forward. The budget is what bounds that cost."""
-    _announcements(monkeypatch)
     dense = torch.tensor([0, -1], dtype=torch.int32)
     for _ in range(compressed_slots.CHECK_LIMIT):
         with pytest.raises(ValueError):
@@ -308,8 +252,8 @@ def test_no_metadata_at_all_is_refused_not_defaulted(ctx):
 
 
 def test_the_label_lookup_answers_rather_than_raises(ctx):
-    """layer_owning only labels a log line; it must not turn a working write
-    into a failed one."""
+    """layer_owning only labels an error message; it must not turn a working
+    write into a failed one."""
     ctx(None)
     assert compressed_slots.layer_owning(
         torch.zeros(2, dtype=torch.int32)) == ()
@@ -326,12 +270,10 @@ def test_the_check_stands_down_under_capture_without_spending_its_budget(
     warmup would use it up and the eager calls that follow -- the ones that
     can actually be checked -- would be silently skipped.
     """
-    lines = _announcements(monkeypatch)
     dense = torch.tensor([0, -1], dtype=torch.int32)
     monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: True)
     for _ in range(compressed_slots.CHECK_LIMIT + 2):
         compressed_slots.check_per_token(dense, torch.arange(2), 2, "w", ("l", ))
-    assert lines == []
 
     monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: False)
     with pytest.raises(ValueError, match="not group boundaries"):
@@ -341,15 +283,7 @@ def test_the_check_stands_down_under_capture_without_spending_its_budget(
 # --------------------------------- the label names every sharing layer
 
 def test_every_layer_sharing_one_mapping_is_named(ctx):
-    """🔴 What flight-23 could not answer.
-
-    Four "convention OK" lines named layers 2 and 20, and there was no way
-    to tell whether layers 8 and 14 were covered by those lines -- their
-    caches sharing one group, one builder and therefore one mapping -- or
-    had simply never run. Those are opposite conclusions about whether the
-    fix has runtime coverage there, and the first match in a dict was
-    deciding which one the reader saw.
-    """
+    """Layers whose caches share a group share one mapping; all are named."""
     shared = torch.zeros(5, dtype=torch.int32)
     req = _Req(shared, 128, ((84, ), ), [0, 5])
     other = _Req(torch.zeros(5, dtype=torch.int32), 32, ((1, ), ), [0, 5])
@@ -365,40 +299,21 @@ def test_every_layer_sharing_one_mapping_is_named(ctx):
         "3:[layers.2.attn, layers.8.attn, layers.14.attn]")
 
 
-def test_the_count_is_printed_even_for_one_layer(ctx, monkeypatch):
-    """So "one layer" and "a group's first member" stop reading the same."""
-    lines = _announcements(monkeypatch)
-    compressed_slots.check_per_token(
-        torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2, "w",
-        ("layers.20.attn", ))
-    assert "layers=1:[layers.20.attn]" in lines[0]
-    assert "a layer absent from every line did not run" in lines[0]
-
-
-def test_a_bare_string_is_one_layer_not_eight(ctx, monkeypatch):
-    """tuple("layer_02") splits into characters, and the log then reports a
-    plausible count of layers that do not exist. Found by a test that passed
-    a string; normalised rather than refused, because refusing would turn a
-    label mistake into a failed write."""
-    lines = _announcements(monkeypatch)
-    compressed_slots.check_per_token(
-        torch.tensor([-1, 0], dtype=torch.int32), torch.arange(2), 2, "w",
-        "layer_02")
-    assert "layers=1:[layer_02]" in lines[0]
+def test_a_bare_string_is_one_layer_not_eight(ctx):
+    """tuple("layer_02") would split into characters and name layers that do
+    not exist. Normalised rather than refused."""
+    with pytest.raises(ValueError, match=r"layers 1:\[layer_02\]"):
+        compressed_slots.check_per_token(
+            torch.tensor([0, -1], dtype=torch.int32), torch.arange(2), 2, "w",
+            "layer_02")
 
 
 # ------------------------- the ring's precondition, made executable
 
 def test_the_shipped_ring_shape_never_reads_across_a_block():
-    """🔴 The property nothing in the source states.
-
-    The reader takes its block from (position // capacity) and its row from
-    ((position - 1) % capacity), so those agree only while position and
-    position-1 share a block. Today they always do -- but only because
-    capacity 8 is a multiple of ratio 2. That is a coincidence of two
-    configuration numbers, and in the code it looks exactly like a designed
-    guarantee.
-    """
+    """The reader takes its block from (position // capacity) and its row
+    from ((position - 1) % capacity); with capacity 8 and ratio 2 those always
+    share a block."""
     assert compressed_slots.positions_that_read_across_a_block(8, 2, 4096) == []
     compressed_slots._RING_SHAPES_CHECKED.clear()
     compressed_slots.require_ring_capacity_divides(8, 2)
@@ -421,16 +336,9 @@ def test_a_shape_that_does_read_across_a_block_is_refused(capacity, ratio):
 @pytest.mark.parametrize("capacity", [2, 4, 6, 8, 16, 32, 128])
 @pytest.mark.parametrize("ratio", [2, 4])
 def test_the_closed_form_agrees_with_the_search(capacity, ratio):
-    """🔴 This is what found the closed form wrong.
-
-    The first version of the guard's docstring said the invariant was
-    `capacity % ratio == 0`. It is sufficient but not necessary -- (6, 4) is
-    safe and fails it -- and the real condition is gcd(capacity, ratio) > 1:
-    the attainable residues of k*capacity mod ratio are the multiples of the
-    gcd, and ratio-1 is one of those only when the gcd is 1.
-
-    The guard searches positions rather than evaluating either form, so the
-    shortcut is checked against it instead of standing in for it.
+    """The safe condition is gcd(capacity, ratio) > 1, not
+    capacity % ratio == 0: the attainable residues of k*capacity mod ratio are
+    the multiples of the gcd, and ratio-1 is one of those only when it is 1.
     """
     import math
 
@@ -461,17 +369,3 @@ def test_ratio_one_has_no_reader_to_protect():
     branch on COMPRESS_RATIO == 2, so no divisibility is required."""
     compressed_slots._RING_SHAPES_CHECKED.clear()
     compressed_slots.require_ring_capacity_divides(7, 1)
-
-
-def test_the_precondition_is_checked_before_the_capture_guard(ctx,
-                                                              monkeypatch):
-    """It is integer arithmetic over two configuration numbers, so neither a
-    graph capture nor a spent budget is a reason to skip it -- and what it
-    protects against is silent."""
-    compressed_slots.reset_for_test()
-    compressed_slots._RING_SHAPES_CHECKED.clear()
-    monkeypatch.setattr(compressed_slots, "_stream_is_capturing", lambda: True)
-    with pytest.raises(ValueError, match="read the previous position's row"):
-        compressed_slots.check_ring_mapping(
-            torch.tensor([0, 1, 2], dtype=torch.int32), torch.arange(3), 3,
-            "w", ("l", ), compress_ratio=2)

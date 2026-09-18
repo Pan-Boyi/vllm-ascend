@@ -7,12 +7,10 @@ platform-specific sparse attention to a subclass. The CUDA subclasses live in
 ``vllm/models/deepseek_v4_1/nvidia/`` and the ROCm one in ``amd/rocm.py``; this
 is the Ascend one.
 
-Only three methods are ``@abstractmethod`` upstream, but that is the floor, not
-the real surface: the ROCm subclass overrides eleven, because the base class
-also reaches for CUDA C++ extensions (``torch.ops._C.fused_deepseek_v4_*`` in
-``_fused_qnorm_rope_kv_insert``) that are not behind any hook. ROCm gets those
-for free -- HIP compiles the same csrc and aliases ``torch.cuda`` -- and Ascend
-does not. Methods still to be filled in are marked below and raise rather than
+Besides the three abstract methods, the base class reaches for CUDA C++
+extensions (``torch.ops._C.fused_deepseek_v4_*`` in
+``_fused_qnorm_rope_kv_insert``) that are not behind any hook, so those
+methods are overridden here as well. Paths not covered here raise rather than
 silently doing the CUDA thing.
 """
 
@@ -42,8 +40,7 @@ from vllm_ascend.utils import oproj_tp_enable
 
 #: MX grouping the A5 quantised batch matmul expects: no grouping on the two
 #: batch axes, 32 elements per scale along the contraction axis. Mirrors
-#: DSAImpl._forward_o_proj in vllm_ascend/attention/dsa_v1.py, which is the
-#: established convention for this weight on this hardware.
+#: DSAImpl._forward_o_proj in vllm_ascend/attention/dsa_v1.py.
 MX_GROUP_SIZES = (0, 0, 32)
 
 #: npu_transpose_batchmatmul takes [tokens, groups, in] against
@@ -54,240 +51,12 @@ PERM_X2 = (0, 1, 2)
 PERM_Y = (1, 0, 2)
 
 
-#: One line per distinct state, not per layer per step.
-_LOGGED_SELECTION_STATES: set = set()
-
-
-def _describe_topk_length(topk_length, idx_host):
-    """`ori_topk_length` 只有一个正确性判据：逐行等于该行真实有效数。
-
-    不传它 ⇒ 算子按满宽度当「整行有效」，去 -1 padding 的槽 gather。
-    传一个属于【别的行】的 length，比不传更糟 —— 它看起来是对的。
-    ⇒ 所以这里不报"传了没有"，报的是它和索引表【对不对得上】。
-    """
-    if topk_length is None:
-        return "🔴 未传（算子会按满宽度当整行有效）"
-    try:
-        import torch
-        t = topk_length.detach().to("cpu")
-        real = (idx_host != -1).sum(dim=-1).reshape(-1)
-        got = t.reshape(-1)
-        if got.numel() != real.numel():
-            return (f"🔴 长度数不匹配: length {tuple(t.shape)} -> {got.numel()} 行，"
-                    f"索引表 {real.numel()} 行")
-        bad = int((got != real).sum().item())
-        if bad == 0:
-            return (f"✅ 逐行相等（{got.numel()} 行）"
-                    f" min={int(got.min())} max={int(got.max())}")
-        return (f"🔴 {bad}/{got.numel()} 行不等 —— 这个 length 描述的不是这张表"
-                f" (length max={int(got.max())} 实际 max={int(real.max())})")
-    except Exception as e:  # 取证失败不能顺带打死这一发
-        return f"⚠️ 算不出来（不算通过）: {e!r}"
-
-def _log_ori_sparse_indices(prefix, source, idx, num_tokens, caller=None,
-                            topk_length=None):
-    """Report the original-stream index list by its *content*, not by presence.
-
-    ``is None`` is not the question. These lists are built into a preallocated
-    buffer, and a buffer that was never written is neither None nor zero -- it
-    holds whatever was there. The operator gathers the original stream through
-    it, so a never-written buffer is an out-of-range gather, which is what an
-    aicore exception with non-zero MTE error info looks like.
-
-    The tell is the padding: a list that was really built carries -1 in the
-    slots it did not fill. No -1 at all, with a large or unpatterned maximum,
-    means nothing wrote it.
-    """
-    import os
-
-    from vllm.logger import logger
-
-    # 🔴 捕获门必须在 env 门【之前】。原来只有下面那道 env 门 ——
-    #    而"环境门"不是"捕获门":DSV41_SAS_DUMP_MAX 一被设上,这个函数就会在
-    #    图捕获期做 .item() / (flat == -1) 的 host 读回。默认关着不等于安全,
-    #    只等于"还没有人踩到"。
-    if _skip_under_capture("ori sparse-indices dump"):
-        return
-    if int(os.environ.get("DSV41_SAS_DUMP_MAX", "0")) <= 0:
-        return
-    if idx is None:
-        logger.info("【ORI-IDX】%s: ori_sparse_indices=None (来源=无) "
-                    "ori_topk_length=%s 调用来自 %s",
-                    prefix, "无" if topk_length is None else "🔴非空但索引是None",
-                    caller)
-        return
-    try:
-        h = idx.detach().to("cpu").contiguous()
-        flat = h.reshape(-1)
-        n_neg1 = int((flat == -1).sum().item())
-        mx = int(flat.max().item()) if flat.numel() else None
-        mn = int(flat.min().item()) if flat.numel() else None
-        verdict = ("🔴从未写过的buffer嫌疑(无 -1 填充)" if n_neg1 == 0
-                   else "有 -1 填充(写过)")
-        logger.info(
-            "【ORI-IDX】%s: 来源=%s shape=%s dtype=%s | min=%s max=%s "
-            "(==-1)=%d %s | 前8=%s | 量程对照: num_tokens=%s 末维=%s | "
-            "🔴ori_topk_length: %s | 调用来自 %s",
-            prefix, source, tuple(h.shape), h.dtype, mn, mx, n_neg1, verdict,
-            flat[:8].tolist(), num_tokens,
-            h.shape[-1] if h.dim() else None,
-            _describe_topk_length(topk_length, h),
-            caller,
-        )
-    except Exception as e:
-        logger.warning("【ORI-IDX】%s: 读不出来(不致命): %r", prefix, e)
-
-
-def _log_compressed_selection(*, prefix, layer_ratio, attends_compressed,
-                              buffer, num_tokens) -> None:
-    """Say whether the indexer's selection actually reaches the operator.
-
-    A register-level diff of two launches showed no zero argument slot becoming
-    an address after cmp_sparse_indices started being passed -- so it never
-    arrived, while the descriptor went on declaring cmp_topk. That is the
-    descriptor-versus-call disagreement again, one level down: the code says
-    both are gated on the same fact, and at runtime one of them did not fire.
-
-    The layer's ratio is printed beside the gate because the descriptor's
-    version of "attends a compressed stream" is computed in the metadata
-    builder from the *cache group's* ratio, and this one from the *layer's*.
-    Those are two different objects with the same meaning, and nothing so far
-    has shown them to agree.
-
-    Four numbers, because three of them cannot separate "no indices at all"
-    from "indices whose rows are all -1".
-    """
-    from vllm.logger import logger
-
-    has_buffer = buffer is not None
-    # Deduplicated per layer, not per state. A state key collapses every layer
-    # that shares one into a single line, and "the log names one layer" then
-    # reads as "one layer took this path" -- which is what it was read as.
-    if prefix in _LOGGED_SELECTION_STATES:
-        return
-    _LOGGED_SELECTION_STATES.add(prefix)
-
-    if not has_buffer:
-        logger.info(
-            "DSV4.1 %s: layer compress_ratio=%s attends_compressed=%s "
-            "topk_indices_buffer=None num_tokens=%s",
-            prefix, layer_ratio, attends_compressed, num_tokens)
-        return
-
-    if _skip_under_capture("ori-idx buffer describe"):
-        return
-    rows = buffer[:num_tokens]
-    capacity = int(rows.numel())
-    pad = int((rows == -1).sum())
-    selected = capacity - pad
-    # capacity and pad are both reported because "selected == capacity" is not
-    # "every slot was chosen": a buffer allocated with torch.empty and never
-    # written holds arbitrary values, almost all of them non-negative, and
-    # counts as full. Under a causal mask the early tokens cannot fill 512
-    # slots, so a *written* buffer always carries padding. No padding at all
-    # therefore means unwritten, not saturated -- and those want opposite
-    # investigations.
-    logger.info(
-        "DSV4.1 %s: layer compress_ratio=%s attends_compressed=%s "
-        "topk_indices_buffer=present selected=%s pad_minus_one=%s "
-        "capacity=%s num_tokens=%s%s",
-        prefix, layer_ratio, attends_compressed, selected, pad, capacity,
-        num_tokens,
-        "  [no padding at all: the buffer reads as never written]"
-        if pad == 0 else "")
-
-
-def _log_batch_shape(prefix, query_start_loc, seq_lens) -> None:
-    """The batch's segmentation, printed whole.
-
-    Not summarised as "num_requests", because the question this answers is
-    whether the batch is one prompt or a profile run's many dummy segments, and
-    a single count invites the reading that produced the last table: a value
-    derived from "there is one prompt" when that premise was never measured.
-    The segment boundaries are the evidence; the count is a consequence.
-    """
-    from vllm.logger import logger
-
-_CAPTURE_SKIP = {"skipped": 0, "ran": 0}
-
-
-def capture_skip_accounting() -> dict:
-    """无条件可读，包括全为零。"""
-    return dict(_CAPTURE_SKIP)
-
-
-def _skip_under_capture(what: str) -> bool:
-    """诊断类读数在捕获期【跳过】—— 它们把设备上的标量读回 host。
-
-    🔴 捕获期对 stream 的同步在任何捕获模式下都非法（实测 107027 /
-    ``LocalScalarDenseNpu.cpp:23``；CANN 把这一类叫 "dynamic control flow on
-    tensor values"）。这些函数只用来【打印一行】，不参与计算 —— 跳过它们
-    不改变任何数值。
-
-    ⚠️ 跳过是【偏宽松】的方向，所以要留痕：``capture_skip_accounting()``
-    无条件可读，否则"捕获期全跳过"和"跑过且没问题"读数一样。
-    ⚪ 捕获只发生在 warmup；真正的请求走 replay，不在捕获里
-      ⇒ eager 路径上这些诊断一次不少。
-    """
-    from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
-        _stream_is_capturing
-
-    if _stream_is_capturing():
-        _CAPTURE_SKIP["skipped"] += 1
-        return True
-    _CAPTURE_SKIP["ran"] += 1
-    return False
-
-
-    if prefix in _LOGGED_BATCH_SHAPES:
-        return
-    _LOGGED_BATCH_SHAPES.add(prefix)
-    if _skip_under_capture("batch shape log"):
-        return
-    starts = query_start_loc.tolist() if query_start_loc is not None else None
-    lens = seq_lens.tolist() if seq_lens is not None else None
-    logger.info(
-        "DSV4.1 %s batch: num_segments=%s cu_seqlens_q=%s seq_lens=%s",
-        prefix,
-        (len(starts) - 1) if starts else None,
-        starts if starts is None or len(starts) <= 40 else
-        f"{starts[:8]} ... {starts[-8:]} (len {len(starts)})",
-        lens if lens is None or len(lens) <= 40 else
-        f"{lens[:8]} ... {lens[-8:]} (len {len(lens)})")
-
-
-_LOGGED_BATCH_SHAPES: set = set()
-
-
-_PAD_TAIL = {"intact": 0, "repaired": 0, "last": None}
-
-
-def pad_tail_accounting() -> dict:
-    """无条件可读，包括全为零。"""
-    return dict(_PAD_TAIL)
-
-
-def _num_actual_tokens_or_none():
-    """这一次前向的【真实】token 数；拿不到就返回 None（调用方退回严格判据）。"""
-    from vllm.forward_context import get_forward_context
-
-    try:
-        ctx = get_forward_context()
-    except AssertionError:
-        return None
-    v = getattr(ctx, "num_actual_tokens", None)
-    if v is None:
-        md = getattr(ctx, "attn_metadata", None)
-        v = getattr(md, "num_actual_tokens", None) if md is not None else None
-    return int(v) if isinstance(v, int) else None
-
-
 def _is_real_batch() -> bool:
     """Whether this forward has scheduler metadata behind it.
 
     The same test ``sparse_indexer.forward_oot`` uses to decide not to write
     the selection buffer, so the reader and the writer agree on what a dummy
-    run is instead of each having its own idea.
+    run is.
     """
     from vllm.forward_context import get_forward_context
 
@@ -302,13 +71,10 @@ _WARNED_UNWRITTEN_SELECTION = False
 
 
 def _warn_unwritten_selection_on_dummy_run() -> None:
-    """Once per process, not once per layer per step.
+    """Warn once per process that a dummy run read the unwritten selection.
 
-    Said at all because the traceback that produced this branch also falsified
-    a comment: forward_oot said "during profiling nothing reads it at all",
-    and forward_mqa demonstrably does. Reading uninitialised memory on a dummy
-    run is harmless for the output, and it is still worth one line that it
-    happens.
+    Harmless for the output of a dummy run; on a real batch the same read
+    would be a defect, which is why ``_checked_selection`` raises there.
     """
     global _WARNED_UNWRITTEN_SELECTION
     if _WARNED_UNWRITTEN_SELECTION:
@@ -318,265 +84,12 @@ def _warn_unwritten_selection_on_dummy_run() -> None:
 
     logger.warning(
         "DSV4.1: a dummy/profile forward read the indexer selection buffer "
-        "before anything wrote it. Expected on that path -- the indexer skips "
-        "the write when there is no metadata -- and reported once because the "
-        "same buffer is uninitialised memory and a real batch reading it "
-        "would be a defect.")
-
-
-
-
-
-def _cache_page_size(cache) -> "int | None":
-    """Tokens per block, from the cache's own shape.
-
-    ``[num_blocks, block_size, ...]`` under PA_BBND, so axis 1 is the page.
-    Taken from the tensor rather than from the config: the two have already
-    disagreed once on this line, and the tensor is the one being indexed.
-    """
-    if not isinstance(cache, torch.Tensor) or cache.ndim < 2:
-        return None
-    return int(cache.shape[1])
-
-
-def _tap_chain_point(attn, key: str, tensor) -> None:
-    """One intermediate of the attn input chain, under its own key.
-
-    Position-sharded like the boundary taps, so it lands in the same
-    ``layer_NN`` file golden compares against. Never propagates: these are
-    observations of a value that is about to be used either way.
-    """
-    try:
-        from vllm_ascend.models.deepseek_v4_1 import align_taps
-
-        if not align_taps.alignment_active():
-            return
-        layer = align_taps.layer_index(
-            attn.prefix, attn.vllm_config.model_config.hf_text_config)
-        positions = align_taps.current_positions()
-        if positions is None:
-            return
-        align_taps.tap(layer, key, tensor, positions)
-    except Exception:                                        # noqa: BLE001
-        # Instrument. One of these has already cost a flight.
-        pass
-
-
-def _tap_write_side_kv(attn, kv, positions, slot_mapping, cache) -> None:
-    """What the original-stream cache is about to be given, before it is.
-
-    ⚠️ Pre-rope. ``qnorm_rope_kv_insert`` applies the rope inside, so this
-    tensor is the input to that and the cache row is the output -- comparing
-    the two directly is comparing across a rotation, which is exactly the
-    mistake that made a cosine of 0.15 look like a finding. The rope is an
-    orthogonal transform, so a *content* comparison at equal positions is
-    still valid; a positional one is not.
-
-    Recorded whole, because there is no token-position scatter to do here
-    that the reader could not do better with the slot mapping alongside.
-    """
-    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
-
-    if not align_taps.alignment_active():
-        return
-    try:
-        layer = align_taps.layer_index(
-            attn.prefix, attn.vllm_config.model_config.hf_text_config)
-        if not read_taps.records_reads(layer):
-            return
-        read_taps.tap_read(layer, "write.ori_kv.latent_pre_rope", kv)
-        read_taps.tap_read(layer, "write.ori_kv.positions", positions)
-        read_taps.tap_read(layer, "write.ori_kv.slots", slot_mapping)
-        # 🔴 Suffixed, not hashed. A raw pointer and a hash of it are both
-        # process-local, so neither can be equal across ranks; the only fix
-        # is to take the key out of the bit-exact comparison, and the suffix
-        # says so in the key itself so a comparator needs no exception list.
-        from vllm_ascend.models.deepseek_v4_1.compressor_insert import \
-            PROCESS_LOCAL
-
-        read_taps.tap_read(
-            layer, f"write.ori_kv.cache_ptr{PROCESS_LOCAL}",
-            torch.tensor([cache.data_ptr()], dtype=torch.int64))
-    except Exception:                                        # noqa: BLE001
-        # Instrument. One of these has already cost a flight.
-        pass
-
-
-_GRAPH_PROBE_ON: "bool | None" = None
-
-
-_WAIT_SAS: "bool | None" = None
-_WAIT_SAS_LOGGED = False
-
-
-def _wait_sas_enabled() -> bool:
-    """DSV41_WAIT_SAS_METADATA，默认开。设 0 恢复未加等待的行为。"""
-    global _WAIT_SAS
-    if _WAIT_SAS is None:
-        import os as _os
-        _WAIT_SAS = _os.getenv(
-            "DSV41_WAIT_SAS_METADATA", "1").strip() not in (
-                "0", "false", "False", "")
-    return _WAIT_SAS
-
-
-_KV_BLK_WARNED = False
-_PTR_LOGGED = 0
-#: 🔴 失败一次就【永久停用】(2026-09-15)。
-#: 第一版每个 forward 抛 4 次 aclnnIndexSelect。停用不是因为证明了它有害 ——
-#: 我一度据一次输出变化断定是它干的,核时间线后发现【那个失败探针在稳定的
-#: 那一发里就已经存在】,归因不成立,已撤回。
-#: 停用的理由是另一条:每步抛 4 次异常的仪器,其"无害"从来没有被证明过,
-#: 而它要服务的正是一个【间歇性】缺陷 —— 在这种场合,未经证明的仪器开销
-#: 本身就是一个无法排除的备选解释。把它压到每进程一次,这个备选就消失了。
-_KV_BLK_OK = True
-#: 算子标量的取值集合。按【取值】去重而不是按次数 —— 我们要的是
-#: "出现过哪几组",出现次数在这里没有信息。
-_SCALAR_SEEN: set = set()
-
-
-def _graph_probe_on() -> bool:
-    """图段内探针的开关 —— **整轮恒定**，捕获和重放必须读到同一个值。
-
-    缓存住,不是省时间:如果它在捕获期和重放期可能取到不同的值,
-    那句 copy 就会"录进图了但不该执行"或"该执行却没录进去",
-    两种都产生一个自洽而错误的 dump。
-    """
-    global _GRAPH_PROBE_ON
-    if _GRAPH_PROBE_ON is None:
-        import os as _os
-        _GRAPH_PROBE_ON = _os.environ.get(
-            "VLLM_ASCEND_DSV41_GRAPH_PROBE", "0") not in ("", "0", "false")
-    return _GRAPH_PROBE_ON
-
-
-def _tap_attn_output_all_rows(attn, output) -> None:
-    """稀疏注意力算子的输出,记【全部行】—— 含 padding 行。
-
-    🔴 为什么要新开一个(2026-09-15):现有的 ``attn.o_raw`` / ``attn.o_unroped``
-    记在 ``_o_proj()`` 里,而 ``_o_proj`` **不在 eager break 区**(DSV4.1 的
-    break 点是 vllm 侧 attention.py:624 的 ``_prepare_and_attn_eager``)。
-    图 replay 只执行 eager 段的 Python,图段只重放录下的 kernel ⇒
-    那两个键在图模式的 dump 里**一次都没出现过**,而"缺的键"读起来和
-    "没差异"一模一样。
-    ⇒ 于是"分歧是注意力算子产生的,还是 _o_proj/MHC/MoE 产生的"这一刀,
-      在产物层面【从来没落下过】。本函数就是那一刀。
-
-    ⚠️ 用 tap_whole 而不是 tap:后者按 position 散射,而 padding 行的
-       position 是 -1 会被丢掉 —— 而 padding 行正是当前最可疑的东西之一
-       (实测图模式的 kv_score padding 行是 NaN)。要判它就必须记下它。
-    """
-    from vllm_ascend.models.deepseek_v4_1 import align_taps
-
-    _ATTN_OUT_TAP["called"] += 1
-    if not align_taps.alignment_active():
-        _ATTN_OUT_TAP["not_active"] += 1
-        return
-    try:
-        layer = align_taps.layer_index(
-            attn.prefix, attn.vllm_config.model_config.hf_text_config)
-        align_taps.tap_whole(layer, "attn.sparse_out.all_rows",
-                             output[:, :attn.n_local_heads])
-        _ATTN_OUT_TAP["recorded"] += 1
-    except Exception as exc:                                 # noqa: BLE001
-        # 🔴 仪表不许杀 run —— 但【只计数不说话】等于静默。
-        #    上一版就是这样:计了 errors 却从来没人打印它,于是
-        #    "tap 没被调到" 和 "tap 每次都抛" 读数完全一样,
-        #    而实际发生的是后者(该键在任何分片里都不存在)。
-        _ATTN_OUT_TAP["errors"] += 1
-        if _ATTN_OUT_TAP["errors"] == 1:
-            from vllm.logger import logger
-            logger.warning(
-                "DSV4.1 attn.sparse_out.all_rows tap 失败(只报第一次): "
-                "%s: %s | output.shape=%s n_local_heads=%s prefix=%s",
-                type(exc).__name__, exc,
-                getattr(output, "shape", None),
-                getattr(attn, "n_local_heads", "<无此属性>"),
-                getattr(attn, "prefix", "<无此属性>"))
-
-
-#: 上面那个 tap 的记账。零覆盖和"全都一致"必须分得开。
-_ATTN_OUT_TAP: dict = {"called": 0, "not_active": 0, "recorded": 0,
-                       "errors": 0}
-
-
-def attn_output_tap_accounting() -> dict:
-    return dict(_ATTN_OUT_TAP)
-
-
-def _tap_what_this_layer_read(attn, kwargs: dict, req, cmp_req) -> None:
-    """Everything the operator is about to be handed, plus the blocks behind
-    the two block tables.
-
-    ⚪ Taken from ``kwargs`` rather than from the variables that produced
-    them: what is wanted is what the operator receives, and this line has
-    already been bitten twice by the gap between the two (the pre-adapter
-    vocabulary, and the descriptor built from another group).
-
-    ⚠️ Only on the layers ``read_taps`` selects, and only while a dump is
-    being recorded. The caches behind these tables are gigabytes; gathering
-    them for forty layers would produce a dump nobody can compare.
-    """
-    from vllm_ascend.models.deepseek_v4_1 import align_taps, read_taps
-
-    if not align_taps.alignment_active():
-        return
-    layer = align_taps.layer_index(attn.prefix,
-                                   attn.vllm_config.model_config.hf_text_config)
-    if not read_taps.records_reads(layer):
-        return
-
-    # The selections and lengths: the indexer's output is the sparse
-    # operator's direct input, and until now it was NOT MEASURED rather than
-    # measured-and-equal. Identical q and kv with different indices is enough
-    # on its own to produce a different output.
-    for key in ("ori_sparse_indices", "cmp_sparse_indices", "ori_topk_length",
-                "cmp_topk_length", "seqused_ori_kv", "seqused_kv",
-                "seqused_cmp_kv", "cmp_residual_kv", "metadata",
-                "ori_win_left", "ori_win_right", "ori_mask_mode",
-                "cmp_mask_mode", "cmp_ratio"):
-        value = kwargs.get(key)
-        if isinstance(value, torch.Tensor):
-            read_taps.tap_read(layer, key, value)
-        elif isinstance(value, int):
-            read_taps.tap_read(layer, key, torch.tensor([value]))
-
-    # The two caches, gathered by the block tables this call passes.
-    # ⚠️ With the lengths, so the block list is bounded by what the request
-    # uses rather than by "non-negative" -- the table is padded with zero and
-    # block 0 is somebody else's.
-    page = _cache_page_size(kwargs.get("ori_kv"))
-    read_taps.tap_cache_read(layer, "ori_kv", kwargs.get("ori_kv"),
-                             kwargs.get("ori_block_table"),
-                             kwargs.get("seqused_ori_kv")
-                             or kwargs.get("seqused_kv"), page)
-    read_taps.tap_cache_read(layer, "cmp_kv", kwargs.get("cmp_kv"),
-                             kwargs.get("cmp_block_table"),
-                             kwargs.get("seqused_cmp_kv"),
-                             _cache_page_size(kwargs.get("cmp_kv")))
-    # 🔵 The half of golden's sa_in.kv this side keeps as a separate
-    # argument. Recorded under its own key with the relation declared, not
-    # concatenated into a tensor the operator never received as one.
-    read_taps.tap_operator_rows(layer, kwargs.get("cmp_kv"),
-                                kwargs.get("cmp_block_table"),
-                                kwargs.get("seqused_cmp_kv"))
-
-    # candidate blocks, which only some layers carry; absent is absent, not
-    # an empty tensor.
-    for source in (cmp_req, req):
-        candidates = getattr(source, "candidate_blocks", None)
-        if isinstance(candidates, torch.Tensor):
-            read_taps.tap_read(layer, "candidate_blocks", candidates)
-            break
+        "before anything wrote it. Expected on that path: the indexer skips "
+        "the write when there is no metadata.")
 
 
 class AscendDeepseekV41Attention(DeepseekV4Attention):
-    """Sparse-MLA attention on Ascend.
-
-    Not usable for inference yet -- see the ``NotImplementedError``s below.
-    Construction is expected to work so that the rest of the model can be
-    built and the next gap found.
-    """
+    """Sparse-MLA attention on Ascend."""
 
     # Selected per layer by compress_ratio in the model layer; this is the
     # default the base class records. The real dispatch happens through
@@ -616,9 +129,8 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         (2b, 2b+1). The compressed cache view, the planner and the operator all
         work in 128-entry pages at allocator-block stride, so kernel page 2b is
         allocator block 2b's memory -- which the shared pool has handed to some
-        other group (a SWA layer, measured: request 1 wrote its ratio-2 compressed
-        entries over layers 1 and 2's SWA pages). Outputs then depend on which
-        block ids a request happens to get, and requests corrupt each other.
+        other group. Outputs then depend on which block ids a request happens to
+        get, and requests corrupt each other.
 
         Ratio 2 therefore reports the C2 backend, so the group resolves to 256 and
         no split happens. Ratio 1 (block 128) is unaffected.
@@ -627,12 +139,6 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             from vllm_ascend.attention.dsa_v1 import AscendDSAC2Backend
             return AscendDSAC2Backend
         return self.backend_cls
-
-    # A _RATIO_BACKENDS map used to sit here, recording that ratio 2 had no
-    # backend. Nothing ever read it, and by the time anyone looked it was false
-    # too -- AscendDSAC2Backend exists. Ratio-to-backend now resolves in
-    # AscendDeepseekV41IndexerCache.get_attn_backend, from the spec that
-    # actually constrains it.
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         """The compressed-KV cache, described the way Ascend's kernels read it.
@@ -712,38 +218,6 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             stream_compress_ratio=stated_stream_ratio(self),
         )
 
-    def _fused_wqa_wkv_gemm(self, hidden_states):
-        """Upstream's fused q-lora/KV projection, with its output recorded.
-
-        🔵 The first thing after ``attn.in`` on this path, and the point that
-        splits the projection from the two RMSNorms that follow it
-        (``_split_qkv_and_norm``, upstream attention.py:601-620). Recorded
-        because ``sa_in.kv`` -- which is the *post*-norm kv -- already differs
-        from golden, so the divergence is at or before that split, and only
-        this key says which side of it.
-
-        Tapped, not reimplemented: the call goes straight to the base class.
-        """
-        out = super()._fused_wqa_wkv_gemm(hidden_states)
-        _tap_chain_point(self, "qkv_a.out", out)
-        return out
-
-    def _split_qkv_and_norm(self, qr_kv):
-        """Upstream's split and the two RMSNorms, with the q half recorded.
-
-        The kv half of this split is already ``sa_in.kv``; the q half had no
-        key, and it is the first point on the q path after the projection.
-
-        ⚠️ ``qr`` is a ``QuantizedActivation`` rather than a tensor when the
-        fused query-quant path is taken. Recorded only when it is a tensor:
-        a key that is sometimes one thing and sometimes another is worse than
-        an absent key, and the absence is visible in the declared coverage.
-        """
-        qr, qr_scale, kv = super()._split_qkv_and_norm(qr_kv)
-        if isinstance(qr, torch.Tensor):
-            _tap_chain_point(self, "split.qr", qr)
-        return qr, qr_scale, kv
-
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         """Upstream's fused prolog, decomposed. See deepseek_v4_1.qkv_prolog.
 
@@ -787,36 +261,12 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 f"metadata says block_size {block_size}, head_dim "
                 f"{self.head_dim}. These index each other, so a mismatch "
                 "writes rows at the wrong offset rather than failing.")
-        # 🔴 The write side of the original stream. golden searched all 40
-        # layers of its own dump -- 275,691 slices -- for anything matching
-        # the NoPE 448 dims of our cached rows and found max |cos| = 0.106,
-        # while the values are plainly activations (std 0.339 against its
-        # 0.306, no zeros, mutually near-orthogonal). So the question is not
-        # "where was it written" but "what was written", and only this side
-        # has the answer: `kv` here is the tensor that becomes those dims.
-        _tap_write_side_kv(self, kv, positions, swa_metadata.slot_mapping,
-                           swa_kv_cache)
-        # 🔴 The q side, one key per step. Measured: the kv side's error is
-        # 99.82% concentrated in its rope slice, while q's is spread evenly
-        # over both halves -- so q carries a second defect somewhere in
-        # wq_a / q_norm / wq_b, and that stretch had no observation at all.
-        #
-        #   qkv_a.out    wq_a + wkv, before either norm
-        #   split.qr     after q_norm (the kv half of that split is sa_in.kv)
-        #   q.wq_b_out   this argument -- after wq_b, before the per-head norm
-        #   rope.q.in    after the weight-free per-head RMSNorm, rope slice
-        #   sa_in.q      after the rotation (already recorded)
-        #
-        # One operation per gap. Without them, "sa_in.q differs" names a
-        # four-operation segment and costs a bisection per flight.
-        _tap_chain_point(self, "q.wq_b_out", q)
         return qnorm_rope_kv_insert(
             q=q, kv=kv, positions=positions,
             cos_sin_cache=self.rotary_emb.cos_sin_cache,
             swa_kv_cache=swa_kv_cache,
             slot_mapping=swa_metadata.slot_mapping,
-            eps=self.eps, rope_head_dim=self.rope_head_dim,
-            tap=lambda key, tensor: _tap_chain_point(self, key, tensor))
+            eps=self.eps, rope_head_dim=self.rope_head_dim)
 
     def __init__(
         self,
@@ -897,31 +347,10 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
     def _configured_ratio(vllm_config, prefix: str) -> int | None:
         """This layer's compress_ratios entry, read before super() sets it.
 
-        ⚠️ Reads ``hf_config``, not ``hf_text_config``, and that is currently
-        correct but not obviously so: V4.1-Flash is a multimodal checkpoint,
-        and the same wrapper has broken three other assumptions written for a
-        text-only shape (the ``use_compress`` config read, the ``{0: []}``
-        multimodal ranges, the module tree under ``language_model``). This one
-        survives because ``DeepseekV41Config`` flattens ``text_config`` to the
-        top level -- measured, not assumed: ``hasattr(hf_config,
-        "compress_ratios")`` is True and the first entries are [0, 0, 2, 2, 2].
-
-        🔴 The ``except Exception`` is a known silent failure point, tolerated
-        for now and not safe. It cannot tell "this model has no ratios" from
-        "the read path moved", and both come back as ``None`` -- which every
-        caller downstream reads as "no ratio configured", i.e. as a ratio-0
-        layer. A ratio-2 layer silently demoted to 0 is the shape of defect
-        this port has already spent a night on.
-
-        Tolerated rather than tightened because it sits on the bring-up path
-        and tightening it means first establishing what ``None`` should mean
-        to each caller. ⇒ Must be narrowed when either of these happens:
-
-          * the read path for ``compress_ratios`` changes at all, or
-          * ``DeepseekV41Config`` stops flattening ``text_config``.
-
-        Both are changes someone would make deliberately, so the trigger is
-        checkable rather than a reminder to be vigilant.
+        Reads ``hf_config`` rather than ``hf_text_config``: V4.1-Flash is a
+        multimodal checkpoint and ``DeepseekV41Config`` flattens
+        ``text_config`` to the top level. ``None`` means the ratio could not
+        be read, which callers treat as "not ratio 2".
         """
         try:
             from vllm.model_executor.models.utils import extract_layer_index
@@ -1027,32 +456,16 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # A ratio-0 layer has no compressed group and correctly falls back.
         cmp_req = None
         if attends_compressed:
-            # Through the same rank helper ori_kv uses. It was written for
-            # ori_kv and only ori_kv was routed through it, so cmp_kv reached
-            # the operator one axis short -- "Cmp_kv strideVec size[3] not
-            # match kvLayout expect len[4]". Third parameter of this call to
-            # arrive missing the same head axis; fixing them one at a time is
-            # what produced the third.
+            # Through the same rank helper as ori_kv: the operator checks the
+            # stride-vector length against layout_kv for both caches.
             cmp_kv = kv_with_layout_rank(
                 self._unwrap_cache(self._compressed_kv_cache()),
                 plan.layout_kv)
-            # 🔴 NOT req.block_table. `req` is the SWA cache group's metadata,
-            # and the compressed cache is a different group -- for a consumer
-            # layer it is another layer's cache entirely
-            # (_compressed_kv_cache follows compressed_cache_prefix). Indexing
-            # one cache with the other's block table gives block ids that are
-            # in range and point at the wrong blocks: nothing raises, the
-            # gather lands on real memory, and it surfaces as an aicore
-            # exception with no frame naming the operator.
-            #
-            # Both the other implementations of this call keep them apart:
-            #   dsa_v1:2657/2695   swa_req_metadata.block_table
-            #                      vs common_metadata.block_table
-            #   flashinfer_sparse:408/364  swa_metadata.block_table
-            #                      vs attn_metadata.block_table
-            #
-            # Resolved through the same prefix the cache came from, so the
-            # table and the cache cannot come from different groups.
+            # Not req.block_table: `req` is the SWA group's metadata, and the
+            # compressed cache belongs to another group (for a consumer layer,
+            # another layer's cache). The other group's block ids are in range
+            # and address the wrong blocks. Resolved through the same prefix
+            # the cache came from, so table and cache cannot disagree.
             cmp_req = self._compressed_group_metadata(attn_metadata)
             cmp_block_table = cmp_req.block_table
 
@@ -1063,93 +476,6 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # vision ones and does not take DSpark's.
         ori_sparse_indices, ori_topk_length = ori_sparse_selection(
             attends_compressed, req)
-        # 来源按【身份】判，不重算那个选择 —— 重算一遍等于给同一个问题写第二个判据，
-        # 两个判据会分头漂，而日志说的来源就不再是实际用的那个。
-        if ori_sparse_indices is None:
-            _ori_idx_src = None
-        elif ori_sparse_indices is getattr(req, "dspark_swa_indices", None):
-            _ori_idx_src = "dspark_swa_indices"
-        elif ori_sparse_indices is getattr(req, "vision_swa_indices", None):
-            _ori_idx_src = "vision_swa_indices"
-        else:
-            _ori_idx_src = "【两个都不是】"
-        # 同一层可能被两条 impl 各调一次 —— 现在没有任何数据能排除它。
-        _log_ori_sparse_indices(swa_prefix, _ori_idx_src, ori_sparse_indices,
-                                num_tokens=q.shape[0],
-                                caller=f"{type(self).__module__}.{type(self).__name__}",
-                                topk_length=ori_topk_length)
-
-        _log_compressed_selection(
-            prefix=swa_prefix,
-            layer_ratio=self.compress_ratio,
-            attends_compressed=attends_compressed,
-            buffer=self.topk_indices_buffer,
-            num_tokens=q.shape[0])
-        _log_batch_shape(swa_prefix, req.query_start_loc, req.seq_lens)
-
-        # The alignment taps for the three values that exist only here. Behind
-        # alignment_active() so the tap functions are not entered at all when
-        # no dump directory is set -- the same guarantee the boundary hooks
-        # get structurally, stated at each site because these are calls.
-        #
-        # sa_in.* is the group that splits responsibility the first time a
-        # comparison disagrees: all three right and attn.o_raw wrong points at
-        # the attention operator; these wrong points upstream of it. Recording
-        # them is what makes that a lookup instead of a bisection.
-        from vllm_ascend.models.deepseek_v4_1 import align_taps
-
-        # 🔴 图内探针版的 sa_in.q / sa_in.kv(2026-09-15)。
-        #    上面那句注释说得对:sa_in.* 是"算子错"和"算子上游错"的分界。
-        #    但它挂在 align_taps 上,而图 replay 不跑 Python ⇒ 图模式下这两个键
-        #    从来不存在,那条分界线在图里根本画不出来。
-        #    copy kernel 版本会被录进图、每次 replay 执行。
-        #    只装层 0/1:decode 的第一个分歧点在 L01.attn.ret,而 L01.mhc_pre.x
-        #    逐位相同 —— 要切的就是这两层之间的这一段。
-        if _graph_probe_on():
-            try:
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
-                _l = align_taps.layer_index(
-                    self.prefix, self.vllm_config.model_config.hf_text_config)
-                if _l in (0, 1, 2):
-                    _gp.probe(f"L{_l:02d}.sa_in.q", q)
-                    _gp.probe(f"L{_l:02d}.sa_in.kv", kv)
-            except Exception:                                # noqa: BLE001
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
-                _gp.note_call_site_error()
-
-        if align_taps.alignment_active():
-            tap_layer = align_taps.layer_index(
-                self.prefix, self.vllm_config.model_config.hf_text_config)
-            align_taps.tap(tap_layer, "sa_in.q", q, positions)
-            align_taps.tap(tap_layer, "sa_in.kv", kv, positions)
-            # No token axis: per-head and scalar. record_whole, or the
-            # coverage assertion could never be satisfied for them.
-            align_taps.tap_whole(tap_layer, "sa_in.attn_sink", self.attn_sink)
-            align_taps.tap_whole(
-                tap_layer, "sa_in.softmax_scale",
-                torch.tensor([self.softmax_scale], dtype=torch.float32))
-            # 🔴 sa_in.topk_idxs is deliberately NOT recorded here yet, and
-            # the gap is left visible in the key difference rather than
-            # filled. Measured from golden's own layer_00 dump: that key is
-            # [1, 1100, 128] holding *token positions* -- row t is
-            # max(0, t-127)..t, -1 padded, max value 1099 -- i.e. the causal
-            # sliding window, 128 = sliding_window.
-            #
-            # Three things that are not what we have:
-            #   * width 128 is the window, not index_topk (512);
-            #   * layers 0/1 have no indexer at all
-            #     (index_source_layer_ids = 2,8,14,20,24,28,32,36), so
-            #     topk_indices_buffer is not their selection;
-            #   * it is token space, while every index this line produces is
-            #     slot space (block * storage_block_size + offset).
-            #
-            # We could synthesise the window list to make the comparison run.
-            # That would be a tap on nothing: the operator derives the window
-            # internally from mask mode 4, so the recorded tensor would be our
-            # reconstruction being compared against golden's, with the thing
-            # actually used by the kernel never entering the comparison.
-            # Waiting on golden for what this key means on a mask-mode-4
-            # layer instead.
 
         # Bound once, so the indices and the length describe the same object.
         # Two expressions producing "the selection" is how they come apart.
@@ -1158,301 +484,42 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             if attends_compressed and self.topk_indices_buffer is not None
             else None)
 
-        # Bound once for the same reason: the residual has to be computed
-        # against the ratio this call passes, not against a ratio computed
-        # separately a few lines later.
+        # Bound once: the residual must use the ratio this call passes.
         cmp_ratio = _dsa_swa_only_cmp_ratio(self.compress_ratio,
                                             self.vllm_config)
         cmp_residual_kv = (
             compressed_lengths(cmp_req.seq_lens, cmp_ratio)[1]
             if attends_compressed and cmp_req is not None else None)
 
-        # 🔴 等 device-metadata 流把 sas_metadata 写完(2026-09-15)。
-        #
-        # sas_metadata 是算子的 tiling 描述符,由 DeviceMetadataExecutor 在
-        # 【另一条 worker 自有的 NPU 流】上异步填进 sas_metadata_buffer
-        # (device_metadata.py: "Submit device metadata tasks on a worker-owned
-        # NPU stream")。消费者必须调 wait_for_device_metadata 才会插入那道
-        # 跨流等待 —— 这在 FULL cudagraph 下是【唯一】的保证:
-        #   model_runner_v1.py: submit(tasks,
-        #       batch_descriptor if mode == FULL else None)
-        # 传 batch_descriptor 走的是 external event 路径,事件在图外 record、
-        # 在图内 wait,跨多次 replay 复用。不调用它,图里就没有录进这次等待,
-        # 算子可以在 buffer 还在被写时读它。
-        #
-        # 🔴 V4.1 在昇腾侧另起了一个手写的算子调用点(本文件),而
-        # wait_for_device_metadata 在【整个 deepseek_v4_1 目录零调用】——
-        # 对照:dsa_v1.py 2 处、dsa_cp.py 5 处、deepseek_v4(V4.0) 各 2 处。
-        # V4.0 没有这个问题,因为它的消费者都走后端自己的 forward,那里有这一句。
-        #
-        # 症状与之相符:只在 FULL 捕获的 decode 上出现(PIECEWISE 下 attention
-        # 不进图,host 侧顺序还兜得住);间歇;算子【输入逐位相同而输出差约一个
-        # bf16 ULP】(描述符大体正确,只是上一步的内容 ⇒ 分块略不同 ⇒ 归约顺序
-        # 不同);第 0 层与第 1 层属不同 cache group、各有自己的 buffer,
-        # 因而时序不同 —— 实测第 0 层始终逐位相同、第 1 层时对时错。
-        #
-        # 该函数在没有 executor 时自行 return,所以这是一个安全的加法。
-        # 局部导入:本文件其余跨模块引用也都是局部的,避开循环导入。
+        # sas_metadata is filled asynchronously on the device-metadata stream.
+        # Under FULL graph capture this call is what records the cross-stream
+        # wait into the graph; without it the operator may read the descriptor
+        # while it is still being written. The backend forwards (dsa_v1,
+        # dsa_cp) have the same call; this hand-written call site needs its
+        # own. It returns immediately when there is no executor.
         from vllm_ascend.worker.device_metadata import (
             DeviceMetadataStage, wait_for_device_metadata)
 
-        # 开关只为做单开关 A/B(默认【开】= 正确行为)。关掉就是加这一句之前的
-        # 上游行为,留作阴性臂 —— 缺陷 #1 也是这么验的。
-        _wait_sas = (cmp_req or req).sas_metadata
-        # 🔴 把"这一句到底有没有【真的做事】"变成产物(2026-09-16)。
-        #    wait_for_device_metadata 在没有 executor 时自行 return ——
-        #    "修好了"和"这条通路压根没启用"产出完全相同的结果。
-        #    今天已经因为分不开这两者误判过一次,这里当场记下来。
-        #    纯 host 侧读取,不碰设备(指针日志那次同步 D2H 拖垮过一整发)。
-        global _WAIT_SAS_LOGGED
-        if not _WAIT_SAS_LOGGED:
-            _WAIT_SAS_LOGGED = True
-            try:
-                # 🔴 logger 和层号都必须在【本块内】自己取:
-                #    第一版直接用了 _lg / _l,而那两个定义在
-                #    `if _graph_probe_on():` 块【里面】—— 在这里是 NameError,
-                #    又被下面那个 except BaseException 静默吞掉,
-                #    产物上表现为"自检一行没打",和"通路没启用"读数一样。
-                from vllm.logger import logger as _slg
-                from vllm.forward_context import (get_forward_context,
-                                                  is_forward_context_available)
-                _ex = (getattr(get_forward_context(),
-                               "device_metadata_executor", None)
-                       if is_forward_context_available() else "无 forward ctx")
-                _slg.info(
-                    "DSV4.1 sas 等待自检 %s: 开关=%s 是张量=%s "
-                    "executor=%s in_flight=%s ⇒ 这一句%s",
-                    self.prefix, _wait_sas_enabled(),
-                    isinstance(_wait_sas, torch.Tensor), _ex is not None
-                    and _ex != "无 forward ctx",
-                    getattr(_ex, "submission_in_flight", "n/a"),
-                    "真的插了跨流等待" if (_ex is not None
-                                   and _ex != "无 forward ctx") else
-                    "是【空操作】—— 异步通路没启用,本开关证明不了任何事")
-            except BaseException:                            # noqa: BLE001
-                pass
-        if isinstance(_wait_sas, torch.Tensor) and _wait_sas_enabled():
+        sas_metadata = (cmp_req or req).sas_metadata
+        if isinstance(sas_metadata, torch.Tensor):
             wait_for_device_metadata(DeviceMetadataStage.ATTENTION,
-                                     id(_wait_sas))
+                                     id(sas_metadata))
 
-        # 一次求值,探针和算子看的是同一个对象 —— 分成两个表达式就会分头漂。
-        _swa_kv_arg = kv_with_layout_rank(
+        swa_kv = kv_with_layout_rank(
             self._unwrap_cache(self.swa_cache_layer.kv_cache),
             plan.layout_kv)
-
-        # 🔴 图内探针:算子【除 q/kv 之外】读的全部东西(2026-09-15)。
-        #    decode 步 1 上 sa_in.q / sa_in.kv 两臂逐位相同而 attn.o_raw 不同
-        #    ⇒ 差异只能来自这里:KV cache 的历史内容,或寻址/描述它的元数据。
-        #    ⚠️ 每个探针的第 0 维都 reshape 成 1:drain() 按本次 forward 的
-        #       token 数过滤桶(decode=1),第 0 维不是 1 的键会被【静默丢掉】,
-        #       而键不存在和两臂无差异读起来一模一样。
-        if _graph_probe_on():
-            try:
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
-                _l = align_taps.layer_index(
-                    self.prefix, self.vllm_config.model_config.hf_text_config)
-                if _l in (0, 1, 2):
-                    from vllm.logger import logger as _lg
-                    _p = f"L{_l:02d}.kvsrc"
-
-                    # 🔴 地址取证(2026-09-15)。图里 seq_lens 读到的是捕获期的
-                    #    全 1,而 block_table / slot_mapping / sas_metadata 全部
-                    #    刷新正常。两种解释修法完全不同:
-                    #      (a) seq_lens 每步是【新张量】⇒ 图烘死了捕获期那一个
-                    #      (b) 地址稳定但内容没刷新
-                    #    连续几步打指针就能分开,而同一行里的 block_table 是
-                    #    已知刷新正常的【阳性对照】—— 没有它,指针"看起来没变"
-                    #    也可能只是分配器复用。
-                    global _PTR_LOGGED
-                    if _PTR_LOGGED < 12:
-                        _PTR_LOGGED += 1
-                        # ⚠️ 只打【host 侧属性】。第一版在这里写了
-                        #    int(req.seq_lens[0]) —— 那是一次同步 D2H,塞在模型
-                        #    forward 里。DP=4 下一个 rank 多同步一次就把集合通信
-                        #    拖散,实测整发死于
-                        #    rtDeviceSynchronizeWithTimeout task timeout +
-                        #    HCCL watchdog。值本来就有探针在采,这里只要地址。
-                        _lg.info(
-                            "DSV4.1 指针 L%02d step#%d tokens=%s | "
-                            "seq_lens ptr=0x%x shape=%s | block_table ptr=0x%x "
-                            "| slot_mapping ptr=%s | qsl ptr=0x%x",
-                            _l, _PTR_LOGGED, int(q.shape[0]),
-                            req.seq_lens.data_ptr(),
-                            tuple(req.seq_lens.shape),
-                            req.block_table.data_ptr(),
-                            hex(req.slot_mapping.data_ptr())
-                            if isinstance(getattr(req, "slot_mapping", None),
-                                          torch.Tensor) else "无",
-                            req.query_start_loc.data_ptr())
-
-                    def _flat1(t, n):
-                        """取前 n 个元素,【定长】补到 n,形状恒为 (1, n)。
-
-                        🔴 为什么必须定长(2026-09-15,这个坑今天第三次):
-                        第一版是 f[:min(n, numel)].reshape(1, -1) —— 长度随
-                        本次 forward 变。prefill 的 seq_lens 有 8 个元素、
-                        decode 只有 1 个,而两者【写同一个键】(第 0 维恒为 1,
-                        桶号一样)。buffer 被先到的 prefill 定成 (1,8),
-                        decode 的 (1,1) 形状不符 ⇒ graph_probe 按设计拒绝拷贝
-                        并记 shape_changed ⇒ 产物里留下的是【上一次的残值】。
-                        我据此读出"图里 seq_lens=1、eager=7",当成了重大发现,
-                        而那只是两臂的 buffer 被不同的历史填过。
-                        ⚠️ 记账当时就报了 shape_changed=8,我读到了那个数,
-                           但没有把它和这个键联系起来。定长之后这条路被堵死。
-                        """
-                        f = t.reshape(-1)
-                        k = min(n, f.numel())
-                        out = torch.zeros(n, dtype=f.dtype, device=f.device)
-                        out[:k] = f[:k]
-                        return out.reshape(1, n)
-
-                    # 🔴 覆盖量进键名(2026-09-15)。
-                    #    第一版 sas_metadata 只取前 64 个元素,而这个 blob 是
-                    #    DSA_METADATA_BUFFER_SIZE=1024 的定长布局 ——
-                    #    覆盖 6.25%,却在比对表里印成"逐位相同"。
-                    #    描述符里随步变化的字段如果在 64 之后,那条绿灯是零覆盖。
-                    #    ⇒ ① 取满;② 把【真实元素数】写进键名:宽度一旦变化
-                    #      就是两个不同的键,不可能再拿不同宽度的东西比出相同。
-                    def _pb(name, t, width):
-                        _gp.probe(f"{_p}.{name}.n{int(t.numel())}",
-                                  _flat1(t, width))
-
-                    _pb("block_table", req.block_table, 256)
-                    _pb("seq_lens", req.seq_lens, 16)
-                    _pb("query_start_loc", req.query_start_loc, 16)
-                    _sas = getattr(req, "sas_metadata", None)
-                    if isinstance(_sas, torch.Tensor):
-                        # 取满 1024 —— 这是算子的 tiling 描述符,
-                        # 也是 GPU 分支完全没有的那一层。
-                        _pb("sas_metadata", _sas, 1024)
-                    _sm = getattr(req, "slot_mapping", None)
-                    if isinstance(_sm, torch.Tensor):
-                        _pb("slot_mapping", _sm, 16)
-                    if isinstance(self.attn_sink, torch.Tensor):
-                        _pb("attn_sink", self.attn_sink, 64)
-                    # 🔴 压缩流的全部参数(2026-09-16)。
-                    #    实测:第 2 层 sa_in.q / sa_in.kv 逐位相同而 attn.o_raw
-                    #    差 rel_l2=5.2e-01(不是 ULP,是完全不同的结果),
-                    #    而第 0/1 层逐位相同 —— 它们的 compress_ratios 是 0,
-                    #    整组压缩流参数全是 None。所以差异只能来自这一组。
-                    #    每个都定长补零并把真实元素数写进键名。
-                    _pb("cmp_ratio_t",
-                        torch.tensor([float(cmp_ratio or 0)]), 1)
-                    _pb("attends_cmp",
-                        torch.tensor([1 if attends_compressed else 0]), 1)
-                    for _nm, _t in (("cmp_block_table", cmp_block_table),
-                                    ("cmp_residual_kv", cmp_residual_kv),
-                                    ("cmp_selection", cmp_selection),
-                                    ("ori_sparse_indices", ori_sparse_indices),
-                                    ("ori_topk_length", ori_topk_length)):
-                        if isinstance(_t, torch.Tensor):
-                            _pb(_nm, _t, 256)
-                    _scmp = (cmp_req.seqused_cmp_kv
-                             if attends_compressed and cmp_req is not None
-                             else None)
-                    if isinstance(_scmp, torch.Tensor):
-                        _pb("seqused_cmp_kv", _scmp, 16)
-                    if cmp_req is not None and isinstance(
-                            getattr(cmp_req, "sas_metadata", None),
-                            torch.Tensor):
-                        _pb("cmp_sas_metadata", cmp_req.sas_metadata, 1024)
-                    if isinstance(cmp_kv, torch.Tensor) and cmp_kv.is_contiguous():
-                        _pb("cmp_kv_head", cmp_kv, 4096)
-
-                    # 算子真正会去读的那几行 KV:按本请求 block_table 的头两个
-                    # block 取出来。这是唯一能回答"两臂读到的字节是否相同"的探针 ——
-                    # 其余几个只回答"寻址是否相同"。
-                    # 🔴 单独一个 try:它在图捕获下会抛(实测 call_site_errors=4,
-                    #    而 kv_blocks 是这段的最后一句 ⇒ 前面的键都落了盘)。
-                    #    放在同一个 try 里的话,它一抛就把后面的探针全带走,
-                    #    而"键不存在"读起来和"两臂没差异"一样。
-                    #    ⚠️ 只计数不说话 ⇒ "从没调用"和"每次都抛"产物相同。
-                    #    所以这里把异常文本打出来,一次就够。
-                    global _KV_BLK_OK, _KV_BLK_WARNED
-                    # 🔴 用【原始】cache,不用 kv_with_layout_rank 之后的视图:
-                    #    后者不连续,reshape(-1) 会失败。第一版加了
-                    #    is_contiguous() 守卫 —— 它把这个探针【静默跳过】了,
-                    #    产物上表现为"键缺席",而缺席读起来和"两臂没差异"一样。
-                    #    这是今天第三次栽在"守卫拒绝了但没人读那个账"上。
-                    _raw_kv = self._unwrap_cache(self.swa_cache_layer.kv_cache)
-                    if not (_KV_BLK_OK and isinstance(_raw_kv, torch.Tensor)
-                            and _raw_kv.is_contiguous()):
-                        if not _KV_BLK_WARNED:
-                            _KV_BLK_WARNED = True
-                            _lg.warning(
-                                "DSV4.1 kv_blocks 探针【跳过】(只报一次): "
-                                "ok=%s 是张量=%s 连续=%s —— 这个键会缺席,"
-                                "而缺席不构成'两臂无差异'的证据",
-                                _KV_BLK_OK, isinstance(_raw_kv, torch.Tensor),
-                                getattr(_raw_kv, "is_contiguous",
-                                        lambda: "n/a")())
-                    else:
-                        try:
-                            # 扁平索引:4 维 index_select 在 A5 上走 AsStrided,
-                            # 51613x32x1x512 的 tiling 直接失败
-                            # ("The output element is out of input range")。
-                            # 一维视图上按偏移取,不触发那条路。
-                            _per = _raw_kv[0].numel()
-                            _b0 = req.block_table.reshape(-1)[:1].long() * _per
-                            _idx = _b0 + torch.arange(
-                                4096, device=_raw_kv.device, dtype=torch.long)
-                            _gp.probe(
-                                f"{_p}.kv_blocks",
-                                _raw_kv.reshape(-1).index_select(
-                                    0, _idx).reshape(1, -1))
-                        except Exception as _exc:            # noqa: BLE001
-                            _gp.note_call_site_error()
-                            _KV_BLK_OK = False    # 只失败这一次,之后不再尝试
-                            if not _KV_BLK_WARNED:
-                                _KV_BLK_WARNED = True
-                                _lg.warning(
-                                    "DSV4.1 kv_blocks 探针失败(只报第一次): %r "
-                                    "kv.shape=%s kv.dtype=%s bt.shape=%s "
-                                    "bt.dtype=%s", _exc,
-                                    tuple(_swa_kv_arg.shape),
-                                    _swa_kv_arg.dtype,
-                                    tuple(req.block_table.shape),
-                                    req.block_table.dtype)
-
-                    # 🔴 算子参数里【不是张量】的那一批(2026-09-15)。
-                    #    它们是 Python 标量 ⇒ 捕获那一刻求值一次,之后每次
-                    #    replay 用的都是【捕获期】的值,永远不再重算。
-                    #    ori_win_* 来自每层各自的 SWA metadata 条目,所以
-                    #    "层 0 恰好对、层 1 不对"在这里是可能的 ——
-                    #    而这正是我们看到的不对称。
-                    #    图臂打的是捕获期的值,eager 臂打的是服务期的值,
-                    #    两者对比就是判据。按取值去重,只打新组合。
-                    _sig = (_l, int(q.shape[0]), bool(attends_compressed),
-                            float(cmp_ratio) if cmp_ratio is not None else None,
-                            req.ori_win_left, req.ori_win_right,
-                            None if ori_topk_length is None else "有",
-                            None if ori_sparse_indices is None else
-                            tuple(ori_sparse_indices.shape))
-                    if _sig not in _SCALAR_SEEN:
-                        _SCALAR_SEEN.add(_sig)
-                        _lg.info(
-                            "DSV4.1 算子标量 L%02d: tokens=%s attends_cmp=%s "
-                            "cmp_ratio=%s ori_win=[%s,%s] ori_topk=%s "
-                            "ori_idx=%s  ← replay 永远用捕获期这一组",
-                            _l, _sig[1], _sig[2], _sig[3], _sig[4], _sig[5],
-                            _sig[6], _sig[7])
-            except Exception:                                # noqa: BLE001
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
-                _gp.note_call_site_error()
 
         kwargs = build_sparse_flash_mla_kwargs(
             q=q,
             num_requests=req.query_start_loc.numel() - 1,
-            swa_kv_cache=_swa_kv_arg,
+            swa_kv_cache=swa_kv,
             swa_block_table=req.block_table,
             cu_seqlens_q=req.query_start_loc,
             seqused_kv=req.seq_lens,
             sinks=self.attn_sink,
-            # 🔴 The compressed group's descriptor when there is one. The SWA
-            # group's spec reports no compression, so its descriptor is built
-            # at ratio 1 -- well-formed, and the wrong tiling for a ratio-2
-            # layer. That disagreement does not get rejected; it faults every
-            # core at once, which is what this call has been doing.
+            # The compressed group's descriptor when there is one: the SWA
+            # group's is built at ratio 1, a well-formed descriptor with the
+            # wrong tiling for a ratio-2 layer, which faults every core.
             metadata=(cmp_req or req).sas_metadata,
             softmax_scale=self.softmax_scale,
             cmp_ratio=cmp_ratio,
@@ -1462,160 +529,69 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
             ori_win_right=req.ori_win_right,
             cmp_kv=cmp_kv,
             cmp_block_table=cmp_block_table,
-            # 🔴 req.seqused_cmp_kv, not req.cu_cmp_seqlen_list. The latter is
-            # cumulative and is what V4.0 sends as the operator's
-            # cu_seqlens_cmp_kv under layout TND; this parameter wants one
-            # value per request. Sending the cumulative one would have been
-            # accepted -- same dtype, same device, plausible values, one
-            # element longer -- and read as lengths.
-            # Both describe the compressed stream, so both come from the
-            # group that owns it -- not from the SWA group, whose ratio is 1.
+            # One value per request, from the group that owns the compressed
+            # stream -- not the cumulative cu_cmp_seqlen_list, which the
+            # operator would also accept and read as lengths.
             seqused_cmp_kv=(cmp_req.seqused_cmp_kv
                             if attends_compressed and cmp_req else None),
-            # 🔴 Derived here, not read from req.qli_cmp_residual_k. The
-            # shared builder computes this correctly for any ratio and then
-            # publishes it behind ``if self.compressor_ratio == 4``
-            # (dsa_v1.py) -- V4.1 carries 1 and 2 and never 4, so the field
-            # arrives None on exactly the layers that need it, and the
-            # operator refuses the call:
-            #
-            #     "Cmp_residual_kv is required when cmp_mask_mode=3 and
-            #      cmp_ratio != 1"
-            #     "cmp_residual_k must be provided when mask_mode=3 and
-            #      cmp_ratio>1."
-            #
-            # The value existed one frame away and was not carried, again.
-            # ``compressed_lengths`` is the same function this line's own
-            # indexer already uses, so this is not a second implementation --
-            # it is the third consumer of the one we had to write. Returns
-            # None at ratio 1, which is what the operator requires there
-            # ("Cmp_ratio is 1 or sparse_mode is 0, cmp_residual_k must be
-            # null"), so the two opposite rules are both satisfied by one
-            # expression rather than by a branch here.
+            # Derived here rather than read from req.qli_cmp_residual_k, which
+            # the shared builder publishes only for ratio 4. None at ratio 1,
+            # which is what the operator requires there.
             cmp_residual_kv=cmp_residual_kv,
             ori_sparse_indices=ori_sparse_indices,
             ori_topk_length=ori_topk_length,
-            # The indexer's selection. Without it the compressed stream is
-            # attended in full: nothing errors, tokens come out, and they are
-            # a V4.1 that does no sparse selection. The descriptor's cmp_topk
-            # is set from the same config value, in the builder, because a
-            # top-k promised there and not supplied here is the same
-            # disagreement that produced the aicore exception.
-            # unsqueeze(1): the buffer is [tokens, index_topk] and the
-            # operator takes [T, KV_N, K2] under layout_q=TND -- the KV-head
-            # axis is missing, and V4.1 has num_key_value_heads = 1 so it is
-            # a unit axis. Three sources agree on the rank: the sibling
-            # operators' own docs (sparse_attn_sharedkv/README.md:65,
-            # kv_quant_sparse_attn_sharedkv/README.md:35), the QLI operator's
-            # measured output (T, num_heads_k, topk), and this same call's
-            # ori_sparse_indices, which is already 3-D and is accepted.
-            #
-            # Upstream stores it 2-D because its own consumer reads it that
-            # way; the shape the operator wants is not a property of the
-            # buffer, so the axis is added here rather than by changing the
-            # buffer everyone else reads.
+            # The indexer's selection; without it the compressed stream is
+            # attended in full. Shaped [T, 1, K2] by _checked_selection: the
+            # operator takes [T, KV_N, K2] under layout_q=TND and V4.1 has a
+            # single KV head.
             cmp_sparse_indices=cmp_selection,
-            # 🔴 Travels with the indices, same rule as ori_topk_length. The
-            # selection buffer is -1 padded; declaring the whole row valid
-            # sends the kernel to gather at those slots, which is the
-            # mechanism kernel proved single-variable on the ori side. Taken
-            # from the indexer that wrote the rows, never recounted here.
+            # Travels with the indices: without a length the operator treats
+            # the whole -1 padded row as valid and gathers at the padding.
             cmp_topk_length=(
                 self._compressed_topk_length(cmp_selection)
                 if cmp_selection is not None else None),
         )
 
-        # 🔴 Here, immediately before the call, because these are caches and
-        # selections: recorded after the forward they answer "what does the
-        # cache hold now", which is a different question from "what did this
-        # layer read". Two requests with byte-identical q/kv/scale/sink
-        # produced different attn.o_raw, so the difference entered through an
-        # input that was not in the dump -- and every candidate is here.
-        _tap_what_this_layer_read(self, kwargs, req, cmp_req)
-
         output.copy_(plan.get_dsa_sparse_attn_op()(q, **kwargs)[0])
-        _tap_attn_output_all_rows(self, output)
 
     def _checked_selection(self, num_tokens: int) -> torch.Tensor:
         """The indexer's selection for these rows, refusing unwritten ones.
 
-        🔴 ``topk_indices_buffer`` is allocated with ``torch.empty`` upstream
-        and cleared only over the rows the indexer wrote this step. Reading
-        past that returns either the previous step's selection or, on the
-        first step, whatever was in HBM -- and both make the forward depend on
-        something other than its input, which is what a greedy decode that
-        gives three different answers to the same prompt looks like.
+        ``topk_indices_buffer`` is allocated with ``torch.empty`` upstream and
+        written only over the rows the indexer handled this step. Rows past
+        that hold the previous step's selection (or uninitialised memory):
+        plausible non-negative indices that ``_compressed_topk_length`` would
+        count as valid. So the check is on provenance -- how many rows were
+        written -- not on the values.
 
-        Range and content cannot tell the two apart: a stale row holds
-        perfectly plausible non-negative block indices, and the length this
-        line derives from it (``(selection >= 0).sum()``) counts them as real.
-        So the check is on provenance -- how many rows were written -- not on
-        the values.
+        Three states:
 
-        Raises rather than clamping. Clamping would silently drop the tokens
-        beyond the boundary, which is a wrong answer that no longer looks
-        wrong; the whole point of finding this is to see whether it happens.
+        * never written on a dummy/profile run: expected, the indexer skips
+          the write when there is no metadata;
+        * never written on a real batch: refused;
+        * fewer rows written than read: under graph capture ``num_tokens`` is
+          padded to the capture size while the indexer wrote only the real
+          tokens. The tail is overwritten with ``NO_TOKEN`` (a shape-constant
+          device write, safe to capture) so no stale row reaches the operator.
         """
         from vllm_ascend.models.deepseek_v4_1.sparse_indexer import rows_written
 
         written = rows_written(self.topk_indices_buffer)
         if written is None:
-            # ⚠️ Three states, and the first version had two. On a dummy or
-            # profile run the indexer returns the buffer without writing it --
-            # this line's own early return in forward_oot -- so "never
-            # written" is the expected state there, not a defect. Raising on
-            # it fired where the premise does not hold and, worse, stopped the
-            # launch before the first real request, so neither arm of the
-            # question got answered.
             if not _is_real_batch():
                 _warn_unwritten_selection_on_dummy_run()
                 return self.topk_indices_buffer[:num_tokens].unsqueeze(1)
             raise ValueError(
                 f"{self.prefix}: this layer attends a compressed stream on a "
                 "real batch and the indexer selection buffer has never been "
-                "written. It is allocated with torch.empty, so every row of "
-                "it is whatever was in HBM -- reading it would make the "
-                "output depend on the contents of device memory rather than "
+                "written. It is allocated with torch.empty, so reading it "
+                "would make the output depend on device memory rather than "
                 "on the prompt.")
-        # 🔴 图捕获下 num_tokens 是【被 padding 到捕获桶】的数，而 indexer 只写
-        #    了真实 token 那几行。实测 xr_gr5_163515：读 8 写 5。
-        #    而这条守卫的前提（"多出来的行是上一步的残留 ⇒ 错答案"）对【padding 那
-        #    一段】不成立：主干把 padding token 的注意力输出整段丢掉
-        #    （attention_v1.py:360 "the attention output for padding tokens is
-        #    trimmed by hidden_states = hidden_states[:-pad_size, :]"）。
-        # ⇒ 判据改成对【真实 token 数】比较；拿不到真实数时【退回严格比较】——
-        #   fail-safe 的方向是拦，不是放行。
-        # ⚠️ 放宽是偏宽松的方向，所以记账：跳过了几次、每次跳过多少行。
-        # 🔴 上一版在这里【放宽判据】（改成和真实 token 数比），那是错的，两重：
-        #   ① 它是死代码：_num_actual_tokens_or_none() 永远返回 None ——
-        #      ForwardContext 没有 num_actual_tokens 这个字段（上游
-        #      vllm/forward_context.py 里该名字命中 0 次），而 attn_metadata 是
-        #      dict，getattr 取不到。⇒ relaxed 恒为 0，"已修好"和"从未生效"读数一样。
-        #   ② 就算接通也不安全：放宽等于【信任】第 written..num_tokens 行，而那些行
-        #      是上一步的残留 slot id，会被 _compressed_topk_length 数成有效。
-        #      "padding 行的输出会被丢弃"这句话的前提是注意力在 query 维严格独立，
-        #      而那一条【没有在算子层面核实过】。
-        # ⇒ 改成【修复】而不是【放宽】或【拒绝】：把尾部那几行显式写成 NO_TOKEN。
-        #   形状恒定、纯设备写、可捕获；而且它把"残留"这个危险【消掉】，
-        #   不是绕过它 —— 之后严格判据照常成立。
         if written < num_tokens:
             from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
                 NO_TOKEN, mark_rows_written)
             self.topk_indices_buffer[written:num_tokens] = NO_TOKEN
             mark_rows_written(self.topk_indices_buffer, num_tokens)
-            _PAD_TAIL["repaired"] += 1
-            _PAD_TAIL["last"] = (int(num_tokens), int(written))
-            written = num_tokens
-        else:
-            _PAD_TAIL["intact"] += 1
-        if num_tokens > written:
-            raise ValueError(
-                f"{self.prefix}: reading {num_tokens} rows of the indexer "
-                f"selection but only {written} were written this step. The "
-                f"remaining {num_tokens - written} hold the previous step's "
-                "selection -- plausible non-negative indices that "
-                "_compressed_topk_length would count as valid, pointing into "
-                "blocks that belong to another request.")
         return self.topk_indices_buffer[:num_tokens].unsqueeze(1)
 
     @staticmethod
@@ -1628,46 +604,22 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         from the right, so the count of non-negative entries is the number of
         leading valid ones -- which is what the operator's length means.
 
-        🔴 The first version published a count from the indexer instead, on the
-        principle that the writer should own it. That principle is right and
-        the scope was wrong: ``topk_indices_buffer`` is one buffer shared by
-        every layer, while ``self.indexer`` is None on every layer that is not
-        an index source. So consumers read shared indices and found no
-        length, and the guard fired on a call that was otherwise fine. A value
-        and its companion have to live at the same scope or they drift apart
-        by construction.
+        Counted here rather than published by the indexer: the buffer is
+        shared by every layer, while ``self.indexer`` exists only on index
+        source layers.
         """
         return (selection >= 0).sum(dim=-1, dtype=torch.int32)
 
     def _compressed_group_metadata(self, attn_metadata: dict):
         """The metadata of the group that owns this layer's compressed cache.
 
-        🔴 Not the SWA group's. Three of this call's arguments describe the
-        compressed stream -- the block table that addresses it, the lengths
-        that bound it, and the descriptor the kernel takes its tiling from --
-        and all three belong to whichever group holds that cache, which for a
-        consumer layer is another layer entirely (``_compressed_kv_cache``
-        follows ``compressed_cache_prefix``).
-
-        V4.0 keeps the two apart and this is the shape to copy
-        (``dsa_v1.py:2574-2580``)::
-
-            common_attn_metadata = layer_metadata.attention or layer_metadata.swa
-            swa_metadata         = layer_metadata.swa
-            ...
-            ori_block_table = swa_req_metadata.block_table
-            metadata        = common_metadata.sas_metadata
-
-        Taking everything from the SWA group is not a shape error and nothing
-        downstream can see it: the block ids are in range for both pools, and
-        the descriptor is a well-formed descriptor -- for the wrong tiling.
-        The SWA group's spec reports no compression, so its descriptor is
-        built at ratio 1; handing that to a ratio-2 layer is the
-        descriptor/call disagreement that opened this port, and it surfaces
-        as an aicore exception with no frame naming the operator.
-
-        Resolved through the same prefix that selects the cache, so cache,
-        table, lengths and descriptor cannot come from different groups.
+        Not the SWA group's. The block table, the compressed lengths and the
+        descriptor all belong to whichever group holds the compressed cache --
+        for a consumer layer, another layer's (``_compressed_kv_cache``
+        follows ``compressed_cache_prefix``). Taking them from the SWA group
+        is not a shape error: its block ids are in range and its descriptor is
+        well-formed for ratio 1, so the mistake surfaces only as an aicore
+        exception. Resolved through the same prefix that selects the cache.
         """
         prefix = (self.prefix if self.is_kv_source
                   else self.compressed_cache_prefix)
@@ -1700,16 +652,14 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         -- same operators, same layout, same permutations -- because V4.0 has
         been running it on this hardware.
 
-        The inverse rotation has no such precedent, and the reason is worth
-        recording: V4.0 is MLA, whose attention output lives in the NoPE latent
+        The inverse rotation has no V4.0 counterpart: V4.0 is MLA, whose attention output lives in the NoPE latent
         space and carries no rotation to undo. V4.1 has ``num_key_value_heads=1``
         with K and V the *same* 512-wide tensor, so the value side carries the
         64 RoPE dimensions and the output inherits them. Skipping this step is
         not a smaller error than getting it wrong.
 
-        Known gap, deliberately: upstream fuses the rotation into the
-        quantisation kernel (one Triton launch); this is several plain torch
-        ops. Correct first, and it is a self-contained replacement later.
+        Upstream fuses the rotation into the quantisation kernel; here it is
+        several plain torch ops.
         """
         if oproj_tp_enable():
             raise NotImplementedError(
@@ -1730,47 +680,8 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
                 "module's table -- rebuilding one here would be a second copy "
                 "of the per-layer theta and YaRN parameters, free to drift.")
 
-        # The two attention-output keys, either side of the one step between
-        # them. Recorded here rather than where the operator returns, because
-        # "before and after this rotation" is what distinguishes them and only
-        # this function sees both.
-        #
-        # Sliced to n_local_heads: `o` is [tokens, padded_heads, head_dim] and
-        # golden's is 64 heads. The padding rows are zeros, so including them
-        # would not change any value -- it would change the shape, and a
-        # shape mismatch is what the format check is there to catch. Slicing
-        # is the same fact stated where it can be checked.
-        from vllm_ascend.models.deepseek_v4_1 import align_taps
-
-        if align_taps.alignment_active():
-            tap_layer = align_taps.layer_index(
-                self.prefix, self.vllm_config.model_config.hf_text_config)
-            align_taps.tap(tap_layer, "attn.o_raw",
-                           o[:, :self.n_local_heads], positions)
-
-        # 🔴 图内探针:算子原始输出。align_taps 的 attn.o_raw 在图段里不执行
-        #    (图 replay 不跑 Python),所以图模式下那个键从来不存在 ——
-        #    而"键不存在"和"两臂没差异"读起来一模一样。
-        #    这里用 copy kernel 版本,它会被录进图、每次 replay 都执行。
-        if _graph_probe_on():
-            try:
-                from vllm_ascend.models.deepseek_v4_1 import (align_taps as _at,
-                                                             graph_probe as _gp)
-                _l = _at.layer_index(self.prefix,
-                                     self.vllm_config.model_config.hf_text_config)
-                if _l in (0, 1, 2):
-                    _gp.probe(f"L{_l:02d}.attn.o_raw",
-                              o[:, :self.n_local_heads])
-            except Exception:                                # noqa: BLE001
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe as _gp
-                _gp.note_call_site_error()
-
         o = inverse_rope_from_cos_sin_cache(o, positions, cos_sin_cache,
                                             self.rope_head_dim)
-
-        if align_taps.alignment_active():
-            align_taps.tap(tap_layer, "attn.o_unroped",
-                           o[:, :self.n_local_heads], positions)
 
         num_tokens = o.shape[0]
         group_in = o.shape[1] * o.shape[2] // self.n_local_groups
@@ -1810,33 +721,4 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
         # quantisation is not optional here. Dequantising both matrices to bf16
         # and multiplying leaves 1.8e-2 relative error on a single layer,
         # against 3.5e-5 for a real block-scaled fp8 GEMM.
-        _out = self.wo_b(z.reshape(num_tokens, -1))
-        # 🔴 图段内的探针：这一句 copy 是 kernel，会被录进图、每次 replay 都执行。
-        #    写在 Python 里的 tap 在这里【一次都不会响】——整段在图里。
-        #    只装 layer 0：分歧就诞生在它内部（layer_00 的注意力输出逐位相同，
-        #    layer_01 的 sa_in 已差 0.26）。
-        # 🔴 这里的门必须和 tap 的门【方向相反】。
-        #    tap 要在捕获期【关掉】(它做 host 读回,捕获期非法)；
-        #    探针必须在捕获期【打开】—— 那句 copy 只有被录进图,replay 才会执行。
-        #    第一版我把它放在 align_taps.alignment_active() 后面,而那道门包含
-        #    _IN_DUMMY_RUN，图捕获正是在 _dummy_run 里发生的 ⇒ 捕获期直接跳过
-        #    ⇒ kernel 从没进图 ⇒ replay 什么都不做,dump 里没有 probe 分片。
-        #    ⇒ 改用一个【整轮恒定】的 env 开关:捕获和重放读到的是同一个值。
-        if _graph_probe_on():
-            try:
-                from vllm_ascend.models.deepseek_v4_1 import (align_taps,
-                                                             graph_probe)
-                _lyr = align_taps.layer_index(
-                    self.prefix, self.vllm_config.model_config.hf_text_config)
-                # 🔴 扩到第 1 层(2026-09-15):decode 的第一个分歧点是
-                #    L01.attn.ret,而它的输入 L01.mhc_pre.x 逐位相同 ⇒ 分歧在
-                #    第 1 层 attention 【内部】。只有第 0 层有切分点的话,
-                #    这一段整体是黑的。名字带层号,第 0 层的键名不变,
-                #    历史产物仍然可比。
-                if _lyr in (0, 1, 2):
-                    graph_probe.probe(f"L{_lyr:02d}.o_proj.in.o_unroped", o)
-                    graph_probe.probe(f"L{_lyr:02d}.o_proj.out.wo_b", _out)
-            except Exception:                                # noqa: BLE001
-                from vllm_ascend.models.deepseek_v4_1 import graph_probe
-                graph_probe.note_call_site_error()
-        return _out
+        return self.wo_b(z.reshape(num_tokens, -1))

@@ -366,12 +366,12 @@ def _get_kv_cache_groups_uniform_groups(
 
 
 def _ring_layer_pages(kv_cache_groups: list[KVCacheGroupSpec]) -> list[tuple[str, int]]:
-    """compressor 环形 buffer 的 (层名, page_size)，按层名定序。
+    """``(layer_name, page_size)`` of the compressor state rings, sorted by name.
 
-    环不属于 DSV4 的 layer-tuple 契约：tuple 的两个页大小来自
-    ``DSV4_BLOCK_SIZES`` 里硬写的 (page_size_padded_t1, page_size_padded_t2)
-    对，那是主 MLA cache 和 indexer K cache 的几何；环的 32768 不在其中。
-    ⇒ 它要单独排在同一块 backing 的尾部，不能塞进 tuple。
+    The ring is not part of the DSV4 layer-tuple contract: the tuple's two page
+    sizes are the (page_size_padded_t1, page_size_padded_t2) pair hardcoded in
+    ``DSV4_BLOCK_SIZES`` (main MLA cache and indexer K cache), so rings are
+    placed separately at the tail of the same backing allocation.
     """
     out: list[tuple[str, int]] = []
     for group in kv_cache_groups:
@@ -405,7 +405,7 @@ def _get_deepseek_v4_cache_layout(
     bucketed: list[dict[int, list[str]]] = []
     for group in kv_cache_groups:
         if isinstance(group.kv_cache_spec, CircularBufferSpec):
-            continue  # 环单独排在 backing 尾部，见 _ring_layer_pages
+            continue  # placed at the backing tail, see _ring_layer_pages
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
         b: dict[int, list[str]] = defaultdict(list)
@@ -423,12 +423,9 @@ def _get_deepseek_v4_cache_layout(
     # this equals the sub-group size (each has a single page_size).
     num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values()) + len(mtp_layer_names)
 
-    # 🔴 这条守卫原本【不存在】，而它挡的正是一个不会报错的错。
-    #    下面两个 planner 都是 `for ps in page_sizes:` 再从各组的桶里取层 ——
-    #    页大小不在 page_sizes 里的桶会被【静默跳过】，那些层一个 KVCacheTensor
-    #    都拿不到，num_blocks 和报出来的显存却完全正常。
-    #    docstring 里那句 "every layer's page_size matches one of the full-MLA
-    #    bucket sizes" 一直只是一句描述；描述不会变红，判据才会。
+    # Both planners iterate `for ps in page_sizes:`, so a bucket whose page
+    # size is not in page_sizes would be skipped silently and its layers
+    # would get no KVCacheTensor.
     strays: dict[int, list[str]] = defaultdict(list)
     for b in bucketed:
         for ps, names in b.items():
@@ -436,10 +433,10 @@ def _get_deepseek_v4_cache_layout(
                 strays[ps].extend(names)
     if strays:
         raise NotImplementedError(
-            f"DSV4 layer-tuple 的页大小集合是 {page_sizes}（取自 full-MLA 组），"
-            f"但有层的 page_size 不在其中："
-            f"{ {k: v[:4] for k, v in sorted(strays.items())} }。"
-            "这些层会被 planner 静默跳过、拿不到任何 KV cache tensor。"
+            f"DSV4 layer-tuple page sizes are {page_sizes} (from the full-MLA "
+            f"group), but some layers have other page sizes: "
+            f"{ {k: v[:4] for k, v in sorted(strays.items())} }. The planner "
+            "would skip these layers silently and give them no KV cache tensor."
         )
 
     return page_sizes, bucketed, mtp_layer_names, mtp_page_size, num_layer_tuples
@@ -454,12 +451,12 @@ def _get_kv_cache_config_deepseek_v4(
     page_sizes, bucketed, mtp_layer_names, mtp_page_size, num_layer_tuples = _get_deepseek_v4_cache_layout(
         kv_cache_groups
     )
-    # 0.28.0 的 shared_by 契约没有排环的位置。这里【拒绝】而不是照常返回：
-    # 照常返回的结果是那几层拿不到 tensor，而这条路径我们跑不到、也就测不到。
+    # The 0.28.0 shared_by layout has no place for the rings; refuse rather
+    # than leave those layers without a tensor.
     if ring := _ring_layer_pages(kv_cache_groups):
         raise NotImplementedError(
-            f"v0.28.0 的 shared_by DSV4 planner 没有实现 compressor 环形 buffer 的排布，"
-            f"涉及层: {[n for n, _ in ring]}"
+            "the v0.28.0 shared_by DSV4 planner does not lay out compressor "
+            f"state rings; layers: {[n for n, _ in ring]}"
         )
     layer_tuple_page_bytes = sum(page_sizes)
 
@@ -499,9 +496,9 @@ def _get_kv_cache_config_deepseek_v4_main(
         num_tuple_slots,
     ) = _get_deepseek_v4_cache_layout(kv_cache_groups)
 
-    # 环形 buffer 的页大小不在 tuple 里（见 _ring_layer_pages），所以它的字节
-    # 必须【在解 num_blocks 之前】就计入分母；事后再往 backing 后面追加，
-    # 得到的总量会超过 available_memory。
+    # Ring pages are outside the tuple, so their bytes must be in the
+    # denominator before solving num_blocks, or the total would exceed
+    # available_memory.
     ring_pages = _ring_layer_pages(kv_cache_groups)
     ring_bytes_per_block = sum(ps for _, ps in ring_pages)
 
@@ -555,12 +552,9 @@ def _get_kv_cache_config_deepseek_v4_main(
             )
         )
 
-    # 环排在 tuple 区之后，每层一段连续区域。
-    #
-    # ⚠️ 为什么不能另开一块 backing：运行时 model_runner_v1 的 is_dsv4_main 分支
-    #    要求【所有 descriptor 的 size 相同】("DeepSeek-V4 KV cache descriptors
-    #    must share one backing allocation")，它只按那个 size 分配一次再切视图。
-    #    给环单独一个小 descriptor 会当场被那条检查拒掉。
+    # Rings follow the tuple region, one contiguous region per layer. They
+    # share the one backing allocation because the runner requires all
+    # DeepSeek-V4 descriptors to have the same size.
     ring_offset = tuple_region_bytes
     for layer_name, page_size in ring_pages:
         tensors.append(
@@ -574,54 +568,22 @@ def _get_kv_cache_config_deepseek_v4_main(
         )
         ring_offset += page_size * num_blocks
     assert ring_offset == backing_size, (
-        f"环区排完后 offset={ring_offset} 与 backing_size={backing_size} 不符"
-    )
-
-    # 🔴 把 num_blocks 和它的每一个因子打出来,并让它们【自洽】。
-    #    2026-09-11 我拿上游那行 "GPU KV cache size: N tokens" 当容量,说了一句
-    #    "容量掉了一半" —— 而 bytes/block 我自己算出来是【变小】的,方向相反。
-    #    两个数没对上之前那句话不能说。
-    #    ⚪ token 数 / num_blocks 如果不等于任何一个组的 block_size,
-    #      那它报的就不是"容量",是【某一个特定组的】容量。
-    block_sizes = sorted({
-        one.block_size
-        for group in kv_cache_groups
-        for one in (group.kv_cache_spec.kv_cache_specs.values()
-                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                    else [group.kv_cache_spec])
-    })
-    logger.info(
-        "DSV4 排布: num_blocks=%d  bytes/block=%d (= tuple %d × %d slots + 环 %d)  "
-        "backing=%.3f GiB  预算=%.3f GiB  占用率=%.4f  各组 block_size=%s",
-        num_blocks, bytes_per_tuple * num_tuple_slots + ring_bytes_per_block,
-        bytes_per_tuple, num_tuple_slots, ring_bytes_per_block,
-        backing_size / 1024 ** 3, available_memory / 1024 ** 3,
-        backing_size / available_memory if available_memory else float("nan"),
-        block_sizes,
-    )
-    logger.info(
-        "  若上游按某个组报 token 数: %s",
-        {bs: num_blocks * bs for bs in block_sizes},
+        f"ring region ends at offset {ring_offset}, backing_size is {backing_size}"
     )
 
     return num_blocks, tensors
 
 
 def _is_deepseek_v4_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
-    """DSV4 的组集合：full-MLA 组打头，其余是 Uniform 组或 compressor 环组。
+    """DSV4 groups: the full-MLA group first, then uniform or compressor ring groups.
 
-    🔴 这里原来要求【每一个】组都是 UniformTypeKVCacheSpecs。2026-09-11 第十三次
-       起飞时，compressor 的环组（裸 CircularBufferSpec）让这个 all() 变成 False，
-       于是整个 Ascend DSV4 planner 被【静默】绕过，落到上游通用 planner，
-       症状却出现在下游一句和分组无关的 layout 报错上
-       （"KV cache layout LBNHC cannot express ... [16896, 32768, 65536, 131072]"）。
-       「走错了路」和「路上有堵墙」在日志里长得一模一样 ——
-       所以这个分支现在会把自己为什么没被选中打出来。
+    Ring groups are bare ``CircularBufferSpec``; requiring every group to be
+    uniform would route DSV4 to the upstream planner.
     """
     if not kv_cache_groups:
         return False
-    # 第 0 组必须是 full-MLA 的 Uniform 组：_get_deepseek_v4_cache_layout 用它
-    # 定义整个 page_size 桶集合，这是它的前提而不是巧合。
+    # Group 0 must be the full-MLA uniform group: _get_deepseek_v4_cache_layout
+    # takes the page-size buckets from it.
     if not isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
         return False
     if not all(
@@ -654,9 +616,8 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
         return _orig_pool_bytes_per_block(kv_cache_groups)
 
     page_sizes, _, _, _, num_layer_tuples = _get_deepseek_v4_cache_layout(kv_cache_groups)
-    # 必须和 _get_kv_cache_config_deepseek_v4_main 的分母【逐字节一致】：
-    # #51718 的跨 rank 重排用 min_num_blocks * 这个值，除数不一致会让各 rank
-    # 算出不同的 num_blocks。
+    # Must equal _get_kv_cache_config_deepseek_v4_main's denominator byte for
+    # byte: the cross-rank rebalance (#51718) uses min_num_blocks * this value.
     ring_bytes_per_block = sum(ps for _, ps in _ring_layer_pages(kv_cache_groups))
     return sum(page_sizes) * num_layer_tuples + ring_bytes_per_block
 
@@ -671,11 +632,8 @@ def _ascend_max_memory_usage_bytes_from_groups(
     if vllm_version_is("0.28.0") or not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
-    # 组里允许有 compressor 的环组（裸 CircularBufferSpec）；tuple 的几何只由
-    # Uniform 组决定，环单独计在下面。
-    # 🔴 这条断言原来写死「每组都是 Uniform」，和 _is_deepseek_v4_groups 放宽后的
-    #    前提对不上 —— 第十五次起飞就死在这里。同一个假设散在三处
-    #    （detector / layout / 这里），改了两处是改不完的。
+    # Compressor ring groups (bare CircularBufferSpec) are allowed; the tuple
+    # geometry comes from the uniform groups and rings are counted below.
     assert all(
         isinstance(group.kv_cache_spec, (UniformTypeKVCacheSpecs, CircularBufferSpec))
         for group in kv_cache_groups
@@ -693,9 +651,8 @@ def _ascend_max_memory_usage_bytes_from_groups(
         for group in kv_cache_groups
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
     )
-    # 环不在 tuple 里，单独计：一个请求整段生命周期占 1 个 block
-    # （CircularBufferSpec.max_memory_usage_bytes 就返回 page_size_bytes）。
-    # 这个 if 过滤原本把环整个漏掉了 —— 漏掉一项和它恰好为 0，在数上分不开。
+    # Rings are outside the tuple: one block per request for its lifetime
+    # (CircularBufferSpec.max_memory_usage_bytes returns page_size_bytes).
     ring_bytes = sum(
         group.kv_cache_spec.max_memory_usage_bytes(vllm_config) * len(group.layer_names)
         for group in kv_cache_groups
@@ -704,13 +661,11 @@ def _ascend_max_memory_usage_bytes_from_groups(
     return uniform_bytes + ring_bytes
 
 
-
-
 def _block_size_supported(block_size: int, supported: list) -> bool:
-    """supported 里可能混着 int 和 MultipleOf(base)，两种都要认。
+    """Whether ``block_size`` matches ``supported`` (ints or ``MultipleOf``).
 
-    上游 ``CompressorBackend.get_supported_kernel_block_sizes()`` 返回
-    ``[MultipleOf(1)]`` —— 拿 ``bs not in supported`` 判会把任何块大小都判成不支持。
+    Upstream's ``CompressorBackend.get_supported_kernel_block_sizes()`` returns
+    ``[MultipleOf(1)]``, so a plain ``in`` test would reject every size.
     """
     for item in supported:
         if isinstance(item, MultipleOf):
@@ -722,12 +677,10 @@ def _block_size_supported(block_size: int, supported: list) -> bool:
 
 
 def _ring_groups(ring: dict[str, KVCacheSpec], vllm_config: VllmConfig) -> list[KVCacheGroupSpec]:
-    """compressor 的 state_cache 各自成组，按 (block_size, page_size) 归并。
+    """Group the compressor state caches by ``(block_size, page_size)``.
 
-    ⚠️ 断言 block_size 落在该 backend 支持的 kernel block size 集合里 ——
-       这是 select_common_block_size 的必要条件，不该默认它成立。
-       （AscendCompressorStateBackend 故意不覆盖 get_supported_kernel_block_sizes，
-        基类给 [2,4,8,16,32,64,128]；无投机时环容量 8、七个草稿 token 时 16，都在里面。）
+    Each ring block_size must be in its backend's supported kernel block
+    sizes, which ``select_common_block_size`` requires.
     """
     ctx = vllm_config.compilation_config.static_forward_context
     buckets: dict[tuple, list[str]] = {}
@@ -736,38 +689,25 @@ def _ring_groups(ring: dict[str, KVCacheSpec], vllm_config: VllmConfig) -> list[
     out: list[KVCacheGroupSpec] = []
     for (bs, _ps), names in sorted(buckets.items()):
         spec = ring[names[0]]
-        # 🔴 backend 必须从【层】上拿。上一版写的是
-        #    getattr(spec, "attn_backend", None) or getattr(spec, "backend", None)
-        #    —— CircularBufferSpec 这两个属性都没有，于是 backend 恒为 None，
-        #    整条断言【一次都没有执行过】。零覆盖的守卫和通过的守卫，日志里一样绿。
-        # 🔴 这个函数在 EngineCore 和 Worker 【两个】进程里都会跑，而 EngineCore
-        #    进程里没有模型 ⇒ static_forward_context 是空的。
-        #    「本进程没有模型」和「这一层不见了」是两件事：前者这条判据在这里
-        #    本来就不适用（worker 进程会做），后者是真的不一致。
-        #    第十七次起飞就是把两者混成一条 ⇒ 我自己的 fail-safe 在 EngineCore 里打死了它。
-        if not ctx:
-            logger.info(
-                "本进程没有模型（static_forward_context 为空），环组 block_size 检查"
-                "留给 worker 进程做；本次【跳过】不是【通过】（涉及 %d 层）", len(names),
-            )
-        else:
+        # The backend comes from the layer. The EngineCore process has no model
+        # (empty static_forward_context), so the check runs in the workers.
+        if ctx:
             layer = ctx.get(names[0])
             if layer is None or not hasattr(layer, "get_attn_backend"):
                 raise NotImplementedError(
-                    f"static_forward_context 有 {len(ctx)} 层，但"
-                    f"{'没有 ' + names[0] if layer is None else names[0] + ' 没有 get_attn_backend'}"
-                    " —— 判据构造不出来就不放行，不能当成检查通过。"
+                    f"static_forward_context has {len(ctx)} layers but "
+                    f"{names[0] + ' is missing' if layer is None else names[0] + ' has no get_attn_backend'}"
+                    "; the ring block_size check cannot be performed."
                 )
             backend = layer.get_attn_backend()
             supported = backend.get_supported_kernel_block_sizes()
             if supported and not _block_size_supported(bs, supported):
                 raise NotImplementedError(
-                    f"compressor state_cache block_size={bs} 不在 {backend.__name__} 支持的 "
-                    f"kernel block sizes {supported} 里 —— select_common_block_size 会失败。"
-                    f"涉及层: {names}"
+                    f"compressor state_cache block_size={bs} is not in "
+                    f"{backend.__name__}'s supported kernel block sizes "
+                    f"{supported}; select_common_block_size would fail. "
+                    f"Layers: {names}"
                 )
-            logger.info("环组 block_size=%d 已对 %s 的支持集 %s 核过（%d 层）",
-                        bs, backend.__name__, supported, len(names))
         out.append(KVCacheGroupSpec(layer_names=sorted(names), kv_cache_spec=spec))
     return out
 
@@ -777,15 +717,10 @@ def _assert_covers(
     kv_cache_spec: dict[str, KVCacheSpec],
     branch: str,
 ) -> list[KVCacheGroupSpec]:
-    """每一层都必须落进某个组，落不进就【当场点名】。
+    """Raise, naming the layers and specs, if any layer is in no group.
 
-    🔴 上游在 kv_cache_utils.py:2649 有这条断言，但它只说
-        "Some layers are not assigned to any group."
-    —— 不说是哪些层、也不说它们是什么 spec。而那两样正是唯一能定位问题的信息，
-    且分组是在【我们这个补丁里】做的 ⇒ 该由这里说出来，不该让上游去说它不知道的事。
-    2026-09-11 第十一次起飞就撞在那条裸断言上，日志里一个层名都没有。
-
-    ⚠️ 这条只改【报错内容】，不改分组行为：覆盖全时原样返回。
+    Upstream's own assert only says "Some layers are not assigned to any
+    group." Groups are returned unchanged when coverage is complete.
     """
     assigned = {name for g in groups for name in g.layer_names}
     missing = [n for n in kv_cache_spec if n not in assigned]
@@ -809,130 +744,37 @@ def _assert_covers(
     )
 
 
-def _log_groups(groups: list[KVCacheGroupSpec], branch: str) -> list[KVCacheGroupSpec]:
-    """把分组结果【无条件】打出来：组号 / spec 类 / block_size / page_size / 层数。
-
-    ⚠️ 只在出错时才打的诊断，等于在「一切正常」和「正常得可疑」之间不给任何信息。
-    第十三次起飞就死在这上面：报错说 page size 有四种
-    ([16896, 32768, 65536, 131072])，而【没有任何一处】说得出这四种各属于哪个组、
-    哪些层 —— 光看报错无法判断该改 layout 还是该改分组。
-    这条 INFO 是判据的输入，不是装饰。
-    """
-    def _page_sizes_of(g: KVCacheGroupSpec) -> dict[int, int]:
-        sp = g.kv_cache_spec
-        specs = sp.kv_cache_specs.values() if isinstance(sp, UniformTypeKVCacheSpecs) else [sp] * len(g.layer_names)
-        out: dict[int, int] = defaultdict(int)
-        for one in specs:
-            out[one.page_size_bytes] += 1
-        return dict(sorted(out.items()))
-
-    logger.info("Ascend KV-cache 分组 [%s]: %d 组, 共 %d 层", branch, len(groups),
-                sum(len(g.layer_names) for g in groups))
-    for i, g in enumerate(groups):
-        sp = g.kv_cache_spec
-        inner = ""
-        if isinstance(sp, UniformTypeKVCacheSpecs):
-            kinds = sorted({type(one).__name__ for one in sp.kv_cache_specs.values()})
-            inner = f" of {{{', '.join(kinds)}}}"
-        # 🔴 页大小是【派生量】,只打它说不出它为什么变。
-        #    SWA 的页 = block_size × num_kv_heads × head_size × itemsize,
-        #    2026-09-11 合并 model 线之后它 65536→131072 正好翻倍,而 block_size
-        #    两轮都是 32 ⇒ 只可能是 head_size 或 itemsize。这两个数当时【一个都没打】,
-        #    于是"页翻倍"这件事无法归因,只能再起一轮。
-        #    ⇒ 派生量和它的每一个因子要一起打。
-        specs = list(sp.kv_cache_specs.values()) if isinstance(sp, UniformTypeKVCacheSpecs) else [sp]
-        def _u(attr):
-            vals = sorted({str(getattr(one, attr, "-")) for one in specs})
-            return vals[0] if len(vals) == 1 else "|".join(vals)
-        logger.info(
-            "  组%d: %s%s  组block_size=%s  层block_size=%s  head_size=%s  dtype=%s  "
-            "cache_dtype=%s  sliding_window=%s  ratio=%s  tokens_per_state=%s  "
-            "page_size->层数=%s  层数=%d  例: %s",
-            i, type(sp).__name__, inner, getattr(sp, "block_size", "?"),
-            # 🔴 组的 block_size 和层的 block_size 是【两个层级】,可以不相等。
-            #    2026-09-11 我据"组 block_size 两轮都是 32"排除了 block_size 变化,
-            #    而页恰恰是从【层】的 block_size 算的 —— 实测它 64→128,页随之 65536→131072。
-            #    ⇒ 一个只打组级、却和层级派生量并排显示的数,会让人做出相反的排除。
-            _u("block_size"),
-            _u("head_size"), _u("dtype"), _u("cache_dtype_str"),
-            _u("sliding_window"), _u("compress_ratio"), _u("tokens_per_state"),
-            _page_sizes_of(g), len(g.layer_names), g.layer_names[:2],
-        )
-    return groups
-
-
 def _ascend_get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     """Route GLM-5.3-Next and DeepSeek-V4 to their Ascend grouping.
 
-    DSV4 deliberately runs two page sizes side by side -- the main MLA cache
-    and the indexer K cache -- and they do not divide each other:
-
-        main MLA   storage_block_size * num_kv_heads * head_size * itemsize
-                   = 128 * 1 * (512 + 128) * 1                  = 81920
-        indexer    128 * 1 * (128 * 1 + scale_dim 1 * fp32 4)   = 16896
-        81920 % 16896 = 14336
-
-    Both land exactly on the (page_size_padded_t1, page_size_padded_t2) pair
-    hardcoded in ``DSV4_BLOCK_SIZES``
-    (``vllm_ascend/models/layer/attention/layer.py:40``), so two page sizes
-    is the design, not an accident to be unified away.
-
-    vLLM used to give this its own branch in ``get_kv_cache_groups``, which
-    ``group_and_unify_kv_cache_specs`` / ``_get_kv_cache_groups_uniform_groups``
-    above replace. vLLM #53896 (e126687a9a, "Support Qwen3.8-Flash-Next")
-    deleted both functions and their call site, leaving the two patches at the
-    bottom of this module bound to names nothing calls any more. DSV4 then
-    falls through to ``unify_kv_cache_spec_page_size``, whose two escape
-    hatches both decline it:
-
-      * ``_get_packed_kv_cache_groups`` wants a block-outermost layout
-        (``vllm/v1/core/kv_cache_utils.py:1955``); Ascend resolves to LBNHC,
-        which is layer-outermost.
-      * ``_try_get_full_allocation_fallback_groups`` returns None for any
-        SlidingWindowMLASpec (``kv_cache_utils.py:1852``), and DSV4's SWA and
-        compressor caches are exactly that.
-
-    so it raises
-
-        NotImplementedError: Layer model.layers.2.self_attn.indexer.k_cache:
-        page size is not divisible by the maximum page size and cannot be
-        padded. Padding is only supported for non-MLA attention layers.
-
-    Restore the branch here instead of upstream. It is gated on the DSV4
-    marker rather than on ``group_and_unify_kv_cache_specs`` alone, whose
-    SlidingWindowMLASpec test is broad enough to catch other models.
-
-    The downstream config-stage planner already assumes this grouping ran:
-    ``_get_deepseek_v4_cache_layout`` documents "Non-full-MLA groups must have
-    been page_size-padded upstream (see _get_kv_cache_groups_uniform_groups)".
+    DSV4 runs two page sizes that do not divide each other -- the main MLA
+    cache (``128 * (512 + 128) = 81920``) and the indexer K cache
+    (``128 * (128 + 4) = 16896``) -- matching the pair hardcoded in
+    ``DSV4_BLOCK_SIZES``. Upstream's DSV4 branch of ``get_kv_cache_groups``
+    was removed (vLLM #53896), and ``unify_kv_cache_spec_page_size`` rejects
+    this layout (Ascend resolves to the layer-outermost LBNHC layout, and the
+    full-allocation fallback declines SlidingWindowMLASpec), so the branch is
+    restored here, gated on the DSV4 marker.
     """
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return _assert_covers(get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec), kv_cache_spec, "GLM5-Next")
     if not vllm_version_is("0.28.0") and has_deepseek_v4_specs(kv_cache_spec):
-        # 🔴 V4.1 的 compressor state_cache 是【第三种】spec，必须单独成组 ——
-        #    而这不是我们的偏好，是上游用代码要求的：
-        #      CircularBufferSpec.is_uniform_with_collection（kv_cache_interface.py:784-789）
-        #      覆盖了基类的默认实现，改成「这一组里【每一个】都必须是 CircularBufferSpec」，
-        #      而 SameTypeKVCacheSpecs.is_uniform_type 正是调它来决定能不能成组。
-        #    ⇒ 把它和任何别的 spec 放进同一组，uniformity 判定直接为假。
-        #    ⚪ 它没有跨层语义（max_num_blocks_per_req()→1、max_memory_usage_bytes()→page_size、
-        #      prefix_cacheable=False）：那个「环」是单层内部跨 token 的，三个环互不相干。
-        #    ⚪ 为什么恰好 3 个：kv_source_layer_ids=[2,8,14,20] 共 4 个，
-        #      而第 20 层 compress_ratio=1（不压缩）⇒ 没有「还在压缩中的组」⇒ 没有 state。
-        #      4 - 1 = 3，和实际看到的一致，不是漏了一个。
+        # V4.1's compressor state caches must form their own groups:
+        # CircularBufferSpec.is_uniform_with_collection requires every spec in
+        # a group to be a CircularBufferSpec.
         ring = {n: sp for n, sp in kv_cache_spec.items() if isinstance(sp, CircularBufferSpec)}
         rest = {n: sp for n, sp in kv_cache_spec.items() if n not in ring}
         if ring and rest:
             if grouped_specs := group_and_unify_kv_cache_specs(rest):
                 groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
                 groups = groups + _ring_groups(ring, vllm_config)
-                return _log_groups(_assert_covers(groups, kv_cache_spec, "DSV4+ring"), "DSV4+ring")
+                return _assert_covers(groups, kv_cache_spec, "DSV4+ring")
         elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
-            return _log_groups(_assert_covers(_get_kv_cache_groups_uniform_groups(grouped_specs), kv_cache_spec, "DSV4"), "DSV4")
-    return _log_groups(_orig_get_kv_cache_groups(vllm_config, kv_cache_spec), "upstream")
+            return _assert_covers(_get_kv_cache_groups_uniform_groups(grouped_specs), kv_cache_spec, "DSV4")
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
 # Kept as an alias: this was the patch's name while it only handled GLM5.
@@ -948,22 +790,6 @@ def _ascend_get_kv_cache_config_from_groups(
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     if vllm_version_is("0.28.0") or not _is_deepseek_v4_groups(kv_cache_groups):
-        # 🔴 这条分支【必须】说出自己为什么被选中。第十三次起飞时它被静默选中
-        #    （_ring_groups 返回的裸 CircularBufferSpec 让 _is_deepseek_v4_groups 的
-        #     all(isinstance(..., UniformTypeKVCacheSpecs)) 变 False），
-        #    于是 Ascend 的 DSV4 planner 整个被绕过，症状却出现在上游的 layout 检查里
-        #    ——「走错了路」和「路上有堵墙」在日志里长得一模一样。
-        non_uniform = [
-            f"组{i}={type(g.kv_cache_spec).__name__}"
-            for i, g in enumerate(kv_cache_groups)
-            if not isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
-        ]
-        logger.info(
-            "Ascend DSV4 planner 未启用，走上游通用 planner（version_is_0.28.0=%s, "
-            "is_dsv4_groups=%s, 非 UniformTypeKVCacheSpecs 的组: %s）",
-            vllm_version_is("0.28.0"), _is_deepseek_v4_groups(kv_cache_groups),
-            non_uniform or "无",
-        )
         return _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
 
     num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4_main(

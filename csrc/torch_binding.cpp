@@ -1186,11 +1186,8 @@ static int64_t sparse_mla_kv_head_num(const c10::optional<at::Tensor> &ori_kv,
     return kv.size(axis);
 }
 
-// `layout_kv`, `ori_kv` and `cmp_kv` are load-bearing here: the earlier version of this helper took
-// only the query, copied its shape and set the last dimension to 1. That is not the shape the
-// kernel writes whenever the query head count differs from the KV head count, and nothing caught it
-// because `return_softmax_lse` defaults to false and had no caller at all -- the mismatch would
-// have surfaced on the first person to ask for the lse, in both eager and compiled paths.
+// The lse shape depends on the KV head count, so it cannot be derived from the query alone; hence
+// `layout_kv`, `ori_kv` and `cmp_kv`.
 std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q,
     const std::string &layout_q, const c10::optional<at::Tensor> &ori_kv,
     const c10::optional<at::Tensor> &cmp_kv, const std::string &layout_kv, bool return_softmax_lse)
@@ -1461,11 +1458,9 @@ at::Tensor npu_hc_post_npu(
 
 constexpr int64_t HC_PRE_HC_LIMIT = 4;
 // Hidden sizes hc_pre is known to serve: 4096 (DeepSeek-V4-Flash), 5120 (DeepSeek-V4.1-Flash) and
-// 7168. The op itself carries no size assumption -- tiling and kernel read d straight off the shape,
-// align it to 16, and never divide by it -- so this list is a tested-configurations gate rather than
-// a capability limit. It was originally copied from the upstream CANN recipe binding, which lists
-// only 4096 and 7168. Keep it an explicit list: an alignment-only rule would also admit hidden sizes
-// large enough to exhaust UB and fall into the d-splitting path, which is far less exercised.
+// 7168. This is a tested-configurations gate, not a capability limit of the op. Keep it an explicit
+// list: an alignment-only rule would also admit sizes large enough to fall into the far less
+// exercised d-splitting path.
 constexpr int64_t HC_PRE_D_LIMIT = 4096;
 constexpr int64_t HC_PRE_D_LIMIT_V41 = 5120;
 constexpr int64_t HC_PRE_D_LIMIT_EXTEND = 7168;
@@ -1572,28 +1567,15 @@ void inplace_partial_rotary_mul_npu(at::Tensor & x, const at::Tensor &r1, const 
     };
     std::string rotary_mode_str = std::string(rotary_mode);
     auto it = mode_map.find(rotary_mode_str);
-    // An unrecognised mode used to return quietly, leaving x unrotated. The caller gets a tensor of
-    // the right shape holding values that were never rotated, and a misspelt mode is therefore
-    // indistinguishable from a correct call until the numbers are compared against something. Fail
-    // instead, and name the modes: this is in-place, so there is not even a new tensor whose
-    // absence might hint that nothing happened.
+    // Fail on an unknown mode: the op is in-place, so returning quietly would leave x unrotated
+    // with no visible sign.
     TORCH_CHECK(it != mode_map.end(), "rotary_mode must be one of half, interleave, quarter, "
         "interleave-half, but got '", rotary_mode_str, "'");
-    // `partial_slice` is [start, end) over the head dimension: the kernel rotates only
-    // `x[..., start:end)` and leaves the rest untouched. It is load-bearing, and it is read
-    // POSITIONALLY as attr index 1 (attr 0 is the mode), so grepping the operator for the name
-    // finds only the two declarations in inplace_partial_rotary_mul_proto.cpp:59 and _def.cpp:46
-    // and misses every use. Both tilings read it:
-    //   op_host/rope_regbase_tiling_base.cpp:330-340   (ASCEND950 / A5, selected at
-    //                                                   inplace_partial_rotary_mul_tiling.cpp:79)
-    //   op_host/inplace_partial_rotary_mul_a3_tiling.cpp:306
-    // Hard constraint, checked in JudgeSliceInfo (rope_regbase_tiling_base.cpp:271-279):
-    //   cos.size(-1) == sin.size(-1) == end - start,  0 <= start,  end <= x.size(-1),  end > start.
-    // So cos/sin are the width of the ROTATED SLICE, not of the head -- for DSV4's indexer that is
-    // 64, against a 128-wide q. The old "D of x, cos, sin must all be equal" check that would have
-    // forbidden this is commented out at rope_regbase_tiling_base.cpp:178-183.
-    // An empty list means the whole head dimension; the proto's {0, 0} default does NOT, it makes
-    // sliceLength 0 and JudgeSliceInfo rejects it.
+    // `partial_slice` is [start, end) over the head dimension; only x[..., start:end) is rotated.
+    // The op reads it positionally (attr 1). Its tiling requires
+    //   cos.size(-1) == sin.size(-1) == end - start,  0 <= start < end <= x.size(-1),
+    // so cos/sin have the width of the rotated slice, not of the head. An empty list means the whole
+    // head dimension; {0, 0} is rejected.
     auto origin_dim_num = x.dim();
     TORCH_CHECK(origin_dim_num == BSND_DIM_NUM, "Input tensor x's dim num should be 4, actual ", origin_dim_num, ".");
     EXEC_NPU_CMD(aclnnInplacePartialRotaryMul, x, r1, r2, it->second, partial_slice);
@@ -1801,13 +1783,8 @@ at::Tensor npu_kv_quant_sparse_attn_sharedkv_metadata_npu(
 // distinguishing feature is the quantised KV container: quant_mode 1 and 2 describe 608- and
 // 584-byte rows of fp8 nope, bf16 rope and a scale field, which no sibling here accepts.
 //
-// It is NOT the only way to get cmp_ratio 2, and choosing it for that reason would be a wasted
-// migration. The vendored KvQuantSparseAttnSharedkv above does restrict cmp_ratio to {1, 4, 128}
-// (kv_quant_sparse_attn_sharedkv_check_existance.cpp:152-166, unconditionally -- that source has no
-// SoC gate), but CANN's own sparse_flash_mla accepts ratio 2 on Ascend 950 with a BF16 KV cache;
-// measured at max rel err 4.044e-03 against a two-stream CPU reference, with a window-only control
-// differing by 6.6e-01 to show the compressed stream was really used
-// (build_artifacts/sparse_flash_mla/test_two_stream_vs_operator.py).
+// It is not needed for cmp_ratio 2: KvQuantSparseAttnSharedkv above restricts cmp_ratio to
+// {1, 4, 128}, but CANN's sparse_flash_mla accepts ratio 2 on Ascend 950 with a BF16 KV cache.
 //
 // It also splits seqused_kv into separate ori/cmp tensors and adds cmp_residual_kv, so that the
 // pre-compression KV length can be recovered, plus per-batch topk lengths. cmp_residual_kv is 1-D,

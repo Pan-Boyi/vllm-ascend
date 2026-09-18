@@ -6,7 +6,7 @@ head_dim)``, saying "these index each other, so a mismatch writes rows at the
 wrong offset rather than failing". That was a reasoned precaution. It is now
 an observation:
 
-    tools/probe_scatter_nd_negative_index.py, card 0, 2026-09-14
+    measured on A5 with a standalone npu_scatter_nd_update_ probe
       indices [0, 16] into a cache of [8, 16, 32]  ->  wrote (1, 0)
 
 An over-large OFFSET is not bounds-checked -- it aliases into the next block,
@@ -17,7 +17,7 @@ ignored, and so is any negative. The two axes are not treated alike.)
 land in a neighbouring block **silently**. The guard is the only thing
 between that and a corruption that surfaces as accuracy.
 
-⚠️ Not covered by ``test_deepseek_v4_1_kv_binding.py`` despite that file
+Not covered by ``test_deepseek_v4_1_kv_binding.py`` despite that file
 containing the same ``shape[1:] == (block_size, head_dim)`` expression: it is
 about binding the cache list, a different object. Same words, different
 subject.
@@ -61,7 +61,7 @@ def _call(layer, metadata):
 
 
 def test_the_guard_fires_when_block_size_disagrees():
-    """🔴 The mismatch this exists for: 16 declared, 32 in the cache.
+    """The mismatch this exists for: 16 declared, 32 in the cache.
 
     Without the refusal, an offset beyond 16 would write into the next block
     and nothing would report it -- measured, see the module docstring.
@@ -92,7 +92,7 @@ def test_the_message_names_both_numbers():
 
 
 def test_a_matching_shape_passes_the_guard():
-    """🔵 The negative arm. Without it, a guard that raises unconditionally
+    """The negative arm. Without it, a guard that raises unconditionally
     would satisfy every test above."""
     cache = torch.zeros(8, 16, 64, dtype=torch.bfloat16)
     layer = _Layer(cache, head_dim=64)

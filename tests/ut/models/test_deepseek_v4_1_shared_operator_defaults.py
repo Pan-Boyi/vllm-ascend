@@ -17,7 +17,7 @@ defaulted flag. So the scope is derived here instead of recalled: signatures
 and their defaults come from the bindings, actual arguments from an AST walk
 of both models' call sites.
 
-⚠️ Everything here is static. It says what the source declares, not what ran.
+Everything here is static. It says what the source declares, not what ran.
 """
 
 import ast
@@ -59,7 +59,7 @@ def _defaults(fn) -> dict:
 @pytest.mark.parametrize("upmod,upname,ourmod,ourname", REBINDS)
 def test_a_replacement_declares_the_same_defaults_as_what_it_replaces(
         upmod, upname, ourmod, ourname):
-    """🔴 The mechanism that produced A-2, at the Python level.
+    """The mechanism that produced A-2, at the Python level.
 
     A replacement that declares a different default silently changes what
     every caller that omits the argument gets -- and the callers that omit it
@@ -123,7 +123,7 @@ def _ops_calls(root: pathlib.Path) -> list:
 @pytest.mark.skipif(not VLLM_SOURCE.exists(),
                     reason="upstream source tree not present")
 def test_the_attention_path_of_v41_turns_the_shared_q_norm_off():
-    """🔴 The fact the decomposition has to match, derived from the source.
+    """The fact the decomposition has to match, derived from the source.
 
     If upstream ever stops passing False here, this decomposition -- which
     applies no norm -- becomes wrong in the other direction, and nothing else
@@ -158,7 +158,7 @@ def test_the_attention_path_of_v41_turns_the_shared_q_norm_off():
 @pytest.mark.skipif(not VLLM_SOURCE.exists(),
                     reason="upstream source tree not present")
 def test_the_dspark_sites_are_known_to_differ_and_are_not_ours():
-    """⚠️ Scope, written down because the first version of this claim said
+    """Scope, written down because the first version of this claim said
     'V4.1 passes False at every call site'.
 
     DSpark omits the argument and takes True, exactly as V4.0 does. It does

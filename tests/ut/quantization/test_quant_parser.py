@@ -55,7 +55,7 @@ class TestRoundModeForcingIsExhaustive(TestBase):
     any type added to the mapping later with none either. These iterate the mapping instead, so a
     new entry is covered the moment it exists.
 
-    🔴 Why the forcing matters. On the non-W4A4 paths the activation is FP8 and
+    Why the forcing matters. On the non-W4A4 paths the activation is FP8 and
     ``npu_dynamic_mx_quant`` is called without a round mode, so "rint" is what the hardware does
     anyway and the reference's round-half-to-even matches the real path. Hand it "round" (round
     away from zero) and the quantisation error stops being two-sided: every tie moves the same

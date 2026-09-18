@@ -13,10 +13,10 @@ The full calibration, measured on CPU against
 
     source dtype              target dtype        bytes after copy_
     ------------------------  ------------------  ---------------------------
-    e8m0 (as safetensors)     uint8               🔴 all 0
-    e8m0 (as safetensors)     float8_e8m0fnu      ✅ 119..122   preserved
-    uint8 view                uint8               ✅ 119..122   preserved
-    uint8 view                float8_e8m0fnu      🔴 all 134    constant
+    e8m0 (as safetensors)     uint8               BAD: all 0
+    e8m0 (as safetensors)     float8_e8m0fnu      ok: 119..122   preserved
+    uint8 view                uint8               ok: 119..122   preserved
+    uint8 view                float8_e8m0fnu      BAD: all 134    constant
 
 Which row is live was settled by two independent things: this table, and a
 runtime read of a pre-fix flight (arm 0ecd4f2bb) reporting
@@ -25,7 +25,7 @@ runtime read of a pre-fix flight (arm 0ecd4f2bb) reporting
 passes the uint8 view -- and therefore ``uint8`` is the declaration that keeps
 the bytes.
 
-🔴 The assertion is behavioural, not ``dtype is uint8``. Restating the fix would
+The assertion is behavioural, not ``dtype is uint8``. Restating the fix would
 pass for a parameter declared in some third dtype that also destroys the bytes;
 what matters is that a byte written by the loader can be read back. So the test
 performs the loader's own copy and compares bytes.
@@ -124,7 +124,7 @@ def test_the_check_fails_for_a_dtype_that_reinterprets(bad):
 
 @pytest.mark.parametrize("safe", [torch.uint8, torch.int8])
 def test_these_dtypes_do_preserve_the_bytes(safe):
-    """🔴 int8 is here because an earlier version of this file asserted it was a hazard.
+    """int8 is here because an earlier version of this file asserted it was a hazard.
 
     It is not: copying uint8 200 into int8 wraps to -56, and viewing that as uint8 gives 200 back.
     Two's complement round-trips every byte. The earlier version drew its test bytes from the

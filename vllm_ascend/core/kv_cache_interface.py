@@ -43,12 +43,8 @@ def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:
 def _merged_stream_compress_ratio(specs) -> int | None:
     """One stream ratio for the merged group, or a refusal.
 
-    Raising is what keeps groups separate rather than what breaks the launch:
-    the grouping pass merges two buckets only if ``merge`` does not raise, so a
-    refusal here leaves layers with different streams in different groups.
-    Silently taking ``specs[0]``'s value would instead produce one group whose
-    single descriptor is wrong for every layer but the first -- which is the
-    failure this field was added to end.
+    The grouping pass merges two buckets only if ``merge`` does not raise, so
+    raising keeps layers with different streams in different groups.
     """
     ratios = {spec.stream_compress_ratio for spec in specs}
     if len(ratios) == 1:
@@ -71,23 +67,12 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     separate :class:`AscendSFAIndexerCacheSpec`.
     """
 
-    #: The layer's configured ``compress_ratios`` entry, verbatim -- 0
-    #: included. ``None`` means no layer stated one, which is every V4.0 caller.
-    #:
-    #: This exists because neither ratio already on these specs can express it.
-    #: ``tokens_per_state`` and ``AscendSlidingWindowMLASpec.compress_ratio``
-    #: are both *divisors of the page* (``storage_block_size = block_size //
-    #: ratio``), so 0 is not a legal value for either and both clamp it to 1.
-    #: V4.1 needs 0 and 1 to stay apart: 0 means "pure sliding window, no
-    #: compressed stream" and 1 means "compressed, pooling disabled".
-    #: Collapsing them made a ratio-0 layer's descriptor get built as though it
-    #: attended a compressed stream while the call supplied none.
-    #:
-    #: Part of the spec's identity, deliberately: groups are keyed on spec
-    #: equality (``kv_cache_utils._get_kv_cache_groups_uniform_page_size``), so
-    #: layers whose streams differ land in different groups. That is the point
-    #: -- the descriptor is built once per group, so a group spanning two
-    #: stream ratios cannot have one descriptor that is right for both.
+    #: The layer's configured ``compress_ratios`` entry, verbatim, 0 included
+    #: (``None`` for V4.0 callers). The other ratios on these specs divide the
+    #: page and clamp 0 to 1, but V4.1 must keep 0 ("no compressed stream")
+    #: apart from 1 ("compressed, no pooling"). Part of the spec's identity so
+    #: layers with different streams land in different groups: the descriptor
+    #: is built once per group.
     stream_compress_ratio: int | None = None
 
     scale_dim: int = 0
@@ -118,16 +103,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         def __post_init__(self):
             """Fill in ``storage_block_size`` when the caller left it unset.
 
-            vLLM #51718 did two things: it replaced
-            ``MLAAttentionSpec.compress_ratio`` with
-            ``AttentionSpec.tokens_per_state`` *and* promoted
-            ``storage_block_size`` from a derived value to a real dataclass
-            field (``vllm/v1/kv_cache_interface.py:560``). Keeping the old
-            read-only property here makes the generated frozen-dataclass
-            ``__init__`` assign to a property with no setter, which raises
-            ``AttributeError``. Derive the value in ``__post_init__`` instead
-            so every construction site keeps the pre-#51718 semantics without
-            having to pass the field explicitly.
+            vLLM #51718 replaced ``MLAAttentionSpec.compress_ratio`` with
+            ``AttentionSpec.tokens_per_state`` and made ``storage_block_size``
+            a dataclass field, so a read-only property here would break the
+            frozen dataclass ``__init__``. Derive it here instead.
 
             Must run before ``super().__post_init__()``: alignment padding
             reads ``real_page_size_bytes``, which depends on this value.
@@ -270,23 +249,12 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     cache_dtype_str: str | None = None
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
     alignment: int | None = None  # Default to None for no padding.
-    #: The layer's configured ``compress_ratios`` entry, verbatim -- 0
-    #: included. ``None`` means no layer stated one, which is every V4.0 caller.
-    #:
-    #: This exists because neither ratio already on these specs can express it.
-    #: ``tokens_per_state`` and ``AscendSlidingWindowMLASpec.compress_ratio``
-    #: are both *divisors of the page* (``storage_block_size = block_size //
-    #: ratio``), so 0 is not a legal value for either and both clamp it to 1.
-    #: V4.1 needs 0 and 1 to stay apart: 0 means "pure sliding window, no
-    #: compressed stream" and 1 means "compressed, pooling disabled".
-    #: Collapsing them made a ratio-0 layer's descriptor get built as though it
-    #: attended a compressed stream while the call supplied none.
-    #:
-    #: Part of the spec's identity, deliberately: groups are keyed on spec
-    #: equality (``kv_cache_utils._get_kv_cache_groups_uniform_page_size``), so
-    #: layers whose streams differ land in different groups. That is the point
-    #: -- the descriptor is built once per group, so a group spanning two
-    #: stream ratios cannot have one descriptor that is right for both.
+    #: The layer's configured ``compress_ratios`` entry, verbatim, 0 included
+    #: (``None`` for V4.0 callers). The other ratios on these specs divide the
+    #: page and clamp 0 to 1, but V4.1 must keep 0 ("no compressed stream")
+    #: apart from 1 ("compressed, no pooling"). Part of the spec's identity so
+    #: layers with different streams land in different groups: the descriptor
+    #: is built once per group.
     stream_compress_ratio: int | None = None
 
     compress_ratio: int = 1

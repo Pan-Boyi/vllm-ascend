@@ -1,27 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Preconditions on the staged engram tables.
 
-The engram lookup tables are 188.83 GiB and do not fit in device memory, so
-they are staged as raw files in ``/dev/shm`` and mapped. Everything downstream
--- registration, the device address, the Triton gather -- assumes those files
-are complete. Nothing downstream can tell that they are not: a short table
-reads as whatever the mapping's tail holds, which is zeros, and zeros are
-valid engram payload.
+The engram tables do not fit in device memory, so they are staged as raw files
+in ``/dev/shm`` and memory-mapped. A short file reads as zeros past its end,
+and zeros are valid engram payload, so nothing downstream can detect it.
 
-This is the second, independent check, and the reason it exists is worth
-recording. The staging side already compares what it wrote against the source
-and reports a byte-for-byte match. That report was true and useless at the same
-time: it compared *the part that had been written*, and the writer had stopped
-7,184 bytes early on all four files -- each truncated to a page boundary,
-invisible at the GiB granularity the report used. A check whose extent is
-derived from the thing it is checking cannot see a short write.
-
-So this one derives the expected size from the *checkpoint* instead: the
-safetensors header's ``data_offsets``, which is the authority on how long the
-tensor is. Integer equality, no tolerance. Anything else -- a missing
-directory, a missing file, a zero-length file -- takes the same refusal path
-rather than a special case; a reboot empties ``/dev/shm`` (it is tmpfs, in
-memory), and that lands here as "expected N, found 0", which is exactly right.
+The expected size therefore comes from the checkpoint (the safetensors
+``data_offsets``), not from anything the staging step recorded, and is
+compared with integer equality. A missing directory or file (``/dev/shm`` is
+emptied by a reboot) takes the same refusal path.
 """
 
 from __future__ import annotations
@@ -45,12 +32,7 @@ def staged_file_name(tensor_name: str) -> str:
 
 
 def expected_nbytes(checkpoint_dir: str, tensor_name: str) -> int:
-    """Length of one tensor according to the checkpoint's own header.
-
-    ``data_offsets`` is the authority here, not the file size of the shard and
-    not anything the staging step recorded -- the point of this module is to
-    compare against something the staging step did not produce.
-    """
+    """Length of one tensor according to the checkpoint's own header."""
     index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
     with open(index_path, "r") as handle:
         weight_map = json.load(handle)["weight_map"]
@@ -71,8 +53,7 @@ def verify_staged_tables(tensor_names: list[str], checkpoint_dir: str,
                          stage_dir: str = DEFAULT_STAGE_DIR) -> dict[str, int]:
     """Refuse to start unless every staged table is exactly the right length.
 
-    Returns the verified sizes, so a caller that wants to report coverage has
-    the numbers rather than a bare True.
+    Returns the verified sizes.
     """
     if not tensor_names:
         raise ValueError(
@@ -120,19 +101,9 @@ def verify_staged_tables(tensor_names: list[str], checkpoint_dir: str,
 
 # -- content, not just length -------------------------------------------------
 #
-# Registration for device access requires the mapping to be writable: the
-# driver pins pages with write intent, and a PROT_READ mapping is refused
-# outright (aclrtHostRegisterV2 rc=507899, with the kernel reporting
-# get_user_pages_fast -EFAULT). So these tables -- read-only data, shared as
-# one set of physical pages across every rank -- are necessarily mapped
-# writable in production. A stray write through any of those mappings corrupts
-# the table for all ranks at once, silently, and the size check above cannot
-# see it: a write changes content, not length.
-#
-# Hence a fingerprint. Two independent folds per file, so a change that happens
-# to preserve one is still caught by the other. Reading is memory-bandwidth
-# bound -- the whole 188.83 GiB folds in about 11 seconds -- which is cheap
-# enough to do at startup.
+# A stray write changes a table's content but not its length, so the size
+# check cannot see it. Two independent folds per file, so a change that
+# preserves one is still caught by the other.
 
 _FOLD_CHUNK = 1 << 30
 _U64_MASK = (1 << 64) - 1
@@ -141,8 +112,7 @@ _U64_MASK = (1 << 64) - 1
 def content_fingerprint(path: str) -> tuple[int, int]:
     """``(sum, xor)`` over the file's 64-bit words, both mod 2**64.
 
-    Mapped read-only on purpose: the check must never be the thing that
-    corrupts the table it is checking.
+    Mapped read-only so the check cannot modify the table it checks.
     """
     import mmap
 
@@ -210,8 +180,4 @@ def verify_staged_content(expected: dict[str, tuple[int, int]],
         raise RuntimeError(
             "staged engram tables have changed since they were written:\n  "
             + "\n  ".join(problems)
-            + "\n\nThe size check passing alongside this means the length is "
-            "unchanged and the bytes are not -- which is what a stray write "
-            "through the writable mapping looks like. Registration requires "
-            "PROT_WRITE, so every rank holds one, and they all address the "
-            "same physical pages. Re-stage rather than continuing.")
+            + "\n\nRe-stage rather than continuing.")

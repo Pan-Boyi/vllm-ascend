@@ -1,26 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A plain-torch reference for the indexer's selection, and what it can settle.
+"""A plain-torch reference for the indexer's selection (test oracle).
 
-Two questions about ``forward_oot`` have been open since it was written, and
-neither needs a GPU:
+The logits are ``sum_h w_h * (q_h . k_h)`` over the compressed K rows, computed
+here in float32, followed by a causal top-k. It takes dequantised inputs, so it
+does not validate the cache layout K is read from.
 
-* **what the operator writes into a short row's tail.** Upstream's contract is
-  ``-1``; the Ascend operator's convention is not documented and not visible in
-  the schema. This is answerable by *measurement*, not comparison -- run one
-  batch whose compressed context is shorter than ``index_topk`` and read the
-  buffer. Every valid position must appear exactly once and whatever fills the
-  rest is the answer. No reference is involved.
-
-* **whether the selected indices are the right ones.** The logits are
-  ``sum_h w_h * (q_h . k_h)`` over the compressed K rows, and that is a matmul.
-  The reference below computes it in float32 on whatever device it is handed.
-  Golden's hardware is not required; what is required is the *inputs*, tapped
-  from a real run.
-
-So the verification path is two taps and this file, not a second machine. What
-this cannot do is validate the cache layout it reads K from -- that has to come
-from the tap, in dequantised form, or the comparison is between two different
-readings of the same bytes.
+It also reads the operator's fill value off a short row's tail: upstream's
+contract is ``-1``, and the Ascend operator's convention is not documented.
 """
 
 from __future__ import annotations

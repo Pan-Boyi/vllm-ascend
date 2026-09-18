@@ -258,11 +258,8 @@ def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
             sparse_attn_metadata_kwargs={},
             include_metadata_device=True,
             applies_sparse_attn_runtime_kwargs=True,
-            # Ratio 2 is why this plan matters: DeepSeek-V4.1 needs it on
-            # layers 2..19, and 1 on 20..39. Being measured -- this plan exists
-            # in the tree but has never been run end to end -- so this entry is
-            # what the model requires, not what anyone has observed. If the
-            # measurement comes back short, it is this tuple that changes.
+            # DeepSeek-V4.1 needs ratio 2 on layers 2..19 and 1 on 20..39;
+            # SparseFlashMla (CANN 9.2) accepts both.
             supported_compress_ratios=(0, 1, 2),
         )
     return DsaAttnKvPlan(

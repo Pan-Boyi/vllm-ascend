@@ -36,41 +36,24 @@ def is_v41(hf_text_config) -> bool:
 def bind_value(kv_cache):
     """What to store on the layer.
 
-    A tensor stays a tensor. Every V4.1 consumer of a single-tensor cache reads
-    it as one -- ``kv_cache.numel()`` in ``engram.ensure_cache``, an assert on
-    ``shape[1:]`` in the SWA path -- so wrapping it is not a conservative
-    default, it is a type error deferred to whoever reads it next. The unit
-    head axis is dropped when there is one, because that is the shape upstream
-    expects; a tensor that arrives already without it is handed over unchanged.
+    A tensor stays a tensor: V4.1 consumers read a single-tensor cache as one
+    (``kv_cache.numel()`` in ``engram.ensure_cache``, an assert on
+    ``shape[1:]`` in the SWA path). The unit head axis is dropped when there is
+    one; a tensor that arrives without it is handed over unchanged.
 
-    The list is kept for a cache that genuinely is several tensors. The
-    indexer's is a (values, scales) pair addressed by fixed slot, and
-    flattening it would turn a slot index into an element index.
-
-    The earlier version wrapped anything it did not recognise, on the reasoning
-    that preserving the old behaviour was the safe default. It was not: the
-    old behaviour belongs to V4.0, whose consumers index the list. Here the
-    reshape path can legitimately hand over a three-dimensional tensor with no
-    head axis at all, and wrapping that produced
-    ``'list' object has no attribute 'numel'`` during decode graph capture --
-    several frames from here, in upstream code that never asked for a list.
+    A cache that genuinely is several tensors (e.g. a (values, scales) pair
+    addressed by fixed slot) is handed over as-is.
     """
     if isinstance(kv_cache, (list, tuple)) and len(kv_cache) == 1:
-        # A one-element list is not "several tensors". The page-strided reshape
-        # branch builds its shapes as a list because some specs need two -- a
-        # scale alongside the values, or a nope/rope split -- and hands back a
-        # list of one when they do not. _adjust_kv_layout always returns a list,
-        # so SWA arrives wrapped.
+        # A one-element list is not "several tensors": _adjust_kv_layout
+        # always returns a list, so SWA arrives wrapped.
         inner = kv_cache[0]
         if isinstance(inner, torch.Tensor):
             return _drop_head_axis(inner)
     if isinstance(kv_cache, torch.Tensor):
         return _drop_head_axis(kv_cache)
-    # Several tensors, addressed by fixed slot. Handed over exactly as it came:
-    # the earlier version returned [kv_cache] here, which wrapped an existing
-    # list in another one and moved every slot index down a level. That half
-    # does not raise -- the indexer reads slot 0 and got the whole pair -- and
-    # it stayed invisible while the SWA failure above it fired first.
+    # Several tensors, addressed by fixed slot: handed over exactly as it
+    # came (wrapping again would shift every slot index down a level).
     return kv_cache
 
 

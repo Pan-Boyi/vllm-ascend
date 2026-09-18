@@ -216,7 +216,7 @@ def _discarding_call_sites():
 def test_no_call_site_discards_the_valid_entry_count():
     """`x, _ = build_...` is how the count was lost for as long as it existed.
 
-    ⚠️ This still only catches the tuple-unpack spelling. `res = build_(...)`
+    This still only catches the tuple-unpack spelling. `res = build_(...)`
     followed by `res[0]` discards the same value and is invisible here. The
     gap is written down rather than papered over -- but the scope is now the
     package, which is the half that actually went wrong.
@@ -557,7 +557,7 @@ def test_the_helper_is_no_longer_documented_as_being_for_one_parameter():
         kv_with_layout_rank
 
     doc = " ".join(kv_with_layout_rank.__doc__.split())
-    assert "a helper that one of two callers uses" in doc
+    assert "Every KV cache argument of this call goes through here" in doc
 
 
 # --------------------------------- the compressed cache's own block table
@@ -711,16 +711,22 @@ def test_a_selection_buffer_nobody_wrote_is_refused_on_a_real_batch(monkeypatch)
         layer._checked_selection(4)
 
 
-def test_reading_past_the_written_rows_is_refused():
-    """This one fires whatever the batch is: rows were written, so the
-    dummy-run escape does not apply."""
-    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import mark_rows_written
+def test_rows_past_the_written_ones_are_cleared_not_read():
+    """Graph capture pads num_tokens past the rows the indexer wrote. The tail
+    holds the previous step's selection, which would be counted as valid, so
+    it is overwritten with NO_TOKEN and the buffer marked written to the new
+    length."""
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
+        NO_TOKEN, mark_rows_written, rows_written)
 
-    buffer = torch.full((8, 512), -1, dtype=torch.int32)
+    buffer = torch.full((8, 512), 7, dtype=torch.int32)
     mark_rows_written(buffer, 4)
-    layer = _sel_bind(buffer)
-    with pytest.raises(ValueError, match="only 4 were written"):
-        layer._checked_selection(6)
+    got = _sel_bind(buffer)._checked_selection(6)
+    assert got.shape == (6, 1, 512)
+    assert torch.all(got[:4] == 7), "written rows must be left alone"
+    assert torch.all(got[4:] == NO_TOKEN)
+    assert torch.all(buffer[6:] == 7), "rows past num_tokens are not touched"
+    assert rows_written(buffer) == 6
 
 
 def test_the_written_rows_are_returned_with_the_head_axis():
