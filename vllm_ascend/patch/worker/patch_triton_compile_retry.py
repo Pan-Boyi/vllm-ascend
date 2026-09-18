@@ -8,7 +8,8 @@ compile at any point during serving, so precompiling cannot rule it out.
 
 On that failure: log the worker's temp-dir state, retry up to 3 times with
 backoff, then once more with a fresh explicit TMPDIR. If all attempts fail the
-original ``check=True`` semantics are kept (CalledProcessError is raised).
+original ``check=True`` semantics are kept (CalledProcessError is raised),
+including when the fresh TMPDIR itself cannot be created (e.g. ENOSPC).
 Disable with VLLM_ASCEND_DSV41_TRITON_COMPILE_RETRY=0.
 """
 import os
@@ -85,13 +86,21 @@ def _run(cmd, *args, **kwargs):
                 break
         else:
             env = dict(kwargs.get("env") or os.environ)
-            fresh = tempfile.mkdtemp(prefix="dsv41_tmpdir_")
-            env.update(TMPDIR=fresh, TMP=fresh, TEMP=fresh)
-            r = _ORIG_RUN(cmd, *args, **dict(kwargs, env=env))
-            if r.returncode == 0:
-                logger.warning("bishengir-compile succeeded with a fresh TMPDIR=%s after 3 retries", fresh)
-            else:
-                logger.error("bishengir-compile failed on every retry: %s", _probe())
+            try:
+                fresh = tempfile.mkdtemp(prefix="dsv41_tmpdir_")
+            except OSError as e:
+                # On a full disk this mkdtemp fails too (ENOSPC, seen 2026-09-18). Log it and
+                # fall through to the original failure instead of dying with a different error.
+                fresh = None
+                logger.error("bishengir-compile failed on every retry and a fresh TMPDIR could not "
+                             "be created (errno=%s, %s): %s", e.errno, os.strerror(e.errno or 0), _probe())
+            if fresh is not None:
+                env.update(TMPDIR=fresh, TMP=fresh, TEMP=fresh)
+                r = _ORIG_RUN(cmd, *args, **dict(kwargs, env=env))
+                if r.returncode == 0:
+                    logger.warning("bishengir-compile succeeded with a fresh TMPDIR=%s after 3 retries", fresh)
+                else:
+                    logger.error("bishengir-compile failed on every retry: %s", _probe())
     if check and r.returncode != 0:
         raise _real_sp.CalledProcessError(r.returncode, cmd, r.stdout, r.stderr)
     return r
