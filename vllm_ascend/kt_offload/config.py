@@ -78,6 +78,10 @@ class KTOffloadConfig:
     # Eager (M1): run kt's synchronous submit/sync path rather than ACL
     # stream callbacks. Sets KT_FORCE_SYNC_SUBMIT=1 for the process.
     force_sync_submit: bool = True
+    # M3: run the captured CPU-expert submit on a side stream so the resident
+    # NPU experts overlap it (sglang's KT_SIDE_STREAM). Interface only; the
+    # default, serial path is the one M2 implements.
+    overlap_side_stream: bool = False
 
     @model_validator(mode="after")
     def _validate_values(self):
@@ -92,6 +96,8 @@ class KTOffloadConfig:
                 f"kt_offload_config.numa_nodes lists {len(self.numa_nodes)} node(s) "
                 f"but threadpool_count is {self.threadpool_count}."
             )
+        if self.overlap_side_stream:
+            raise ValueError("kt_offload_config.overlap_side_stream is reserved for M3 (not implemented).")
         if self.chunked_prefill_size < 0:
             raise ValueError("kt_offload_config.chunked_prefill_size must be >= 0.")
         if self.resident_strategy in ("prefix", "frequency") and self.num_resident_experts <= 0:
@@ -122,9 +128,5 @@ class KTOffloadConfig:
             )
         if pc.enable_eplb:
             raise ValueError("kt_offload_config is incompatible with EPLB (it owns the expert placement).")
-        if not vllm_config.model_config.enforce_eager:
-            # M1 implements the eager path only; graph capture needs the
-            # host-func node of M2 (see docs/moe_offload_design.md §f).
-            raise ValueError("kt_offload_config currently requires --enforce-eager (graph mode is M2).")
         if vllm_config.speculative_config is not None:
             raise ValueError("kt_offload_config does not support speculative decoding (MTP experts stay unhandled).")

@@ -42,6 +42,7 @@ def test_config_defaults_off():
         dict(cpuinfer_threads=8, resident_strategy="explicit"),  # no list
         dict(cpuinfer_threads=8, num_resident_experts=100, threadpool_count=2, numa_nodes=[0]),
         dict(cpuinfer_threads=8, num_resident_experts=100, resident_strategy="random"),
+        dict(cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=True),  # reserved for M3
     ],
 )
 def test_config_rejects_incomplete(kwargs):
@@ -67,7 +68,8 @@ def _vllm_config(tp=1, dp=1, pp=1, eager=True, eplb=False, spec=None):
 def test_preconditions():
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100)
     cfg._validate_preconditions(_vllm_config())
-    for bad in (dict(dp=4), dict(tp=2), dict(eager=False), dict(eplb=True), dict(spec=object())):
+    cfg._validate_preconditions(_vllm_config(eager=False))  # graph mode allowed since M2
+    for bad in (dict(dp=4), dict(tp=2), dict(eplb=True), dict(spec=object())):
         with pytest.raises(ValueError):
             cfg._validate_preconditions(_vllm_config(**bad))
     KTOffloadConfig()._validate_preconditions(_vllm_config(dp=4, eager=False))  # off: no checks

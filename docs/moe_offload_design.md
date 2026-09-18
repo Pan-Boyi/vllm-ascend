@@ -1,6 +1,6 @@
 # DSV4.1 单卡 MoE offload（vLLM-Ascend + kt-kernel）M1 设计
 
-> 范围：M1 = eager（`--enforce-eager`）。M2 图模式只预留接口（§f）。
+> 范围：M1 = eager；M2 = 图模式（FULL / PIECEWISE，§f）。侧流 overlap 只留开关（M3）。
 > 行号基于本分支 `dsv41-moe-offload`（vllm-ascend）与 `worktrees/moe-offload-vllm`（vllm，`dd63fc7d6`）。
 > 标 ⚫ 的是依赖 kt-kernel 或上卡才能确认的点。跟踪文档是 `MOE_OFFLOAD_PLAN.md`，本文不维护状态。
 
@@ -38,8 +38,9 @@
 | `chunked_prefill_size` | 0=`max_num_batched_tokens` | kt 单次最大 token 数；超出 kt 直接 raise |
 | `skip_cpu_in_profile_run` | `true` | 见 §h |
 | `force_sync_submit` | `true` | eager 下设 `KT_FORCE_SYNC_SUBMIT=1`，走 kt 的同步 submit/sync |
+| `overlap_side_stream` | `false` | M3 预留（sglang `KT_SIDE_STREAM` 的对应物）；设 `true` 目前直接报错 |
 
-前置条件（`config.py:107-130`）：TP=DP=PP=1、无 EPLB、`--enforce-eager`、无投机解码。
+前置条件（`config.py` `_validate_preconditions`）：TP=DP=PP=1、无 EPLB、无投机解码。M2 起不再要求 `--enforce-eager`。
 层级前置条件（`layer.py:100-116`）：层号 < `num_hidden_layers`（MTP 层拒绝）、无冗余专家、`ep_size=tp_size=1`、
 `mix_placement=false`、`dynamic_eplb=false`。
 
@@ -152,19 +153,50 @@ merge: sync_forward → [KT_FORCE_SYNC_SUBMIT=1: cpu_infer.sync()] → H2D(outpu
 - kt 的 pinned/输出缓冲按 batch size 缓存（`KExpertsCPUBuffer`，slot=layer_idx%2），eager 下 bs 变化会重分配
   （含设备上的 `output_gpu`）。merge 的结果是新张量，不写回 kt 的缓冲。
 
-## f. M2 预留（不在 M1 实现）
+## f. M2 图模式（`layer.py` 的 captured 路径）
 
-照 `models/deepseek_v4_1/engram_embedding.py:270-307` 的做法：
-- 捕获下 `route` 改为 `copy_inputs_to_cpu_buffers` + `torch_npu.npu._launch_host_func(stream, run_pinned_forward_sync)`，
-  `merge` 改为 `copy_forward_output_to_device`（kt `experts_base.py:602,684,830`）。
-- 订阅**捕获流**（107015），只吞 107011；进程设 `KT_EXTERNAL_NPU_REPORT_SUBSCRIBER=1`，kt 不再自带 poller/订阅。
-- 设备表已在 `process_weights_after_loading` 预烘（107030：捕获期 H2D 被拒）——M1 已这样做。
-- 所有捕获 bs 先 `KTMoEWrapper.set_capture_batch_sizes(...)` 登记（只有登记过的 bs 永久缓存 pinned 缓冲），payload 活到进程结束。
-- 捕获态判断：kt 计划加 `set_capture_probe(fn)` 注入点（M0 反馈，尚未合入）；vLLM 侧注入
-  `torch.npu.is_current_stream_capturing` 或 forward context 的 capturing 标志，替掉 kt 里写死的 sglang 探针
-  （kt `experts_base.py:113-124`）。
-- 接口：`KTLayerOffload.route/merge` 内按"是否捕获"分支即可，routed_experts.py 的挂点不变。
-- 删 `config.py:125-127` 的 enforce_eager 前置条件。
+每次 forward 按"当前流是否正在被捕获"二选一（`layer.py:314`，判据 `_capturing()` = `torch.npu.is_current_stream_capturing() is True`，
+与 engram host gather 同一判据；照抄而非 import，因为 import `models.deepseek_v4_1` 会触发 V4.1 平台补丁）：
+
+```
+捕获中  route: copy_inputs_to_cpu_buffers(h, ids, w)      (D2H 进 kt pinned 缓冲，被捕获成 memcpy 节点)
+             _launch_host_func(捕获流, _kt_host_forward)   (host-func 节点：每次 replay 在主机上跑 run_pinned_forward_sync)
+       NPU: split → dispatch → GMM(驻留) → combine → finalize (普通捕获)
+       merge: copy_forward_output_to_device(h)             (pinned → output_gpu 的 H2D，流序在 host-func 之后)
+             routed_out = (routed_out.f32 + cpu_out.f32).bf16
+非捕获  M1 的 eager 路径（prefill、未捕获的 bs、warmup）
+```
+
+- **捕获分支不受任何运行时条件控制**（`layer.py:314` 在 profile 判断之前）：捕获那一次跳过的东西，每次 replay 都没有
+  （memory「运行时条件为闸的块不会进图」）。捕获用的 `_dummy_run` 传 `is_profile=False`（`model_runner_v1.py:3933`），
+  本来也不会随机路由；这条是防御，单测有 `in_profile_run=True` 的捕获臂。
+- **订阅捕获流、只吞 107011**：`_subscribe_stream`（`layer.py:408`），每条流订阅一次；torch_npu ≥ 2.10 捕获时已预订阅，
+  engram 也可能订阅过，重复订阅报 107011 = 已订阅。
+- **`KT_EXTERNAL_NPU_REPORT_SUBSCRIBER=1`**：图模式下构造 wrapper 前设置（`layer.py:270`），kt 不起 poller、不自己订阅。
+- **捕获前登记全部捕获 bs 并分配缓冲**（`_prepare_capture_buffers`，`layer.py:226`）：在 `process_weights_after_loading` 里，
+  `set_capture_batch_sizes(compilation_config.cudagraph_capture_sizes)`，并对每个 bs 调一次 `KExpertsCPUBuffer.get_buffer`
+  把 pinned 缓冲和设备 `output_gpu` 分配好（kt 的缓冲是类级、进程共享，只做一次）。捕获到未登记的 bs 直接报错
+  （`layer.py:348` 起），不在捕获内分配。捕获 bs 大于 kt `chunked_prefill_size` 也在此拒绝。
+  代价：设备 `output_gpu` = 2 × Σbs × 5120 × 2 B，pinned 约 3 倍于此；发生在 KV profile 之前，会被计入。
+- **查表预烘**：M1 已在 `process_weights_after_loading` 放到设备上，捕获期没有 H2D 建表。
+- **捕获态探针注入 kt**：ktransformers `292be81` 加了 `set_capture_probe(fn)`（默认仍是 sglang 探针）；我们注入 `_capturing`
+  （`_install_capture_probe`，`layer.py:440`）。captured 路径本身不调 kt 的 `_wait_device`，这是第二道防线；kt 版本没有这个钩子时只警告。
+- **payload 常驻**：`(wrapper, meta 张量, 流句柄, layer_idx)` 追加进 `_CAPTURED_PAYLOADS`，活到进程结束。kt 在 replay 时只读输入张量的
+  形状，所以传 meta 张量，不拖住图内存池的内存。
+- **host-func 异常不外抛**（ACL 侧没人接）：记 error 日志，说明本步 CPU 输出是旧值；`HOST_FUNC_CALLS[layer]` 只在成功时 +1，
+  供上卡核对"replay 真的跑了节点"。
+- **FULL 与 PIECEWISE**：两者都是流捕获，MoE 在两种描述符下都在图内（PIECEWISE 下 MoE 在 `moe_forward` 自定义算子里，dynamo 不追踪，
+  我们的 Python 在捕获时执行一次），captured 路径与描述符无关，不需要分支。
+- **捕获后要不要多 replay 一次**：不需要我们额外做。捕获那一次 host-func 节点**只被记录不执行**，捕获那一次的输出里 CPU 部分是
+  pinned 缓冲的旧值；但捕获用的是 dummy run，输出被丢弃。
+  - 已验证配置用的 `VLLM_USE_BREAKABLE_CUDAGRAPH=1`：vLLM 核心捕获后已 replay 一次（vllm `compilation/breakable_cudagraph.py:398-404`，为 engram 加的）。
+  - 默认的 `ACLGraphWrapper`（`vllm_ascend/compilation/acl_graph.py:164-240`）不 replay，同样只影响丢弃的 dummy 输出。
+  - ⚫ 上卡核：第一个真实请求的第一步 CPU 输出不是旧值（§M2 验证 3）。
+- **串行代价**：host-func 节点阻塞所在流直到 CPU 专家算完，排在它后面的驻留专家 GMM 要等（与 sglang 不开 `KT_SIDE_STREAM` 时相同）。
+  M3 用 `overlap_side_stream`：fork 到侧流跑 D2H + host-func，merge 前 join（sglang `kt_ep_wrapper.py:652-679` 的做法），
+  event 活到进程结束。M2 只留开关。
+- 备选（M3 可比）：breakable 图的 `eager_break_during_capture` 能把整个 CPU 部分做成 eager 段，replay 时直接跑 Python 的 eager 路径；
+  代价是每层两次断图。
 
 ## g. world_size=1 的 comm 路径
 
@@ -182,21 +214,31 @@ merge: sync_forward → [KT_FORCE_SYNC_SUBMIT=1: cpu_infer.sync()] → H2D(outpu
 - 处理：`skip_cpu_in_profile_run=true` 时 profile run 不提交 kt、merge 为 no-op（`layer.py:241-245`）。NPU 侧照常改写，
   dispatcher 行数仍是 T×6 ⇒ NPU 峰值显存与真实 decode/prefill 同形，**profile 不失真**。
 - 不算进 profile 的：kt 的 `output_gpu` 设备缓冲（2×T×5120×bf16，T=4096 时 80 MiB）——建议 `--gpu-memory-utilization` 留出这点。
-- 统计：M1 不采路由统计。以后若加计数，必须排除 `in_profile_run`。
+- 统计：路由计数钩子（`tools/kt_offload/`）只在 `in_profile_run=False` 时累加，被排除的步数单独计。
 
-## i. 显存与起服务
+## i. 显存与主机内存账（integration 写起飞闸用）
 
-- 每驻留专家每层：w13 `[2I, H/2]` + w2 `[H, I/2]` + E8M0 scale `[2I, H/32]` + `[H, I/32]` = **18,800,640 B = 17.93 MiB**
-  （`placement.py:362 resident_bytes_per_slot`，未计 NZ cast 可能的对齐填充）；40 层 = 0.70 GiB/槽。
-- `N = floor((HBM 可用 − 其余权重 − KV/工作区) / (40 × 17.93 MiB))`；按计划 §1 的估算 (107 − 10.4 − 25) / 0.70 ≈ 100。
+所有系数由形状推导（`placement.py:362 resident_bytes_per_slot`），代码里没有写死的 GiB 系数。
+
+| 项 | 公式 | DSV4.1 数值 |
+|---|---|---|
+| 每专家每层（卡上/盘上） | w1+w3: I8`[2×2304, 2560]` + E8M0`[2×2304, 160]`；w2: I8`[5120, 1152]` + E8M0`[5120, 72]` | **18,800,640 B**（17.93 MiB） |
+| 每专家跨 40 层 | ×40（**不含 MTP**；275.7 GiB 总数含 MTP 6.72 GiB，别用 0.718） | **0.7004 GiB** |
+| 卡上 | 其余权重 10.4 + 0.7004 × N | N=100 ⇒ ≈ 80.4 GiB（⚫ NZ `format_cast` 是否有对齐填充，待实测校准） |
+| 主机常驻（kt BufferB） | compact scale 下与盘上同大：(384 − N) × 0.7004；关 compact（`KT_MXFP4_COMPACT_SCALES=0`）为 (384 − N) × 0.824 | N=100 ⇒ ≈ 198.9 GiB（关 compact ≈ 234.0） |
+| 每 NUMA 节点 | threadpool=2 时约一半，`hwloc` 严格 BIND，本节点不够直接 OOM 不溢出 | N=100 ⇒ ≈ 99.5 GiB/节点 |
+| 加载瞬时 | ≈ 单层子集 × 3（推断：safetensors 副本 + staging + BufferB） | N=100 ⇒ 284 × 17.93 MiB × 3 ≈ 14.9 GiB |
+| 图模式 kt 缓冲 | 设备 2 × Σ捕获bs × 5120 × 2 B；pinned 约 3 倍 | 依捕获 bs 列表 |
+
+- `N = floor((HBM 可用 − 10.4 − KV/工作区) / 0.7004)`；按计划 §1 的估算 (107 − 10.4 − 25) / 0.7004 ≈ 102。
   实测做法：先 N=100 起，读 vLLM 日志的 model weights 占用和 KV 可用量再调整。
-- 起服务参数：`--tensor-parallel-size 1 --data-parallel-size 1`（不加 `--enable-expert-parallel`）、`--enforce-eager`、
+- 起服务参数：`--tensor-parallel-size 1 --data-parallel-size 1`（不加 `--enable-expert-parallel`）、M1 用 `--enforce-eager`（M2 起可不加，需 `VLLM_USE_BREAKABLE_CUDAGRAPH=1` 与已验证配置一致）、
   `--max-model-len` 小值起、`--max-num-batched-tokens` ≤ kt `chunked_prefill_size`、`--kv-cache-dtype bfloat16 --block-size 128`、
   `--additional-config '{"kt_offload_config": {...}}'`；环境：`unset LD_PRELOAD`（jemalloc），PYTHONPATH 加 kt wheel
   目录 `build_artifacts/moe_offload_ref/kt_site`。
 - **`serve_v41_bringup.sh` 需要协调（本线不改）**：
   - `:127 MIN_EP=3` 与 `:151` 的健康卡数检查、`:204` 的 `DP<3` 拒绝：offload 时每卡权重不是 `275.7/DP + 10.4`，
-    而是 `10.4 + 0.70×N` GiB。建议加一个 `KT_OFFLOAD=1` 分支：`MIN_EP=1`，`:204` 改为按 `10.4 + 0.70×N` 判。
+    而是 `10.4 + 0.7004×N` GiB。建议加一个 `KT_OFFLOAD=1` 分支：`MIN_EP=1`，`:204` 改为按 `10.4 + 0.7004×N` 判。
   - `:447-449` 固定传 `--data-parallel-size "$DP" --enable-expert-parallel`：offload 分支去掉 `--enable-expert-parallel`。
   - `:322 verify_shm_sharing.py --ranks "$DP"` 对 DP=1 应能直接用（待确认）。
   - `HCCL_BUFFSIZE`（MC2 用）在 ALLGATHER/单卡下无意义，保留无害。
@@ -226,6 +268,20 @@ offload **关**、384 专家全驻留，走 `AscendRoutedExperts.forward_impl` �
 步骤 4 —— **整网 GSM8K 50 题冒烟**：贪心、thinking 关、max4096（口径同基线；harness 默认 temp=1.0 要显式改）；
 对照 integration 多卡同 50 题逐题配对。再换 frequency 集合跑一次同 50 题（验证非连续集合路径）。
 
+## 上卡验证草案（M2）
+
+前提：M1 步骤 1–2 通过。`VLLM_USE_BREAKABLE_CUDAGRAPH=1`（已验证配置），另跑一遍 `=0`（ACLGraphWrapper）。
+1. **eager vs graph 逐 token 一致**：同一批提示（含 bs=1 与 bs 在捕获列表内的多个值），贪心，同 N 同驻留集；
+   eager（`--enforce-eager`）与 graph（FULL_AND_PIECEWISE）逐 token 比，判据：前 256 token 逐 token 相同；
+   不同则先量地板：graph 关 offload（全驻留）与 eager 关 offload 的同一对比。
+2. **无 10701x**：日志与 plog 里 `107011/107015/107027/107030` 为 0（107011 被吞，只允许出现在我们吞掉的那条路径，grep 应为 0 条外抛）。
+3. **CPU 输出不是捕获那一次的旧值**：在同一个捕获 bs 下连续发 ≥3 个不同输入，单层 dump `merge` 前的 `cpu_out`
+   （或比较 routed_out − NPU 驻留部分）：3 个输入必须得到 3 个不同的 CPU 输出，且各自与 eager 同输入的 CPU 输出一致（bf16 地板内）。
+   "多个输入同一个输出"= 图没重放 host-func 节点的指纹。另核 `HOST_FUNC_CALLS[layer]` 随 decode 步数增长（每步每层 +1）。
+4. **首个请求**：服务起来后的第一个请求第一步即满足 3（捕获那一次不执行节点，这里核它不影响真实请求）。
+5. **FULL 与 PIECEWISE 各一遍**：`--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'` 与 `PIECEWISE` 分别跑 1–3。
+6. 变异臂：把 `_capturing` 恒 False（捕获时走 eager）——应在捕获时报 107027 或出现 3 的指纹；必须红。
+
 ## 开放问题
 
 - ⚫ NPU 驻留专家是 W4A8（激活量化为 MXFP8），kt CPU 专家是 bf16 激活（M0 反馈）⇒ "驻留+CPU" 与 "NPU 全专家" 不会逐位一致，
@@ -234,3 +290,7 @@ offload **关**、384 专家全驻留，走 `AscendRoutedExperts.forward_impl` �
   torch 参考，需确认参考与 NPU 算子语义一致。
 - ⚫ `npu_format_cast(29)` 对 N 槽权重是否有对齐填充（影响 §i 的 17.93 MiB）。
 - ALLGATHER + W4A8 `quant_mode=3` 在 A5/V4.1 未验证（§g）。
+- ⚫ 构建在 `build_artifacts/moe_offload_ref/kt_site` 的 kt wheel 早于 `292be81`，没有 `set_capture_probe`；图模式上卡前需要 kt agent 重建。
+- ⚫ `_launch_host_func` 回调里调 kt 的 `cpu_infer.submit/sync`（阻塞主机回调线程直到 CPU 专家算完）在 ACL 回调线程上是否有超时/死锁
+  问题：sglang 在 A5 上同样这样做（`_kt_npu_graph_host_forward`），旁证可行。
+- kt 缓冲是 `layer_idx % 2` 两槽复用、按 bs 共享；eager 与 replay 对同一 bs 用同一组 pinned 缓冲（时间上不重叠，eager 路径自带同步）。

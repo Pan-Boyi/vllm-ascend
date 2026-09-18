@@ -17,6 +17,15 @@ and no function here runs on the forward path.
                  tables go to the device and the kt wrapper loads its experts.
   forward_impl   ``route(...)`` right after expert selection (logical ids),
                  ``merge(...)`` right after finalize.
+
+Two execution paths, chosen per forward by whether the current stream is
+being captured (the same predicate the engram host gather uses):
+
+  eager    kt ``submit_forward`` / ``sync_forward`` (host blocks, device syncs).
+  captured D2H into kt's pinned buffers, a ``_launch_host_func`` node that runs
+           ``run_pinned_forward_sync`` at every replay, H2D back. Nothing on
+           this path may depend on a runtime condition: whatever the capture
+           run skips is absent from every replay.
 """
 
 from __future__ import annotations
@@ -36,6 +45,16 @@ logger = logging.getLogger(__name__)
 # One plan per process: placement is a whole-model decision made once.
 _PLAN: OffloadPlan | None = None
 _PLAN_KEY: tuple | None = None
+
+# Captured graphs hold host-func nodes whose payloads are read at every
+# replay; they must live for the whole process.
+_CAPTURED_PAYLOADS: list = []
+# layer_idx -> number of times its host-func node has run (replays + the
+# breakable wrapper's post-capture replay). Read by the on-card checks.
+HOST_FUNC_CALLS: dict[int, int] = {}
+# kt's pinned/device buffers for the capture sizes are process-wide
+# (KExpertsCPUBuffer is class-level); they are registered and allocated once.
+_CAPTURE_BUFFERS_READY: tuple | None = None
 
 
 def _layer_index(layer_name: str) -> int:
@@ -139,6 +158,16 @@ class KTLayerOffload:
         self._slot_tables: dict[torch.dtype, torch.Tensor] = {}
         self._keep_tables: dict[torch.dtype, torch.Tensor] = {}
         self._pending: torch.Tensor | None = None
+        self._pending_captured = False
+        # Graph mode: capture sizes are known from the config before any
+        # capture; kt needs them registered and their buffers allocated first.
+        mc, cc = vllm_config.model_config, getattr(vllm_config, "compilation_config", None)
+        mode = getattr(cc, "cudagraph_mode", None)
+        self.graph_enabled = (
+            not getattr(mc, "enforce_eager", True) and mode is not None and getattr(mode, "name", str(mode)) != "NONE"
+        )
+        sizes = getattr(cc, "cudagraph_capture_sizes", None) or []
+        self.capture_sizes = sorted(set(sizes)) if self.graph_enabled else []
 
     @property
     def num_slots(self) -> int:
@@ -191,6 +220,40 @@ class KTLayerOffload:
         if not p.cpu_ids:
             return  # every expert resident: nothing for kt to do
         self.wrapper = self._build_wrapper()
+        if self.graph_enabled:
+            self._prepare_capture_buffers(device)
+
+    def _prepare_capture_buffers(self, device: torch.device) -> None:
+        """Register every capture size with kt and allocate its buffers now.
+
+        Only registered sizes are kept by KExpertsCPUBuffer, and allocating
+        pinned host memory or a new device buffer inside a capture is not an
+        option. Done once per process (the buffers are class-level in kt).
+        """
+        global _CAPTURE_BUFFERS_READY
+        key = (tuple(self.capture_sizes), self.hidden_size, self.top_k, str(device))
+        if key == _CAPTURE_BUFFERS_READY:
+            return
+        if _CAPTURE_BUFFERS_READY is not None:
+            raise RuntimeError(f"kt_offload: capture buffers already prepared for {_CAPTURE_BUFFERS_READY}, now {key}")
+        too_big = [bs for bs in self.capture_sizes if bs > self.chunked_prefill_size]
+        if too_big:
+            raise ValueError(
+                f"kt_offload: capture sizes {too_big} exceed chunked_prefill_size {self.chunked_prefill_size}"
+            )
+        kt_buffer = _kt_buffer_class()
+        type(self.wrapper).set_capture_batch_sizes(list(self.capture_sizes))
+        for bs in self.capture_sizes:
+            kt_buffer.get_buffer(torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device=device), self.top_k)
+        missing = [bs for bs in self.capture_sizes if bs not in kt_buffer.capture_buffers]
+        if missing:
+            raise RuntimeError(f"kt_offload: kt did not keep capture buffers for sizes {missing}")
+        _CAPTURE_BUFFERS_READY = key
+        logger.info(
+            "kt_offload: kt capture buffers ready for %d sizes (max %d)",
+            len(self.capture_sizes),
+            max(self.capture_sizes, default=0),
+        )
 
     @staticmethod
     def _device_of(layer) -> torch.device:
@@ -201,7 +264,13 @@ class KTLayerOffload:
     def _build_wrapper(self):
         if self.cfg.force_sync_submit:
             os.environ["KT_FORCE_SYNC_SUBMIT"] = "1"
+        if self.graph_enabled:
+            # We subscribe the capture stream ourselves (_subscribe_stream);
+            # kt must not start its own poller or subscribe it a second time.
+            os.environ["KT_EXTERNAL_NPU_REPORT_SUBSCRIBER"] = "1"
         from kt_kernel import KTMoEWrapper  # host-only dependency, imported when enabled
+
+        _install_capture_probe(KTMoEWrapper)
 
         wrapper = KTMoEWrapper(
             layer_idx=self.layer_idx,
@@ -238,16 +307,20 @@ class KTLayerOffload:
         the same ids.
         """
         self._pending = None
-        if (
-            self.wrapper is not None
-            and hidden_states.shape[0] > 0
-            and not (in_profile_run and self.cfg.skip_cpu_in_profile_run)
-        ):
+        self._pending_captured = False
+        if self.wrapper is not None and hidden_states.shape[0] > 0:
             if hidden_states.dtype != torch.bfloat16:
                 raise TypeError(f"kt_offload: kt takes bf16 activations, got {hidden_states.dtype}")
-            hs = hidden_states.contiguous()
-            self.wrapper.submit_forward(hs, topk_ids, topk_weights, _stream_handle(hs.device))
-            self._pending = hs
+            if _capturing():
+                # No runtime condition here (not even the profile flag): a
+                # branch the capture run skips is missing from every replay.
+                hs = hidden_states.contiguous()
+                self._submit_captured(hs, topk_ids, topk_weights)
+                self._pending, self._pending_captured = hs, True
+            elif not (in_profile_run and self.cfg.skip_cpu_in_profile_run):
+                hs = hidden_states.contiguous()
+                self.wrapper.submit_forward(hs, topk_ids, topk_weights, _stream_handle(hs.device))
+                self._pending = hs
         return split_routing(
             topk_ids,
             topk_weights,
@@ -262,9 +335,122 @@ class KTLayerOffload:
             return routed_out
         if routed_out.shape != hs.shape:
             raise AssertionError(f"kt_offload: routed_out {tuple(routed_out.shape)} vs kt input {tuple(hs.shape)}")
-        cpu_out = self.wrapper.sync_forward(hs, _stream_handle(hs.device))
+        if self._pending_captured:
+            self._pending_captured = False
+            # H2D from the pinned output the host-func node filled; stream
+            # order puts it after that node at every replay.
+            cpu_out = self.wrapper.copy_forward_output_to_device(hs)
+        else:
+            cpu_out = self.wrapper.sync_forward(hs, _stream_handle(hs.device))
         # One rounding to the activation dtype instead of two.
         return (routed_out.float() + cpu_out.float()).to(routed_out.dtype)
+
+    def _submit_captured(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
+        """Record D2H + host-func for this layer into the graph being captured."""
+        if not self.graph_enabled:
+            raise RuntimeError("kt_offload: a capture reached a layer built for eager mode (enforce_eager on?)")
+        bs = hs.shape[0]
+        if bs not in _kt_buffer_class().capture_buffers:
+            raise RuntimeError(
+                f"kt_offload: capturing {bs} tokens but kt has no pre-allocated buffers for that size "
+                f"(prepared: {self.capture_sizes}). Allocating inside the capture is not possible."
+            )
+        stream = torch.npu.current_stream(hs.device)
+        _subscribe_stream(stream)
+        self.wrapper.copy_inputs_to_cpu_buffers(hs, topk_ids, topk_weights)
+        # kt reads only the shape of this tensor at replay; a meta tensor keeps
+        # no graph-pool memory alive.
+        shape_ref = torch.empty(tuple(hs.shape), dtype=hs.dtype, device="meta")
+        payload = (self.wrapper, shape_ref, int(stream.npu_stream), self.layer_idx)
+        _CAPTURED_PAYLOADS.append(payload)
+        _launch_host_func(stream, _kt_host_forward, payload)
+
+
+def _kt_host_forward(payload) -> None:
+    """Graph-node callback: run this layer's CPU experts on the pinned buffers.
+
+    Exceptions must not escape (nothing on the ACL side receives them); the
+    device would then read the previous step's CPU output. Log loudly.
+    """
+    wrapper, shape_ref, stream_handle, layer_idx = payload
+    try:
+        wrapper.run_pinned_forward_sync(shape_ref, stream_handle)
+        HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+    except BaseException as exc:  # noqa: BLE001
+        logger.error(
+            "kt_offload host-func for layer %d raised inside a graph node: %r. The CPU-expert output "
+            "of this step is NOT this step's -- the device reads whatever the pinned buffer held.",
+            layer_idx,
+            exc,
+        )
+
+
+# -- platform indirections (monkeypatched by the CPU unit tests) -------------
+
+
+def _capturing() -> bool:
+    """Is the current stream being captured?
+
+    Same predicate as the engram host gather
+    (models/deepseek_v4_1/engram_embedding.py _stream_is_capturing). Copied,
+    not imported: importing that package applies the V4.1 platform patches.
+    ``is True`` so a test double returning a Mock does not read as capturing.
+    """
+    predicate = getattr(getattr(torch, "npu", None), "is_current_stream_capturing", None)
+    if predicate is None:
+        return False
+    return predicate() is True
+
+
+_REPORT_SUBSCRIBED: set[int] = set()
+
+
+def _subscribe_stream(stream) -> None:
+    """Subscribe the capture stream for host-func reports; swallow only 107011.
+
+    torch_npu >= 2.10 already subscribes a capture stream inside NPUGraph, and
+    engram may have subscribed it too; a repeat subscribe raises 107011, which
+    means "already subscribed". Anything else propagates.
+    """
+    import torch_npu
+
+    key = int(stream.npu_stream)
+    if key in _REPORT_SUBSCRIBED:
+        return
+    try:
+        torch_npu.npu._subscribe_report(stream)
+    except RuntimeError as exc:
+        if "107011" not in str(exc):
+            raise
+    _REPORT_SUBSCRIBED.add(key)
+
+
+def _launch_host_func(stream, fn, payload) -> None:
+    import torch_npu
+
+    torch_npu.npu._launch_host_func(stream, fn, payload)
+
+
+def _kt_buffer_class():
+    from kt_kernel.experts_base import KExpertsCPUBuffer
+
+    return KExpertsCPUBuffer
+
+
+def _install_capture_probe(kt_wrapper_cls) -> None:
+    """Point kt's capture check at our predicate instead of sglang's flag.
+
+    Our captured path never calls kt's _wait_device, so this is a second line
+    of defence; a kt build without the hook only gets a warning.
+    """
+    setter = getattr(kt_wrapper_cls, "set_capture_probe", None)
+    if setter is None:
+        logger.warning(
+            "kt_offload: this kt-kernel has no set_capture_probe (needs ktransformers 292be81+); "
+            "kt's own device sync falls back to torch.npu.is_current_stream_capturing() alone."
+        )
+        return
+    setter(_capturing)
 
 
 def _stream_handle(device: torch.device) -> int:
