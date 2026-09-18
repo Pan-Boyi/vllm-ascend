@@ -455,10 +455,17 @@ echo "  ⚪ LD_PRELOAD 已 unset(jemalloc)；HCCL_BUFFSIZE=${HCCL_BUFFSIZE} MB"
 # ─────────────────────────────────────────────────────────────────────────
 
 if [ "${KT_OFFLOAD:-0}" = "1" ]; then
-  # 单卡 MoE offload(M1):TP1/DP1、不开 EP、强制 eager、kt_offload_config 走 --additional-config。
+  # 单卡 MoE offload(M1):TP1/DP1、不开 EP、kt_offload_config 走 --additional-config。
   # kt_site 追加在 PYTHONPATH 末尾(不前置,免得它遮住 vllm/vllm_ascend)。
+  # 图模式开关(09-18):本分支 EAGER 默认 1(= 原来写死的 --enforce-eager,不设 EAGER 时行为不变);
+  #   EAGER=0 去掉 --enforce-eager,其余照抄默认(四卡)路径 —— 默认路径不传 --compilation-config
+  #   (vLLM 默认 FULL_AND_PIECEWISE),也不在脚本里设 VLLM_USE_BREAKABLE_CUDAGRAPH:
+  #   已验证的图模式发次都由调用方(runner)传 VLLM_USE_BREAKABLE_CUDAGRAPH=1(指南 §199/§277),这里同样由调用方传。
+  # ⚠️ 注意默认值和默认路径相反:默认路径不设 EAGER = 图模式;本分支不设 EAGER = eager。
   export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ROOT/build_artifacts/moe_offload_ref/kt_site"
-  echo "  ⚪ KT_OFFLOAD=1:单卡 offload 起法(DP=1、无 EP、--enforce-eager);kt_site 已追加到 PYTHONPATH"
+  KT_EAGER="${EAGER:-1}"
+  if [ "$KT_EAGER" = "1" ]; then KT_MODE_DESC="--enforce-eager"; else KT_MODE_DESC="图模式,VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-未设}"; fi
+  echo "  ⚪ KT_OFFLOAD=1:单卡 offload 起法(DP=1、无 EP、EAGER=$KT_EAGER → $KT_MODE_DESC);kt_site 已追加到 PYTHONPATH"
   exec vllm serve "$MODEL" \
     --served-model-name dsv41 \
     --tensor-parallel-size 1 \
@@ -472,7 +479,7 @@ if [ "${KT_OFFLOAD:-0}" = "1" ]; then
     --no-enable-prefix-caching \
     --trust-remote-code \
     "${LOADER_ARGS[@]}" \
-    --enforce-eager \
+    $([ "$KT_EAGER" = "1" ] && echo --enforce-eager) \
     --additional-config "$KT_ADDITIONAL_CONFIG" \
     ${EXTRA_ARGS:-} \
     --port "$PORT"
