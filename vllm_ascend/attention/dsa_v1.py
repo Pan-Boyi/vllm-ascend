@@ -74,8 +74,6 @@ else:
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
-#: num_compressed_tokens 取证的打印计数(列表以便闭包内自增)
-_DSA_NCT_LOGGED = [0]
 _SEQUSED_CMP_PERSIST = [None]
 
 
@@ -325,6 +323,13 @@ def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int
     """
     if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
         return 1
+    if compress_ratio == 2:
+        from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+            c2_window_mode
+        if c2_window_mode() == "ratio1":
+            # V4.1 ratio-2 layers in the operator's sliding-window configuration;
+            # see sparse_attn_args.c2_window_mode.
+            return 1
     return max(compress_ratio, 1)
 
 
@@ -1409,9 +1414,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             index_topk = self.model_config.hf_config.index_topk
             validate_compress_ratio(self.compressor_ratio, layer_name,
                                     get_dsa_attn_kv_plan(self.vllm_config))
+            from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import \
+                c2_window_mode
             cmp_ratio = (
                 _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
                 if self.compressor_ratio <= 1
+                or (self.compressor_ratio == 2 and c2_window_mode() != "0")
                 else 4
                 if self.compressor_ratio == 4
                 else 128
@@ -1806,30 +1814,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_actual_reqs = num_reqs
             else:
                 num_compressed_tokens = self._num_compressor_metadata_rows(num_reqs)
-            # 🔴 取证(2026-09-16):这条 `if full_graph_mode` 是 FULL 与 PIECEWISE
-            #    之间【字面意义上的岔路】,而它的门控 compressor_ratio > 1 正好把
-            #    层 0/1 排除在外 —— 与实测的分歧起点完全重合:
-            #      FULL vs PIECEWISE 在同一次 decode forward 上,
-            #      L00/L01 全部激活值逐位相同,L02.ret.residual 起 rel_l2=4.3e-01。
-            #    两个分支的公式是同一个(_num_compressor_metadata_rows:1224-1225),
-            #    唯一的差别是 padded(num_input_tokens) 还是 actual(num_actual_tokens)。
-            #    所以判据很简单:把两个值都算出来,看它们是否相等。
-            #    纯 host 侧整数运算,那个函数是纯的(两行算术),多调一次无副作用。
-            try:
-                _alt = self._num_compressor_metadata_rows(num_reqs)
-                if _alt != num_compressed_tokens or _DSA_NCT_LOGGED[0] < 8:
-                    _DSA_NCT_LOGGED[0] += 1
-                    from vllm.logger import logger as _nlg
-                    _nlg.info(
-                        "DSV4.1 num_compressed_tokens 取证 %s: full_graph=%s "
-                        "ratio=%s num_reqs=%s padded=%s actual=%s | "
-                        "FULL分支=%s else分支=%s %s",
-                        layer_name, full_graph_mode, self.compressor_ratio,
-                        num_reqs, common_attn_metadata.num_input_tokens,
-                        self.num_actual_tokens, num_compressed_tokens, _alt,
-                        "🔴 两者不同" if _alt != num_compressed_tokens else "相同")
-            except BaseException:                            # noqa: BLE001
-                pass
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
             slot_mapping = None
         else:

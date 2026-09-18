@@ -218,7 +218,8 @@ def is_plain_sliding_window(attends_compressed: bool,
         return True
     # A compressed layer may still take the window, but only where the
     # operator allows one: "SWA mode requires cmp_ratio=1".
-    return _causal_without_indices() and cmp_ratio == 1
+    return _causal_without_indices() and (cmp_ratio == 1
+                                          or c2_window_mode() == "window")
 
 
 def ori_mask_mode_for(attends_compressed: bool, ori_sparse_indices,
@@ -319,6 +320,49 @@ def _causal_without_indices() -> bool:
     from vllm_ascend import envs
 
     return envs.VLLM_ASCEND_DSV41_ORI_WINDOW_WITHOUT_INDICES == "1"
+
+
+def c2_window_mode() -> str:
+    """How ratio-2 layers (2..19) mask their original stream.
+
+    "0": the port's previous behaviour -- ori_mask_mode 3 (causal) with no window
+    and the operator's cmp_ratio 2 (descriptor 128). Causal without a window
+    lets a prefill query attend every raw token of the chunk, and a decode query
+    attend the whole paged SWA stream, whose blocks outside the window the
+    sliding-window manager has already swapped for the null block. That is not
+    the model: the reference (inference/model.py Attention) gives every
+    compressed layer the 128-token window plus the indexer's top-k compressed
+    entries, and a decode query drowning in thousands of null-block keys loses
+    anything further back than the window and the few entries that still win
+    the softmax (needle retrieval fails past ~2K tokens in chat mode).
+
+    "ratio1": hand the operator cmp_ratio 1 for these layers, which puts them in
+    the same sliding-window configuration as the ratio-1 layers (ori_mask_mode 4,
+    window bounds 127/0). The indexer still selects with the layer's real ratio
+    2, and the selection is already causal, so the operator's compressed-stream
+    mask at ratio 1 is a superset that removes nothing the indexer picked.
+
+    ⚠️ Measured afterwards: this leaks the future into prefill. The operator's
+    compressed-stream causal mask at cmp_ratio 1 lets a query at position q see
+    entries j <= q, while a ratio-2 entry j closes at token 2j+1; changing the
+    tokens after position 11 of a 58-token prompt moved the logprob at position
+    10 by 0.97. Decode is unaffected (q is the last position).
+
+    "window" (default): keep cmp_ratio 2 (descriptor and call) and send
+    ori_mask_mode 4 with window bounds 127/0. CANN 9.2.0 on A5 accepts it, and it
+    is the reference semantics: window + ratio-2-causal compressed entries.
+    Measured: prefill exactly causal at 62 tokens (max |d logprob| 0.0 over five
+    future-content variants), needles 6/6 at 7.3K tokens, decode-vs-prefill
+    argmax mismatch 1.8% on 1024 prose tokens with no margin >= 2 (the
+    cann-recipes native reference measures 1.4%).
+
+    Measured on 4x A5 eager, MXFP8, chat mode, needle at 1/4..3/4 depth:
+    "0" finds 6/6 at 1.1K tokens, 2/6 at 3.8K and 1/4 at 7.3K; "ratio1" finds
+    6/6 at 2.1K, 3.8K, 7.3K and 13.7K ("window" the same at 7.3K).
+    """
+    import os
+
+    return os.getenv("VLLM_ASCEND_DSV41_C2_WINDOW", "window")
 
 
 _DEVICE_PRED = {"evaluated": 0, "skipped_under_capture": 0}
@@ -636,10 +680,11 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
         # every one of layers 20..39 -- exactly the twenty that are entitled
         # to the window. A guard stricter than the rule it cites reads as
         # rigour and costs the configuration it excluded.
-        _check(cmp_ratio == 1, "SWA mode requires cmp_ratio = 1",
+        _check(cmp_ratio == 1 or c2_window_mode() == "window",
+               "SWA mode requires cmp_ratio = 1",
                f"window bounds are set but cmp_ratio={cmp_ratio}")
     if has_cmp_kv:
-        _check(not windowed or cmp_ratio == 1,
+        _check(not windowed or cmp_ratio == 1 or c2_window_mode() == "window",
                "non-sliding-window modes require ori_win_left = ori_win_right = -1",
                f"a compressed stream at cmp_ratio={cmp_ratio} cannot be in "
                "sliding-window mode, but the window bounds are "
