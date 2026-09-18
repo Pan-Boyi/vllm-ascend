@@ -33,6 +33,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.kt_offload import expert_counter as _expert_counter
 from vllm_ascend.kt_offload.layer import create_layer_offload
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
@@ -377,6 +378,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.router: FusedMoERouter | None = None
         ascend_config = get_ascend_config()
         vllm_config = get_current_vllm_config()
+        if _expert_counter.ENABLED:
+            _expert_counter.check_config(vllm_config)
         self.n_shared_experts = n_shared_experts
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.enable_npugraph_ex_static_kernel = ascend_config.ascend_compilation_config.enable_static_kernel
@@ -600,6 +603,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             router_logits=router_logits,
             input_ids=input_ids,
         )
+        if _expert_counter.ENABLED:
+            # Logical ids, before log2phy / mix_placement / the profile-run
+            # randomisation (counted only when that flag is off).
+            _expert_counter.record(self, topk_ids, enable_force_load_balance)
         if self.log2phy is not None:
             topk_ids = self.log2phy[topk_ids]
 

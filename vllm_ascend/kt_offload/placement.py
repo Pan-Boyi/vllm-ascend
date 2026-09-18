@@ -258,6 +258,9 @@ def load_frequency_table(path: str) -> torch.Tensor:
                 if key in data:
                     data = data[key]
                     break
+            # tools/kt_offload/expert_count_report.py writes counts={decode, prefill, all}
+            if isinstance(data, Mapping) and "all" in data:
+                data = data["all"]
     elif ext == ".npy":
         import numpy as np
 

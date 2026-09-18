@@ -214,7 +214,8 @@ merge: sync_forward → [KT_FORCE_SYNC_SUBMIT=1: cpu_infer.sync()] → H2D(outpu
 - 处理：`skip_cpu_in_profile_run=true` 时 profile run 不提交 kt、merge 为 no-op（`layer.py:241-245`）。NPU 侧照常改写，
   dispatcher 行数仍是 T×6 ⇒ NPU 峰值显存与真实 decode/prefill 同形，**profile 不失真**。
 - 不算进 profile 的：kt 的 `output_gpu` 设备缓冲（2×T×5120×bf16，T=4096 时 80 MiB）——建议 `--gpu-memory-utilization` 留出这点。
-- 统计：路由计数钩子（`tools/kt_offload/`）只在 `in_profile_run=False` 时累加，被排除的步数单独计。
+- 统计：路由计数钩子（`vllm_ascend/kt_offload/expert_counter.py`，开关 `VLLM_ASCEND_DSV41_EXPERT_COUNT`，用法见 `tools/kt_offload/README.md`）
+  只在 `enable_force_load_balance=False` 时累加，被排除的步数单独计；图模式下拒绝启用。
 
 ## i. 显存与主机内存账（integration 写起飞闸用）
 
