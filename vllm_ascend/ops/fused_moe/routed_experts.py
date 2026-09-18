@@ -33,6 +33,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.kt_offload.layer import create_layer_offload
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
@@ -339,6 +340,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     """
 
     moe_counter = -1
+    # Per-instance kt offload state (vllm_ascend.kt_offload.layer); the class
+    # default keeps it None for the feature-off path and for __new__-built
+    # instances.
+    kt_offload = None
 
     def __init__(
         self,
@@ -348,6 +353,17 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         **kwargs,
     ):
         object.__setattr__(self, "tid2eid", tid2eid)
+        # None unless additional_config.kt_offload_config.enabled. When set, it
+        # has already shrunk moe_config.num_local_experts to the resident slots.
+        try:
+            ascend_config = get_ascend_config()
+        except RuntimeError:
+            # Not initialised: the offload cannot have been asked for. The
+            # get_ascend_config() below, after the parent init, still raises.
+            ascend_config = None
+        object.__setattr__(
+            self, "kt_offload", create_layer_offload(ascend_config, RoutedExperts.__init__, args, kwargs)
+        )
         super().__init__(*args, **kwargs)
         if self.quant_config is None:
             # Preserve the pre-refactor BF16 lifecycle: let upstream create
@@ -378,6 +394,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if not self._use_v2_model_runner:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
+        if self.kt_offload is not None:
+            self.kt_offload.attach_after_init(self)
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         try:
@@ -456,6 +474,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         expected_local_num_experts = (
             placement_moe_config.num_experts + self.global_redundant_expert_num
         ) // self.moe_config.ep_size
+        if self.kt_offload is not None:
+            expected_local_num_experts = self.kt_offload.num_slots
         if local_num_experts != expected_local_num_experts:
             raise ValueError(
                 "EPLB local expert capacity mismatch: "
@@ -539,6 +559,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
     def get_log2phy_map(self) -> torch.Tensor | None:
         return self.log2phy
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        # Upstream weight_loader skips an expert mapped to -1. With kt offload
+        # that is every CPU expert; the rest land in their resident slot.
+        if self.kt_offload is not None:
+            return self.kt_offload.placement.slot_of(expert_id)
+        return super()._map_global_expert_id_to_local_expert_id(expert_id)
 
     @property
     def ep_rank(self) -> int:
@@ -655,6 +682,17 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             enable_force_load_balance=enable_force_load_balance,
             input_ids=input_ids,
         )
+        kt_offload = self.kt_offload
+        if kt_offload is not None:
+            # Logical ids, after the profile-run randomisation above: the CPU
+            # half gets the original routing, the NPU half resident slots with
+            # CPU routes turned into a zero-weight resident slot.
+            topk_weights, topk_ids = kt_offload.route(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                in_profile_run=enable_force_load_balance,
+            )
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         try:
@@ -697,6 +735,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
+        if kt_offload is not None:
+            # Same point as the NPU experts' output: router weights (incl.
+            # routed_scaling_factor) are already applied on both sides; the
+            # shared expert is added later by the runner.
+            routed_out = kt_offload.merge(routed_out)
 
         # Clear per-forward LoRA state from long-lived singletons.
         if lora_context is not None:

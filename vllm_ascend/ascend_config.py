@@ -26,6 +26,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
+from vllm_ascend.kt_offload.config import KTOffloadConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -359,6 +360,21 @@ class AscendConfig:
                 "topk_buffer_size": 4096,
                 "dram_size_per_dp_GB": 128,
                 "keep_device_kv_cache": false
+            },
+            "kt_offload_config": {
+                "enabled": false,
+                "weight_path": null,
+                "method": "MXFP4",
+                "resident_strategy": "prefix",
+                "num_resident_experts": 0,
+                "frequency_table_path": null,
+                "resident_experts_path": null,
+                "cpuinfer_threads": 0,
+                "threadpool_count": 2,
+                "numa_nodes": null,
+                "chunked_prefill_size": 0,
+                "skip_cpu_in_profile_run": true,
+                "force_sync_submit": true
             }
         }
 
@@ -440,6 +456,8 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    # Single-card MoE expert offload to kt-kernel (vllm_ascend/kt_offload). Off by default.
+    kt_offload_config: KTOffloadConfig = dataclasses.field(default_factory=KTOffloadConfig)
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
 
@@ -1503,6 +1521,7 @@ def init_ascend_config(vllm_config):
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    new_config.kt_offload_config._validate_preconditions(vllm_config)
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config
