@@ -604,6 +604,30 @@ class AscendDeepseekV41Attention(DeepseekV4Attention):
     # padding heads carry whatever was in them.
     use_fp8_ds_mla_layout: ClassVar[bool] = False
 
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        """The backend of this layer's own compressed-KV cache.
+
+        Upstream returns ``backend_cls`` -- here the SWA backend, whose kernel
+        block sizes are [32, 64, 128]. A ratio-2 kv-source layer's spec has
+        ``block_size`` 256 and shares its KV cache group with the ratio-2 indexer
+        caches (AscendDSAC2Backend, [64, 128, 256]). ``select_common_block_size``
+        needs a size every backend in the group lists, so 256 fell back to 128 and
+        the runner split every allocator block b of the group into kernel blocks
+        (2b, 2b+1). The compressed cache view, the planner and the operator all
+        work in 128-entry pages at allocator-block stride, so kernel page 2b is
+        allocator block 2b's memory -- which the shared pool has handed to some
+        other group (a SWA layer, measured: request 1 wrote its ratio-2 compressed
+        entries over layers 1 and 2's SWA pages). Outputs then depend on which
+        block ids a request happens to get, and requests corrupt each other.
+
+        Ratio 2 therefore reports the C2 backend, so the group resolves to 256 and
+        no split happens. Ratio 1 (block 128) is unaffected.
+        """
+        if getattr(self, "compress_ratio", 0) == 2:
+            from vllm_ascend.attention.dsa_v1 import AscendDSAC2Backend
+            return AscendDSAC2Backend
+        return self.backend_cls
+
     # A _RATIO_BACKENDS map used to sit here, recording that ratio 2 had no
     # backend. Nothing ever read it, and by the time anyone looked it was false
     # too -- AscendDSAC2Backend exists. Ratio-to-backend now resolves in
