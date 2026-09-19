@@ -11,7 +11,8 @@ rebound there rather than the layer being forked.
 - pre uses upstream's torch reference (``mhc_pre_delayed_torch``) by default,
   plus the RMSNorm the tilelang kernel folds in. An operator path built on
   torch_npu's ``npu_mhc_pre`` / ``npu_mhc_sinkhorn`` is selected by
-  ``VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR=1``.
+  ``VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR=1`` (default off); the first layer's
+  broadcast-embedding call stays on torch either way.
 """
 
 from __future__ import annotations
@@ -88,7 +89,10 @@ def mhc_pre_delayed_ascend(
     takes ``norm_weight`` / ``norm_eps`` and returns the collapsed layer input
     RMS-normalised, which the torch reference does not do.
     """
-    if envs_dsv41_mhc_pre_operator():
+    # The first layer passes ``x`` (the bare embedding) with ``fn`` already
+    # summed over the hc copies, [hc3, D]. npu_mhc_pre needs phi as
+    # [hc3, hc*D] against a [T, hc, D] x, so that one call stays on torch.
+    if envs_dsv41_mhc_pre_operator() and x is None:
         post_mix, res_mix, next_pre_mix = _pre_parts_from_operators(
             residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
             hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, x)
@@ -149,9 +153,27 @@ def _collapse_with(pre_mix: torch.Tensor | None,
 def _pre_parts_from_operators(residual, fn, hc_scale, hc_base, rms_eps,
                               hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
                               sinkhorn_repeat, x):
-    """``post``, ``comb`` and the next ``pre``, from the two torch_npu ops."""
+    """``post``, ``comb`` and the next ``pre``, from the two torch_npu ops.
+
+    npu_mhc_pre takes x as [T, n, D] or [B, S, n, D] and refuses 2-D ("Input x
+    must be 3D or 4D"), so ``residual`` goes in as it is, [T, hc, D], against
+    phi [hc^2 + 2hc, hc*D]. Outputs: post [T, hc], the pre-sinkhorn comb
+    [T, hc, hc], pre [T, hc]. The flattened [T, hc*D] form belongs to the torch
+    reference only.
+    """
     del hc_post_mult_value          # folded into the operator's post
-    source = residual.flatten(1) if x is None else x
+    if x is not None:
+        raise ValueError(
+            "the operator path takes no x: the first layer's x is the bare "
+            "[T, D] embedding with fn summed over the hc copies, which "
+            "npu_mhc_pre's [T, n, D] / [n^2+2n, n*D] contract cannot express. "
+            "mhc_pre_delayed_ascend keeps that call on torch.")
+    if residual.dim() != 3:
+        raise ValueError(
+            f"residual has shape {tuple(residual.shape)}; expected "
+            "(tokens, hc, hidden), the 3-D x npu_mhc_pre takes.")
+    tokens, hc = residual.shape[0], residual.shape[1]
+    source = residual
 
     # out_flag=1 is not optional: at the default 0 the last three outputs come
     # back empty, and `pre` is one of them. An empty tensor here would look
@@ -176,7 +198,14 @@ def _pre_parts_from_operators(residual, fn, hc_scale, hc_base, rms_eps,
         comb_fragment, eps=hc_sinkhorn_eps, num_iters=sinkhorn_repeat,
         out_flag=1)[0]
 
+    for name, got, want in (("post", post, (tokens, hc)),
+                            ("comb", comb, (tokens, hc, hc)),
+                            ("pre", next_pre, (tokens, hc))):
+        if tuple(got.shape) != want:
+            raise RuntimeError(
+                f"npu_mhc_pre/sinkhorn returned {name} of shape "
+                f"{tuple(got.shape)} for x {tuple(residual.shape)}; the "
+                f"documented shape is {want}.")
+
     # Upstream's contract puts a trailing 1 on post; the operator does not.
-    if post.dim() == residual.dim() - 1:
-        post = post.unsqueeze(-1)
-    return post, comb, next_pre
+    return post.unsqueeze(-1), comb, next_pre
