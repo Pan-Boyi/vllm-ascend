@@ -306,6 +306,15 @@ def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
 
 
+def _dsv41_engram_out_of_graph() -> bool:
+    """``VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1``. Read from the env module
+    rather than the model package: importing that package applies the V4.1
+    platform patches."""
+    from vllm_ascend import envs as envs_ascend
+
+    return envs_ascend.VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH == "1"
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -3061,6 +3070,15 @@ class NPUModelRunner(GPUModelRunner):
             "inputs_embeds": inputs_embeds,
             **model_kwargs,
         }
+        if _dsv41_engram_out_of_graph():
+            # DeepSeek-V4.1 engram, prepared before the forward and outside
+            # any graph (hash, id D2H, host gather, H2D into persistent
+            # buffers). The hash reads the device input_ids; the CPU copy is
+            # passed only to be refused (async scheduling leaves placeholders
+            # in it).
+            prepare_engram = getattr(self.model, "prepare_engram_out_of_graph", None)
+            if prepare_engram is not None:
+                prepare_engram(input_ids, positions, host_input_ids=self.input_ids.cpu)
         run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:
@@ -3641,7 +3659,9 @@ class NPUModelRunner(GPUModelRunner):
         # Models may gate graph-captured work on attn_metadata being present
         # (DeepSeek-V4.1 runs its engram prologue only when it is a dict).
         # Anything skipped at capture is never replayed, so PIECEWISE capture
-        # needs the dummy metadata too.
+        # needs the dummy metadata too. This holds with
+        # VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1 as well: the prologue and
+        # every layer's engram injection stay gated on the metadata.
         return not is_profile and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
 
     @torch.inference_mode()
