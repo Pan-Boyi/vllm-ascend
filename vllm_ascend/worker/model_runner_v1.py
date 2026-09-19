@@ -379,6 +379,7 @@ class NPUModelRunner(GPUModelRunner):
         # TODO delete it if fia's check is removed.
         self._has_gdn = check_gdn_layer(vllm_config)
         self._has_sinks = False
+        self._v41_candidate_guards = None
         if self._has_gdn:
             self.gdn_query_start_loc = self._make_buffer(
                 self.max_num_reqs + 1,  # type: ignore[has-type]
@@ -1363,6 +1364,12 @@ class NPUModelRunner(GPUModelRunner):
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if self._v41_candidate_guards is not None and num_reqs > 0:
+            # Host-side, no device sync: the value _build_attention_metadata
+            # passes as max_seq_len outside capture.
+            self._v41_candidate_guards.check(
+                int(self.optimistic_seq_lens_cpu[:num_reqs].max()),
+                "longest sequence this step")
 
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
@@ -4058,6 +4065,16 @@ class NPUModelRunner(GPUModelRunner):
             # at construction time, which raises on NPU without the wrapper.
             with _torch_cuda_wrapper():
                 self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            # DeepSeek-V4.1 candidate-mask guard (O6). In graph mode the
+            # indexer's own check runs once, at capture, against max_model_len;
+            # check that bound here, then every step on the host (_prepare_inputs).
+            from vllm_ascend.models.deepseek_v4_1.indexer_select import (
+                collect_candidate_guards)
+            self._v41_candidate_guards = collect_candidate_guards(
+                self.model, self.model_config.hf_text_config)
+            if self._v41_candidate_guards is not None:
+                self._v41_candidate_guards.check(self.max_model_len,
+                                                 "max_model_len")
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name

@@ -85,6 +85,53 @@ def assert_candidate_mask_is_vacuous(max_seq_len: int, compress_ratio: int,
         "max_model_len or an operator that exposes the logits.")
 
 
+
+class CandidateGuards:
+    """Every V4.1 indexer's candidate-mask guard inputs, for the runner.
+
+    Each indexer calls ``assert_candidate_mask_is_vacuous`` on
+    ``metadata.max_seq_len`` in its forward. Under graph capture that value is
+    ``max_model_len`` and replay never runs the check again, so a longer
+    sequence would silently skip the candidate filter. These are the same
+    inputs, read from the same modules, checked by the runner at startup and
+    on the host every step.
+    """
+
+    def __init__(self, entries):
+        self.entries = tuple(entries)
+
+    def check(self, max_seq_len: int, why: str) -> None:
+        for where, ratio, topk_blocks, block_size in self.entries:
+            assert_candidate_mask_is_vacuous(max_seq_len, ratio, topk_blocks,
+                                             block_size, f"{where} [{why}]")
+
+
+def collect_candidate_guards(model, hf_config) -> "CandidateGuards | None":
+    """Guard inputs of every Ascend indexer in a V4.1 model; None otherwise."""
+    model_type = getattr(hf_config, "model_type", None)
+    if not (isinstance(model_type, str)
+            and model_type.startswith("deepseek_v41")):
+        return None
+    from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
+        AscendSparseAttnIndexer)
+    # Same expressions as AscendSparseAttnIndexer.forward_oot passes.
+    entries = [(m.k_cache.prefix, m.compress_ratio,
+                m.candidate_blocks.shape[1]
+                if m.candidate_blocks is not None else 0,
+                m.candidate_block_size)
+               for m in model.modules()
+               if isinstance(m, AscendSparseAttnIndexer)]
+    if not entries:
+        raise RuntimeError(
+            f"{model_type}: found no AscendSparseAttnIndexer in the built "
+            "model, so the candidate-mask guard would check nothing. Either "
+            "the indexer class changed or it is not the one being built.")
+    from vllm.logger import init_logger
+    init_logger(__name__).info(
+        "candidate-mask guard: %d indexers, %d read a candidate mask",
+        len(entries), sum(1 for e in entries if e[2] > 0))
+    return CandidateGuards(entries)
+
 def _query_dequant_scale(q_quant, q_scale, num_tokens: int, num_heads: int,
                          device, dtype: torch.dtype) -> torch.Tensor:
     """The scale the operator requires, including when nothing scaled it.
