@@ -13,6 +13,12 @@ Instead:
 2. Each forward gathers the needed rows on the host, copies them to HBM in one
    H2D, and a Triton kernel dequantises them. Under graph capture the host
    gather is recorded as a host-function node so it replays with the graph.
+
+   With ``VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1`` the gather and the H2D
+   run in the model runner before every forward instead
+   (``stage_out_of_graph``, driven by ``engram_out_of_graph.prepare``), and
+   the forward only dequantises the persistent staging buffer: no
+   host-function node, no synchronisation inside the forward.
 """
 
 from __future__ import annotations
@@ -279,6 +285,12 @@ class AscendStagedEngramEmbedding:
         """
         import torch_npu
 
+        if out_of_graph_enabled():
+            raise RuntimeError(
+                "engram reached the host-function capture route with "
+                "VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1. Under that flag the "
+                "rows are staged by the model runner before the forward and "
+                "the graph must contain no host-function node.")
         flat = indices.reshape(-1)
         if flat.numel() != rows:
             raise AssertionError(
@@ -344,6 +356,24 @@ class AscendStagedEngramEmbedding:
                 "their device addresses stay stable for graph replay, so this "
                 "cannot grow on demand.")
 
+        if out_of_graph_enabled():
+            # The runner staged this step's rows before the forward
+            # (stage_out_of_graph); only the dequantisation is part of the
+            # forward, so graph replay reads nothing but persistent buffers.
+            # Host-side check: runs in eager and at capture, not at replay.
+            staged = self._oog_staged_rows
+            self._oog_staged_rows = None
+            if staged != rows:
+                raise RuntimeError(
+                    f"engram lookup for {rows} staging rows, but the runner "
+                    f"staged {staged} for this forward. With "
+                    "VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1 the model runner "
+                    "must call prepare_engram_out_of_graph() before every "
+                    "forward; without it the dequantisation would read the "
+                    "previous step's rows.")
+            self._dequantize_staged(rows, out)
+            return
+
         weight_table, scale_table = self.staged_tables()
 
         if _stream_is_capturing():
@@ -370,6 +400,67 @@ class AscendStagedEngramEmbedding:
             torch.from_numpy(host_scale), non_blocking=True)
 
         self._dequantize_staged(rows, out)
+
+    #: Rows staged by stage_out_of_graph() for the forward about to run;
+    #: consumed (reset to None) by lookup().
+    _oog_staged_rows: int | None = None
+
+    def stage_out_of_graph(self, host_ids: torch.Tensor,
+                           num_actual_tokens: int, num_tokens: int) -> None:
+        """Stage one step's rows before the forward, outside any graph.
+
+        ``host_ids`` is ``[num_actual_tokens, n_hash_cols]`` on the host: the
+        D2H copy of the ids the device hash computed this step (the caller,
+        ``engram_out_of_graph.prepare``, is the only one that produces it).
+        Rows ``[num_actual_tokens * cols, num_tokens * cols)`` -- the padding
+        of a padded batch -- are zeroed in HBM, so the kernel writes +0.0 for
+        them: an all-zero ue8m0 byte is the fp32 bit pattern 0.
+        """
+        from vllm_ascend.models.deepseek_v4_1.engram_layout import \
+            gather_into_staging
+
+        if _stream_is_capturing():
+            raise RuntimeError(
+                "engram stage_out_of_graph() ran inside a graph capture; it "
+                "synchronises and runs host code, so it must run before the "
+                "captured forward.")
+        cols = self.part_n_hash_cols
+        self._layout.assert_head_sharding_is_degenerate(
+            cols, self.n_hash_cols, self.head_start)
+        if not 0 <= num_actual_tokens <= num_tokens <= self._max_tokens:
+            raise ValueError(
+                f"engram staging for {num_actual_tokens} real of {num_tokens} "
+                f"tokens against buffers sized for {self._max_tokens}.")
+        if not getattr(self, "_pin_ready", False):
+            raise RuntimeError(
+                "engram pinned staging buffers are not allocated; they are "
+                "allocated at construction.")
+        if (host_ids.device.type != "cpu"
+                or tuple(host_ids.shape) != (num_actual_tokens, cols)):
+            raise ValueError(
+                f"engram host ids are {tuple(host_ids.shape)} on "
+                f"{host_ids.device}; expected ({num_actual_tokens}, {cols}) "
+                "on the host.")
+        rows = num_tokens * cols
+        real = num_actual_tokens * cols
+        self._oog_staged_rows = None
+        if real:
+            weight_table, scale_table = self.staged_tables()
+            row_ids = host_ids.reshape(-1).numpy().astype("int64")
+            gather_into_staging(weight_table, scale_table, row_ids,
+                                self._pin_weight_np[:real],
+                                self._pin_scale_np[:real])
+            # Pinned -> async. The next step's id D2H is synchronous on the
+            # same stream, so these copies finish before the host rewrites
+            # the pinned buffers.
+            self._dev_weight[:real].copy_(self._pin_weight[:real],
+                                          non_blocking=True)
+            self._dev_scale[:real].copy_(self._pin_scale[:real],
+                                         non_blocking=True)
+        if rows > real:
+            self._dev_weight[real:rows].zero_()
+            self._dev_scale[real:rows].zero_()
+        self._oog_staged_rows = rows
 
     def _dequantize_staged(self, rows: int, out: torch.Tensor) -> None:
         """Dequantise the staged rows in HBM into ``out``.
@@ -435,6 +526,14 @@ def _engram_host_gather(payload) -> None:
             "engram host gather callback raised inside a graph node: %r. "
             "The staged rows for this step are NOT this step's rows -- the "
             "device will read whatever the buffer held before.", exc)
+
+
+def out_of_graph_enabled() -> bool:
+    """``VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1``: the runner stages the rows
+    before the forward and the forward only dequantises them."""
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH == "1"
 
 
 def _stream_is_capturing() -> bool:

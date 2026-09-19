@@ -88,6 +88,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # builder's compressor_ratio also sets tokens_per_state, so redirecting it
     # changes the page size too; enabling this requires splitting the two.
     "VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO": lambda: os.getenv("VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO", "0"),
+    # DeepSeek-V4.1 engram: "1" runs the n-gram hash, the id D2H, the host
+    # gather and the H2D in the model runner before every forward, outside any
+    # captured graph; the graph then only dequantises a persistent staging
+    # buffer. "0" keeps the host gather inside the forward, recorded as a
+    # host-function node under graph capture.
+    "VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH", "0"),
 }
 
 # end-env-vars-definition
