@@ -184,12 +184,16 @@ def per_token_compressed_slots(
     blocks = block_table.to(torch.int64)[req_of_token, safe_index]
 
     flat = blocks * page + (state % page)
-    # Known limitation: ``blocks >= 0`` cannot tell a padded request row from
-    # a real block 0, because the runner fills padded block_table rows with 0
-    # (not -1). Under graph replay a padding token can land on such a row and
-    # be treated as valid. Nothing here carries a per-token validity signal
-    # to fix it; the fix belongs in the runner (fill -1, or pass a mask).
-    keep = publishes & addressable & (blocks >= 0)
+    # ``blocks >= 0`` cannot tell a padded request row from a real block 0:
+    # the runner fills padded block_table rows with 0 (not -1; FIA and the
+    # attention backend rely on that). seq_lens is the per-token validity
+    # signal instead: the runner zeroes it for padded rows on every step
+    # (``self.seq_lens[num_reqs:].fill_(0)``) and every live token has
+    # position < seq_len, so padding tokens drop out here, graph replay too.
+    seq_lens = req.seq_lens.to(device=device, dtype=torch.int64)
+    seq_row = req_of_token.clamp(max=max(int(seq_lens.shape[0]) - 1, 0))
+    live = pos < seq_lens[seq_row]
+    keep = publishes & addressable & (blocks >= 0) & live
     slots = torch.where(keep, flat, torch.full_like(flat, SKIP_SLOT))
     return slots.to(slot_mapping.dtype), layer_names
 
