@@ -75,12 +75,57 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
     draft_model_config._architecture = architecture
 
 
+#: Modules that implement a DeepSeek-V4.1 DSpark drafter on Ascend. Empty: none
+#: is ported yet, so every V4.1 target with method="dspark" is refused.
+V41_DSPARK_DRAFTER_MODULES: frozenset[str] = frozenset()
+
+
+def _is_v41_model_type(model_type) -> bool:
+    return isinstance(model_type, str) and model_type.startswith("deepseek_v41")
+
+
+def _refuse_v40_drafter_for_v41_target(spec_config) -> None:
+    """Refuse a V4.1 target whose DSpark drafter resolved to anything unported.
+
+    Upstream rewrites the draft config's *instance* ``model_type`` to
+    ``"deepseek_v4"``, so V4.1 is recognised by the target's ``model_type``
+    or by the draft config's *class* attribute, which that rewrite leaves
+    alone. The decision is made on the registry entry that will actually be
+    built, against an allow-list.
+    """
+    target_hf = getattr(getattr(spec_config, "target_model_config", None), "hf_config", None)
+    draft = getattr(spec_config, "draft_model_config", None)
+    draft_hf = getattr(draft, "hf_config", None)
+    if not (_is_v41_model_type(getattr(target_hf, "model_type", None))
+            or _is_v41_model_type(getattr(type(draft_hf), "model_type", None))):
+        return
+    arch = draft._architecture
+    entry = draft.registry.models[arch]
+    if entry.module_name in V41_DSPARK_DRAFTER_MODULES:
+        return
+    raise NotImplementedError(
+        "DeepSeek-V4.1 target (model_type="
+        f"{getattr(target_hf, 'model_type', None)!r}) with speculative method='dspark' "
+        f"resolved the drafter to {entry.module_name}:{entry.class_name} (architecture "
+        f"{arch!r}). That is the DeepSeek-V4.0 DSpark drafter: it sizes the draft MoE by "
+        f"the target's n_routed_experts={getattr(draft_hf, 'n_routed_experts', '?')} "
+        "(this checkpoint's drafter has dspark_n_routed_experts="
+        f"{getattr(draft_hf, 'dspark_n_routed_experts', '?')}), expects mtp.*.hc_head_* "
+        "and markov_w1/markov_w2, which the V4.1 checkpoint does not have, and reads "
+        "config.num_hash_layers, which V4.1 configs do not define. No V4.1 DSpark drafter "
+        "is ported to vllm-ascend yet (a missing port, not a hardware limit). Run without "
+        "--speculative-config, or register a V4.1 drafter and add its module to "
+        "V41_DSPARK_DRAFTER_MODULES."
+    )
+
+
 def _dspark_post_init(self):
     _orig_post_init(self)
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
         _normalize_deepseek_v4_dspark_draft(draft_model_config)
+        _refuse_v40_drafter_for_v41_target(self)
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "dspark_noise_token_id", None)  # type: ignore
