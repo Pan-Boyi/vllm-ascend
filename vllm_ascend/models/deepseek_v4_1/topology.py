@@ -204,8 +204,8 @@ def validate_if_v41(cfg) -> list[LayerRole] | None:
     if not is_v41_config(cfg):
         return None
     roles = validate_v41_topology(cfg)
-    from vllm.logger import init_logger
-    init_logger(__name__).info(
+    from vllm.logger import logger
+    logger.info(
         "DeepSeek-V4.1 topology OK: %d layers, index-K owners %s, indexers %s, "
         "candidate writer %s", len(roles),
         [r.layer for r in roles if r.owns_index_k],

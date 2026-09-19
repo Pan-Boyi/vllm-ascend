@@ -126,8 +126,8 @@ def collect_candidate_guards(model, hf_config) -> "CandidateGuards | None":
             f"{model_type}: found no AscendSparseAttnIndexer in the built "
             "model, so the candidate-mask guard would check nothing. Either "
             "the indexer class changed or it is not the one being built.")
-    from vllm.logger import init_logger
-    init_logger(__name__).info(
+    from vllm.logger import logger
+    logger.info(
         "candidate-mask guard: %d indexers, %d read a candidate mask",
         len(entries), sum(1 for e in entries if e[2] > 0))
     return CandidateGuards(entries)
