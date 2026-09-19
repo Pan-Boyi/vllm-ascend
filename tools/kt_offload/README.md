@@ -5,6 +5,9 @@
 - `serve_v41_singlecard.sh`：共享 `build_artifacts/serve_v41_bringup.sh` 的副本 + `KT_OFFLOAD=1` 分支
   （默认路径与原版逐字相同，integration 用 24 种环境组合比对过）。闸改为按本脚本所在目录找。
   ⚠️ 共享原版以后若有修复，本副本不会自动同步 —— 起飞前 diff 一次。
+  2026-09-19 已同步共享原版的逐卡 dmesg 闸（`gate_cards.sh`，共享版 sha256 31b5ca8d…）；默认路径 6 格 dry-run 逐字节相同
+  （`build_artifacts/moe_offload_ref/m0_evidence/serve_sync_0919_dryrun/`）。
+- `oncard/`：单层上卡测试 T0/T1/T2 与外壳 `run_oncard.sh`（租约、异常立停、产物），见其 README。
 - `kt_offload_gate.py`：起飞前显存 + 主机内存（逐 NUMA）两道闸；rc 0 放行 / 1 拒绝 / 2 算不出。
   `KT_DEVICE_FACTOR`、进程开销两个常数待首次上卡实测校准。
 - `dsv41_expert_counter.py` / `routed_experts_counter_hook.diff` / `expert_count_report.py`：M0c① 路由频率计数器（离线测过）。

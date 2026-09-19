@@ -266,8 +266,14 @@ done
 #   卡 1 实证：health 曾一度答 OK，而 udis 状态机从 09-10 16:24 起就没好过。
 #   后来 health 能拦住它是因为它烂到连 health 都超时了 —— 那是运气不是设计。
 #   ⇒ 判据覆盖的子系统数，要和结论需要的子系统数对得上。
-"$ROOT/build_artifacts/check_card_dmesg.sh" "$NPUS" || {
-  echo "❌ dmesg 侧检查未过，拒绝启动"; exit 1; }
+#   2026-09-19 重设计：窗口以【现在】为锚（见 check_card_dmesg.sh）。逐卡判：
+#     0 干净 ⇒ 过；1 判不了 ⇒ 拒绝（不能被放行）；3 窗口内有错 ⇒ 对这张卡做一次显式健康检查
+#     （card_health_check.py，在本发次的租约下），过了才放行；检查跑不起来和卡坏了分开报，都拒绝。
+#     DSV41_GATE_OVERRIDE="<卡>:<理由>" 只能放行"窗口内有错"的卡（不能放行"判不了"），并写进记录。
+#     每个决定都追加到 card_health.jsonl（出处）。
+_HREC="$(dirname "${SERVE_LOG:-/tmp/serve.log}")/card_health.jsonl"
+if [ "${LEASE:-1}" = "1" ]; then _HOWNER="$LEASE_OWNER"; else _HOWNER="${HEALTH_LEASE_OWNER:-}"; fi
+"$ROOT/build_artifacts/gate_cards.sh" "$NPUS" "$_HREC" "$_HOWNER" || { echo "❌ dmesg 侧检查未过，拒绝启动"; exit 1; }
 
 
 # ---- 等卡空闲：只查指定卡 + timeout（全量 npu-smi 会被坏卡挂死）--------------

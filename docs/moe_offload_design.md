@@ -2,6 +2,8 @@
 
 > 范围：M1 = eager；M2 = 图模式（FULL / PIECEWISE，§f）。侧流 overlap 只留开关（M3）。
 > 行号基于本分支 `dsv41-moe-offload`（vllm-ascend）与 `worktrees/moe-offload-vllm`（vllm，`dd63fc7d6`）。
+> 2026-09-19 变基到 dsv41-clean `1b1ad396b` / vllm `8b24cc594e`：新基线没动 `ops/`、`quantization/`、`compilation/`、`ascend_config.py`、vllm 的 fused_moe/breakable_cudagraph，
+> 所以本文 vllm-ascend 这些文件的行号仍有效；`model_runner_v1.py` 的行号整体后移（见 §j）。
 > 标 ⚫ 的是依赖 kt-kernel 或上卡才能确认的点。跟踪文档是 `MOE_OFFLOAD_PLAN.md`，本文不维护状态。
 
 代码位置一览：
@@ -168,7 +170,7 @@ merge: sync_forward → [KT_FORCE_SYNC_SUBMIT=1: cpu_infer.sync()] → H2D(outpu
 ```
 
 - **捕获分支不受任何运行时条件控制**（`layer.py:314` 在 profile 判断之前）：捕获那一次跳过的东西，每次 replay 都没有
-  （memory「运行时条件为闸的块不会进图」）。捕获用的 `_dummy_run` 传 `is_profile=False`（`model_runner_v1.py:3933`），
+  （memory「运行时条件为闸的块不会进图」）。捕获用的 `_dummy_run` 传 `is_profile=False`（`model_runner_v1.py:3960` `in_profile_run=is_profile`；捕获调用在 vllm `gpu_model_runner.py:6937`，不传 is_profile ⇒ 默认 False），
   本来也不会随机路由；这条是防御，单测有 `in_profile_run=True` 的捕获臂。
 - **订阅捕获流、只吞 107011**：`_subscribe_stream`（`layer.py:408`），每条流订阅一次；torch_npu ≥ 2.10 捕获时已预订阅，
   engram 也可能订阅过，重复订阅报 107011 = 已订阅。
@@ -245,7 +247,38 @@ merge: sync_forward → [KT_FORCE_SYNC_SUBMIT=1: cpu_infer.sync()] → H2D(outpu
   - `HCCL_BUFFSIZE`（MC2 用）在 ALLGATHER/单卡下无意义，保留无害。
   - 这些改动经 flash_dev（计划 §5）。
 
+## j. 与新多卡基线（dsv41-clean `1b1ad396b`）的关系（2026-09-19 变基后核对）
+
+**N3 候选掩码守卫 ⇒ 单卡 offload 的 max-model-len 上限 = 16384。**
+- 公式（`vllm_ascend/models/deepseek_v4_1/indexer_select.py:35-56`）：放行当且仅当
+  `ceil(floor(L / max(r,1)) / candidate_block_size) ≤ candidate_topk_blocks`。等价于 `L ≤ topk_blocks × block_size × r + (r − 1)`。
+- 受检对象：只有读候选掩码的 indexer（`candidate_blocks` 非 None：候选源层 20 及其后的 indexer，vllm `attention.py:398-419`；
+  `collect_candidate_guards` 只收 `candidate_blocks.shape[1] > 0` 的项生效）。V4.1-Flash `config.json`：`candidate_source_layer_id=20`、
+  `candidate_topk_blocks=2048`、`candidate_block_size=8`、`compress_ratios[20..39]=1`、`index_source_layer_ids=[2,8,14,20,24,28,32,36]`
+  ⇒ 受检的是 20/24/28/32/36，r=1 ⇒ `L ≤ 2048 × 8 × 1 + 0 = 16384`。16385 ⇒ 2049 块 > 2048 ⇒ 第 20 层先报（与多卡实测一致）。
+- 检查时刻：模型构建后按 `max_model_len` 查一次，之后每步在 host 上按本步最长序列查（`model_runner_v1.py` `_v41_candidate_guards`）。
+  两处都与 TP/DP/offload 无关 ⇒ 单卡同一上限。**实际能开多大还受单卡 KV 余量约束**（N=100 时卡上权重 ≈80 GiB，KV 余量远小于四卡），
+  那是另一条更紧的线，上卡读 vLLM 的 KV 可用量再定；16384 只是守卫给的硬顶。
+- `tools/kt_offload/serve_v41_singlecard.sh` 的 `MAXLEN` 默认 8192 ≤ 16384，不冲突。
+
+**第 3 批（engram 移出图，`VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH`，默认 0，4 卡上崩过）与本线无关：**
+本线 M2 不把任何东西挪出图 —— kt 的 CPU 专家是**图内**的 host-func 节点（D2H → host-func → H2D 都被捕获，§f），不依赖该开关，
+也不依赖 engram 先订阅捕获流（`_subscribe_stream` 自己订阅、只吞 107011）。开关=1 时 engram 那条 host-func 节点消失，kt 的仍在；
+开关=0（默认）两者并存。本线不打开第 3/4 批开关。第 2 批（mHC pre、逆 RoPE 走算子）默认开，与 MoE 无交集，照默认。
+
+**没有挂任何 vLLM KV / offload connector**（官方 review：connector 下 slot cache 每请求前 3 位出错）：kt offload 是 MoE 层内的
+host 计算，不经 vLLM 的 KV connector / `kv_transfer_config`。核对：`command grep -rni "connector|kv_transfer|kv-transfer|kv_offload"`
+于 `vllm_ascend/kt_offload/`、`tools/kt_offload/`、`routed_experts.py` 零命中（同路径 grep `kt_offload_config` 有命中作阳性对照）；
+单卡脚本不传 `--kv-transfer-config`，`env_dsv41.sh` 也没有。⚠️ 唯一入口是调用方自己在 `EXTRA_ARGS` 里加 —— 不要加。
+
+**新基线里本线依赖的对象（逐项核过未变）**：`routed_experts.py` 的 `_select_experts` / `forward_impl` /
+`enable_force_load_balance = _EXTRA_CTX.in_profile_run`；`token_dispatcher.py` ALLGATHER；`w4a8_mxfp4.py` DS method；
+vllm `breakable_cudagraph.py` 捕获后 replay 一次；engram 的 host-func 订阅与 107011 处理（新基线只在前面加了 out-of-graph 分支，订阅代码未改，
+M2 照抄的部分无需同步）。新增、与本线相关的只有：模型构建前的 `validate_if_v41` 拓扑校验与上面的 N3 守卫（均模型级，offload 不影响）。
+
 ## 上卡验证草案（M1，供排卡；先拿租约 `card_lease.sh acquire`，TMPDIR=/dev/shm/dsv41_tmp）
+
+> 步骤 1–2 与 M2 的单层部分已写成脚本：`tools/kt_offload/oncard/`（T0/T1/T2，外壳 `run_oncard.sh` 强制租约与异常立停；判据、时长、资源见其 README）。
 
 步骤 1 —— **基线臂先行，把 ALLGATHER 缺口与 offload 分开**：单层小用例（真实 V4.1 第 L 层权重，L 取 0/20/39），
 offload **关**、384 专家全驻留，走 `AscendRoutedExperts.forward_impl` 的 ALLGATHER 路径。对照：同层 torch CPU 参考
