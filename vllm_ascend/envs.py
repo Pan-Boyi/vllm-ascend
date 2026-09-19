@@ -94,6 +94,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # buffer. "0" keeps the host gather inside the forward, recorded as a
     # host-function node under graph capture.
     "VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH", "0"),
+    # DeepSeek-V4.1: "1" undoes RoPE before the output projection with one
+    # inplace_partial_rotary_mul over the rope slice (sin negated) instead of
+    # the torch ops. A5 honours partial_slice bit-exactly (card A4). Off until
+    # TPOT and GSM8K are compared on the card in the same build.
+    "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR", "0"),
 }
 
 # end-env-vars-definition

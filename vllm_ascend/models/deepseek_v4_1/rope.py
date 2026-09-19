@@ -82,12 +82,48 @@ def inverse_rope_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return out.copy_(torch.view_as_real(z * conj).flatten(-2))
 
 
-#: Torch rather than ``inplace_partial_rotary_mul``: that operator's
-#: ``partial_slice`` attribute is never read, so it rotates all of ``D`` and
-#: would rotate the 448 NoPE dimensions too. Rotating only the tail would need
-#: a non-contiguous 4-D view passed to an in-place operator and cos/sin widened
-#: to 64. Its ``interleave`` mode is the GPT-J pairing, and the inverse is the
-#: forward rotation with ``sin`` negated.
+#: ``inplace_partial_rotary_mul`` does honour ``partial_slice`` on A5: with
+#: slice [448, 512] and 64-wide cos/sin it rotates only the tail, leaves the
+#: NoPE bytes untouched, and with ``sin`` negated is bit-exact against the
+#: torch path below (card A4, CARD_RESULTS.md). Its ``interleave`` mode is the
+#: GPT-J pairing, and the inverse is the forward rotation with ``sin`` negated.
+#: It takes x as [T, 1, H, D] and cos/sin widened to the slice width
+#: (``rope_widen.cos_sin_for_slice``). The operator form is selected by
+#: ``VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR=1`` (default off, pending a TPOT
+#: A/B); the torch form stays the default.
+
+
+def _inverse_rope_operator_enabled() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR == "1"
+
+
+def _inverse_rope_operator(o: torch.Tensor, positions: torch.Tensor,
+                           cos_sin_cache: torch.Tensor,
+                           rope_head_dim: int) -> torch.Tensor:
+    """The inverse rotation as one ``inplace_partial_rotary_mul`` call.
+
+    Rotates a copy, so the caller's ``o`` is left as it was, as in the torch
+    form.
+    """
+    from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
+
+    if o.dim() != 3:
+        raise ValueError(
+            f"o has shape {tuple(o.shape)}; expected [num_tokens, heads, "
+            "head_dim]. The operator takes x 4-D and one axis is added here.")
+    head_dim = o.shape[-1]
+    cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
+    out = o.clone(memory_format=torch.contiguous_format)
+    torch.ops._C_ascend.inplace_partial_rotary_mul(
+        out.unsqueeze(1),                       # [T, 1, H, D]
+        cos[:, None, None, :],                  # [T, 1, 1, rope_head_dim]
+        (-sin)[:, None, None, :],
+        rotary_mode="interleave",
+        partial_slice=[head_dim - rope_head_dim, head_dim],
+    )
+    return out
 
 
 def inverse_rope_from_cos_sin_cache(
@@ -124,6 +160,9 @@ def inverse_rope_from_cos_sin_cache(
         raise ValueError(
             f"{o.shape[0]} tokens but {positions.shape[0]} positions; each row "
             "is rotated by its own absolute position, so these cannot differ")
+
+    if _inverse_rope_operator_enabled():
+        return _inverse_rope_operator(o, positions, cos_sin_cache, rope_head_dim)
 
     half = rope_head_dim // 2
     cs = cos_sin_cache.to(torch.float32).index_select(0, positions.to(torch.long))
