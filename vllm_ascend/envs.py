@@ -99,6 +99,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the torch ops. A5 honours partial_slice bit-exactly (card A4). Off until
     # TPOT and GSM8K are compared on the card in the same build.
     "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR", "0"),
+    # DeepSeek-V4.1 indexer K write: "1" quantises and stores through CANN's
+    # indexer_quant_cache (fp8 mode, round_scale=True: power-of-two scales,
+    # byte-equal to upstream's quantiser, card A6) instead of
+    # indexer_compress_epilog_v2 (scale absmax/448, not a power of two; N5).
+    # k_norm/RoPE/slot gating are unchanged either way. Off until GSM8K and
+    # TPOT are compared on the card (CARD_TEST_TABLE 戊).
+    "VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE", "0"),
 }
 
 # end-env-vars-definition
