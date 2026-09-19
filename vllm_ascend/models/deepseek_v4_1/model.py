@@ -26,6 +26,20 @@ class AscendDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         _assert_patches_applied()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        from vllm_ascend.models.deepseek_v4_1 import engram_out_of_graph
+        if engram_out_of_graph.enabled():
+            # Before any capture: the stand-in allocates its buffers here.
+            engram_out_of_graph.install(self)
+
+    def prepare_engram_out_of_graph(self, input_ids, positions,
+                                    host_input_ids=None) -> None:
+        """Called by the model runner before every forward when
+        ``VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH=1``; see
+        ``engram_out_of_graph``. ``host_input_ids`` is the runner's CPU copy,
+        passed only so it can be refused."""
+        from vllm_ascend.models.deepseek_v4_1 import engram_out_of_graph
+        engram_out_of_graph.prepare(self, input_ids, positions,
+                                    host_input_ids=host_input_ids)
 
 
 def _assert_patches_applied() -> None:
