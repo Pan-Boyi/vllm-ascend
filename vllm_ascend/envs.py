@@ -79,10 +79,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
-    # DeepSeek-V4.1 mHC pre: "1" uses npu_mhc_pre + npu_mhc_sinkhorn instead of
-    # upstream's torch reference. Off until the operator chain is validated
-    # numerically at hidden size 5120.
-    "VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR", "0"),
+    # DeepSeek-V4.1 mHC pre: "1" (default) uses npu_mhc_pre + npu_mhc_sinkhorn
+    # instead of upstream's torch reference; "0" selects the torch reference.
+    # On by default since the 2026-09-19 4-card A/B (together with the inverse
+    # RoPE operator: TPOT -25..-38%, 12/12 cells separated).
+    "VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR", "1"),
     # DeepSeek-V4.1: "1" carries each layer's configured compress ratio (0
     # included) to the metadata builder as its own spec field. Off: the
     # builder's compressor_ratio also sets tokens_per_state, so redirecting it
@@ -94,11 +95,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # buffer. "0" keeps the host gather inside the forward, recorded as a
     # host-function node under graph capture.
     "VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH": lambda: os.getenv("VLLM_ASCEND_DSV41_ENGRAM_OUT_OF_GRAPH", "0"),
-    # DeepSeek-V4.1: "1" undoes RoPE before the output projection with one
-    # inplace_partial_rotary_mul over the rope slice (sin negated) instead of
-    # the torch ops. A5 honours partial_slice bit-exactly (card A4). Off until
-    # TPOT and GSM8K are compared on the card in the same build.
-    "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR", "0"),
+    # DeepSeek-V4.1: "1" (default) undoes RoPE before the output projection with
+    # one inplace_partial_rotary_mul over the rope slice (sin negated) instead
+    # of the torch ops; "0" selects the torch ops. A5 honours partial_slice
+    # bit-exactly (card A4). On by default since the 2026-09-19 4-card A/B
+    # (together with the mHC pre operator).
+    "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR", "1"),
     # DeepSeek-V4.1 indexer K write: "1" quantises and stores through CANN's
     # indexer_quant_cache (fp8 mode, round_scale=True: power-of-two scales,
     # byte-equal to upstream's quantiser, card A6) instead of

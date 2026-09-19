@@ -89,8 +89,8 @@ def inverse_rope_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 #: GPT-J pairing, and the inverse is the forward rotation with ``sin`` negated.
 #: It takes x as [T, 1, H, D] and cos/sin widened to the slice width
 #: (``rope_widen.cos_sin_for_slice``). The operator form is selected by
-#: ``VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR=1`` (default off, pending a TPOT
-#: A/B); the torch form stays the default.
+#: ``VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR`` (default "1" since the
+#: 2026-09-19 4-card A/B); "0" selects the torch form.
 
 
 def _inverse_rope_operator_enabled() -> bool:

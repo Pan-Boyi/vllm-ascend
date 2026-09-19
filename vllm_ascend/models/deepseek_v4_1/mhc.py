@@ -8,11 +8,11 @@ rebound there rather than the layer being forked.
 
 - post runs on the ``aclnnHcPost`` operator (``npu_hc_post``), with the shapes
   adapted to its contract.
-- pre uses upstream's torch reference (``mhc_pre_delayed_torch``) by default,
-  plus the RMSNorm the tilelang kernel folds in. An operator path built on
-  torch_npu's ``npu_mhc_pre`` / ``npu_mhc_sinkhorn`` is selected by
-  ``VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR=1`` (default off); the first layer's
-  broadcast-embedding call stays on torch either way.
+- pre uses an operator path built on torch_npu's ``npu_mhc_pre`` /
+  ``npu_mhc_sinkhorn`` by default (``VLLM_ASCEND_DSV41_MHC_PRE_OPERATOR``,
+  default "1"); "0" selects upstream's torch reference
+  (``mhc_pre_delayed_torch``) plus the RMSNorm the tilelang kernel folds in.
+  The first layer's broadcast-embedding call stays on torch either way.
 """
 
 from __future__ import annotations
