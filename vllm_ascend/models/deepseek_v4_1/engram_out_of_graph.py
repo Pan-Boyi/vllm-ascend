@@ -258,7 +258,10 @@ def prepare(model, input_ids, positions, host_input_ids=None) -> None:
 
     swa_metadata = attn_metadata[inner.engram_swa_prefix]
     image_mask = image_sentinel_mask(input_ids)
-    num_reqs = swa_metadata.num_decodes + swa_metadata.num_prefills
+    # One row per query_start_loc row, padding requests included: the hash
+    # kernel reads row S-1 for padded lanes. Mirrors upstream after N8
+    # (vllm 8b24cc594e); test_prepare_passes_the_prologue_arguments pins it.
+    num_reqs = swa_metadata.query_start_loc.numel() - 1
     lookback_token_ids = input_ids.new_full((num_reqs, proxy.lookback_depth),
                                             -1)
     hashes = proxy.inner(
