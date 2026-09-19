@@ -32,6 +32,8 @@ Five details are silent if wrong:
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 #: The rope width of the V4.1 indexer key, against a head width of 128.
@@ -373,13 +375,14 @@ def indexer_quant_cache_enabled() -> bool:
     return envs.VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE == "1"
 
 
+@lru_cache
 def _indexer_quant_cache_op():
     """``torch.ops.cann_ops_transformer.indexer_quant_cache``, with the
-    registration it needs.
+    registration it needs. Resolved once (a failure is not cached).
 
     The op is registered by importing ``cann_ops_transformer`` (CANN 9.2 python
-    package); its first call JIT-builds a small C++ binding through
-    ``torch.utils.cpp_extension.load``.
+    package); its first *call* JIT-builds a small C++ binding through
+    ``torch.utils.cpp_extension.load`` (torch's extensions dir, file-locked).
     """
     from importlib import import_module
 
