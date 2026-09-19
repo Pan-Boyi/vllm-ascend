@@ -1,6 +1,6 @@
 # DSV4.1-flash 单卡 MoE offload（vLLM + kt-kernel）计划与跟踪
 
-> ⏸ **2026-09-19 暂停**（用户）：多卡版本在更新，等那边 fix 后再继续。恢复时先把本分支同步到新的 dsv41-clean，再写上卡脚本（tools/kt_offload/oncard/，尚未开始），然后排卡做 T0。
+> ▶ 2026-09-19 恢复（多卡 fix 已合入 clean 1b1ad396b / 8b24cc594e）：不占卡部分已完成，上卡待用户确认 + flash_dev 排卡。
 
 > 本文是这条线的**唯一跟踪文档**，由 dsv41_vllm_singlecard 会话维护。
 > 状态格式：⬜ 未开始 · 🟡 进行中 · ✅ 完成(附产物/判据读数) · ⛔ 阻塞(附原因)。
@@ -10,8 +10,8 @@
 
 | 仓 | 路径 | 分支 | 起点 |
 |---|---|---|---|
-| vllm-ascend | `worktrees/moe-offload` | `dsv41-moe-offload` | dsv41-clean `b7c9ca944` |
-| vllm | `worktrees/moe-offload-vllm` | `dsv41-moe-offload` | dsv41-clean `dd63fc7d6` |
+| vllm-ascend | `worktrees/moe-offload` | `dsv41-moe-offload` | dsv41-clean `1b1ad396b`（09-19 变基；旧头备份 `dsv41-moe-offload-pre-rebase-0919`） |
+| vllm | `worktrees/moe-offload-vllm` | `dsv41-moe-offload` | dsv41-clean `8b24cc594e`（09-19 快进） |
 | ktransformers | `worktrees/ktransformers` | `dsv41_vllm_offload_dev` | kvcache-ai upstream/main `105359b` |
 
 - ktransformers remote：`origin`=`wenxuewuhd/ktransformers-AK`（推送目标，待用户确认），`upstream`=kvcache-ai。
@@ -97,7 +97,7 @@
 | M0c | 找 integration：GSM8K 路由 topk 频率（每层，eager 采；DP=4 各 rank 加总）＋第二类数据一份；clean 多卡 bs=1 性能基线 + 同一 profiler 脚本采算子分布 | 他们的卡 | 频率表：每层计数和 = token 数×6，id 为全局 0..383；两份 top-100 重合度；profiler 脚本可复用于单卡 | 🟡 ① 计数钩子已入本树 1c047fee7（起法见 tools/kt_offload/README.md），等 flash_dev 排多卡卡位；② integration 测，等卡 |
 | M1 | vLLM 集成 eager（`--enforce-eager`）：掩码/加载/分流/加回。先单层小用例，再整网 | 1 | 单层分臂：NPU 驻留部分逐位一致 / kt vs bf16 参考按 M0b 地板 / 合成 vs 全专家按 fp8 激活地板×1.5；整网 GSM8K 50 题冒烟（prefix 与 frequency 各一次） | 🟡 代码 ✅（548f4907b 设计 `docs/moe_offload_design.md`；24881294e 代码 `vllm_ascend/kt_offload/`，默认关；CPU 单测 59/59，dsv41_vllm_singlecard 复跑确认（非独立第三方）；11 类变异全红）。上卡验证 ⬜ 等卡 |
 | M2 | 图模式 FULL_AND_PIECEWISE + host-func 节点 | 1 | **多请求并发批（不同长度、含续写），不只单 prompt 冒烟**（official review N1：PIECEWISE 下 engram n-gram hash 的 query_start_loc 尾部填 -1 会把 token 分到补齐请求、静默读越界，单 prompt 看不出）；eager vs graph 前 256 token 一致；无 10701x；同 bs ≥3 个不同输入 CPU 输出各异且等于 eager（多输入同输出=未重放指纹）；HOST_FUNC_CALLS 每步每层 +1；FULL_DECODE_ONLY/PIECEWISE × BREAKABLE 0/1 各一遍；探针恒 False 的变异臂必红 | 🟡 代码 ✅（vllm-ascend 50f37e662；kt 292be81 set_capture_probe，待用户 push；CPU 单测 92/92，dsv41_vllm_singlecard 复跑（非独立第三方））。kt wheel 已按 292be81 重建（sha256 06a89e4a…，M0b 重跑 PASS）；单卡脚本 EAGER=0 去掉 --enforce-eager（609bb16be，默认路径 9 格对比逐字节相同）——图模式需调用方自设 VLLM_USE_BREAKABLE_CUDAGRAPH=1（已验证发次均为 1）；上卡 ⬜ 等卡 |
-| M3 | 性能（**目标 bs=1 延迟**）：侧流、提前一层下发、频率放置、线程/NUMA 调优 | 1 | bs=1 TPOT（bs=32 附带），用同一 perf_baseline.sh / perf_bench.py 同参数，预热到 Triton 缓存不再增长；**多卡基线（clean 新环境 4 卡图模式，2026-09-19）：bs1 TPOT 43.28±0.08 ms，bs32 77.05±1.58 ms / 398 tok/s**（`build_artifacts/m1_run/perf_flight1_unfixed_newenv_0919_005457/`） | ⬜ |
+| M3 | 性能（**目标 bs=1 延迟**）：侧流、提前一层下发、频率放置、线程/NUMA 调优 | 1 | bs=1 TPOT（bs=32 附带），用同一 perf_baseline.sh / perf_bench.py 同参数，预热到 Triton 缓存不再增长；**多卡基线（最终形态 clean 1b1ad396b，4 卡图模式，2026-09-19）：bs1 TPOT 26.84 ms；bs32 54.97 ms / 563 tok/s（IN128）；IN4096 bs1 27.08 / bs32 78.60 ms**（`build_artifacts/m1_run/gsm8k_flight4_final_101009/`）。旧的 43.28 ms 是修复前，作废 | ⬜ |
 | P | **NPU 算子耗时分布**（用户要求）：服务拉起后 profiler 采 decode 稳态，按算子类型聚合 device 时间 + host-func/空隙；M2 起每个里程碑各采一次，M3 优化前后对比 | 1 | 分算子表（总时长/次数/占比）+ device-busy 与空隙占比；预热后采，多步取中位 | ⬜ |
 | M4 | 精度：GSM8K 1319 全量 graph，口径同基线（thinking 关、贪心、max4096） | 1 | 逐题配对，对 96.97% 在噪声内 | ⬜ |
 
@@ -114,6 +114,20 @@ KT_ADDITIONAL_CONFIG='{"kt_offload_config":{...}}' MAXLEN=... bash worktrees/moe
 - 起飞闸 `tools/kt_offload/kt_offload_gate.py`：N 从 KT_ADDITIONAL_CONFIG 读；HBM：10.4 + N×0.7004×KT_DEVICE_FACTOR ≤ 128×GPUUTIL − 25；主机：(384−N)×0.7004 + 15 + 10 + 16 对 MemAvailable，另逐 NUMA。rc 0 放行 / 1 拒绝 / 2 算不出。
 - **首次上卡待回报**：KT_DEVICE_FACTOR（NZ 填充）、进程开销实测。
 - M0c① 计数器也归本线：钩子进本树 routed_experts.py，用**本树**起多卡服务（offload 关、WT=moe-offload）采，卡由 flash_dev 排。M0c② 多卡性能基线 integration 照做。
+
+## 4.2 上卡测试（`tools/kt_offload/oncard/`，ce0c49f4d，CPU 自检 43/43，未上卡）
+
+`run_oncard.sh <card> <t0|t1|t2>`：租约随进程死、ASCEND_RT_VISIBLE_DEVICES、私有缓存 /dev/shm/dsv41_singlecard/、前后显存+dmesg、AICore 类异常立停保留现场。
+
+| 测试 | 内容 | 墙钟（估） | HBM | 主机 |
+|---|---|---|---|---|
+| t0 单层 | offload 关，384 专家，world_size=1 ALLGATHER + W4A8 vs 参考 | 10–15 min | ≈14 GiB | ≈10 GiB |
+| t0 三层 | 同上 L=0/20/39 | 30–45 min | ≈14 GiB | ≈10 GiB |
+| t1 | offload 开单层分臂（prefix 100 + 非连续 explicit） | 25–40 min | ≈17 GiB | ≈30 GiB |
+| t2 | 图模式单层捕获/replay | 5–10 min | ≈5 GiB | ≈25 GiB |
+
+- max-model-len 硬顶 16384（N3 守卫 `ceil(floor(L/r)/8) ≤ 2048`，层 20/24/28/32/36，r=1；与 TP/DP/offload 无关）；脚本默认 8192。
+- 本线不挪任何东西出图（第 3 批关），不挂任何 KV/offload connector（设计文档 §j）。
 
 ## 5. 边界（不碰）
 
@@ -158,3 +172,4 @@ KT_ADDITIONAL_CONFIG='{"kt_offload_config":{...}}' MAXLEN=... bash worktrees/moe
 - 2026-09-19：多卡性能基线到（bs1 TPOT 43.28 ms）。官方代码 review 两条相关：① slot cache 在挂 P/D 或 offload **connector** 时每请求前 3 位出错 —— 本线 kt offload 是层内 host 计算，不走 vLLM connector（待在设计文档写明并核无间接挂载）；② engram 缺陷 N1 有遮蔽效应 ⇒ M2 验证必须多请求并发。
   ⚠️ 协调失误：flash_dev 给了卡 0 做 T0 单层用例，我没及时响应、脚本也没写好 ⇒ 窗口让给 integration。教训：卡到之前把上卡脚本备好，排卡时能直接报时长。上卡测试脚本已派 agent 编写（tools/kt_offload/oncard/）。
 - 2026-09-19：⏸ 用户指示暂停，等多卡版本 fix。上卡脚本 agent 已停（无残留），未持有租约。恢复步骤：同步新 clean → 写 oncard 脚本 → 排卡 T0。
+- 2026-09-19：▶ 恢复。vllm 快进 8b24cc594e；vllm-ascend 变基到 1b1ad396b（唯一冲突 envs.py 两边都保留），kt_offload UT 95 过（新 clean 上收集失败 = 反向对照），mock 回归与新 clean 失败集合逐条相同；N3 上限 16384；单卡脚本副本同步共享原版的逐卡 dmesg 闸。上卡脚本 ce0c49f4d（§4.2）。对标改为 bs1 26.84 ms。
