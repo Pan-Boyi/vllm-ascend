@@ -99,6 +99,41 @@ def _inverse_rope_operator_enabled() -> bool:
     return envs.VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR == "1"
 
 
+_PARTIAL_ROTARY_OP = None
+
+
+def _partial_rotary_op():
+    """``torch.ops._C_ascend.inplace_partial_rotary_mul``, loading its library.
+
+    On A5 ``enable_custom_op()`` returns False, so nothing imports
+    ``vllm_ascend.vllm_ascend_C`` on purpose; the op is registered only if some
+    other module happened to import it (today ``device_allocator/camem.py``).
+    Without that the flag-on path failed with a bare host error that names
+    neither the library nor the flag. Load it here, and say so if it cannot be.
+    """
+    global _PARTIAL_ROTARY_OP
+    if _PARTIAL_ROTARY_OP is not None:
+        return _PARTIAL_ROTARY_OP
+    if not hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul"):
+        try:
+            import vllm_ascend.vllm_ascend_C  # noqa: F401  registers _C_ascend ops
+        except ImportError as e:
+            raise RuntimeError(
+                "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR=1 needs "
+                "torch.ops._C_ascend.inplace_partial_rotary_mul, which is "
+                "registered by vllm_ascend.vllm_ascend_C, and that library "
+                f"could not be imported ({e}). Build/install vllm_ascend_C or "
+                "set the flag to 0.") from e
+        if not hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul"):
+            raise RuntimeError(
+                "vllm_ascend.vllm_ascend_C was imported but did not register "
+                "_C_ascend::inplace_partial_rotary_mul (the built library is "
+                "older than this code?). Set "
+                "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR=0 or rebuild.")
+    _PARTIAL_ROTARY_OP = torch.ops._C_ascend.inplace_partial_rotary_mul
+    return _PARTIAL_ROTARY_OP
+
+
 def _inverse_rope_operator(o: torch.Tensor, positions: torch.Tensor,
                            cos_sin_cache: torch.Tensor,
                            rope_head_dim: int) -> torch.Tensor:
@@ -116,7 +151,7 @@ def _inverse_rope_operator(o: torch.Tensor, positions: torch.Tensor,
     head_dim = o.shape[-1]
     cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
     out = o.clone(memory_format=torch.contiguous_format)
-    torch.ops._C_ascend.inplace_partial_rotary_mul(
+    _partial_rotary_op()(
         out.unsqueeze(1),                       # [T, 1, H, D]
         cos[:, None, None, :],                  # [T, 1, 1, rope_head_dim]
         (-sin)[:, None, None, :],
