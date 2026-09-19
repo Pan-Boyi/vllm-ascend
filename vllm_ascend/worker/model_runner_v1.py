@@ -4043,6 +4043,11 @@ class NPUModelRunner(GPUModelRunner):
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_true
             rocm_aiter_ops.is_fused_moe_enabled = mock_true
 
+        # DeepSeek-V4.1: refuse a bad kv/index/candidate topology before the
+        # model is built; the model accepts several of them silently.
+        from vllm_ascend.models.deepseek_v4_1.topology import validate_if_v41
+        validate_if_v41(self.model_config.hf_text_config)
+
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 def mock_pass(param1, param2):
