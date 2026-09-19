@@ -1,5 +1,7 @@
 # DSV4.1-flash 单卡 MoE offload（vLLM + kt-kernel）计划与跟踪
 
+> ⏸ **2026-09-19 暂停**（用户）：多卡版本在更新，等那边 fix 后再继续。恢复时先把本分支同步到新的 dsv41-clean，再写上卡脚本（tools/kt_offload/oncard/，尚未开始），然后排卡做 T0。
+
 > 本文是这条线的**唯一跟踪文档**，由 dsv41_vllm_singlecard 会话维护。
 > 状态格式：⬜ 未开始 · 🟡 进行中 · ✅ 完成(附产物/判据读数) · ⛔ 阻塞(附原因)。
 > 每次更新在文末「变更记录」加一行，**带日期**。数字带出处；推断/估算明确标注。
@@ -155,3 +157,4 @@ KT_ADDITIONAL_CONFIG='{"kt_offload_config":{...}}' MAXLEN=... bash worktrees/moe
 - 2026-09-18：计数器加身份判据（29d3e9668，旧切片变异下新判据红、求和判据绿）；kt wheel 重建；单卡脚本 EAGER 开关。**不占卡的工作已全部完成**，等：卡（多卡 4 张采频率表 / 单卡 1 张上卡验证）、官方 v0.27.1rc engram_offload/MegaMoE 比对。
 - 2026-09-19：多卡性能基线到（bs1 TPOT 43.28 ms）。官方代码 review 两条相关：① slot cache 在挂 P/D 或 offload **connector** 时每请求前 3 位出错 —— 本线 kt offload 是层内 host 计算，不走 vLLM connector（待在设计文档写明并核无间接挂载）；② engram 缺陷 N1 有遮蔽效应 ⇒ M2 验证必须多请求并发。
   ⚠️ 协调失误：flash_dev 给了卡 0 做 T0 单层用例，我没及时响应、脚本也没写好 ⇒ 窗口让给 integration。教训：卡到之前把上卡脚本备好，排卡时能直接报时长。上卡测试脚本已派 agent 编写（tools/kt_offload/oncard/）。
+- 2026-09-19：⏸ 用户指示暂停，等多卡版本 fix。上卡脚本 agent 已停（无残留），未持有租约。恢复步骤：同步新 clean → 写 oncard 脚本 → 排卡 T0。
