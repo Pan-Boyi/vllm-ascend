@@ -328,11 +328,155 @@ def indexer_k_norm_rope_store_ascend(
     # then the per-token fp32 scales.
     # Bound once so the guard checks the same tensor the operator receives.
     x = k.to(torch.bfloat16)
+    if indexer_quant_cache_enabled():
+        # Same x, same slots, same packed cache; only the quantiser changes.
+        store_with_indexer_quant_cache(k_cache, x, slots)
+        return
     torch.ops._C_ascend.indexer_compress_epilog_v2(
         indexer_compress_cache=_checked_cache(k_cache, x),
         x=x,
         slot_mapping=slots,
         layout=2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# F9: the same store through CANN's indexer_quant_cache
+# (VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE=1).
+#
+# The call is the one card A6 ran and judged by bytes
+# (unit_tests/card_A/a6_indexer_quant_cache.py, CARD_RESULTS.md §A6): the
+# packed fp8 cache split into its value and scale views by
+# ``split_indexer_cache``, x bf16 [T, 128], the int32 slots from
+# ``group_boundary_slots``, quant_mode="fp8", round_scale=True, x_scale=1.0.
+# On that call the operator wrote exactly the slots != -1 (357/357, 178/178),
+# every scale was a power of two, and the bytes equalled upstream's quantiser
+# except for an all-zero row (upstream floors amax at 1e-4: scale 2^-22;
+# this operator writes scale 0; the values are 0 either way).
+#
+# Only the quantiser changes. k_norm, RoPE, the group gate and the slot
+# rebuild above are still ours, so the rebind of upstream's Triton K producer
+# (apply_indexer_k_store_patch, platform patch #7) is still what keeps the
+# Triton kernel from running, flag on or off.
+# ---------------------------------------------------------------------------
+
+#: The cache element type A6 ran. The Ascend indexer cache is allocated with
+#: it on A5 (``AscendDeepseekV41IndexerCache``, DSV4_COMPRESSED_CACHE). Any
+#: other type means a different cache configuration -- the non-compressed
+#: profile carries fp16 scales -- and the fp8 call has not been run on it.
+QUANT_CACHE_DTYPE = torch.float8_e4m3fn
+
+
+def indexer_quant_cache_enabled() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE == "1"
+
+
+def _indexer_quant_cache_op():
+    """``torch.ops.cann_ops_transformer.indexer_quant_cache``, with the
+    registration it needs.
+
+    The op is registered by importing ``cann_ops_transformer`` (CANN 9.2 python
+    package); its first call JIT-builds a small C++ binding through
+    ``torch.utils.cpp_extension.load``.
+    """
+    from importlib import import_module
+
+    try:
+        import_module("cann_ops_transformer")
+        return torch.ops.cann_ops_transformer.indexer_quant_cache
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE=1 needs "
+            "cann_ops_transformer.indexer_quant_cache from the CANN 9.2 "
+            "toolkit's python package, and it could not be loaded. This is "
+            "an environment problem (package missing or not on PYTHONPATH), "
+            "not an operator refusal; unset the flag to use "
+            "indexer_compress_epilog_v2.") from exc
+
+
+def quant_cache_views(k_cache: torch.Tensor, x: torch.Tensor):
+    """``(key, key_scale)`` views of the packed cache, as A6 passed them.
+
+    Refuses what A6 did not run rather than adapting to it. All checks read
+    only shapes, dtypes and strides, so nothing here syncs the device or
+    breaks a graph capture.
+    """
+    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import \
+        split_indexer_cache
+    from vllm_ascend.models.deepseek_v4_1.kv_binding import HEAD_AXIS
+
+    if k_cache.dtype != QUANT_CACHE_DTYPE:
+        raise ValueError(
+            f"indexer k cache is {k_cache.dtype}; the indexer_quant_cache "
+            f"path was verified (card A6) on the {QUANT_CACHE_DTYPE} packed "
+            "cache the A5 compressed profile allocates. Another element type "
+            "is another cache configuration, and quant_mode='fp8' has not "
+            "been run on it. Unset VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE.")
+    # The unit head axis, if the binding left it on (see with_head_axis).
+    packed = k_cache.squeeze(HEAD_AXIS) if (
+        k_cache.ndim == 4 and k_cache.shape[HEAD_AXIS] == 1) else k_cache
+    if packed.ndim != 3:
+        raise ValueError(
+            f"indexer k cache is {tuple(k_cache.shape)}; expected the packed "
+            "[num_blocks, tokens_per_block, width] (optionally with a unit "
+            "head axis) that A6 ran.")
+    tokens_per_block, width = int(packed.shape[1]), int(packed.shape[2])
+    # split_indexer_cache places block b at b * tokens_per_block * width, and
+    # so does the reader. A different block stride would put this writer and
+    # the reader in different places.
+    if packed.shape[0] > 1 and int(packed.stride(0)) != tokens_per_block * width:
+        raise ValueError(
+            f"indexer k cache block stride {packed.stride(0)} is not "
+            f"{tokens_per_block} x {width}; split_indexer_cache (and the "
+            "reader) assume back-to-back blocks, so the operator would write "
+            "where nothing reads.")
+    if packed.stride(2) != 1 or packed.stride(1) != width:
+        raise ValueError(
+            f"indexer k cache is not contiguous within a block (strides "
+            f"{tuple(packed.stride())}); indexer_quant_cache accepts "
+            "non-contiguity only across blocks.")
+    key, scale = split_indexer_cache(packed)
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or \
+            int(x.shape[1]) != int(key.shape[-1]):
+        raise ValueError(
+            f"x is {x.dtype} {tuple(x.shape)}; the verified call writes bf16 "
+            f"[T, {int(key.shape[-1])}] into this cache. The operator only "
+            "requires headDim >= d, so a narrower x would be written short "
+            "rather than refused.")
+    if int(scale.shape[-1]) != 1:
+        raise ValueError(
+            f"the scale view has {int(scale.shape[-1])} columns; fp8 mode "
+            "writes one float32 scale per token.")
+    return key, scale
+
+
+def store_with_indexer_quant_cache(k_cache: torch.Tensor, x: torch.Tensor,
+                                   slots: torch.Tensor) -> None:
+    """Quantise ``x`` and store it at ``slots`` through indexer_quant_cache.
+
+    ``slots`` is passed exactly as ``group_boundary_slots`` built it: int32,
+    ``-1`` = skip, the same sentinel the operator documents. It is not cast:
+    the operator takes int32 only, and so does the epilog operator this
+    replaces, so a different dtype here is an upstream change to look at, not
+    one to convert away.
+    """
+    if slots.dtype != torch.int32 or slots.ndim != 1 or \
+            int(slots.shape[0]) != int(x.shape[0]):
+        raise ValueError(
+            f"slots are {slots.dtype} {tuple(slots.shape)} for x "
+            f"{tuple(x.shape)}; indexer_quant_cache takes int32 [T], one "
+            "per row of x.")
+    key, scale = quant_cache_views(k_cache, x)
+    _indexer_quant_cache_op()(
+        cache=key,
+        cache_scale=scale,
+        x=x,
+        slot_mapping=slots,
+        quant_mode="fp8",
+        round_scale=True,
+        x_scale=1.0,
     )
 
 
