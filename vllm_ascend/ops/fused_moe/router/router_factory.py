@@ -12,6 +12,19 @@ from vllm_ascend.ops.fused_moe.router.fused_topk_router import (
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
 
 
+# This predicate answers ONE question: can the fused Ascend path express this
+# routing rule at all? A False means "use AscendGroupedTopKRouter instead", and
+# that fallback is only sound where it computes the same thing. It does for
+# sigmoid + renormalize=False (no hash table is involved), which is why that
+# rule lives here and is left as it is.
+#
+# The sqrtsoftplus + norm_topk_prob=False case deliberately does NOT get a rule
+# here, although it is also unsupported. Returning False for it would route
+# DeepSeek-V4 hash MoE to AscendGroupedTopKRouter, which is never given tid2eid
+# or bias_vl -- trading a silent renormalisation for a silent loss of the hash
+# route. It is rejected instead, with a raise, by
+# ``reject_unrenormalizable_hash_routing`` (fused_topk_router.py), called from
+# the constructor of the router that actually calls the operator.
 def check_npu_moe_gating_top_k(
     top_k: int,
     renormalize: bool,
