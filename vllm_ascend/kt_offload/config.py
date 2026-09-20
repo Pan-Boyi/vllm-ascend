@@ -78,9 +78,10 @@ class KTOffloadConfig:
     # Eager (M1): run kt's synchronous submit/sync path rather than ACL
     # stream callbacks. Sets KT_FORCE_SYNC_SUBMIT=1 for the process.
     force_sync_submit: bool = True
-    # M3: run the captured CPU-expert submit on a side stream so the resident
-    # NPU experts overlap it (sglang's KT_SIDE_STREAM). Interface only; the
-    # default, serial path is the one M2 implements.
+    # M3: hand the CPU-expert submit to a side stream so the resident NPU
+    # experts overlap it (sglang's KT_SIDE_STREAM). Off by default: with it on,
+    # the two arms must produce bit-identical output (a capture that does not
+    # propagate to the side stream is faster and wrong).
     overlap_side_stream: bool = False
 
     @model_validator(mode="after")
@@ -96,8 +97,11 @@ class KTOffloadConfig:
                 f"kt_offload_config.numa_nodes lists {len(self.numa_nodes)} node(s) "
                 f"but threadpool_count is {self.threadpool_count}."
             )
-        if self.overlap_side_stream:
-            raise ValueError("kt_offload_config.overlap_side_stream is reserved for M3 (not implemented).")
+        if self.overlap_side_stream and self.force_sync_submit is False:
+            raise ValueError(
+                "kt_offload_config.overlap_side_stream needs force_sync_submit (the overlap path drives "
+                "kt's submit itself; kt's own stream-callback submit would enqueue a second time)."
+            )
         if self.chunked_prefill_size < 0:
             raise ValueError("kt_offload_config.chunked_prefill_size must be >= 0.")
         if self.resident_strategy in ("prefix", "frequency") and self.num_resident_experts <= 0:

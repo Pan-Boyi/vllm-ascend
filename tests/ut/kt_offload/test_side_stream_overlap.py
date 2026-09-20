@@ -1,0 +1,451 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Side-stream overlap (cfg.overlap_side_stream) -- CPU only, fake streams.
+
+Two layers of checking, and the second one is the point:
+
+1. The call sequence the real ``KTLayerOffload`` emits (fork -> side wait ->
+   D2H/host-func on the side stream -> join -> H2D on the compute stream),
+   event lifetime, stale-join clearing, and the refusal when a capture does not
+   follow onto the side stream.
+
+2. A tiny stream simulator *executes* that recorded schedule and compares the
+   result with the serial (overlap off) one **bit for bit**. Every mutant below
+   (join dropped, join recorded too early, events not kept alive, capture not
+   propagated) produces a schedule that is FASTER and WRONG -- each test asserts
+   both, so the record shows why the on-card criterion is bit-identity and not
+   TPOT. sglang's F1 failure was exactly this shape: the capture did not
+   propagate to the side stream, the graph got quicker and the CPU experts'
+   contribution froze at the capture run's value.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_ascend.kt_offload import layer as kl
+from vllm_ascend.kt_offload.config import KTOffloadConfig
+from vllm_ascend.kt_offload.placement import build_plan
+
+H, TOPK, NEXP = 8, 2, 16
+
+# ---------------------------------------------------------------------------
+# a minimal device: streams of timed ops, events, pinned/device buffers
+# ---------------------------------------------------------------------------
+
+
+class Box:
+    """A device or pinned buffer whose content is read when an op executes."""
+
+    def __init__(self, value=None):
+        self.value = value
+
+
+class Op:
+    def __init__(self, kind, fn, cost, event=None):
+        self.kind, self.fn, self.cost, self.event = kind, fn, cost, event
+
+
+class Sim:
+    def __init__(self):
+        self.programs: dict[str, list[Op]] = {}
+        self.capturing = False
+        self.captured: dict[str, list[Op]] = {}
+        self.current = None
+
+    def enqueue(self, stream, op):
+        self.programs.setdefault(stream.name, []).append(op)
+
+    def reset_programs(self):
+        self.programs = {}
+
+    def run(self, programs) -> float:
+        """Execute per-stream op lists in time order, honouring event waits.
+
+        Time order across streams is what makes a missing or early join a data
+        hazard here, exactly as on the device: the H2D reads the pinned buffer
+        at the moment it executes, not at the moment it was enqueued.
+        """
+        idx = {name: 0 for name in programs}
+        clock = dict.fromkeys(programs, 0.0)
+        recorded: dict[int, float] = {}
+        while True:
+            runnable = []
+            for name, ops in programs.items():
+                if idx[name] >= len(ops):
+                    continue
+                op = ops[idx[name]]
+                if op.kind == "wait" and id(op.event) not in recorded:
+                    continue  # blocked until some stream records it
+                start = max(clock[name], recorded[id(op.event)]) if op.kind == "wait" else clock[name]
+                runnable.append((start + op.cost, name, op))
+            if not runnable:
+                break
+            end, name, op = min(runnable, key=lambda r: (r[0], r[1]))
+            clock[name] = end
+            if op.kind == "record":
+                recorded[id(op.event)] = end
+            elif op.kind != "wait":
+                # The effect lands when the op *completes*: that is what makes a
+                # missing or early join read the previous contents.
+                op.fn()
+            idx[name] += 1
+        if any(idx[n] < len(ops) for n, ops in programs.items()):
+            raise AssertionError("deadlock: an event was never recorded")
+        return max(clock.values(), default=0.0)
+
+    def drain(self) -> None:
+        """Host-side wait: everything enqueued so far runs now (eager path)."""
+        self.run({name: list(ops) for name, ops in self.programs.items()})
+
+
+class FEvent:
+    def __init__(self, sim):
+        self.sim = sim
+
+    def record(self, stream):
+        self.sim.enqueue(stream, Op("record", None, 0.0, self))
+
+
+class FStream:
+    def __init__(self, sim, name):
+        self.sim, self.name, self.npu_stream = sim, name, hash(name) & 0xFFFF
+
+    def wait_event(self, ev):
+        self.sim.enqueue(self, Op("wait", None, 0.0, ev))
+
+    def synchronize(self):
+        self.sim.host_syncs = getattr(self.sim, "host_syncs", 0) + 1
+        self.sim.drain()
+
+
+class FakeKT:
+    """kt wrapper on the simulator: CPU experts compute out = 3 * input."""
+
+    _layer_has_pending_deferred: dict = {}
+
+    def __init__(self, sim, device_in: Box, pinned_in: Box, pinned_out: Box, out_gpu: Box):
+        self.sim, self.device_in = sim, device_in
+        self.pinned_in, self.pinned_out, self.out_gpu = pinned_in, pinned_out, out_gpu
+        self.cpu_infer = SimpleNamespace(sync=lambda allow: setattr(self, "host_synced", True))
+        self.calls: list[str] = []
+
+    # eager (non-overlap) path, kept so the serial arm can run
+    def submit_forward(self, hs, ids, w, stream):
+        self.calls.append("submit_forward")
+        self.pinned_in.value = self.device_in.value
+        self.pinned_out.value = 3 * self.pinned_in.value
+
+    def sync_forward(self, hs, stream):
+        self.calls.append("sync_forward")
+        self._h2d()
+        return self.out_gpu
+
+    # overlap / captured path
+    def copy_inputs_to_cpu_buffers(self, hs, ids, w):
+        self.calls.append("copy_inputs")
+        self.sim.enqueue(
+            self.sim.current, Op("d2h", lambda: setattr(self.pinned_in, "value", self.device_in.value), 5.0)
+        )
+
+    def forward_on_pinned_buffers(self, hs, stream):
+        self.calls.append("forward_on_pinned")
+        self.pinned_out.value = 3 * self.pinned_in.value  # host-side submit + worker pool
+
+    def copy_forward_output_to_device(self, hs):
+        self.calls.append("copy_output")
+        self.sim.enqueue(self.sim.current, Op("h2d", self._h2d, 5.0))
+        return self.out_gpu
+
+    def _h2d(self):
+        v = self.pinned_out.value
+        self.out_gpu.fill_(float("nan") if v is None else v)
+
+    def run_pinned_forward_sync(self, shape_ref, stream):
+        self.pinned_out.value = 3 * self.pinned_in.value
+
+
+@pytest.fixture
+def sim(monkeypatch):
+    s = Sim()
+    compute, side = FStream(s, "compute"), FStream(s, "side")
+    s.current = compute
+    s.compute, s.side = compute, side
+    monkeypatch.setattr(kl, "_capturing", lambda: s.capturing and s.current is not None and _prop(s))
+    monkeypatch.setattr(kl, "_subscribe_stream", lambda stream: None)
+    monkeypatch.setattr(kl, "_kt_buffer_class", lambda: SimpleNamespace(capture_buffers={1: object()}))
+    monkeypatch.setattr(kl, "_stream_handle", lambda device: 0)
+    monkeypatch.setattr(kl, "_handle_of", lambda stream: stream.npu_stream)
+    monkeypatch.setattr(kl, "_new_stream", lambda device: side)
+    monkeypatch.setattr(kl, "_new_event", lambda device: FEvent(s))
+    monkeypatch.setattr(kl, "_SIDE_STREAM", None)
+    monkeypatch.setattr(kl, "_SIDE_EVENTS", [])
+    monkeypatch.setattr(kl, "_CAPTURED_PAYLOADS", [])
+    monkeypatch.setattr(kl, "HOST_FUNC_CALLS", {})
+
+    def stream_ctx(stream, device):
+        class Ctx:
+            def __enter__(_self):
+                s.prev, s.current = s.current, stream
+
+            def __exit__(_self, *a):
+                s.current = s.prev
+
+        return Ctx()
+
+    monkeypatch.setattr(kl, "_stream_ctx", stream_ctx)
+
+    def host_func(stream, fn, payload):
+        s.enqueue(stream, Op("hostfunc", lambda: fn(payload), 40.0))
+
+    monkeypatch.setattr(kl, "_launch_host_func", host_func)
+    fake_npu = SimpleNamespace(current_stream=lambda device=None: s.compute)
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    s.capture_propagates = True
+    return s
+
+
+def _prop(s):
+    """Whether the capture is visible on the stream the code is enqueueing to."""
+    return s.current is s.compute or s.capture_propagates
+
+
+def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes):
+    plan = build_plan([[0, 3]], NEXP)
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=overlap)
+    vcfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(hidden_size=H, moe_intermediate_size=4, num_experts_per_tok=TOPK),
+            model="/m",
+            enforce_eager=not graph,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="FULL_DECODE_ONLY" if graph else "NONE"),
+            cudagraph_capture_sizes=[1] if graph else [],
+        ),
+    )
+    rt = kl.KTLayerOffload(cfg, plan.layer(0), 0, vcfg)
+    fake = FakeKT(sim, *boxes)
+    monkeypatch.setattr(rt, "_build_wrapper", lambda: fake)
+    monkeypatch.setattr(rt, "_prepare_capture_buffers", lambda device: None)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(torch.ones(plan.num_slots, 3), requires_grad=False)
+    rt.after_weights_loaded(layer)
+    return rt, fake
+
+
+def _boxes():
+    """device_in, pinned_in, pinned_out (host side), out_gpu (a real tensor)."""
+    return (Box(1.0), Box(None), Box(None), torch.zeros(1, H))
+
+
+def _inputs(seed):
+    g = torch.Generator().manual_seed(seed)
+    hs = torch.randn(1, H, generator=g).to(torch.bfloat16)
+    ids = torch.tensor([[0, 9]], dtype=torch.int32)
+    w = torch.rand(1, TOPK, generator=g)
+    return hs, ids, w
+
+
+# ---------------------------------------------------------------------------
+# 1. the call sequence
+# ---------------------------------------------------------------------------
+
+
+def test_eager_overlap_avoids_the_device_wide_sync(monkeypatch, sim):
+    boxes = _boxes()
+    rt, fake = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes)
+    hs, ids, w = _inputs(0)
+    rt.route(hs, w, ids, in_profile_run=False)
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    # kt's own submit_forward (which calls torch.npu.synchronize) is never used
+    assert fake.calls == ["copy_inputs", "forward_on_pinned", "copy_output"]
+    assert getattr(sim, "host_syncs", 0) == 1  # the side stream only
+    assert fake.host_synced is True  # WorkerPool drained before the H2D
+    # the D2H was enqueued on the side stream, behind an event from compute
+    side_ops = sim.programs["side"]
+    assert [o.kind for o in side_ops] == ["wait", "d2h"]
+    assert [o.kind for o in sim.programs["compute"]] == ["record", "h2d"]
+
+
+def test_captured_overlap_records_fork_side_work_and_join(monkeypatch, sim):
+    boxes = _boxes()
+    rt, fake = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(1)
+    rt.route(hs, w, ids, in_profile_run=False)
+    assert rt._pending_join is not None
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    assert rt._pending_join is None  # consumed
+    assert [o.kind for o in sim.programs["compute"]] == ["record", "wait", "h2d"]
+    assert [o.kind for o in sim.programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
+    # the event objects the graph's nodes point at are kept for the process
+    assert len(kl._SIDE_EVENTS) == 1 and len(kl._SIDE_EVENTS[0]) == 2
+    assert len(kl._CAPTURED_PAYLOADS) == 1
+
+
+def test_capture_that_does_not_reach_the_side_stream_is_refused(monkeypatch, sim):
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    sim.capture_propagates = False
+    hs, ids, w = _inputs(2)
+    with pytest.raises(RuntimeError, match="did not propagate to the side stream"):
+        rt.route(hs, w, ids, in_profile_run=False)
+
+
+def test_stale_join_from_a_previous_capture_is_cleared(monkeypatch, sim):
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(3)
+    rt.route(hs, w, ids, in_profile_run=False)
+    stale = rt._pending_join
+    rt.route(hs, w, ids, in_profile_run=False)  # a second capture, no merge in between
+    assert rt._pending_join is not stale and rt._pending_join is not None
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    assert rt._pending_join is None
+
+
+def test_merge_without_a_join_is_an_error(monkeypatch, sim):
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(4)
+    rt.route(hs, w, ids, in_profile_run=False)
+    rt._pending_join = None  # what "the join was dropped" looks like from merge
+    with pytest.raises(AssertionError, match="no side-stream join"):
+        rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+
+
+def test_overlap_off_keeps_the_m2_path(monkeypatch, sim):
+    boxes = _boxes()
+    rt, fake = _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(5)
+    rt.route(hs, w, ids, in_profile_run=False)
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    assert "side" not in sim.programs and kl._SIDE_EVENTS == []
+    assert [o.kind for o in sim.programs["compute"]] == ["d2h", "hostfunc", "h2d"]
+
+
+# ---------------------------------------------------------------------------
+# 2. execute the recorded schedule: bit-identity vs wall time
+# ---------------------------------------------------------------------------
+
+
+def _capture_schedule(monkeypatch, sim, boxes, *, overlap: bool):
+    rt, fake = _runtime(monkeypatch, sim, overlap=overlap, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(7)
+    rt.route(hs, w, ids, in_profile_run=False)
+    # the resident experts, between route and merge: the work the side stream is
+    # supposed to hide behind (on card ~0.62 ms/layer against ~0.45 ms of host)
+    sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    sim.capturing = False
+    return {name: list(ops) for name, ops in sim.programs.items()}
+
+
+def _replay(sim, programs, device_in: Box, out_gpu: torch.Tensor, value: float, routed_out: float = 100.0):
+    """One graph replay with a fresh input; returns (merged value, wall time).
+
+    The merge's add is enqueued on the compute stream after the H2D, so the
+    merged value is ``routed_out + out_gpu`` read once the schedule has run.
+    """
+    device_in.value = value
+    out_gpu.zero_()
+    wall = sim.run(programs)
+    return routed_out + float(out_gpu[0, 0]), wall
+
+
+def _arms(monkeypatch, sim, mutate=None):
+    """Serial (overlap off) vs overlap schedules, replayed on the same inputs."""
+    serial_boxes = _boxes()
+    serial = _capture_schedule(monkeypatch, sim, serial_boxes, overlap=False)
+    sim.reset_programs()
+    ov_boxes = _boxes()
+    overlap = _capture_schedule(monkeypatch, sim, ov_boxes, overlap=True)
+    if mutate is not None:
+        overlap = mutate(overlap, ov_boxes)
+    out_s, out_o, t_s, t_o = [], [], [], []
+    for v in (2.0, 5.0, 9.0):
+        y, t = _replay(sim, serial, serial_boxes[0], serial_boxes[3], v)
+        out_s.append(y)
+        t_s.append(t)
+        y, t = _replay(sim, overlap, ov_boxes[0], ov_boxes[3], v)
+        out_o.append(y)
+        t_o.append(t)
+    return out_s, out_o, max(t_s), max(t_o)
+
+
+def _bits_equal(a, b):
+    return torch.equal(torch.tensor(a, dtype=torch.float64), torch.tensor(b, dtype=torch.float64))
+
+
+def test_correct_overlap_is_bit_identical_and_not_slower(monkeypatch, sim):
+    out_s, out_o, t_s, t_o = _arms(monkeypatch, sim)
+    assert _bits_equal(out_s, out_o), (out_s, out_o)
+    # serial: d2h 5 + host 40 + npu 30 + h2d 5 = 80; overlapped: max(45, 30) + 5 = 50
+    assert t_o < t_s, (t_o, t_s)  # the point of the change; never the criterion on its own
+
+
+def _drop_join(programs, boxes):
+    return {n: [o for o in ops if not (n == "compute" and o.kind == "wait")] for n, ops in programs.items()}
+
+
+def _join_before_host_func(programs, boxes):
+    side = programs["side"]
+    rec = [o for o in side if o.kind == "record"]
+    rest = [o for o in side if o.kind != "record"]
+    # the join event recorded right after the D2H, before the host func
+    return {**programs, "side": rest[:2] + rec + rest[2:]}
+
+
+def _events_not_kept(programs, boxes):
+    """Events collected: their record/wait nodes degrade into no-ops."""
+    out = {}
+    for n, ops in programs.items():
+        out[n] = [Op("nop", lambda: None, 0.0) if o.kind in ("wait", "record") else o for o in ops]
+    return out
+
+
+def _capture_not_propagated(programs, boxes):
+    """The side stream's work never made it into the graph (sglang's F1).
+
+    In that shape the D2H and the host func ran once, eagerly, while the graph
+    was being captured: the pinned output keeps that run's value for ever.
+    """
+    device_in, pinned_in, pinned_out, _ = boxes
+    pinned_in.value = device_in.value
+    pinned_out.value = 3 * pinned_in.value  # the capture run's CPU output, frozen
+    return {n: ([] if n == "side" else [o for o in ops if o.kind != "wait"]) for n, ops in programs.items()}
+
+
+@pytest.mark.parametrize(
+    "name, mutate",
+    [
+        ("join dropped", _drop_join),
+        ("join recorded before the host func", _join_before_host_func),
+        ("events not kept alive", _events_not_kept),
+        ("capture not propagated to the side stream", _capture_not_propagated),
+    ],
+)
+def test_mutants_are_faster_and_wrong(monkeypatch, sim, name, mutate):
+    """Bit-identity catches each mutant; a wall-time criterion passes all of them.
+
+    This is the argument for the on-card criterion: every one of these makes the
+    step FASTER, so "TPOT improved" is evidence of nothing.
+    """
+    out_s, out_o, t_s, t_o = _arms(monkeypatch, sim, mutate)
+    assert not _bits_equal(out_s, out_o), f"{name}: bit-identity did not catch it ({out_s} vs {out_o})"
+    assert t_o <= t_s, f"{name}: expected the mutant to be no slower (time is not a criterion)"
+
+
+def test_stale_output_fingerprint_of_the_unpropagated_capture(monkeypatch, sim):
+    """The F1 shape specifically: one CPU output reused for every replay."""
+    _, out_o, _, _ = _arms(monkeypatch, sim, _capture_not_propagated)
+    assert len(set(out_o)) == 1, f"expected one frozen value, got {out_o}"

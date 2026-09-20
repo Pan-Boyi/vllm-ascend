@@ -42,7 +42,8 @@ def test_config_defaults_off():
         dict(cpuinfer_threads=8, resident_strategy="explicit"),  # no list
         dict(cpuinfer_threads=8, num_resident_experts=100, threadpool_count=2, numa_nodes=[0]),
         dict(cpuinfer_threads=8, num_resident_experts=100, resident_strategy="random"),
-        dict(cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=True),  # reserved for M3
+        # overlap needs kt's submit driven by us (force_sync_submit)
+        dict(cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=True, force_sync_submit=False),
     ],
 )
 def test_config_rejects_incomplete(kwargs):

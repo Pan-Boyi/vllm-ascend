@@ -281,6 +281,77 @@ host 计算，不经 vLLM 的 KV connector / `kv_transfer_config`。核对：`co
 vllm `breakable_cudagraph.py` 捕获后 replay 一次；engram 的 host-func 订阅与 107011 处理（新基线只在前面加了 out-of-graph 分支，订阅代码未改，
 M2 照抄的部分无需同步）。新增、与本线相关的只有：模型构建前的 `validate_if_v41` 拓扑校验与上面的 N3 守卫（均模型级，offload 不影响）。
 
+## k. 侧流重叠（M3，`overlap_side_stream`，默认关）
+
+**靶子**（本线实测，产物 `build_artifacts/moe_offload_ref/prof_0920_045212/op_breakdown_bs1.txt`）：图模式 bs=1 TPOT
+40.47±0.38 ms；device 真实忙（区间并集）57.1% = 24.96 ms/token，空隙 18.73 ms，其中 >100 µs 的大空隙每 token 43 段
+合计 17.91 ms ⇒ host offload 完全暴露。kt 纯计算约 10.4 ms（CPU 曲线 T(k)=66.8+43.95k µs/层），余 ≈7.5 ms 是搬运+回调。
+
+实现（`vllm_ascend/kt_offload/layer.py`）：
+
+```
+捕获中  route: fork.record(compute); side.wait_event(fork)
+             with stream(side):  [捕获传播检查] → copy_inputs_to_cpu_buffers → _launch_host_func
+             记下 (join, side, compute)，(fork, join) 进 _SIDE_EVENTS（活到进程结束）
+       compute: split → dispatch → GMM(驻留) → combine
+       merge: join.record(side); compute.wait_event(join); copy_forward_output_to_device
+eager  route: fork.record(compute); side.wait_event(fork); with stream(side): copy_inputs…
+             side.synchronize()（只等这条流）→ forward_on_pinned_buffers（提交，不阻塞）
+       merge: cpu_infer.sync() → copy_forward_output_to_device
+```
+
+- eager 这条路的收益来自**绕开 kt 自己的 `torch.npu.synchronize()`**：kt 的 `submit_forward` 为了确保输入 D2H 落地会做
+  整卡同步（`experts_base.py` `_wait_device`），那会连驻留专家一起等，重叠归零。改成只 `side.synchronize()`。
+  代价是要用 kt 的 `forward_on_pinned_buffers` + `cpu_infer.sync`，所以 `overlap_side_stream` 要求 `force_sync_submit`
+  （否则 kt 自己还会再提交一次），且启用时会检查这几个方法在不在（`_overlap_supported`，`layer.py` 约 :233）。
+- **捕获传播检查**（`layer.py:451` 起）：在侧流上下文里再问一次 `_capturing()`；为假就 raise。
+  sglang 的 F1 失效正是"捕获没传播到侧流"——侧流上的 D2H 与 host-func **只在捕获那一次执行**、不进图，
+  于是每次 replay 都复用捕获那一次的 CPU 输出：**更快而且算错**。只看 TPOT 的判据对它是零覆盖。
+- **event 保活**：每对 (fork, join) 进 `_SIDE_EVENTS`，捕获图里的 record/wait 节点引用它们（sglang 丢过）。
+- **陈旧 join 清理**：每次 `_submit_captured_forked` 先把上一轮的 `_pending_join` 清掉（sglang `18c8b21e3`）；
+  `merge` 在 overlap 打开却没有 join 时直接 raise（不静默跳过）。
+- CPU 单测 `tests/ut/kt_offload/test_side_stream_overlap.py`：除调用序列外，有一个**按完成时间调度的流模拟器**，
+  把录下来的调度真的跑一遍并与串行臂**逐位**比较。四个变异臂（join 去掉 / join 记早 / event 未保活 / 捕获未传播）
+  每一个都**更快且算错**，测试同时断言"更快"与"逐位不同"，把"只看时间抓不到"写成可执行的事实。
+
+## l. 搬运与回调那 7.5 ms 的归因（测量项，**不与侧流同一个变更**）
+
+字节账（`tools/kt_offload/transport_budget.py budget`，纯算术）：每层每 token D2H 10,312 B（hidden bf16 + ids int64 +
+weights fp32）+ H2D 10,240 B = 20,552 B；40 层 = 822 KB/token ⇒ 20 GB/s 下 **41 µs/token**。
+⇒ 相对 7.5 ms，**带宽只占 0.5%**（推断，链路带宽未实测）。同一脚本按 120 个操作（40 层 × D2H/host-func/H2D）反推：
+**每个操作 62.5 µs 固定开销**。kt 侧的 CPU 曲线也有每层 66.8 µs 的固定项。
+⇒ 待验证的假设：这 7.5 ms 是**每操作固定成本 × 操作数**，不是字节数；能减的是操作数（例如 ids/weights 与 hidden 合并成一次拷贝、
+把 H2D 并进下一层的 D2H）或回调路径本身，不是加带宽。
+上卡确认办法：`transport_budget.py measure <kernel_details.csv> --steps N`，它按**区间并集**算真实忙、单列 D2H/H2D/host-func
+的次数与时长、并给 >100 µs 空隙的个数与合计。**这项单独提，别和侧流绑在一个变更里**：重叠是把成本藏起来，不是去掉。
+
+## 上卡 A/B 方案（M3 侧流，1 张卡；两臂只差一个开关）
+
+两臂：`overlap_side_stream: false`（现状）与 `true`。**同一构建、同一配置、同一套仪器**，只切这个开关。
+
+1. **判据①逐位相同（最重要，先跑，不过不看性能）**
+   - 单条请求：同一组提示、贪心、同 seed，两臂逐 token 比对；判据用 `oncard_common.bit_identical`（字节相同 or 值相同，
+     处理 ±0/NaN），不是 rel_l2。
+   - **并发**：≥2 组并发请求（不同长度、含一条长 prefill 与若干 decode 混跑），跑够让同一捕获 bs 被多次 replay；
+     侧流的风险正在跨请求/跨流的时序，单条比对对这类缺陷是零覆盖。
+   - 另核 `HOST_FUNC_CALLS[layer]` 随 decode 步数线性增长（侧流上的 host-func 真的每次都跑）。
+2. **判据② TPOT**：`perf_baseline.sh`（同脚本、同参数），n≥3 且**重复到能看出分布形状**再下结论
+   （多卡在 bs=4 上栽过：第一档取样看不出双峰）。报中位数 + 全部样本 + 离散度，不只报差值。
+3. **判据③ 算子级 profiling 两臂各一份**（用户点名要）。开法与坑（计划 §4.6）：
+   - 本版 vLLM 不认 `VLLM_TORCH_PROFILER_DIR`，要 `EXTRA_ARGS='--profiler-config {"profiler":"torch","torch_profiler_dir":"<dir>"}'`；
+   - `prof_decode_capture.py` 在 404 时照样打印 "✅ captured" ⇒ **自己数 `<dir>/*_ascend_pt`**；
+   - `prof_decode_breakdown.py` 会因「无 kernel 带图 Model ID」拒绝出结果 ⇒ 直接聚合 `kernel_details.csv`
+     （`transport_budget.py measure` 就是干这个的）。
+4. **收益要落到空隙表上**，不只一个 TPOT 差值。两臂各重算三项并对照：
+   | 量 | 现状（offload 开、侧流关） | 侧流开 | 读法 |
+   |---|---|---|---|
+   | 每 token 空隙合计 | 18.73 ms | ? | 总量 |
+   | >100 µs 大空隙：个数 / 合计 | 43 段 / 17.91 ms | ? | **个数减少**=某些层的暴露被整段盖住 |
+   | 单段大空隙的中位/分布 | ≈0.42 ms | ? | **单段变短**=部分盖住（NPU 活不够长） |
+   | device 真实忙（并集）占比 | 57.1% | ? | **占比升高**=同样的活挤进更短的时间 |
+   三种机制（段数少了 / 单段短了 / 整体被盖住）要能分开报，别合成一句"变快了"。
+5. 失败处置：判据①不过 ⇒ 立刻停，不看性能数字；先查捕获是否传播到侧流（我们的检查应当已经 raise，没 raise 就是检查本身漏了）。
+
 ## 上卡验证草案（M1，供排卡；先拿租约 `card_lease.sh acquire`，TMPDIR=/dev/shm/dsv41_tmp）
 
 > 步骤 1–2 与 M2 的单层部分已写成脚本：`tools/kt_offload/oncard/`（T0/T1/T2，外壳 `run_oncard.sh` 强制租约与异常立停；判据、时长、资源见其 README）。
