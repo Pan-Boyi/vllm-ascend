@@ -120,6 +120,9 @@ def _runtime(monkeypatch, packed: bool, layers: int = 4, sizes=(1, 2)):
         dst.copy_(src)
 
     monkeypatch.setattr(kl, "_host_copy", host_copy)
+    # pinned memory needs a real accelerator; the layout and the pointers are
+    # what these tests are about, so plain host memory stands in
+    monkeypatch.setattr(kl, "_pinned_empty", lambda shape, dtype: torch.empty(shape, dtype=dtype))
     monkeypatch.setattr(kl, "_device_fill", device_fill)
     rts = []
     for i in range(layers):
@@ -200,6 +203,7 @@ def test_refuses_a_kt_build_without_the_entry_points(monkeypatch):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
         compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="NONE"), cudagraph_capture_sizes=[]),
     )
+    monkeypatch.setattr(kl, "_pinned_empty", lambda shape, dtype: torch.empty(shape, dtype=dtype))
     rt = kl.KTLayerOffload(cfg, plan.layer(0), 0, vcfg)
     monkeypatch.setattr(rt, "_build_wrapper", lambda: SimpleNamespace())  # no moe / cpu_infer
     mod = torch.nn.Module()

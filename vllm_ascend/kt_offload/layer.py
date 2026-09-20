@@ -291,7 +291,7 @@ class KTLayerOffload:
             return buf
         lay = packed_layout(bs, self.hidden_size, self.top_k)
         dev = torch.empty(lay["nbytes"], dtype=torch.uint8, device=device)
-        pin = torch.empty(lay["nbytes"], dtype=torch.uint8, device="cpu", pin_memory=True)
+        pin = _pinned_empty((lay["nbytes"],), torch.uint8)
 
         def view(store, region, dtype, shape):
             off, nbytes = lay[region]
@@ -307,9 +307,9 @@ class KTLayerOffload:
             "pin_hidden": view(pin, "hidden", torch.bfloat16, (bs, self.hidden_size)),
             "pin_ids": view(pin, "ids", torch.int64, (bs, self.top_k)),
             "pin_weights": view(pin, "weights", torch.float32, (bs, self.top_k)),
-            "pin_out": torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device="cpu", pin_memory=True),
+            "pin_out": _pinned_empty((bs, self.hidden_size), torch.bfloat16),
             "dev_out": torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device=device),
-            "bsz": torch.full((1,), bs, dtype=torch.int32, device="cpu", pin_memory=True),
+            "bsz": _pinned_empty((1,), torch.int32).fill_(bs),
         }
         self._packed[bs] = buf
         return buf
@@ -785,6 +785,11 @@ def _install_capture_probe(kt_wrapper_cls) -> None:
         )
         return
     setter(_capturing)
+
+
+def _pinned_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Pinned host memory: the only kind an async host-device copy may use."""
+    return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
 
 
 def _device_fill(dst: torch.Tensor, src: torch.Tensor) -> None:
