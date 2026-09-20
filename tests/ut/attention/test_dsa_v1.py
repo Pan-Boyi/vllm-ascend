@@ -963,8 +963,9 @@ def test_build_classifies_short_speculative_extends_as_decodes(
     assert metadata.num_prefills == 0
 
 
-def test_build_req_metadata_preserves_zero_max_sequence_lengths():
-    builder = _make_builder(compressor_ratio=1)
+@pytest.mark.parametrize("compressor_ratio", [1, 4])
+def test_build_req_metadata_preserves_zero_max_sequence_lengths(compressor_ratio: int):
+    builder = _make_builder(compressor_ratio=compressor_ratio)
     builder.common_ratio_to_sas_metadata = {}
     builder.num_actual_tokens = 0
     builder.num_prefills = 1
@@ -990,11 +991,18 @@ def test_build_req_metadata_preserves_zero_max_sequence_lengths():
     )
 
     sas_kwargs = builder._build_sas_metadata.call_args.kwargs
-    qli_kwargs = builder._build_qli_metadata.call_args.kwargs
     assert sas_kwargs["max_seqlen_q"] == 0
     assert sas_kwargs["max_seqlen_kv"] == 0
-    assert qli_kwargs["max_seqlen_q"] == 0
-    assert qli_kwargs["max_seqlen_kv"] == 0
+    # The QLI descriptor is built only at ratio 4, on this branch as on the
+    # device-metadata one: its single reader is V4.0's indexer, which also
+    # takes qli_cu_seqlens_q / qli_seqused_k / qli_cmp_residual_k, and those
+    # are published at ratio 4 only. Asserted as an iff so that a future
+    # ungating shows up here rather than as a device operator nobody reads.
+    assert builder._build_qli_metadata.called is (compressor_ratio == 4)
+    if compressor_ratio == 4:
+        qli_kwargs = builder._build_qli_metadata.call_args.kwargs
+        assert qli_kwargs["max_seqlen_q"] == 0
+        assert qli_kwargs["max_seqlen_kv"] == 0
     assert metadata.num_compressed_tokens == 0
 
 

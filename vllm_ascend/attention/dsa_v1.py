@@ -1631,12 +1631,32 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
                 **sas_mask_kwargs,
             )
-            qli_metadata = self._build_qli_metadata(
-                metadata_cache=metadata_cache,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
+            # Same gate as the device-metadata branch above, which registers
+            # the INDEXER task only at ratio 4. The two branches publish the
+            # same field and it has one reader: V4.0's indexer
+            # (models/deepseek_v4/indexer.py:222,239). That reader also takes
+            # qli_cu_seqlens_q / qli_seqused_k / qli_cmp_residual_k, which are
+            # published at ratio 4 only (below, after the branches join), so
+            # ratio 4 is already the condition under which the descriptor is
+            # read -- it was simply missing here.
+            #
+            # V4.1 never reads the field. It builds its own descriptor in
+            # models/deepseek_v4_1/sparse_indexer.py:_qli_metadata, and its
+            # ratios are 0, 1 and 2 only (vllm/models/deepseek_v4_1/
+            # attention.py raises on anything else), so without this gate every
+            # V4.1 build on this branch launched
+            # npu_quant_lightning_indexer_v2_metadata on the device for a
+            # descriptor that was then dropped.
+            qli_metadata = (
+                self._build_qli_metadata(
+                    metadata_cache=metadata_cache,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                )
+                if self.compressor_ratio == 4
+                else None
             )
 
         full_compress_cos, full_compress_sin = None, None
