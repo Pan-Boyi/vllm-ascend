@@ -58,6 +58,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.custom_op_guards import require_transpose_kv_cache_by_block
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -1315,6 +1316,14 @@ class KVCacheRecvingThread(threading.Thread):
         tp_num_need_pulls: int,
         kv_caches: dict[str, Any] | None = None,
     ):
+        # First, before anything is allocated: this method exists only to call
+        # TransposeKvCacheByBlock, and its selector
+        # (additional_config.enable_transpose_kv_cache_by_block) DEFAULTS TO
+        # TRUE. Guarded, not called directly -- the guard returns the operator
+        # it vetted, so the check and the call cannot drift apart. The cost of
+        # getting this wrong is an EXEC_NPU_CMD failure that names libopapi.so
+        # and blames the wrong component.
+        transpose_kv_cache_by_block = require_transpose_kv_cache_by_block()
         if kv_caches is None:
             kv_caches = self.kv_caches
         k_cache = list(kv_caches.values())[0][0]
@@ -1331,7 +1340,7 @@ class KVCacheRecvingThread(threading.Thread):
             k_caches.append(k_cache_layer)
             v_caches.append(v_cache_layer)
 
-        torch.ops._C_ascend.transpose_kv_cache_by_block(
+        transpose_kv_cache_by_block(
             k_caches, v_caches, block_ids_tensor, block_size, num_kv_head, head_dim, tp_num_need_pulls, layers
         )
 

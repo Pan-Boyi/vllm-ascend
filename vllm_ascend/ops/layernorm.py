@@ -21,6 +21,7 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 
+from vllm_ascend.custom_op_guards import require_add_rms_norm_bias
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.kda.kda import rms_norm_gated
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
@@ -70,9 +71,14 @@ class AscendRMSNorm(RMSNorm):
 
         if residual is not None:
             if enable_custom_op():
-                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, self.weight, self.bias, self.variance_epsilon
-                )
+                # enable_custom_op() says the hardware profile ALLOWS custom
+                # ops; it says nothing about whether AddRmsNormBias was built
+                # into the operator package on this machine, and on A5 it is
+                # not. Guarded, not called directly: the guard hands back the
+                # operator it just vetted, so the check and the call cannot
+                # drift apart.
+                add_rms_norm_bias = require_add_rms_norm_bias()
+                x, _, residual = add_rms_norm_bias(x, residual, self.weight, self.bias, self.variance_epsilon)
             else:
                 x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
                 if self.bias is not None:
@@ -96,9 +102,10 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
 
         if residual is not None:
             if enable_custom_op():
-                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, 1.0 + self.weight, None, self.variance_epsilon
-                )
+                # Same guard as AscendRMSNorm above; see require_add_rms_norm_bias
+                # for what it can and cannot judge.
+                add_rms_norm_bias = require_add_rms_norm_bias()
+                x, _, residual = add_rms_norm_bias(x, residual, 1.0 + self.weight, None, self.variance_epsilon)
             else:
                 x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
             return x, residual

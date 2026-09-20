@@ -53,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.custom_op_guards import require_transpose_kv_cache_by_block
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import PD_QOS_DEFAULT, get_transfer_timeout_value, inject_qos
 from vllm_ascend.utils import enable_custom_op, get_kv_cache_tensor_layers, is_vl_model
@@ -878,6 +879,15 @@ class KVCacheRecvingThread(threading.Thread):
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
+        # First, before anything is allocated: this method exists only to call
+        # TransposeKvCacheByBlock, and its selector
+        # (additional_config.enable_transpose_kv_cache_by_block) DEFAULTS TO
+        # TRUE. Guarded, not called directly -- the guard returns the operator
+        # it vetted, so the check and the call cannot drift apart. Same guard
+        # as MooncakeConnectorWorker.reformat_kv_cache_with_fused_op: one
+        # implementation, imported by both, because a copy would not receive
+        # the next fix to it.
+        transpose_kv_cache_by_block = require_transpose_kv_cache_by_block()
         # Get necessary parameters
         k_cache = list(self.kv_caches.values())[0][0]
         device = k_cache.device
@@ -894,7 +904,7 @@ class KVCacheRecvingThread(threading.Thread):
             k_caches.append(k_cache_layer)
             v_caches.append(v_cache_layer)
 
-        torch.ops._C_ascend.transpose_kv_cache_by_block(
+        transpose_kv_cache_by_block(
             k_caches, v_caches, block_ids_tensor, block_size, num_kv_head, head_dim, tp_num_need_pulls, layers
         )
 

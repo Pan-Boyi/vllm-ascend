@@ -113,6 +113,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     #                                 enable_custom_op() AND a Mooncake P2P KV
     #                                 transfer deployment. On A5 it is held off
     #                                 only by enable_custom_op() -- see below.
+    #                                 R55: both fused call sites now refuse
+    #                                 through custom_op_guards
+    #                                 .require_transpose_kv_cache_by_block, so
+    #                                 flipping the switch produces an
+    #                                 attributed refusal instead of an
+    #                                 EXEC_NPU_CMD failure.
     #   GroupedMatmulSwigluQuantWeightNzTensorList
     #                                 eplb_config.dynamic_eplb
     #                                 (ascend_config.py:116, default False) AND
@@ -125,12 +131,26 @@ env_variables: dict[str, Callable[[], Any]] = {
     #                                 additional_config.ascend_compilation_config
     #                                 .fuse_norm_quant (ascend_config.py:70,
     #                                 default True).
+    #                                 R55: the two layernorm.py call sites now
+    #                                 refuse through custom_op_guards
+    #                                 .require_add_rms_norm_bias. The THREE
+    #                                 norm_quant_fusion_pass.py pattern
+    #                                 declarations are NOT guarded -- see that
+    #                                 module's docstring for why, and the R55
+    #                                 suite scans for them on every run.
     #
     # enable_custom_op() is FALSE ON A5 (hardware_profile.py's A5 capability set
     # has no RUNTIME_CUSTOM_OPS), which is what holds the last three off today --
     # a hardware probe, not a decision anybody made about these operators. The
     # defaults above are therefore misleading read on their own: two of them say
     # True.
+    #
+    # R55 addressed exactly those two (TransposeKvCacheByBlock, AddRmsNormBias):
+    # their call paths now RAISE with an attribution instead of being rescued by
+    # enable_custom_op(). The criterion there is whether a kernel is installed,
+    # NOT whether enable_custom_op() is true -- the flag is the accident, not the
+    # decision. The other five in this list are still held off by their own
+    # switches only.
     # ----------------------------------------------------------------------
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
