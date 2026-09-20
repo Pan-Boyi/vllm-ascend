@@ -289,6 +289,16 @@ class KTLayerOffload:
         buf = self._packed.get(bs)
         if buf is not None:
             return buf
+        if bs > self.chunked_prefill_size:
+            # kt's own wrappers check this (experts_base._check_qlen_fits_cpp_buffers);
+            # we call the C++ task directly, so the check is ours. The C++ output
+            # pointer advances qlen * hidden_size with no bound of its own: past
+            # chunked_prefill_size it writes outside the allocation and the heap
+            # damage surfaces later, somewhere else.
+            raise ValueError(
+                f"kt_offload packed_transfer: {bs} tokens exceeds chunked_prefill_size "
+                f"{self.chunked_prefill_size}; the CPU MoE would write past its output buffer."
+            )
         lay = packed_layout(bs, self.hidden_size, self.top_k)
         dev = torch.empty(lay["nbytes"], dtype=torch.uint8, device=device)
         pin = _pinned_empty((lay["nbytes"],), torch.uint8)
@@ -311,6 +321,20 @@ class KTLayerOffload:
             "dev_out": torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device=device),
             "bsz": _pinned_empty((1,), torch.int32).fill_(bs),
         }
+        for name, dtype, shape in (
+            ("pin_hidden", torch.bfloat16, (bs, self.hidden_size)),
+            ("pin_ids", torch.int64, (bs, self.top_k)),
+            ("pin_weights", torch.float32, (bs, self.top_k)),
+            ("pin_out", torch.bfloat16, (bs, self.hidden_size)),
+        ):
+            t = buf[name]
+            # The C++ task takes raw pointers: a non-contiguous view or the
+            # wrong dtype is read as if it were the layout it expects.
+            if t.dtype != dtype or tuple(t.shape) != shape or not t.is_contiguous():
+                raise AssertionError(
+                    f"kt_offload packed buffer {name}: {t.dtype}{tuple(t.shape)} "
+                    f"contiguous={t.is_contiguous()}, want {dtype}{shape} contiguous"
+                )
         self._packed[bs] = buf
         return buf
 
@@ -650,6 +674,20 @@ def _kt_packed_forward(payload) -> None:
     kt's own entry points read its three pinned allocations; here the same C++
     task is handed our three pointers into one buffer, so the step paid one
     host-device copy instead of three. Exceptions must not escape a graph node.
+
+    Four properties of that C++ task this relies on (kt, 2026-09-20):
+      * the arguments are positional and ``qlen`` is a *pointer* to an int32
+        batch size, not the number (ext_bindings.cpp ForwardBindings::Args);
+      * every buffer must stay alive and unchanged until the task has run --
+        ours live in ``self._packed`` for the process, the D2H before this node
+        and the H2D after it are on the same stream, and each layer has its own
+        buffer, so kt's ``layer_idx % 2`` slot sharing does not apply to us;
+      * ``incremental=False`` overwrites the output (True would read it back
+        and accumulate, which is not what the merge wants);
+      * kt's queue is one serial FIFO worker, and it re-raises a task's
+        exception only at the next sync -- so the submit and the sync stay in
+        the same node here, and a layer that submits without syncing would hide
+        its own errors for ever.
     """
     wrapper, buf, layer_idx = payload
     try:

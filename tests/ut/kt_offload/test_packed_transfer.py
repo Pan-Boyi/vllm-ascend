@@ -218,3 +218,67 @@ def test_capture_of_an_unprepared_size_is_refused(monkeypatch):
     hs = torch.zeros(4, H, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="no buffer was prepared"):
         rts[0].route(hs, torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32), in_profile_run=False)
+
+
+# ---------------------------------------------------------------------------
+# the four properties of kt's raw task we now depend on (kt, 2026-09-20)
+# ---------------------------------------------------------------------------
+
+
+def test_refuses_more_tokens_than_kt_sized_its_output_for(monkeypatch):
+    """kt's own wrappers check qlen; calling the C++ task directly makes it ours.
+
+    Past chunked_prefill_size the C++ output pointer runs outside the
+    allocation and the heap damage shows up somewhere else entirely.
+    """
+    rts, _ = _runtime(monkeypatch, packed=True, layers=1, sizes=(1,))
+    rts[0].chunked_prefill_size = 4
+    rts[0]._packed_buffers(4, torch.device("cpu"))  # at the limit: fine
+    with pytest.raises(ValueError, match="exceeds chunked_prefill_size"):
+        rts[0]._packed_buffers(5, torch.device("cpu"))
+
+
+def test_task_arguments_are_in_kt_positional_order(monkeypatch):
+    """(qlen_ptr, k, ids, weights, input, output, incremental) -- and qlen is a pointer."""
+    rts, _ = _runtime(monkeypatch, packed=True, layers=1, sizes=(1,))
+    rt = rts[0]
+    buf = rt._packed_buffers(1, torch.device("cpu"))
+    seen = {}
+
+    class Recorder:
+        def forward_task(self, *args):
+            seen["args"] = args
+            return ("task",)
+
+    rt.wrapper.moe = Recorder()
+    kl._kt_packed_forward(rt._packed_payload(1))
+    qlen_ptr, k, ids, w, inp, out, incremental = seen["args"]
+    assert qlen_ptr == buf["bsz"].data_ptr() and int(buf["bsz"][0]) == 1
+    assert k == TOPK
+    assert (ids, w, inp, out) == (
+        buf["pin_ids"].data_ptr(),
+        buf["pin_weights"].data_ptr(),
+        buf["pin_hidden"].data_ptr(),
+        buf["pin_out"].data_ptr(),
+    )
+    assert incremental is False  # overwrite; True would accumulate into output
+
+
+def test_every_layer_submits_and_syncs_in_the_same_node(monkeypatch):
+    """kt re-raises a task's exception only at the next sync, so a submit
+    without a sync would hide the error for ever."""
+    rts, _ = _runtime(monkeypatch, packed=True, layers=2, sizes=(1,))
+    _step(rts, 1, 0)
+    for rt in rts:
+        assert rt.wrapper.syncs == 1 and rt.wrapper.submitted == []
+
+
+def test_buffers_are_dtype_and_contiguity_checked(monkeypatch):
+    rts, _ = _runtime(monkeypatch, packed=True, layers=1, sizes=(1,))
+    rt = rts[0]
+    rt._packed.clear()
+    monkeypatch.setattr(kl, "packed_layout", lambda t, h, k: {  # ids region one byte short
+        "hidden": (0, t * h * 2), "ids": (512, t * k * 8 - 1), "weights": (1536, t * k * 4), "nbytes": 2048
+    })
+    with pytest.raises(RuntimeError):  # a view of the wrong size cannot be built
+        rt._packed_buffers(1, torch.device("cpu"))
