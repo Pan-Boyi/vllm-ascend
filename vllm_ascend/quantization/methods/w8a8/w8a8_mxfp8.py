@@ -160,10 +160,18 @@ def assert_e8m0_scale_load_preserves_bytes(param_dtype: torch.dtype, loader_give
     allow-list passes every destructive dtype nobody thought to list, and rejects the
     byte-safe ones (int8) that are not on it.
     """
-    codes = torch.arange(E8M0_CODE_COUNT, dtype=torch.uint8)
+    # 🔴 device="cpu" 是必须的，不是风格。这是纯 host 侧的 256 字节契约往返，与设备无关；
+    # 但它在 load_model 里被调用，那时 torch 的默认设备已被 DeviceContext 接管切到 NPU
+    # （torch/utils/_device.py 的 __torch_function__），于是这句会去调 aclnnArange，
+    # 而它**不支持 uint8**：
+    #   AclNN_Parameter_Error(EZ1001): Tensor out not implemented for DT_UINT8,
+    #   should be in [DT_FLOAT16,DT_FLOAT,DT_DOUBLE,DT_INT64,DT_INT32,DT_BFLOAT16]
+    # ⇒ 整个模型构造在起服务阶段就挂（2026-09-20 的回归实测）。
+    # CPU 套件看不见这一类：那里的默认设备是 CPU，而**默认设备不在任何签名里**。
+    codes = torch.arange(E8M0_CODE_COUNT, dtype=torch.uint8, device="cpu")
     checkpoint = codes.view(torch.float8_e8m0fnu)
     loaded = checkpoint.view(torch.uint8) if loader_gives_byte_view else checkpoint
-    param = torch.empty_like(codes, dtype=param_dtype)
+    param = torch.empty(codes.shape, dtype=param_dtype, device="cpu")
     try:
         param.copy_(loaded)
         recovered = recover_e8m0_scale_bytes(param)
