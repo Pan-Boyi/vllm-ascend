@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import functools
 from typing import Any
 
 import torch
@@ -40,6 +41,146 @@ from ..base import (
     WeightSwitchGatherSpec,
 )
 from ..registry import register_scheme
+
+# An mx block scale is a raw e8m0 exponent BYTE. Two different contracts can carry that
+# byte from the checkpoint into a layer parameter, and each one is a PAIR of halves --
+# what the model's load_weights hands to the weight loader, and what dtype the parameter
+# declares:
+#
+#   byte contract   loader passes ``loaded_weight.view(torch.uint8)`` into a uint8 param,
+#                   so ``copy_`` moves bytes. The MoE scales use this
+#                   (vllm/models/deepseek_v4_1/nvidia/model.py, the ``".experts." in name``
+#                   branch is the only place the uint8 view is taken).
+#   value contract  loader passes the float8_e8m0fnu tensor into a float32 param, so
+#                   ``copy_`` converts the VALUE. Every e8m0 code is an exactly
+#                   representable float32 (or NaN), so the byte survives in the fp32
+#                   exponent field and comes back out with ``>> 23 & 0xFF``. The DS linear
+#                   scales below use this, because their names contain no ``.experts.``.
+#
+# Crossing the halves is silent: both scale dtypes are one byte wide, every shape still
+# matches, and nothing downstream complains -- it just turns a byte move into arithmetic
+# (or the reverse) and destroys every scale. So the decode below is exhaustive over
+# dtypes and RAISES on anything it was not written for, instead of sending the rest
+# through the float32 bit extraction, and `assert_e8m0_scale_load_preserves_bytes` proves
+# a (loader half, declared dtype) pair by running the copy and comparing BYTES.
+E8M0_CODE_COUNT = 256
+FP32_EXPONENT_SHIFT = 23
+FP32_EXPONENT_MASK = 0xFF
+FP32_MANTISSA_MASK = 0x7FFFFF
+
+
+def _scale_dtype_provenance(dtype: torch.dtype, declared_dtype: torch.dtype | None, prefix: str | None) -> str:
+    """Say WHERE this dtype came from, so the reader knows whose problem it is.
+
+    "Unsupported dtype" sends the reader nowhere: the same message fits a bad checkpoint
+    and a changed declaration in this file, and those are opposite fixes.
+    """
+    where = f" on {prefix}" if prefix else ""
+    if declared_dtype is None:
+        return (
+            f"The caller passed no declared dtype, so the origin of the {dtype} tensor{where} cannot "
+            "be attributed. Pass declared_dtype=self.scale_param_dtype to find out."
+        )
+    if dtype == declared_dtype:
+        return (
+            f"The parameter{where} has exactly the dtype this class declares: "
+            f"scale_param_dtype={declared_dtype}, set in "
+            f"{AscendW8A8MXFP8DSDynamicLinearMethod.__name__} and allocated by get_pergroup_param in "
+            "this file. The checkpoint is not involved -- change the declaration here, and move "
+            "loader_gives_scale_byte_view with it."
+        )
+    return (
+        f"The parameter{where} was allocated as scale_param_dtype={declared_dtype}, and something "
+        f"REPLACED its .data with a {dtype} tensor after allocation. This class did not do that. The "
+        "steps that can: the checkpoint tensor handed to the weight loader by "
+        "vllm/models/deepseek_v4_1/nvidia/model.py load_weights (which substitutes "
+        "loaded_weight.view(torch.uint8) only for names containing '.experts.', so these names should "
+        "arrive as float8_e8m0fnu), and restore_weights_for_rl_loading, which leaves the already "
+        f"processed uint8 scales in place. Check the checkpoint's .scale dtype{where} first."
+    )
+
+
+def recover_e8m0_scale_bytes(
+    scale: torch.Tensor,
+    *,
+    declared_dtype: torch.dtype | None = None,
+    param_name: str = "weight_scale",
+    prefix: str | None = None,
+) -> torch.Tensor:
+    """Return the raw e8m0 exponent byte of every element of a block-scale tensor.
+
+    Every dtype that carries the byte has its OWN branch. There is deliberately no
+    fall-through: the branch that used to catch everything else decoded a uint8 byte view
+    as float32 bits, at exactly the right shape.
+    """
+    dtype = scale.dtype
+    if dtype == torch.float8_e8m0fnu:
+        # Byte contract: the byte itself, reinterpreted.
+        return scale.view(torch.uint8)
+    if dtype == torch.uint8:
+        # Byte contract: already the byte, because the loader handed over a uint8 view.
+        return scale
+    if dtype == torch.int8:
+        # Byte contract: also byte-exact, two's complement wraps back under the view.
+        return scale.view(torch.uint8)
+    if dtype == torch.float32:
+        # Value contract: the byte is in the exponent field of an exactly representable
+        # power of two.
+        bits = scale.view(torch.int32)
+        exponent = bits >> FP32_EXPONENT_SHIFT & FP32_EXPONENT_MASK
+        # Tripwire, not a proof: a value-copied e8m0 scale is a power of two, so its
+        # mantissa is zero except for the two codes fp32 cannot hold as a normal number
+        # (code 0 -> the subnormal 2**-127, code 255 -> NaN). A byte that was copied as a
+        # NUMBER instead -- the failure this whole comment is about -- lands off a power
+        # of two for 247 of the 256 codes, so any real scale tile trips this.
+        off_power_of_two = (bits & FP32_MANTISSA_MASK != 0) & (exponent != 0) & (exponent != FP32_EXPONENT_MASK)
+        if bool(off_power_of_two.any()):
+            raise ValueError(
+                f"{param_name}: float32 block scales must be value-copied e8m0 codes, i.e. powers of "
+                f"two, but {int(off_power_of_two.sum())} of {off_power_of_two.numel()} elements are not. "
+                "The checkpoint bytes were most likely copied as numbers rather than converted from "
+                "float8_e8m0fnu, which destroys every exponent. "
+                + _scale_dtype_provenance(dtype, declared_dtype, prefix)
+            )
+        return exponent.to(torch.uint8)
+    raise ValueError(
+        f"{param_name} has dtype {dtype}, which carries no e8m0 exponent byte this code knows how to "
+        "read: float8_e8m0fnu/uint8/int8 carry it as a raw byte and float32 carries it in the exponent "
+        "field. Decoding any other dtype as float32 bits would produce wrong scales at exactly the "
+        "right shape, with nothing downstream to complain. "
+        + _scale_dtype_provenance(dtype, declared_dtype, prefix)
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def assert_e8m0_scale_load_preserves_bytes(param_dtype: torch.dtype, loader_gives_byte_view: bool) -> None:
+    """Fail unless this (loader half, declared dtype) pair round-trips every e8m0 byte.
+
+    Run before any weight is loaded. This is behavioural on purpose: a ``dtype == uint8``
+    allow-list passes every destructive dtype nobody thought to list, and rejects the
+    byte-safe ones (int8) that are not on it.
+    """
+    codes = torch.arange(E8M0_CODE_COUNT, dtype=torch.uint8)
+    checkpoint = codes.view(torch.float8_e8m0fnu)
+    loaded = checkpoint.view(torch.uint8) if loader_gives_byte_view else checkpoint
+    param = torch.empty_like(codes, dtype=param_dtype)
+    try:
+        param.copy_(loaded)
+        recovered = recover_e8m0_scale_bytes(param)
+        preserved = recovered.dtype == torch.uint8 and torch.equal(recovered, codes)
+    except Exception as exc:
+        raise ValueError(
+            f"Loading an e8m0 block scale as {param_dtype} "
+            f"(loader_gives_byte_view={loader_gives_byte_view}) failed: {exc}"
+        ) from exc
+    if not preserved:
+        differing = int((recovered.view(torch.uint8) != codes).sum()) if recovered.numel() == codes.numel() else -1
+        raise ValueError(
+            f"Declaring an e8m0 block scale as {param_dtype} with "
+            f"loader_gives_byte_view={loader_gives_byte_view} does not preserve the exponent "
+            f"bytes: {differing} of {E8M0_CODE_COUNT} codes come back different. Both halves of "
+            "the contract have to move together -- the loader's view and this dtype."
+        )
 
 
 @register_scheme("W8A8_MXFP8", "linear")
@@ -506,6 +647,11 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         WeightSwitchGatherSpec("weight_scale"),
     )
     supports_weight_switch = True
+    # The two halves of the scale contract, kept next to each other so neither can move
+    # alone. False: the DS linear scale names hold no ".experts.", so the model's
+    # load_weights hands the float8_e8m0fnu tensor straight to the weight loader.
+    scale_param_dtype = torch.float32
+    loader_gives_scale_byte_view = False
 
     def __init__(self, weight_block_size):
         super().__init__()
@@ -532,19 +678,26 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         # Declared float32: the loader value-copies the e8m0 checkpoint scale into it, and
         # process_weights_after_loading recovers the exponent byte from the fp32 bits. This relies
         # on that value copy being exact; declaring it e8m0/uint8 here would change that contract.
+        # The guard proves that round trip on all 256 codes before anything is loaded, so a change
+        # to either half of the contract fails here instead of silently rescaling the model.
+        assert_e8m0_scale_load_preserves_bytes(self.scale_param_dtype, self.loader_gives_scale_byte_view)
         params_dict["weight_scale"] = torch.empty(
-            output_size // self.block_size, input_size // self.block_size, dtype=torch.float32
+            output_size // self.block_size, input_size // self.block_size, dtype=self.scale_param_dtype
         )
         params_dict["_packed_dim"] = 0
         params_dict["_packed_factor"] = self.block_size
         return params_dict
 
     def process_weights_after_loading(self, layer):
-        if layer.weight_scale.data.dtype == torch.float8_e8m0fnu:
-            layer.weight_scale.data = layer.weight_scale.data.view(torch.uint8)
-        else:
-            layer.weight_scale.data = layer.weight_scale.data.view(torch.int32) >> 23 & 0xFF
-            layer.weight_scale.data = layer.weight_scale.data.to(torch.uint8)
+        # Exhaustive over the dtypes that carry an e8m0 byte; anything else raises instead of
+        # falling through to the float32 bit extraction, which used to take every other dtype
+        # -- a uint8 view included -- and decode it as fp32 bits.
+        layer.weight_scale.data = recover_e8m0_scale_bytes(
+            layer.weight_scale.data,
+            declared_dtype=self.scale_param_dtype,
+            param_name="weight_scale",
+            prefix=getattr(layer, "prefix", None),
+        )
         # Broadcast the [out/block, in/block] tile scales to [out, in/group_size], the layout
         # npu_quant_matmul consumes: (4, 128) for a 128 block, (1, 32) for a 32 block.
         layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(
