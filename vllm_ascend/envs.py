@@ -70,7 +70,68 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     # Whether to anbale dynamic EPLB
+    # NOTE (R44): this is the ONLY key in this file that appears anywhere in the
+    # gating of the operators listed in the block below, and even here it is a
+    # co-requirement, not an enabler: ascend_config.py:151-155 only ASSERTS that
+    # it is set once additional_config.eplb_config.dynamic_eplb is already true.
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
+    # ----------------------------------------------------------------------
+    # Operators that are BUILT INTO csrc BUT NOT INSTALLED in the A5 operator
+    # package -- i.e. one flipped switch away from failing. Inventory, evidence
+    # and the per-operator verdicts:
+    #     build_artifacts/official_code_review/o_csrc_vs_installed_ops.md
+    #
+    # WHEN THEY FAIL: at the operator's FIRST CALL, not at import and not at
+    # startup. Every torch schema in csrc/torch_binding.cpp is registered
+    # unconditionally, so the extension imports and the service comes up
+    # exactly as it does on a machine where these operators exist. "The server
+    # started" is not evidence that any of them is installed.
+    #
+    # NONE OF THEM IS AN ENVIRONMENT VARIABLE, so none of them can be given a
+    # comment next to its own entry here -- scanned by read point, not by
+    # scanning this file (they are additional_config fields, a vLLM config, or
+    # not user-facing at all). Where each one's switch actually lives:
+    #   FusedSparseAttentionOverlap   additional_config.sparse_kv_offload_config
+    #                                 .use_fused_overlap  (ascend_config.py:1327,
+    #                                 default False; parent .enabled :1322)
+    #   StoreKVBlock                  additional_config.enable_sparse_li_c8
+    #                                 (ascend_config.py:450, default False) AND a
+    #                                 PD kv_producer node (derived at :705)
+    #   DispatchFFNCombine(+BF16/W4A8) additional_config.enable_fused_mc2 == 1
+    #                                 (ascend_config.py:418, default 0). The BF16
+    #                                 and W4A8 variants have no Python switch at
+    #                                 all: csrc/mc2/dispatch_ffn_combine/
+    #                                 dispatch_ffn_combine_torch_adpt.h:38-73
+    #                                 picks one by weight dtype.
+    #   CopyAndExpandEagleInputs      vLLM's speculative_config.parallel_drafting
+    #                                 (vllm/config/speculative.py:166, default
+    #                                 False) via needs_extra_input_slots; nothing
+    #                                 in vllm-ascend gates it.
+    #   TransposeKvCacheByBlock       additional_config
+    #                                 .enable_transpose_kv_cache_by_block
+    #                                 (ascend_config.py:427, DEFAULT TRUE) AND
+    #                                 enable_custom_op() AND a Mooncake P2P KV
+    #                                 transfer deployment. On A5 it is held off
+    #                                 only by enable_custom_op() -- see below.
+    #   GroupedMatmulSwigluQuantWeightNzTensorList
+    #                                 eplb_config.dynamic_eplb
+    #                                 (ascend_config.py:116, default False) AND
+    #                                 ascend_fusion_config.fusion_ops_gmmswigluquant
+    #                                 (:102, default True) AND a W8A8-dynamic
+    #                                 checkpoint AND enable_custom_op().
+    #   AddRmsNormBias                no user switch: enable_custom_op() alone
+    #                                 (utils.py:419) for ops/layernorm.py:73,99;
+    #                                 the fusion-pass patterns additionally need
+    #                                 additional_config.ascend_compilation_config
+    #                                 .fuse_norm_quant (ascend_config.py:70,
+    #                                 default True).
+    #
+    # enable_custom_op() is FALSE ON A5 (hardware_profile.py's A5 capability set
+    # has no RUNTIME_CUSTOM_OPS), which is what holds the last three off today --
+    # a hardware probe, not a decision anybody made about these operators. The
+    # defaults above are therefore misleading read on their own: two of them say
+    # True.
+    # ----------------------------------------------------------------------
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),

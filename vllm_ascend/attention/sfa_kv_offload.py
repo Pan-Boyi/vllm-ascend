@@ -21,7 +21,7 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple, TypeVar
+from typing import Any, ClassVar, NamedTuple, TypeVar
 
 import torch
 import torch_npu
@@ -33,6 +33,7 @@ from vllm.forward_context import (
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.aclnn_availability import require_aclnn_op
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa_v1 import (
@@ -407,28 +408,72 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             return tensor
         return tensor.to(device=device, dtype=torch.int32)
 
-    @staticmethod
-    def _get_optional_custom_op(op_name: str):
-        for namespace in (
-            getattr(torch.ops, "_C_ascend", None),
-            getattr(torch.ops, "custom", None),
-            torch_npu,
-        ):
-            if namespace is None:
-                continue
-            op = getattr(namespace, op_name, None)
-            if op is not None:
-                return op
-        return None
+    # ``_get_optional_custom_op`` used to live here: it walked
+    # ``torch.ops._C_ascend`` / ``torch.ops.custom`` / ``torch_npu`` with
+    # getattr and returned the first hit. It is gone rather than merely
+    # unused, because it is the exact shape of check this fix removed -- a
+    # name lookup that answers "registered" on installations where the
+    # operator cannot run -- and leaving it in the class as a helper is an
+    # invitation to rebuild the same false guard. The namespace walk itself
+    # survives, as ``find_torch_op`` in ``vllm_ascend.aclnn_availability``,
+    # where it is level (1) of four rather than the whole answer.
+
+    # torch name -> (aclnn API, OpType). Read off the call sites, not derived:
+    # ``csrc/.../fused_sparse_attention_overlap_torch_adpt.h:140`` is the
+    # EXEC_NPU_CMD whose first token is the aclnn API, and
+    # ``..._def.cpp:106`` is the OP_ADD whose argument is the OpType (and,
+    # verbatim, the ops-info registry key). There is no rule that turns one of
+    # these names into the other -- ``LightningIndexerVllm`` and
+    # ``VllmQuantLightningIndexer`` are different operators whose names are each
+    # other's word order -- so this table is maintained by reading, and a wrong
+    # entry here would make the guard judge a different operator.
+    _CUSTOM_OP_IDENTITY: ClassVar[dict[str, tuple[str, str]]] = {
+        "npu_fused_sparse_attention_overlap": (
+            "aclnnFusedSparseAttentionOverlap",
+            "FusedSparseAttentionOverlap",
+        ),
+    }
 
     def _require_custom_op(self, op_name: str):
-        op = self._get_optional_custom_op(op_name)
-        if op is None:
+        """Refuse unless the operator can actually RUN, not just be named.
+
+        The check this replaced asked ``getattr(torch.ops._C_ascend, name)``.
+        That is a question about TORCH REGISTRATION, and every schema in
+        ``csrc/torch_binding.cpp`` is registered unconditionally -- so the old
+        guard passed on every machine, including machines where the operator
+        was never compiled. A guard that cannot fail is worse than none: it
+        reads as a check that was made.
+
+        Its message was also pointed at the wrong person. It said the operator
+        was "not registered in torch.ops._C_ascend"; the real state on a
+        stock A5 install is that it IS registered and simply was not built into
+        the operator package. Whoever followed that text went to look at the
+        torch bindings, where nothing is wrong.
+
+        ``require_aclnn_op`` asks instead whether the aclnn entry points
+        resolve, out of WHICH library they resolve, and whether the package
+        that supplied them actually registers a kernel for the OpType -- and
+        produces a different attribution for each. What it cannot judge is
+        written into the warning it logs, not silently dropped.
+        """
+        identity = self._CUSTOM_OP_IDENTITY.get(op_name)
+        if identity is None:
             raise RuntimeError(
-                f"fused_overlap offload requires custom op {op_name}, but it is not registered "
-                "in torch.ops._C_ascend, torch.ops.custom, or torch_npu."
+                f"fused_overlap offload asked for custom op {op_name}, which has no "
+                f"entry in _CUSTOM_OP_IDENTITY. Add the (aclnn API, OpType) pair by "
+                f"reading the operator's EXEC_NPU_CMD and OP_ADD in csrc -- refusing to "
+                f"guess them from the torch name, because a guessed pair would make the "
+                f"guard check a different operator and still look green."
             )
-        return op
+        aclnn_api, op_type = identity
+        return require_aclnn_op(
+            torch,
+            torch_npu,
+            torch_name=op_name,
+            aclnn_api=aclnn_api,
+            op_type=op_type,
+            feature="fused_overlap sparse KV offload",
+        )
 
     def _normalize_fused_overlap_topk_indices(
         self,

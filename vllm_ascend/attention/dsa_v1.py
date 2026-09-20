@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.aclnn_availability import require_aclnn_op
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -72,6 +73,74 @@ else:
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
+
+# --------------------------------------------------------------------------
+# npu_rms_norm_dynamic_quant: a name that another operator answers to.
+#
+# ``RmsNormDynamicQuant`` is declared in vllm-ascend's own csrc, but its
+# ``AddConfig`` lists only ascend910 variants, so no A5 operator package
+# contains it. ``GetOpApiFuncAddr`` (csrc/aclnn_torch_adapter/op_api_common.h)
+# searches the vendor packages first and then falls through to CANN's own
+# ``libopapi.so`` -- which EXPORTS A SYMBOL OF THE SAME NAME. dlsym succeeds,
+# the TORCH_CHECK inside EXEC_NPU_CMD passes, and the call proceeds against a
+# different operator:
+#
+#   CANN 9.2 aclnnop/aclnn_rms_norm_dynamic_quant.h declares
+#       x, gamma, smoothScalesOptional, betaOptional, epsilon, dstType,
+#       yOut, scaleOut                                              -> 8
+#   csrc/torch_binding.cpp's npu_rms_norm_dynamic_quant_npu passes
+#       x, gamma, smooth_scale, smooth_scale2, beta, epsilon, output_mask,
+#       dst_type, y_out, y2_out, scale_out, scale2_out              -> 12
+#
+# Nothing in the stack compares those. An arity mismatch is not reported as an
+# error at all; it is an ABI violation whose cost is unrelated to its nature.
+#
+# The branch below is unreachable today only because DSV4.1 is MXFP8/MXFP4 and
+# ``_is_w8a8_dynamic`` is false. "Currently unreachable" is not "fixed": the
+# first person to run a W8A8 DSA on A5 walks straight into it. Hence a guard
+# that RAISES at the call site rather than a comment.
+#
+# 12 is a literal copied out of another repository file, so it is re-derived by
+# the R50 test suite from ``csrc/torch_binding.cpp`` at the revision under
+# test; if somebody edits that EXEC_NPU_CMD the test goes red rather than this
+# constant going quietly stale.
+_RMS_NORM_DYNAMIC_QUANT_ARG_COUNT = 12
+
+
+def _require_rms_norm_dynamic_quant():
+    """Refuse the W8A8 q_norm path unless OUR operator is the one installed.
+
+    What this can judge:
+      * the torch schema is registered (it always is -- registration is
+        unconditional, which is why it cannot be the criterion);
+      * whether the aclnn entry points resolve at all;
+      * WHICH library they resolve out of -- the discriminator that matters
+        here, because a name-existence check reads identically whether the
+        operator is installed or whether CANN's same-named one answered;
+      * how many operator arguments the INSTALLED declaration takes, when a
+        declaration can be found, against the 12 this build passes.
+
+    What this cannot judge, and says so in the message instead of pretending:
+      * the argument ORDER and MEANING of whatever did resolve -- a shared
+        object carries neither;
+      * the arity of an operator supplied by a vendor package, because vendor
+        packages ship no aclnnop header to read;
+      * ``vllm_ascend/attention/context_parallel/dsa_cp.py`` has the same call
+        and is NOT guarded from here. It is owned by another change in flight;
+      * whether CANN's implementation is semantically ours when the arity
+        happens to match. It reports the provenance mismatch regardless.
+    """
+    return require_aclnn_op(
+        torch,
+        torch_npu,
+        torch_name="npu_rms_norm_dynamic_quant",
+        aclnn_api="aclnnRmsNormDynamicQuant",
+        op_type="RmsNormDynamicQuant",
+        feature="W8A8-dynamic DSA q_norm (npu_rms_norm_dynamic_quant)",
+        expected_arg_count=_RMS_NORM_DYNAMIC_QUANT_ARG_COUNT,
+        require_vendor_package=True,
+    )
+
 CompressorMetadataOutput: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 _DSV4_DSA_OVERLAP_STREAM = None
@@ -2319,9 +2388,10 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         # q
         if _is_w8a8_dynamic(self.wq_b):
-            qr, qr_pertoken_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-                q_a, self.q_norm.weight, epsilon=self.eps
-            )
+            # Guarded, not called directly: the guard hands back the operator it
+            # just vetted, so the check and the call cannot drift apart.
+            rms_norm_dynamic_quant = _require_rms_norm_dynamic_quant()
+            qr, qr_pertoken_scale = rms_norm_dynamic_quant(q_a, self.q_norm.weight, epsilon=self.eps)
             q = torch_npu.npu_quant_matmul(
                 qr,
                 self.wq_b.weight,
@@ -2448,7 +2518,10 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr)
             qr_pertoken_scale = None
         elif is_w8a8:
-            qr, qr_pertoken_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
+            # Same guard as the single-stream prolog above; see
+            # _require_rms_norm_dynamic_quant for what it can and cannot judge.
+            rms_norm_dynamic_quant = _require_rms_norm_dynamic_quant()
+            qr, qr_pertoken_scale = rms_norm_dynamic_quant(
                 wq_a_result, self.q_norm.weight, epsilon=self.eps
             )
             q_b_quant, q_b_scale = qr, qr_pertoken_scale
