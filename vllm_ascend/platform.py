@@ -66,7 +66,20 @@ else:
 
 # Keep Breakable CUDAGraph opt-in on Ascend. Upstream may auto-enable it
 # for selected architectures when the environment variable is absent.
-value = os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+BREAKABLE_CUDAGRAPH_ENV = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+#: What the launcher actually passed, captured BEFORE the default is written.
+#: ``None`` means "not passed at all".
+#:
+#: This is the last moment in the process at which "not passed" and "passed as
+#: 0" are distinguishable, and it is also why upstream's auto-enable cannot
+#: fire: ``VllmConfig._maybe_enable_breakable_cudagraph`` asks
+#: ``"VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ``, and the setdefault on
+#: the next line has always already put it there. Without this capture, a
+#: launcher that forgot the variable and a launcher that meant to disable it
+#: produce the same state, so the guard below could report a symptom but not
+#: say whose fault it is.
+LAUNCHER_BREAKABLE_CUDAGRAPH: str | None = os.environ.get(BREAKABLE_CUDAGRAPH_ENV)
+value = os.environ.setdefault(BREAKABLE_CUDAGRAPH_ENV, "0")
 logger.info_once(
     "Breakable CUDAGraph on Ascend is opt-in; using VLLM_USE_BREAKABLE_CUDAGRAPH=%s.",
     value,
@@ -1229,6 +1242,112 @@ def _setup_compile_backend(
             "for example, check the plog files (default: $HOME/ascend/log/debug) "
             "for more information about runtime errors."
         )
+
+    _require_validated_dsv41_graph_mode(vllm_config)
+
+
+def _require_validated_dsv41_graph_mode(vllm_config: VllmConfig) -> None:
+    """Refuse to start DeepSeek-V4.1 in graph mode on the unvalidated path.
+
+    Every validated DSV4.1 graph-mode flight passed
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` (build_artifacts/accuracy_eval/
+    run_suite.sh:120). Leaving it out is not an error anywhere: platform.py
+    writes "0" at import, upstream's auto-enable is then unreachable, and the
+    run proceeds into piecewise torch.compile plus a plain ACLGraph -- a path
+    no DSV4.1 accuracy or soak number was ever taken on. Nothing reports it,
+    because from the process's point of view nothing went wrong.
+
+    A comment saying "always pass it" does not stop that; it has to raise.
+
+    The value is read through ``vllm.envs``, which is the resolver the rest of
+    the process reads, rather than through ``os.environ``: envs re-evaluates
+    its lambda on each access, so asking it is asking what everyone else will
+    see. (``vllm.envs.enable_envs_cache()`` freezes that later, after service
+    initialisation; this runs during config resolution, well before.)
+
+    Scope, and why it is not wider:
+
+    * only DeepSeek-V4.1. Other models on Ascend have their own validated
+      configurations and this says nothing about them.
+    * only when a graph is actually captured. ``--enforce-eager`` resolves to
+      ``cudagraph_mode == NONE``, where breakable cudagraph is not in play at
+      all; raising there would kill eager runs that are perfectly fine, which
+      is the one real mis-kill this guard could commit.
+    * ``VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE=1`` takes the
+      unvalidated path on purpose -- someone comparing the two paths needs to
+      be able to run the other one.
+
+    REMOVE THIS when either becomes true, and not before -- it is a guard
+    about what has been measured, so it expires when the measurements change,
+    not on a date:
+
+    * a DSV4.1 accuracy and soak result exists on the non-breakable path, in
+      which case this refuses a configuration that is now validated; or
+    * platform.py stops defaulting VLLM_USE_BREAKABLE_CUDAGRAPH, in which
+      case upstream's auto-enable becomes reachable and the attribution below
+      names a mechanism that no longer exists.
+    """
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_ascend import envs as envs_ascend
+    from vllm_ascend.attention.dsa_v1 import is_deepseek_v41_text
+
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None or not is_deepseek_v41_text(hf_text_config):
+        return
+
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    effective = bool(envs_vllm.VLLM_USE_BREAKABLE_CUDAGRAPH)
+    allow_unvalidated = (
+        envs_ascend.VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE == "1")
+
+    # One line, with the values in it. A guard that only speaks up when it
+    # fails cannot be told apart from a guard that was never reached, and
+    # "check passed" without the numbers cannot be told apart from a check
+    # that read the wrong thing. logger here is vllm.logger.logger (imported
+    # at the top of this module), which is at INFO in a serve run.
+    logger.info(
+        "DSV4.1 graph-mode preflight: cudagraph_mode=%s, %s launcher=%r "
+        "effective=%s, VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE=%s",
+        cudagraph_mode,
+        BREAKABLE_CUDAGRAPH_ENV,
+        LAUNCHER_BREAKABLE_CUDAGRAPH,
+        effective,
+        allow_unvalidated,
+    )
+
+    if cudagraph_mode == CUDAGraphMode.NONE or effective or allow_unvalidated:
+        return
+
+    if LAUNCHER_BREAKABLE_CUDAGRAPH is None:
+        attribution = (
+            f"{BREAKABLE_CUDAGRAPH_ENV} was NOT PASSED. The launcher did not "
+            "set it; vllm_ascend/platform.py then defaulted it to \"0\" at "
+            "import, which is also why upstream's auto-enable in "
+            "VllmConfig._maybe_enable_breakable_cudagraph never runs. Fix the "
+            "launcher.")
+    elif LAUNCHER_BREAKABLE_CUDAGRAPH == "1":
+        attribution = (
+            f"{BREAKABLE_CUDAGRAPH_ENV} WAS PASSED as \"1\" but reads as "
+            "disabled now: something in this process rewrote os.environ after "
+            "vllm_ascend.platform was imported. The launcher is not at fault; "
+            "look for the writer.")
+    else:
+        attribution = (
+            f"{BREAKABLE_CUDAGRAPH_ENV} WAS PASSED as "
+            f"{LAUNCHER_BREAKABLE_CUDAGRAPH!r}, which is not \"1\".")
+
+    raise RuntimeError(
+        "DeepSeek-V4.1 graph mode: refusing to start on a configuration that "
+        f"has never been validated. {attribution} cudagraph_mode="
+        f"{cudagraph_mode}. Without breakable cudagraph this run falls into "
+        "piecewise torch.compile plus a plain ACLGraph, which no DSV4.1 "
+        "accuracy or soak result covers, and nothing downstream would report "
+        "it. Pass VLLM_USE_BREAKABLE_CUDAGRAPH=1, or run with "
+        "--enforce-eager, or set "
+        "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE=1 to take the "
+        "unvalidated path deliberately.")
 
 
 def _setup_worker_and_scheduler(
