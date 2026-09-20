@@ -255,6 +255,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Empty (default) = off. Diagnostic only; requires --enforce-eager. Read
     # once at import. Not sensitive.
     "VLLM_ASCEND_DSV41_EXPERT_COUNT": lambda: os.getenv("VLLM_ASCEND_DSV41_EXPERT_COUNT", ""),
+    # DeepSeek-V4.1 MoE offload: sampling interval in seconds for the per-layer
+    # host-func counters (vllm_ascend/kt_offload/hostfunc_log.py). Only a
+    # host-func node inside the graph increments them, so a layer whose count
+    # does not grow while decoding has no CPU-expert work in the graph. "" or
+    # "0" (default) = off. Diagnostic; read once at import. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG", ""),
 }
 
 # end-env-vars-definition

@@ -160,6 +160,10 @@ class KTLayerOffload:
 
     def __init__(self, cfg, placement: LayerPlacement, layer_idx: int, vllm_config):
         self.cfg = cfg
+        # Only the diagnostic sampler needs this; a test double need not carry it.
+        self.num_layers = int(getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)) or (
+            placement.layer_idx + 1
+        )
         self._ids_i64: dict[int, torch.Tensor] = {}
         self.placement = placement
         self.layer_idx = layer_idx
@@ -233,6 +237,7 @@ class KTLayerOffload:
 
     def after_weights_loaded(self, layer) -> None:
         """Pre-bake device tables and load the kt experts (before any capture)."""
+        _maybe_start_host_func_log(self.num_layers)
         device = self._device_of(layer)
         p = self.placement
         self._slot_tables = {dt: p.safe_slot_table(dt).to(device) for dt in (torch.int32, torch.int64)}
@@ -823,6 +828,22 @@ def _install_capture_probe(kt_wrapper_cls) -> None:
         )
         return
     setter(_capturing)
+
+
+def _maybe_start_host_func_log(num_layers: int) -> None:
+    """Start the per-layer host-func sampler if the env var asks for it."""
+    from vllm_ascend import envs
+    from vllm_ascend.kt_offload import hostfunc_log
+
+    raw = envs.VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG
+    if not raw:
+        return
+    try:
+        interval = float(raw)
+    except ValueError:
+        logger.warning("kt_offload: VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=%r is not a number of seconds", raw)
+        return
+    hostfunc_log.start(interval, HOST_FUNC_CALLS, num_layers)
 
 
 def _pinned_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
