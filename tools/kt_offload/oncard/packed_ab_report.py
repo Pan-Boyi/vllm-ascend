@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Judge a packed_transfer A/B run (arms A = off, B = on).
+
+Six readings, in the order they decide anything:
+
+  1. bit-identity of every answer, WITH A POSITIVE CONTROL. The comparison
+     field has to be shown to discriminate first: on 2026-09-20 a comparison
+     against a field that did not exist read as "0 differences" -- a green
+     light from an empty set. So the run also compares arm B against arm B
+     with one character changed, and the report fails if that does not show up.
+  2. TPOT, n>=REPEAT: median, every sample, and the spread. Never one number.
+  3. the gap table: device busy (union of intervals, never the sum -- parallel
+     streams would be counted twice), gap ms/token, >100us gaps per token, and
+     the median length of those gaps.
+  4. the per-operation cost C, solved from the arms: packed removes 2 of 5
+     host-device operations per layer, so 40 layers x 2 operations per token.
+         C = delta(>100us gap ms/token) / 80
+     Three outcomes, and the third is the one to watch:
+       C ~= 62 us     the inferred model holds, form C is worth implementing
+       C >= 300 us    one extra callback would eat the GMM window: form C dies
+       delta does not match 80 x C  ->  "fixed cost x operation count" is the
+                      wrong model and the 7.5 ms attribution has to be redone
+                      per operation kind (D2H / H2D / host-func separately)
+  5. the per-layer host-func counts the service logged (only an in-graph node
+     increments them, so a layer that never grows has no CPU work in the graph).
+  6. 10701x and the dmesg counts.
+
+Usage: packed_ab_report.py <run dir>   (exit 1 if a required reading fails)
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+GAP_US = 100.0
+OPS_SAVED_PER_TOKEN = 80  # 40 layers x (5 - 3) host-device operations
+C_INFERRED_US = 62.5
+
+
+# ---------------------------------------------------------------- answers ---
+
+
+def load_answers(arm: str) -> dict[str, str]:
+    path = os.path.join(arm, "gsm8k50", "output-rs0.jsonl")
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path) as f:
+        for line in f:
+            row = json.loads(line)
+            out[row["id"]] = row.get("generation", "")
+    return out
+
+
+def compare_answers(a: dict[str, str], b: dict[str, str]) -> dict:
+    """Bit-identity plus the two properties that make it mean anything."""
+    ids = sorted(set(a) | set(b))
+    differ = [i for i in ids if a.get(i) != b.get(i)]
+    nonempty = sum(1 for i in ids if (a.get(i) or "").strip())
+    # positive control: one character changed must be reported
+    control_src = next((i for i in ids if a.get(i)), None)
+    control_ok = False
+    if control_src is not None:
+        mutated = dict(b)
+        text = mutated.get(control_src) or a[control_src]
+        mutated[control_src] = ("X" if text[:1] != "X" else "Y") + text[1:]
+        control_ok = bool(compare_raw(a, mutated))
+    return {
+        "n": len(ids),
+        "differ": differ,
+        "identical": len(ids) - len(differ),
+        "nonempty": nonempty,
+        "field_has_content": nonempty == len(ids) and len(ids) > 0,
+        "positive_control_detects_one_char": control_ok,
+    }
+
+
+def compare_raw(a: dict[str, str], b: dict[str, str]) -> list[str]:
+    return [i for i in sorted(set(a) | set(b)) if a.get(i) != b.get(i)]
+
+
+# ------------------------------------------------------------------- perf ---
+
+
+def load_tpot(arm: str) -> dict:
+    perf = os.path.join(arm, "perf")
+    samples = []
+    for name in sorted(os.listdir(perf)) if os.path.isdir(perf) else []:
+        if not name.endswith(".json") or "warmup" in name or not name.startswith("bs1_r"):
+            continue
+        try:
+            with open(os.path.join(perf, name)) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for key in ("median_tpot_ms", "mean_tpot_ms"):
+            if key in data:
+                samples.append(float(data[key]))
+                break
+    if not samples:
+        return {"samples": [], "n": 0}
+    return {
+        "samples": samples,
+        "n": len(samples),
+        "median": statistics.median(samples),
+        "mean": statistics.mean(samples),
+        "stdev": statistics.pstdev(samples) if len(samples) > 1 else 0.0,
+        "min": min(samples),
+        "max": max(samples),
+    }
+
+
+# -------------------------------------------------------------- gap table ---
+
+
+def gap_table(arm: str) -> dict:
+    csv_path = os.path.join(arm, "prof_csv", "kernel_details.csv")
+    if not os.path.exists(csv_path):
+        return {}
+    intervals, steps = [], 0
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            try:
+                start = float(row["Start Time(us)"].strip())
+                dur = float(row["Duration(us)"])
+            except (KeyError, ValueError):
+                continue
+            intervals.append((start, start + dur))
+            if row.get("Type") == "MoeInitRoutingV3":
+                steps += 1
+    if not intervals:
+        return {}
+    intervals.sort()
+    busy, gaps = 0.0, []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s > cur_e:
+            gaps.append(s - cur_e)
+            busy += cur_e - cur_s
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    busy += cur_e - cur_s
+    span = intervals[-1][1] - intervals[0][0]
+    big = [g for g in gaps if g >= GAP_US]
+    tokens = steps / 40 if steps else 0  # one MoeInitRoutingV3 per layer per step
+    out = {
+        "tokens": tokens,
+        "span_ms": span / 1000,
+        "busy_share": busy / span if span else float("nan"),
+        "busy_ms_per_token": busy / 1000 / tokens if tokens else float("nan"),
+        "gap_ms_per_token": sum(gaps) / 1000 / tokens if tokens else float("nan"),
+        "big_per_token": len(big) / tokens if tokens else float("nan"),
+        "big_ms_per_token": sum(big) / 1000 / tokens if tokens else float("nan"),
+        "big_median_us": statistics.median(big) if big else float("nan"),
+    }
+    return out
+
+
+def solve_c(a: dict, b: dict) -> dict:
+    """C from the two arms, and which of the three outcomes it is."""
+    if not a or not b or math.isnan(a.get("big_ms_per_token", float("nan"))):
+        return {"ok": False, "why": "a gap table is missing"}
+    delta_ms = a["big_ms_per_token"] - b["big_ms_per_token"]
+    c_us = delta_ms * 1000 / OPS_SAVED_PER_TOKEN
+    predicted_ms = OPS_SAVED_PER_TOKEN * C_INFERRED_US / 1000
+    # the model's own prediction, against what the arms actually moved
+    ratio = delta_ms / predicted_ms if predicted_ms else float("nan")
+    if c_us >= 300:
+        verdict = ("C >= 300 us: one extra callback would eat the 0.62 ms GMM window "
+                   "-> form C is not worth implementing; keep reducing operations")
+    elif 30 <= c_us <= 130:
+        verdict = f"C = {c_us:.0f} us, near the inferred 62.5 -> the model holds; form C is worth implementing"
+    else:
+        verdict = (f"C = {c_us:.0f} us is far from the inferred 62.5 and outside the band this test can "
+                   "explain -> treat 'fixed cost x operation count' as unproven")
+    model_ok = 0.5 <= ratio <= 2.0 if not math.isnan(ratio) else False
+    return {
+        "ok": True,
+        "delta_big_ms_per_token": delta_ms,
+        "C_us": c_us,
+        "predicted_ms_at_62.5us": predicted_ms,
+        "delta_over_predicted": ratio,
+        "model_holds": model_ok,
+        "verdict": verdict,
+        "model_note": (
+            "delta matches the model within 2x"
+            if model_ok
+            else "🔴 delta does NOT match 80 x C: the 'fixed cost x operation count' model is wrong, "
+            "and the 7.5 ms attribution has to be redone per operation kind (D2H / H2D / host-func)"
+        ),
+    }
+
+
+# ------------------------------------------------------- host-func counts ---
+
+_HF = re.compile(r"kt_offload host-func over ([\d.]+)s: (\d+) calls across (\d+) layers, per-layer min/max (\d+)/(\d+)")
+
+
+def host_func_report(arm: str) -> dict:
+    log = os.path.join(arm, "serve.log")
+    if not os.path.exists(log):
+        return {"lines": 0}
+    lines, never, uneven = 0, 0, 0
+    last = ""
+    with open(log, errors="replace") as f:
+        for line in f:
+            if not _HF.search(line):
+                continue
+            lines += 1
+            last = line.strip()[-300:]
+            if "never ran" in line:
+                never += 1
+            elif "uneven" in line:
+                uneven += 1
+    return {"lines": lines, "samples_with_dead_layers": never, "samples_uneven": uneven, "last": last}
+
+
+# ----------------------------------------------------------------- report ---
+
+
+def read_int(path: str) -> int:
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(__doc__)
+        return 2
+    run = sys.argv[1]
+    arms = {name: os.path.join(run, f"arm{name}") for name in ("A", "B")}
+    missing = [n for n, p in arms.items() if not os.path.isdir(p)]
+    if missing:
+        print(f"❌ arm directories missing: {missing} (an arm did not run)")
+        return 1
+
+    fails: list[str] = []
+    print("=== 1. answers, bit-identical (the criterion; TPOT decides nothing until this passes)")
+    ans = {n: load_answers(p) for n, p in arms.items()}
+    cmp_ = compare_answers(ans["A"], ans["B"])
+    print(f"  {cmp_['identical']}/{cmp_['n']} identical, {len(cmp_['differ'])} differ: {cmp_['differ'][:8]}")
+    print(f"  field non-empty for every answer: {cmp_['field_has_content']} ({cmp_['nonempty']}/{cmp_['n']})")
+    print(f"  positive control (one character changed is reported): {cmp_['positive_control_detects_one_char']}")
+    if not cmp_["n"]:
+        fails.append("no answers to compare")
+    if not cmp_["field_has_content"]:
+        fails.append("the compared field is empty for some answers -- a comparison of nothing reads as agreement")
+    if not cmp_["positive_control_detects_one_char"]:
+        fails.append("the positive control did not fire: the comparison has no discriminating power")
+    if cmp_["differ"]:
+        fails.append(f"{len(cmp_['differ'])} answers differ between the arms")
+
+    print("\n=== 2. TPOT (bs1)")
+    tp = {n: load_tpot(p) for n, p in arms.items()}
+    for n in ("A", "B"):
+        t = tp[n]
+        if not t["n"]:
+            print(f"  arm {n}: no samples")
+            fails.append(f"arm {n} has no TPOT samples")
+            continue
+        print(f"  arm {n}: median {t['median']:.2f} ms  mean {t['mean']:.2f} +- {t['stdev']:.2f}  "
+              f"min/max {t['min']:.2f}/{t['max']:.2f}  n={t['n']}  samples={[round(s, 2) for s in t['samples']]}")
+    if tp["A"]["n"] and tp["B"]["n"]:
+        print(f"  delta (A - B) = {tp['A']['median'] - tp['B']['median']:+.2f} ms/token")
+
+    print("\n=== 3. gap table (union busy; the sum would double-count parallel streams)")
+    gt = {n: gap_table(p) for n, p in arms.items()}
+    for n in ("A", "B"):
+        g = gt[n]
+        if not g:
+            print(f"  arm {n}: no kernel_details.csv")
+            fails.append(f"arm {n} has no profile csv")
+            continue
+        print(f"  arm {n}: tokens {g['tokens']:.0f}  busy {100 * g['busy_share']:.1f}%  "
+              f"busy {g['busy_ms_per_token']:.2f} ms/tok  gaps {g['gap_ms_per_token']:.2f} ms/tok  "
+              f">{GAP_US:.0f}us {g['big_per_token']:.2f}/tok totalling {g['big_ms_per_token']:.2f} ms "
+              f"(median {g['big_median_us']:.0f} us)")
+
+    print("\n=== 4. per-operation cost C, solved from the arms")
+    c = solve_c(gt.get("A", {}), gt.get("B", {}))
+    if not c["ok"]:
+        print(f"  not solvable: {c['why']}")
+        fails.append("C could not be solved")
+    else:
+        print(f"  delta(>100us ms/token) = {c['delta_big_ms_per_token']:+.2f} ms over {OPS_SAVED_PER_TOKEN} operations")
+        print(f"  C = {c['C_us']:.1f} us   (inferred was {C_INFERRED_US})")
+        print(f"  the model predicted {c['predicted_ms_at_62.5us']:.2f} ms; measured/predicted = "
+              f"{c['delta_over_predicted']:.2f}")
+        print(f"  ⇒ {c['verdict']}")
+        print(f"  ⇒ {c['model_note']}")
+
+    print("\n=== 5. per-layer host-func counts (only an in-graph node increments them)")
+    for n in ("A", "B"):
+        h = host_func_report(arms[n])
+        print(f"  arm {n}: {h.get('lines', 0)} samples, {h.get('samples_with_dead_layers', 0)} with layers that "
+              f"never ran, {h.get('samples_uneven', 0)} uneven")
+        if h.get("last"):
+            print(f"     last: {h['last']}")
+        if h.get("lines", 0) == 0:
+            print("     (sampling was off or the service logged nothing -- set HFLOG)")
+
+    print("\n=== 6. anomalies")
+    for n in ("A", "B"):
+        arm = arms[n]
+        n10701 = read_int(os.path.join(arm, "n_10701x.txt"))
+        dmesg_new = 0
+        p = os.path.join(arm, "dmesg_new.txt")
+        if os.path.exists(p):
+            with open(p, errors="replace") as f:
+                dmesg_new = sum(1 for _ in f)
+        anomaly = os.path.getsize(os.path.join(arm, "anomaly.txt")) if os.path.exists(
+            os.path.join(arm, "anomaly.txt")) else 0
+        print(f"  arm {n}: 10701x {n10701}, new dmesg lines {dmesg_new}, anomaly markers {'yes' if anomaly else 'no'}")
+        if n10701:
+            fails.append(f"arm {n} logged 10701x")
+        if anomaly:
+            fails.append(f"arm {n} hit an anomaly marker")
+
+    print("\n=== verdict")
+    if fails:
+        for f in fails:
+            print(f"  ❌ {f}")
+        print("  FAIL")
+        return 1
+    print("  ✅ bit-identical, both arms measured; read C above before deciding on form C")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
