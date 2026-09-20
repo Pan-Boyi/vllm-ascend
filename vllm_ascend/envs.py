@@ -170,6 +170,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # builder's compressor_ratio also sets tokens_per_state, so redirecting it
     # changes the page size too; enabling this requires splitting the two.
     "VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO": lambda: os.getenv("VLLM_ASCEND_DSV41_SPEC_STREAM_RATIO", "0"),
+    # DeepSeek-V4.1 sliding-window cache block size, in tokens. "0" (default)
+    # keeps whatever the attention layer passed -- upstream hard-codes 32 at
+    # vllm/models/deepseek_v4_1/attention.py:456. A positive value replaces it
+    # and must appear verbatim in the SWA backend's supported kernel block
+    # sizes. The SWA page is 32 tokens * 512 * 2 B = 32 KiB, which the planner
+    # pads up to the 128 KiB full-MLA page (4.00x), and each of the 40
+    # single-layer SWA groups then charges a whole 529 KiB pool block per
+    # admitted block. 128 makes the page exact and cuts the admitted blocks
+    # per request by 4. Ascend's own V4.0 path already runs SWA at
+    # DSV4_BLOCK_SIZES[128][0][1] = 128 on the same backend.
+    "VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE": lambda: int(os.getenv("VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE") or 0),
     # DeepSeek-V4.1 engram: "1" runs the n-gram hash, the id D2H, the host
     # gather and the H2D in the model runner before every forward, outside any
     # captured graph; the graph then only dequantises a persistent staging

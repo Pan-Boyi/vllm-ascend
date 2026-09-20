@@ -116,13 +116,86 @@ class AscendDeepseekV41CompressorStateCache(CompressorStateCache):
         return AscendCompressorStateBackend
 
 
+def resolve_swa_block_size(constructed: int, backend_cls, prefix: str,
+                           main_storage_block_size: int) -> int:
+    """The SWA cache's block size, after the override switch.
+
+    ``VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE`` is 0 by default, which returns
+    ``constructed`` unchanged -- upstream's hard-coded 32
+    (``vllm/models/deepseek_v4_1/attention.py:456``) -- so the spec, the cache
+    tensor and the metadata stay byte-identical and an A/B attributes a launch
+    to this change and nothing else.
+
+    A positive value must pass both checks below, or this raises. Neither is a
+    preference:
+
+    * **Verbatim membership in the backend's supported kernel block sizes.**
+      Not "divisible by": ``select_common_block_size`` silently falls back to a
+      smaller supported size that divides it, which leaves the planner and the
+      operator working from different page sizes with nothing raised. The
+      backend is read off the object being judged (the ``backend_cls`` this
+      cache will return from ``get_attn_backend``), not looked up by name.
+    * **Not larger than the main cache's storage block size.** The planner pads
+      each SWA page up to the nearest full-MLA page that is not smaller
+      (``patch_kv_cache_utils.py:331``) and asserts the SWA page never exceeds
+      the largest one (``:328``). On this path the SWA and main caches share
+      ``head_dim`` and dtype, so comparing block sizes is comparing pages; past
+      the ceiling the failure is a bare ``assert`` several frames inside the
+      planner, which names nothing.
+
+    Ascend's own V4.0 path already runs the SWA cache at
+    ``DSV4_BLOCK_SIZES[cache_block_size][0][1]`` -- 128 at the default cache
+    block size -- on this same ``AscendDSASWABackend`` and this same
+    ``AscendSlidingWindowMLASpec`` (``models/deepseek_v4/model.py:124``). V4.1
+    is at 32 only because upstream hard-codes it at the construction site and
+    the Ascend subclass overrode ``get_kv_cache_spec`` and not the block size.
+    """
+    from vllm_ascend import envs
+
+    override = envs.VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE
+    if not override:
+        return constructed
+    if override < 0:
+        raise ValueError(
+            f"VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE={override} is negative; use 0 "
+            "to keep the constructed block size.")
+
+    supported = backend_cls.get_supported_kernel_block_sizes()
+    if override not in [s for s in supported if isinstance(s, int)]:
+        raise NotImplementedError(
+            f"{prefix}: VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE={override} is not "
+            f"verbatim in {backend_cls.__name__}'s supported kernel block "
+            f"sizes {supported}. select_common_block_size would silently fall "
+            "back to a smaller supported size that divides it, leaving the "
+            "planner and the operator on different page sizes.")
+    if override > main_storage_block_size:
+        raise NotImplementedError(
+            f"{prefix}: VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE={override} exceeds "
+            f"the main cache's storage block size {main_storage_block_size}. "
+            "The SWA and main caches share head_dim and dtype here, so the "
+            "SWA page would exceed the largest full-MLA page and "
+            "_get_kv_cache_groups_uniform_groups' "
+            "`assert max(sm_page_sizes) <= max(all_page_sizes)` would fire "
+            "with no attribution.")
+    return override
+
+
 class AscendDeepseekV41SWACache(DeepseekV4SWACache):
     """The sliding-window cache, reporting an Ascend kv-cache spec.
 
-    Only ``get_kv_cache_spec`` changes. ``get_attn_backend`` upstream already
-    returns ``self.backend_cls``, which the V4.1 attention layer supplies from
-    ``swa_backend_cls`` -- the Ascend SWA backend -- so overriding it would
-    replace a correct value with the same one.
+    ``get_kv_cache_spec`` changes, and ``block_size`` is re-resolved at
+    construction (see :func:`resolve_swa_block_size`; default off, identical to
+    before). ``get_attn_backend`` upstream already returns ``self.backend_cls``,
+    which the V4.1 attention layer supplies from ``swa_backend_cls`` -- the
+    Ascend SWA backend -- so overriding it would replace a correct value with
+    the same one.
+
+    The block size is set on ``self``, not only inside the spec: the attention
+    layer's prolog checks ``swa_kv_cache.shape[1:] == (metadata.block_size,
+    head_dim)`` and the JIT warmup registers kernels with
+    ``self.swa_cache_layer.block_size``. Changing only the spec would make the
+    planner and those two disagree, which writes rows at the wrong offset
+    rather than failing.
 
     The dtype is left exactly as constructed. V4.1 resolves it once in the
     attention layer (``_resolve_dsv4_kv_cache_dtype``) and hands it in; V4.0's
@@ -130,6 +203,26 @@ class AscendDeepseekV41SWACache(DeepseekV4SWACache):
     ``vllm_config.cache_config.cache_dtype`` as a side effect, which there is
     no reason to reproduce for a model that already did the resolution.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from vllm_ascend import envs
+
+        if not envs.VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE:
+            # Off: not even the table lookup runs, so the switch adds no new
+            # way to fail on the path that is in production today.
+            return
+        from vllm.config import get_current_vllm_config
+
+        from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
+
+        vllm_config = get_current_vllm_config()
+        table = dsv4_block_sizes(vllm_config)
+        main_storage_block_size = table[
+            vllm_config.cache_config.block_size][0][0]
+        self.block_size = resolve_swa_block_size(
+            self.block_size, self.backend_cls, self.prefix,
+            main_storage_block_size)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config  # every field comes from construction, as upstream
