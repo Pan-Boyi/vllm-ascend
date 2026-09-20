@@ -505,6 +505,8 @@ kt 的输入放在**三块独立 pinned 内存**里（`input_tensor_cpu` / `imme
 
 ## k.6 形态 C 方案（**已审阅通过，但暂停实现，等 k.5b 的 C**；2026-09-20 按 kt 回复重写）
 
+> 🔴 **前置约束（A6，k.11）**：形态 C **必须建在 packed 的每层自有缓冲之上**。用 kt 的缓冲时第 L 与 L+2 层共用同一组 pinned 张量（`layer_idx % 2`），去掉整卡 `_wait_device` 之后L 层的输出 H2D 还在飞、L+2 层的 CPU 任务已经在改同一块内存；今天不炸只是被那次整卡同步顺带救了。
+
 **形态**：在**正被捕获的那条流**上放**两个** `_launch_host_func` 节点，不碰侧流、不用 ExternalEvent、不用 task group。
 这是 engram 已交付的形态（host 工作进图是支持的；不支持的只有"fork 到另一条流再 join 进捕获"）。
 
@@ -662,6 +664,55 @@ T=1 每层耗时（µs，p50 / p90）：
 - overlap 开关在 config 里**仍然是拒绝**的；用例只在自己建的层实例上翻 `off.overlap`，不动生产捕获路径。
 - 失败的捕获可能污染同进程里后一次捕获 ⇒ 默认 `--arm both` 会打印这条警告，正式判读请分两次
   （`run_oncard.sh <card> t5 --arm on` 与 `--arm off`）。
+
+
+
+## k.11 跨层入口全清单（kt 侧提供，已对着我们分支的 kt 逐行核过）
+
+行号：`build_artifacts/moe_offload_ref/kt_site/kt_kernel/experts_base.py`（分支 HEAD `033ea76`）。
+我方已核实的事实：标志字典 `BaseMoEWrapper._layer_has_pending_deferred` 是**类属性、键是裸 layer_idx**（:411）；
+提交读的是**上一层**的键（:667/:744/:819）；自己那层的键决定 drain allowance（:771/:942）；
+False 只在成功提交之后写（:697/:755/:844）；pinned 槽位 = `layer_idx % buffer_depth`，`buffer_depth=2`（:259）；
+输出 H2D 是 `non_blocking=True`（:916）；整卡同步在 `submit_forward` 的 `_wait_device`（:817）。
+
+### A 组：已变成会 raise 的拦截（代码里，不是文档里）
+
+| 判据 | 判什么 | 在哪 | 失效形态 |
+|---|---|---|---|
+| A1 | `max_deferred_experts_per_token == 0` | `_refuse_cross_layer`，建 wrapper 后 | deferral **能不能产生** |
+| **A3** | `not has_pending_deferred(L-1)` | 每次提交前（eager 的 `route`、两个图节点回调） | kt **读到了** ⇒ 下一次提交变 `incremental=True`，静默累加 |
+| **A4** | `not has_pending_deferred(L)` | 每层 drain 之后（`merge`、两个图节点回调） | 残留 True ⇒ allowance 变 1（:771/:942）**少等一个任务**，读到写了一半的 output；异常路径（`_check_qlen_fits_cpp_buffers` :593/:650/:728、`_wait_device` :817）正会留下它 |
+| A5 | 我方 wrapper 的 `layer_idx` 互不重复（弱引用，只管活着的） | `_register_wrapper` | 字典是进程级裸键 ⇒ 别人的 True 被我们读成"上一层有 deferred" |
+| A9 | 所有 wrapper 的 `cpu_infer` 是同一个对象 | `_register_wrapper` | 两个队列 ⇒ "串行 FIFO" 这个前提悄悄不成立 |
+
+A1 与 A3/A4 都留着：**一个判"能不能产生"，一个判"有没有读到"**，失效点不同。
+kt build 若没有 `has_pending_deferred`，A3/A4 打 warning 明说**本 build 上覆盖为零**（缺席不是证据）。
+单测 `tests/ut/kt_offload/test_cross_layer_contract.py`（13 条，含"图节点里必须记日志而不是抛进 ACL"、
+"弱引用不能误红已释放的 wrapper"）。
+
+### 🔴 A6：形态 C 必须建在**我们自己的缓冲**之上
+
+kt 的 pinned 槽位是 `layer_idx % 2`（:259）⇒ **第 L 层与第 L+2 层共用同一组 input/ids/weights/output**。
+形态 C 去掉 `submit_forward` 里那次整卡 `_wait_device`（:817）之后，L 层的输出 H2D（:916，non_blocking）
+可能还在飞，而 L+2 层的 CPU 任务已经在改同一块 `output_cpu`。**今天不炸，只是因为那次整卡同步顺带等掉了它。**
+⇒ 形态 C 若继续用 kt 的缓冲，就**必须**自己维护"未 drain 的在飞层数 < buffer_depth"的守卫；
+而我们 packed 路径**每层各自的 pinned/设备缓冲**天然没有这个共享（`_packed_buffers` 按 bs 建、按层持有）。
+**结论：形态 C 建在 packed 的缓冲之上**——即便 packed 因长尾默认关（k.8），**缓冲这一半要复用**。
+"不受 A6 约束"的**前提就是用我们自己的缓冲**；一旦改回 kt 的缓冲，这条约束立刻回来。
+
+### B 组：**强制不了**，只能写进设计并在评审时逐条过（不要假装拦住了）
+
+| | 事实 | 我们能做的 |
+|---|---|---|
+| B1 | 队列在飞任务数**不可查**（sync 能让它变真，但查不到） | 只能靠"每层必须 drain"的结构，不能靠运行时断言 |
+| B2 | pinned 输出的 H2D 是否完成 kt **不留句柄** | 守卫只能由**我们自己 record 的 event** 提供（形态 C 的等待点就要用它） |
+| B3 | 所有层的中间缓冲是**进程级同一块内存**（C++ 侧 `shared_mem_buffer` 静态全局；此条在 Python 层看不到，未由我方复核） | 今天安全只因队列串行；任何并行化都要先解决它 |
+| B4 | 加载与前向**不能重叠** | 结构上保证：`after_weights_loaded` 之后才有前向 |
+| B5 | 换 bs / `clear_buffer_cache()` 会换张量对象，而在飞任务持**裸指针** | 缓解：所有捕获 bs 都在 `set_capture_batch_sizes` 里登记（已做，`_prepare_capture_buffers`） |
+| B6 | `incremental=True` 还有两个 C++ 直接入口（`ext_bindings.cpp:472/477`） | 只能钉死我们自己的调用点：单测按 **AST** 检查每个 `forward_task` 的 `incremental` 实参必须是字面量 `False`（字符串搜索会被解释这件事的散文骗到，已踩过） |
+
+⚪ 两条排查用（不是判据）：`new Args{}` 无 `delete`，每次 `forward_task` 漏 72–80 B——长跑时症状**看起来像"跨层缓冲没释放"**，
+别误诊；任务异常**在下一次 sync 才重抛** ⇒ 报错会记在**下一层**账上，定位时要把层号往前推一格。
 
 
 ## 上卡 A/B 方案（M3 侧流，1 张卡；两臂只差一个开关）

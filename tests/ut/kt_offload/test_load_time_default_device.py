@@ -185,6 +185,10 @@ def _layer_runtime(mods, monkeypatch, packed: bool):
 
     monkeypatch.setitem(sys.modules, "kt_kernel", SimpleNamespace(KTMoEWrapper=factory))
     monkeypatch.setattr(lm, "_install_capture_probe", lambda cls: None)
+    # each arm stands in for a fresh process: the wrapper registry (A5) is
+    # process-level by design, and a module-scoped mutant keeps earlier arms'
+    # wrappers alive
+    lm._reset_wrapper_registry()
     # Pinned allocation needs a registered accelerator, so the CPU suite cannot
     # call the real one. The stand-in names its device exactly as the subject
     # does -- and that the subject does is asserted separately, on its source.

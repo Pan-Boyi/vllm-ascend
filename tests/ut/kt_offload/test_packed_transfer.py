@@ -326,8 +326,26 @@ def test_every_forward_task_call_overwrites_rather_than_accumulates():
     """The other half of the same constraint: incremental=True would read the
     output back and accumulate, which is how a deferred expert's contribution
     would arrive a layer late."""
+    # AST, not a text search: the prose around these checks legitimately says
+    # "incremental=True" when it explains what must never be passed, and a
+    # substring criterion cannot tell an argument from a sentence.
+    import ast
     import inspect
 
-    src = inspect.getsource(kl)
-    assert "False,  # incremental: no deferred experts" in src, "the packed call no longer pins incremental=False"
-    assert "incremental=True" not in src, [ln for ln in src.splitlines() if "incremental" in ln]
+    tree = ast.parse(inspect.getsource(kl))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "forward_task"
+    ]
+    assert calls, "no forward_task call found; this check has zero coverage"
+    for call in calls:
+        by_name = {kw.arg: kw.value for kw in call.keywords}
+        arg = by_name.get("incremental")
+        if arg is None:
+            assert len(call.args) >= 7, f"forward_task at line {call.lineno} passes no incremental argument"
+            arg = call.args[6]
+        assert isinstance(arg, ast.Constant) and arg.value is False, (
+            f"forward_task at line {call.lineno} passes incremental={ast.unparse(arg)}; only a literal False "
+            "is allowed (True accumulates the previous layer's experts into this one)"
+        )

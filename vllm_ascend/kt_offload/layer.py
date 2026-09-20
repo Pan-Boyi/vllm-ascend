@@ -33,6 +33,7 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import weakref
 from typing import Any
 
 import torch
@@ -461,7 +462,8 @@ class KTLayerOffload:
         # default device is the NPU, and kt's argument is a *host* map
         # (physical_to_logical_map_cpu).
         wrapper.load_weights(torch.arange(self.placement.num_experts, dtype=torch.int64, device="cpu"))
-        _refuse_cross_layer(wrapper, self.layer_idx)
+        _refuse_cross_layer(wrapper, self.layer_idx)  # A1: deferral cannot be produced
+        _register_wrapper(wrapper, self.layer_idx)  # A5/A9: one wrapper per index, one CPUInfer
         return wrapper
 
     # -- forward ------------------------------------------------------------
@@ -499,6 +501,9 @@ class KTLayerOffload:
         if self.wrapper is not None and hidden_states.shape[0] > 0:
             if hidden_states.dtype != torch.bfloat16:
                 raise TypeError(f"kt_offload: kt takes bf16 activations, got {hidden_states.dtype}")
+            # A3: what kt would READ as incremental for this submit. The knob
+            # (A1) says deferral cannot be produced; this says none was seen.
+            _assert_no_pending(self.wrapper, self.layer_idx, self.layer_idx - 1, "before this layer's submit")
             if _capturing():
                 # No runtime condition here (not even the profile flag): a
                 # branch the capture run skips is missing from every replay.
@@ -560,6 +565,11 @@ class KTLayerOffload:
             cpu_out = self._packed_output(hs)
         else:
             cpu_out = self.wrapper.sync_forward(hs, _stream_handle(hs.device))
+        # A4: after this layer drained, its own flag must be clear. A stale
+        # True survives an exception on kt's pre-submit checks and then makes
+        # the NEXT drain wait for one task fewer -- an early return, not a
+        # raise, so nothing else would notice.
+        _assert_no_pending(self.wrapper, self.layer_idx, self.layer_idx, "after this layer drained")
         # One rounding to the activation dtype instead of two.
         return (routed_out.float() + cpu_out.float()).to(routed_out.dtype)
 
@@ -707,6 +717,10 @@ def _kt_packed_forward(payload) -> None:
     """
     wrapper, buf, layer_idx = payload
     try:
+        # A3/A4 per replay: in graph mode route()/merge() run once, at capture,
+        # so this node is the only place a per-step check exists. Raising here
+        # is caught below and logged -- the graph has nowhere to return to.
+        _assert_no_pending(wrapper, layer_idx, layer_idx - 1, "before this node's submit")
         task = wrapper.moe.forward_task(
             buf["bsz"].data_ptr(),
             buf["pin_ids"].shape[-1],
@@ -718,6 +732,7 @@ def _kt_packed_forward(payload) -> None:
         )
         wrapper.cpu_infer.submit(task)
         wrapper.cpu_infer.sync(0)
+        _assert_no_pending(wrapper, layer_idx, layer_idx, "after this node drained")
         HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
     except BaseException as exc:  # noqa: BLE001
         logger.error(
@@ -736,7 +751,9 @@ def _kt_host_forward(payload) -> None:
     """
     wrapper, shape_ref, stream_handle, layer_idx = payload
     try:
+        _assert_no_pending(wrapper, layer_idx, layer_idx - 1, "before this node's submit")
         wrapper.run_pinned_forward_sync(shape_ref, stream_handle)
+        _assert_no_pending(wrapper, layer_idx, layer_idx, "after this node drained")
         HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
     except BaseException as exc:  # noqa: BLE001
         logger.error(
@@ -787,6 +804,105 @@ def _subscribe_stream(stream) -> None:
     _REPORT_SUBSCRIBED.add(key)
 
 
+
+
+# -- the no-cross-layer contract, read off kt's own bookkeeping --------------
+#
+# kt keeps one process-level dict, ``BaseMoEWrapper._layer_has_pending_deferred``,
+# keyed by bare layer_idx (experts_base.py:411). Three facts follow, and the
+# checks below read the dict through kt's public accessor rather than the
+# switch that is supposed to keep it empty:
+#   * a submit reads the PREVIOUS layer's flag and turns it into
+#     ``incremental=True`` (:667/:744/:819) -- a silent accumulation across a
+#     layer boundary, which this deployment forbids;
+#   * a layer's own flag sets its drain allowance to 1 (:771/:942), i.e. the
+#     sync waits for one task FEWER. That failure returns early instead of
+#     raising, and the output read afterwards is half written;
+#   * the flag is written False only after a successful immediate submit
+#     (:697/:755/:844), while the checks before it (`_check_qlen_fits_cpp_buffers`
+#     at :593/:650/:728, `_wait_device` at :817) can raise first and leave a
+#     stale True behind.
+# A1 (max_deferred_experts_per_token == 0) says deferral cannot be *produced*;
+# these say nothing was *read*. Both are kept: they fail in different places.
+_PENDING_API_WARNED = False
+# weak refs: a wrapper that has been dropped no longer writes kt's flags, and
+# a test (or a rebuilt model) may legitimately construct a fresh one for the
+# same index. What must never happen is two LIVE wrappers on one index.
+_WRAPPER_REGISTRY: weakref.WeakValueDictionary[int, object] = weakref.WeakValueDictionary()
+
+
+def _pending_reader(wrapper):
+    """kt's public accessor, or None on a build that predates it."""
+    global _PENDING_API_WARNED
+    reader = getattr(wrapper, "has_pending_deferred", None)
+    if reader is None and not _PENDING_API_WARNED:
+        _PENDING_API_WARNED = True
+        logger.warning(
+            "kt_offload: this kt build has no has_pending_deferred(); the no-cross-layer contract is "
+            "checked only by the configuration knob (A1), not by what kt actually read. Coverage of "
+            "the A3/A4 checks on this build is zero."
+        )
+    return reader
+
+
+def _assert_no_pending(wrapper, layer_idx: int, which: int, when: str) -> None:
+    """Refuse to continue if kt's flag for layer ``which`` is set."""
+    reader = _pending_reader(wrapper)
+    if reader is None:
+        return
+    if not reader(which):
+        return
+    own = which == layer_idx
+    raise RuntimeError(
+        f"kt_offload: layer {layer_idx}: kt reports a pending deferred task for layer {which} {when}. "
+        + (
+            "Its own flag makes this layer's drain allowance 1 (experts_base.py:771/:942), so the sync "
+            "returns one task early and the output read after it is half written."
+            if own
+            else "The next submit would read it as incremental=True (experts_base.py:667/:744/:819) and "
+            "accumulate the previous layer's CPU experts into this layer's output."
+        )
+        + " Crossing a layer boundary is forbidden for this deployment; a stale True is also what an "
+        "exception on kt's pre-submit checks leaves behind."
+    )
+
+
+def _reset_wrapper_registry() -> None:
+    """Forget every registered wrapper. For tests that stand in for a fresh
+    process; a service never calls this, and calling it would throw away the
+    only record that two wrappers share an index."""
+    _WRAPPER_REGISTRY.clear()
+
+
+def _register_wrapper(wrapper, layer_idx: int) -> None:
+    """A5/A9: the bookkeeping is process-level, so our wrappers must not share
+    a layer index, and they must share one CPUInfer.
+
+    kt's dict is keyed by the bare layer index: a second wrapper built for the
+    same index would write flags this one then reads as "the previous layer
+    left something". And two CPUInfer instances would mean two queues, so
+    "the queue is serial" -- the assumption every ordering argument here rests
+    on -- would quietly stop being true.
+    """
+    previous = _WRAPPER_REGISTRY.get(layer_idx)
+    if previous is not None and previous is not wrapper:
+        raise RuntimeError(
+            f"kt_offload: a second live kt wrapper was built for layer_idx {layer_idx}. kt's deferred "
+            "bookkeeping is a process-level dict keyed by that index (experts_base.py:411), so the two "
+            "would read each other's flags."
+        )
+    _WRAPPER_REGISTRY[layer_idx] = wrapper
+    infer = getattr(wrapper, "cpu_infer", None)
+    for other_idx, other in _WRAPPER_REGISTRY.items():
+        other_infer = getattr(other, "cpu_infer", None)
+        if other is wrapper or other_infer is None or infer is None:
+            continue
+        if other_infer is not infer:
+            raise RuntimeError(
+                f"kt_offload: layer {layer_idx} and layer {other_idx} have different CPUInfer objects "
+                f"({infer!r} vs {other_infer!r}). Two queues means the serial-FIFO ordering every "
+                "cross-layer argument here rests on no longer holds."
+            )
 
 def _refuse_cross_layer(wrapper, layer_idx: int) -> None:
     """Hard constraint (user, 2026-09-20): nothing may cross a layer boundary.
