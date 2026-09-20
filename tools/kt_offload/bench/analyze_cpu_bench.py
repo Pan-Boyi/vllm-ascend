@@ -128,6 +128,18 @@ def main():
         print(f"{target:13.2f}   {need if need is not None else 'impossible':>14}"
               f"   {'' if need is None else N_EXP - need}")
 
+    # The reverse solve above is only meaningful inside the HBM gate: every
+    # resident expert costs HBM.  tools/kt_offload/kt_offload_gate.py:80-82
+    # 10.4 + N_res * 0.7004 * KT_DEVICE_FACTOR <= HBM*GPUUTIL - KV_reserve
+    gate_max = int((128 * 0.9 - 25 - 10.4) / 0.7004)
+    print(f"\n# HBM gate (kt_offload_gate.py defaults: 128 GiB x 0.9 - 25 KV - 10.4 other,"
+          f" 0.7004 GiB/expert, KT_DEVICE_FACTOR=1): N_resident <= {gate_max}")
+    ms_gate, _ = per_token_ms(Tk, {k: hypergeom(N_EXP - gate_max, k) for k in range(TOPK + 1)})
+    print(f"  at N_resident = {gate_max}: CPU {ms_gate:.2f} ms/token (uniform),"
+          f" host experts {(N_EXP - gate_max) * 0.7004:.1f} GiB")
+    print("  => targets needing N_resident above that are not reachable on one card"
+          " without changing KV reserve / GPUUTIL / KT_DEVICE_FACTOR.")
+
     floor_ms = N_LAYERS * Tk[0] / 1000.0
     print(f"\n# floors: k_cpu=0 on every layer still costs {N_LAYERS} x {Tk[0]:.1f} us "
           f"= {floor_ms:.2f} ms/token (do_numa_job round trip)")
