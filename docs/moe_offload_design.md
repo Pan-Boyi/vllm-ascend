@@ -116,6 +116,11 @@
    **fp32 相加后回 bf16**（少一次舍入）。这是 routed 输出的语义点：两边都已含 1.5 缩放，runner 的
    `routed_scaling_factor` 传的是 1.0（vllm `fused_moe/layer.py:131,393,418-424`，`apply_routed_scale_to_output=False`），
    shared expert 在之后由 runner 加（`fused_moe.py:347-363`，vllm `moe_runner.py:787`）。⇒ CPU 输出不再乘 1.5，也不含 shared。
+- **返回值按名字绑定**：`route` 返回 `NpuRouting(topk_weights, topk_ids)`（`placement.py` `NpuRouting`），
+  字段顺序与本仓所有 MoE 调用点的命名一致；调用点读字段不按位置解包。入口另有 dtype 契约检查
+  （`assert_routing_dtypes`）：ids 必须 int32/int64、weights 必须浮点、两者同形，不满足当场 raise，不用 `.to()` 纠正。
+  2026-09-20 上卡 t1 的实证：位置解包把两者调换后，唯一的报错来自 `npu_moe_init_routing_v2`
+  （`aclnnMoeInitRoutingV3 ... EZ1001: expertIdx not implemented for DT_FLOAT`），既不点名调用点也不点名参数。
 - 集合判据（`placement.py:144 check_split`，按 kt 的 mask 而不是 NPU 的表判定，避免两表同错）：
   NPU 有效路由（权重≠0）与 kt 路由互补、并集覆盖全部 topk；NPU 权重 + CPU 权重 == 原权重（逐位）；NPU id ∈ [0, 驻留数)。
 - 已知代价（M3 处理）：槽位 0 被当 dummy，bs=1 时 CPU 路由的 ≈4.4 行会让专家 0 在它本不被选中时多算一次，

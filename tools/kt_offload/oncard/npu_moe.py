@@ -254,7 +254,8 @@ def offload_forward(off, layer, comm, x, topk_weights, topk_ids):
     """forward_impl, call for call: route -> apply -> (finalize no-op) -> merge.
 
     Returns (npu_part_before_merge, merged)."""
-    w2, ids2 = off.route(x, topk_weights, topk_ids, in_profile_run=False)
+    npu_routing = off.route(x, topk_weights, topk_ids, in_profile_run=False)
+    w2, ids2 = npu_routing.topk_weights, npu_routing.topk_ids
     pre = npu_moe(layer, comm, x, w2, ids2)
     pre_copy = pre.detach().clone()
     merged = off.merge(pre)

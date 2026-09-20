@@ -26,6 +26,7 @@ import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -123,12 +124,56 @@ class LayerPlacement:
 # ---------------------------------------------------------------------------
 
 
+class NpuRouting(NamedTuple):
+    """The NPU half of a routing decision.
+
+    Field order is ``(topk_weights, topk_ids)``: the order every Ascend MoE
+    call site names them in (``_select_experts``, ``quant_method.apply``), so
+    positional unpacking at a call site cannot silently swap them.
+    """
+
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+
+
+ID_DTYPES = (torch.int32, torch.int64)
+
+
+def assert_routing_dtypes(topk_ids: torch.Tensor, topk_weights: torch.Tensor, where: str) -> None:
+    """Refuse routing tensors the Ascend MoE kernels cannot take, at the call site.
+
+    The kernel's own complaint arrives far away and names neither the caller
+    nor the argument that is wrong: a float ``topk_ids`` surfaces inside
+    ``npu_moe_init_routing_v2`` as ``aclnnMoeInitRoutingV3 ... EZ1001: Tensor
+    expertIdx not implemented for DT_FLOAT`` (seen on card 2026-09-20, from a
+    caller that had swapped weights and ids). Never coerce with ``.to()``: the
+    swap would then run and produce silently wrong routing.
+    """
+    if topk_ids.dtype not in ID_DTYPES:
+        raise TypeError(
+            f"{where}: topk_ids must be int32/int64 (the Ascend routing kernel's expertIdx takes DT_INT32), "
+            f"got {topk_ids.dtype} with shape {tuple(topk_ids.shape)}. If this is float, the caller has "
+            "probably passed topk_weights where topk_ids belong -- the argument order is (ids, weights) here "
+            "and the return order is NpuRouting(topk_weights, topk_ids)."
+        )
+    if not topk_weights.is_floating_point():
+        raise TypeError(
+            f"{where}: topk_weights must be a floating dtype, got {topk_weights.dtype} with shape "
+            f"{tuple(topk_weights.shape)} (weights/ids swapped?)."
+        )
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            f"{where}: topk_ids {tuple(topk_ids.shape)} and topk_weights {tuple(topk_weights.shape)} "
+            "must have the same shape."
+        )
+
+
 def split_routing(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     safe_slot_table: torch.Tensor,
     keep_table: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> NpuRouting:
     """NPU half of a routing decision.
 
     ``topk_ids`` are *logical* ids (before any log2phy). Resident routes become
@@ -136,9 +181,10 @@ def split_routing(
     weight 0. Shapes and dtypes are preserved; no -1 is produced. Two gathers
     and a multiply; both tables live on the compute device.
     """
+    assert_routing_dtypes(topk_ids, topk_weights, "kt_offload split_routing")
     npu_ids = safe_slot_table[topk_ids.long()].to(topk_ids.dtype)
     npu_weights = topk_weights * keep_table[topk_ids.long()].to(topk_weights.dtype)
-    return npu_ids, npu_weights
+    return NpuRouting(topk_weights=npu_weights, topk_ids=npu_ids)
 
 
 def check_split(

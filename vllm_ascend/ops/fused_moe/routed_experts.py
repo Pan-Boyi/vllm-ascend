@@ -694,12 +694,17 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             # Logical ids, after the profile-run randomisation above: the CPU
             # half gets the original routing, the NPU half resident slots with
             # CPU routes turned into a zero-weight resident slot.
-            topk_weights, topk_ids = kt_offload.route(
+            npu_routing = kt_offload.route(
                 hidden_states,
                 topk_weights,
                 topk_ids,
                 in_profile_run=enable_force_load_balance,
             )
+            # By field, not by position: binding these the other way round
+            # only fails deep inside npu_moe_init_routing_v2 (EZ1001, expertIdx
+            # DT_FLOAT), which names neither this call nor the argument.
+            topk_weights = npu_routing.topk_weights
+            topk_ids = npu_routing.topk_ids
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         try:

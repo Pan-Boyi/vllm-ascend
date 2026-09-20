@@ -211,7 +211,7 @@ def test_route_submits_original_and_returns_split(monkeypatch):
     hs = torch.randn(4, 8, dtype=torch.bfloat16)
     ids = torch.tensor([[2, 3], [5, 11], [0, 1], [11, 15]], dtype=torch.int32)
     w = torch.rand(4, 2) + 0.1
-    nid, nw = rt.route(hs, w, ids, in_profile_run=False)
+    nw, nid = rt.route(hs, w, ids, in_profile_run=False)
     ((s_hs, s_ids, s_w),) = rt.wrapper.submits
     assert s_ids is ids and s_w is w and s_hs.data_ptr() == hs.data_ptr()  # original routing to kt
     assert check_split(rt.placement, ids, w, nid, nw) == []
@@ -226,7 +226,7 @@ def test_profile_run_skips_cpu(monkeypatch):
     hs = torch.randn(3, 8, dtype=torch.bfloat16)
     ids = torch.tensor([[0, 9], [4, 1], [7, 8]], dtype=torch.int32)
     w = torch.rand(3, 2)
-    nid, nw = rt.route(hs, w, ids, in_profile_run=True)
+    nw, nid = rt.route(hs, w, ids, in_profile_run=True)
     assert rt.wrapper.submits == []
     assert check_split(rt.placement, ids, w, nid, nw) == []  # NPU half unchanged in shape/legality
     routed = torch.randn(3, 8, dtype=torch.bfloat16)
@@ -247,7 +247,7 @@ def test_all_resident_layer_needs_no_kt(monkeypatch):
     hs = torch.randn(2, 8, dtype=torch.bfloat16)
     ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     w = torch.rand(2, 2)
-    nid, nw = rt.route(hs, w, ids, in_profile_run=False)
+    nw, nid = rt.route(hs, w, ids, in_profile_run=False)
     assert torch.equal(nid, ids) and torch.equal(nw, w)
 
 
@@ -284,7 +284,7 @@ def test_frequency_plan_through_runtime(monkeypatch):
     hs = torch.randn(9, 8, dtype=torch.bfloat16)
     ids = torch.argsort(torch.rand(9, 16, generator=g), dim=1)[:, :2].to(torch.int64)
     w = torch.rand(9, 2, generator=g)
-    nid, nw = rt.route(hs, w, ids, in_profile_run=False)
+    nw, nid = rt.route(hs, w, ids, in_profile_run=False)
     assert check_split(rt.placement, ids, w, nid, nw) == []
 
 
@@ -313,3 +313,53 @@ def test_attach_wraps_post_load_and_requires_swiglu_limit(monkeypatch):
     layer.log2phy = torch.arange(5)
     with pytest.raises(ValueError):
         rt.attach_after_init(layer)
+
+
+def test_route_rejects_swapped_ids_and_weights(monkeypatch):
+    rt, _ = _runtime(monkeypatch, [[0, 1]])
+    hs = torch.randn(2, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 9], [4, 1]], dtype=torch.int32)
+    w = torch.rand(2, 2)
+    with pytest.raises(TypeError, match="topk_ids must be int32/int64"):
+        rt.route(hs, ids, w, in_profile_run=False)  # swapped, as the on-card scaffold did
+    with pytest.raises(TypeError, match="no topk_weights table baked"):
+        rt.route(hs, w.to(torch.float64), ids, in_profile_run=False)  # no table baked for f64
+
+
+def test_production_call_site_binds_route_by_field():
+    """forward_impl must read .topk_weights/.topk_ids, never unpack route() positionally."""
+    tree = ast.parse(ROUTED_EXPERTS.read_text())
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "route"
+    ]
+    assert len(calls) == 1
+    src = ROUTED_EXPERTS.read_text()
+    assert "npu_routing.topk_weights" in src and "npu_routing.topk_ids" in src
+    # no `a, b = <something>.route(...)` anywhere
+    bad = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Tuple)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Attribute)
+        and n.value.func.attr == "route"
+    ]
+    assert bad == [], f"route() unpacked positionally at {bad}"
+
+
+def test_call_site_check_mutation_is_red():
+    src = "def f(self):\n    topk_weights, topk_ids = self.kt_offload.route(a, b, c)\n"
+    tree = ast.parse(src)
+    bad = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Tuple)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Attribute)
+        and n.value.func.attr == "route"
+    ]
+    assert bad == [2]

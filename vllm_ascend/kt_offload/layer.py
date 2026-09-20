@@ -38,7 +38,14 @@ from typing import Any
 
 import torch
 
-from vllm_ascend.kt_offload.placement import LayerPlacement, OffloadPlan, plan_from_config, split_routing
+from vllm_ascend.kt_offload.placement import (
+    LayerPlacement,
+    NpuRouting,
+    OffloadPlan,
+    assert_routing_dtypes,
+    plan_from_config,
+    split_routing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -299,13 +306,24 @@ class KTLayerOffload:
         topk_ids: torch.Tensor,
         *,
         in_profile_run: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> NpuRouting:
         """Submit the CPU half with the original routing; return the NPU half.
 
         ``topk_ids`` must be logical ids (log2phy is refused at init), and
         this must run after the profile-run randomisation so both halves see
-        the same ids.
+        the same ids. The result is a named pair, so a call site cannot bind
+        the two tensors the wrong way round.
         """
+        assert_routing_dtypes(topk_ids, topk_weights, "kt_offload route")
+        for name, dtype, baked in (
+            ("topk_ids", topk_ids.dtype, self._slot_tables),
+            ("topk_weights", topk_weights.dtype, self._keep_tables),
+        ):
+            if baked and dtype not in baked:
+                raise TypeError(
+                    f"kt_offload route: no {name} table baked for {dtype}; the placement tables were built "
+                    f"for {sorted(str(d) for d in baked)} in process_weights_after_loading."
+                )
         self._pending = None
         self._pending_captured = False
         if self.wrapper is not None and hidden_states.shape[0] > 0:

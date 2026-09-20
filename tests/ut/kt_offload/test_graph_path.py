@@ -173,7 +173,7 @@ def test_capture_records_one_host_func_and_no_eager_calls(cap, monkeypatch, in_p
     rt, fake = _runtime(monkeypatch)
     hs, ids, w = _inputs(4, 1)
     cap.on = True
-    nid, nw = rt.route(hs, w, ids, in_profile_run=in_profile_run)
+    nw, nid = rt.route(hs, w, ids, in_profile_run=in_profile_run)
     rt.merge(torch.zeros(4, H, dtype=torch.bfloat16))
     cap.on = False
     # the profile flag must not gate anything that is being captured

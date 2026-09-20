@@ -232,7 +232,7 @@ def test_split_contract(name, id_dtype, w_dtype):
     cpu_routes = 0
     for p in PLANS[name].layers[::7]:
         ids, w = _random_topk(257, seed=p.layer_idx, id_dtype=id_dtype, w_dtype=w_dtype)
-        nid, nw = split_routing(ids, w, p.safe_slot_table(id_dtype), p.keep_table(w_dtype))
+        nw, nid = split_routing(ids, w, p.safe_slot_table(id_dtype), p.keep_table(w_dtype))
         assert check_split(p, ids, w, nid, nw) == []
         assert nid.shape == ids.shape and nw.shape == w.shape and int(nid.min()) >= 0
         routes += ids.numel()
@@ -328,7 +328,7 @@ def test_split_recombines_to_full_moe(name):
     npu_w = torch.zeros(p.num_slots, H, H, dtype=torch.float64)
     for lid in p.resident_ids:
         npu_w[p.slot_of(lid)] = experts_w[lid]
-    nid, nw = split_routing(ids, w, p.safe_slot_table(ids.dtype), p.keep_table(w.dtype))
+    nw, nid = split_routing(ids, w, p.safe_slot_table(ids.dtype), p.keep_table(w.dtype))
     npu_out = _moe_ref(x, nid, nw, npu_w)
     # CPU (kt semantics): full ids, skip experts in gpu_experts_mask.
     kt_w = torch.where(p.resident_mask()[ids.long()], torch.zeros_like(w), w)
@@ -344,3 +344,53 @@ def test_split_recombines_to_full_moe(name):
 
 def test_resident_bytes_per_slot_dsv41():
     assert resident_bytes_per_slot(5120, 2304) == 18_800_640
+
+
+# ---------------------------------------------------------------------------
+# the (weights, ids) contract at the call sites
+# ---------------------------------------------------------------------------
+
+
+def test_split_routing_returns_a_named_pair_weights_first():
+    p = PLANS["frequency"].layer(0)
+    ids, w = _random_topk(8)
+    out = split_routing(ids, w, p.safe_slot_table(ids.dtype), p.keep_table(w.dtype))
+    assert out._fields == ("topk_weights", "topk_ids")
+    assert out[0] is out.topk_weights and out[1] is out.topk_ids
+    assert out.topk_ids.dtype == ids.dtype and out.topk_weights.dtype == w.dtype
+    # the order is the one every Ascend MoE call site names: weights, ids
+    npu_weights, npu_ids = out
+    assert check_split(p, ids, w, npu_ids, npu_weights) == []
+
+
+@pytest.mark.parametrize(
+    "ids_dtype, w_dtype",
+    [(torch.float32, torch.float32), (torch.bfloat16, torch.float32), (torch.int32, torch.int32)],
+)
+def test_routing_dtype_contract_rejects(ids_dtype, w_dtype):
+    """A swapped (weights, ids) pair must fail here, not inside the routing kernel."""
+    p = PLANS["prefix"].layer(0)
+    ids, w = _random_topk(4)
+    with pytest.raises(TypeError) as exc:
+        split_routing(ids.to(ids_dtype), w.to(w_dtype), p.safe_slot_table(), p.keep_table())
+    assert "kt_offload split_routing" in str(exc.value)
+
+
+def test_routing_dtype_contract_accepts_the_real_dtypes():
+    p = PLANS["prefix"].layer(0)
+    for ids_dtype in (torch.int32, torch.int64):
+        for w_dtype in (torch.float32, torch.bfloat16):
+            ids, w = _random_topk(4, id_dtype=ids_dtype, w_dtype=w_dtype)
+            pl.assert_routing_dtypes(ids, w, "test")
+            split_routing(ids, w, p.safe_slot_table(ids_dtype), p.keep_table(w_dtype))
+    with pytest.raises(ValueError):
+        pl.assert_routing_dtypes(torch.zeros(4, 6, dtype=torch.int32), torch.zeros(4, 5), "test")
+
+
+def test_dtype_contract_mutation_is_red():
+    """Mutant: coerce instead of raising -- the swapped call then runs and routes by weight value."""
+    p = PLANS["prefix"].layer(0)
+    ids, w = _random_topk(4)
+    coerced_ids = w.to(torch.int32)  # what a silent .to() would produce from the weights
+    out = split_routing(coerced_ids, ids.to(torch.float32), p.safe_slot_table(), p.keep_table())
+    assert check_split(p, ids, w, out.topk_ids, out.topk_weights) != []
