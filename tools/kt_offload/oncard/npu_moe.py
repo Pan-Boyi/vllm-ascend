@@ -195,12 +195,12 @@ def npu_moe(layer, comm, x, topk_weights, topk_ids):
 
 
 def kt_cfg(strategy: str, n: int, explicit_path: str | None, threads: int, numa: list[int], graph: bool,
-           overlap: bool = False):
+           overlap: bool = False, packed: bool = False):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
     return KTOffloadConfig(
         enabled=True, weight_path=C.CKPT, method="MXFP4", resident_strategy=strategy,
-        overlap_side_stream=overlap,
+        overlap_side_stream=overlap, packed_transfer=packed,
         num_resident_experts=n if strategy != "explicit" else 0,
         resident_experts_path=explicit_path, cpuinfer_threads=threads,
         threadpool_count=len(numa), numa_nodes=numa, chunked_prefill_size=64,

@@ -94,6 +94,30 @@ CARD_LEASE_DIR="$LD" ONCARD_DRY=1 ONCARD_RUNS_DIR="$W/runs_dry" bash "$D/run_onc
 { [ $r -eq 0 ] && command grep -q "Stopping before acquire" "$W/dry.out"; } || { [ $r -eq 3 ] && command grep -q "preflight" "$W/dry.out"; }
 ok $? "ONCARD_DRY=1 stops before acquire (rc $r: $(tail -n 1 "$W/dry.out"))"
 [ -z "$(ls -A "$LD")" ]; ok $? "lease dir still untouched"
+echo "== 7. t4 (overlap ceiling): refuses what it cannot read, and is honest about what it does not check"
+ONCARD_DRY=1 python3 "$D/t4_overlap_ceiling.py" > "$W/t4dry.out" 2>&1; r=$?
+[ $r -eq 0 ]; ok $? "t4 dry run exits 0 without touching a device (rc $r)"
+command grep -q "no device was touched" "$W/t4dry.out"; ok $? "t4 dry run says it touched nothing"
+command grep -q "This test cannot show form C is correct" "$W/t4dry.out"; ok $? "t4 prints the not-a-correctness-test line"
+command grep -q "sglang-shape" "$W/t4dry.out"; ok $? "t4 plan names the sglang arm"
+python3 "$D/t4_overlap_ceiling.py" --reps 5 > "$W/t4few.out" 2>&1; r=$?
+[ $r -eq 2 ]; ok $? "t4 refuses fewer than 20 reps (rc $r)"
+python3 - "$D" <<'PY' > "$W/t4model.out" 2>&1; r=$?
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("t4_model", sys.argv[1] + "/t4_model.py")
+M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
+assert not M.instrument_control(3.0, 500.0)[0], "instrument control stayed green with an invisible fat node"
+assert not M.negative_control([5.0]*24, [100.0]*24, 0.35)[0], "negative control stayed green on a hollow graph"
+assert M.verdict(M.ceiling(400.0, 100.0, 500.0, 40))["worth_it"] is False, "a 500us node did not kill form C"
+assert M.cross_check(5.0, 62.5)["state"] == "inconsistent", "two sources 12x apart read as agreement"
+try:
+    M.stats([1.0]*19); raise SystemExit("stats accepted 19 samples")
+except ValueError:
+    pass
+print("t4_model positive controls all red where they must be")
+PY
+[ $r -eq 0 ]; ok $? "t4 decision model: every control goes red when it must ($(tail -n 1 "$W/t4model.out"))"
+
 bash "$D/run_oncard.sh" x t0 > /dev/null 2>&1; r=$?; [ $r -eq 2 ]; ok $? "bad card -> usage rc $r"
 bash "$D/run_oncard.sh" 0 t9 > /dev/null 2>&1; r=$?; [ $r -eq 2 ]; ok $? "unknown test -> usage rc $r"
 
