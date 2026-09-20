@@ -60,17 +60,65 @@ class Sim:
 
     def reset_programs(self):
         self.programs = {}
+        for attr in ("_idx", "_clock"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def run(self, programs) -> float:
-        """Execute per-stream op lists in time order, honouring event waits.
+        """Execute per-stream op lists from the start, honouring event waits.
 
-        Time order across streams is what makes a missing or early join a data
-        hazard here, exactly as on the device: the H2D reads the pinned buffer
-        at the moment it executes, not at the moment it was enqueued.
+        Used for a graph replay: fresh indices and a fresh event table.
         """
-        idx = {name: 0 for name in programs}
-        clock = dict.fromkeys(programs, 0.0)
-        recorded: dict[int, float] = {}
+        return self._run(programs, {}, {}, {})
+
+    def drain(self) -> float:
+        """Host-side device sync: everything enqueued and not yet executed runs.
+
+        Indices, clocks and recorded events persist, so a second drain does not
+        re-run what the first one already executed (the host runs ahead between
+        drains -- which is exactly the window this file is about).
+        """
+        if not hasattr(self, "_idx"):
+            self._idx, self._recorded, self._clock = {}, {}, {}
+        return self._run(self.programs, self._idx, self._recorded, self._clock)
+
+    def drain_stream(self, name: str) -> None:
+        """Host wait on one stream: run its ops, and only what they wait on."""
+        if not hasattr(self, "_idx"):
+            self._idx, self._recorded, self._clock = {}, {}, {}
+        if name not in self.programs:
+            return
+        while True:
+            self._run({name: self.programs[name]}, self._idx, self._recorded, self._clock, partial=True)
+            if self._idx.get(name, 0) >= len(self.programs[name]):
+                return
+            # blocked on an event another stream has not recorded yet: let that
+            # stream run until it has (the device would do the same).
+            blocking = self.programs[name][self._idx[name]]
+            progressed = False
+            for other, ops in self.programs.items():
+                if other == name:
+                    continue
+                while self._idx.get(other, 0) < len(ops):
+                    self._run({other: ops}, self._idx, self._recorded, self._clock, partial=True, one=True)
+                    progressed = True
+                    if id(blocking.event) in self._recorded:
+                        break
+                if id(blocking.event) in self._recorded:
+                    break
+            if not progressed:
+                raise AssertionError("deadlock in drain_stream")
+
+    def _run(self, programs, idx, recorded, clock, partial=False, one=False) -> float:
+        """Time-ordered execution; an op's effect lands when it completes.
+
+        Completion order across streams is what makes a missing or early join a
+        data hazard here, exactly as on the device: the H2D reads the pinned
+        buffer at the moment it executes, not when it was enqueued.
+        """
+        for name in programs:
+            idx.setdefault(name, 0)
+            clock.setdefault(name, 0.0)
         while True:
             runnable = []
             for name, ops in programs.items():
@@ -83,22 +131,18 @@ class Sim:
                 runnable.append((start + op.cost, name, op))
             if not runnable:
                 break
-            end, name, op = min(runnable, key=lambda r: (r[0], r[1]))
+            end, name, op = min(runnable, key=lambda r: (r[0], r[1]))  # noqa: PLW2901
             clock[name] = end
             if op.kind == "record":
                 recorded[id(op.event)] = end
             elif op.kind != "wait":
-                # The effect lands when the op *completes*: that is what makes a
-                # missing or early join read the previous contents.
                 op.fn()
             idx[name] += 1
-        if any(idx[n] < len(ops) for n, ops in programs.items()):
+            if one:
+                break
+        if not partial and any(idx[n] < len(ops) for n, ops in programs.items()):
             raise AssertionError("deadlock: an event was never recorded")
         return max(clock.values(), default=0.0)
-
-    def drain(self) -> None:
-        """Host-side wait: everything enqueued so far runs now (eager path)."""
-        self.run({name: list(ops) for name, ops in self.programs.items()})
 
 
 class FEvent:
@@ -117,8 +161,14 @@ class FStream:
         self.sim.enqueue(self, Op("wait", None, 0.0, ev))
 
     def synchronize(self):
+        """Host waits for THIS stream only (torch.npu.Stream.synchronize).
+
+        Other streams keep their queued work: that is the whole difference
+        from kt's torch.npu.synchronize(device), and the window in which the
+        host can run ahead of a pending H2D.
+        """
         self.sim.host_syncs = getattr(self.sim, "host_syncs", 0) + 1
-        self.sim.drain()
+        self.sim.drain_stream(self.name)
 
 
 class FakeKT:
@@ -127,6 +177,7 @@ class FakeKT:
     _layer_has_pending_deferred: dict = {}
 
     def __init__(self, sim, device_in: Box, pinned_in: Box, pinned_out: Box, out_gpu: Box):
+        self.ids_seen: list = []
         self.sim, self.device_in = sim, device_in
         self.pinned_in, self.pinned_out, self.out_gpu = pinned_in, pinned_out, out_gpu
         self.cpu_infer = SimpleNamespace(sync=lambda allow: setattr(self, "host_synced", True))
@@ -146,6 +197,7 @@ class FakeKT:
     # overlap / captured path
     def copy_inputs_to_cpu_buffers(self, hs, ids, w):
         self.calls.append("copy_inputs")
+        self.ids_seen.append(ids)
         self.sim.enqueue(
             self.sim.current, Op("d2h", lambda: setattr(self.pinned_in, "value", self.device_in.value), 5.0)
         )
@@ -234,6 +286,7 @@ def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes):
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(torch.ones(plan.num_slots, 3), requires_grad=False)
     rt.after_weights_loaded(layer)
+    rt._ids_i64 = {bs: torch.zeros(bs, TOPK, dtype=torch.int64) for bs in (1, 2, 4, 8)}
     return rt, fake
 
 
@@ -255,20 +308,37 @@ def _inputs(seed):
 # ---------------------------------------------------------------------------
 
 
-def test_eager_overlap_avoids_the_device_wide_sync(monkeypatch, sim):
+def test_eager_is_never_forked_even_with_overlap_on(monkeypatch, sim):
+    """Eager keeps kt's own submit/sync, whatever overlap_side_stream says.
+
+    A fork there buys nothing -- the side stream's first op waits on an event
+    recorded on the compute stream after the previous layer's H2D, so waiting
+    for the side stream waits for the compute stream anyway -- and it takes kt's
+    pinned slots out from under the device sync kt's submit_forward does.
+    """
     boxes = _boxes()
     rt, fake = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes)
     hs, ids, w = _inputs(0)
     rt.route(hs, w, ids, in_profile_run=False)
+    assert rt._pending_join is None
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
-    # kt's own submit_forward (which calls torch.npu.synchronize) is never used
-    assert fake.calls == ["copy_inputs", "forward_on_pinned", "copy_output"]
-    assert getattr(sim, "host_syncs", 0) == 1  # the side stream only
-    assert fake.host_synced is True  # WorkerPool drained before the H2D
-    # the D2H was enqueued on the side stream, behind an event from compute
-    side_ops = sim.programs["side"]
-    assert [o.kind for o in side_ops] == ["wait", "d2h"]
-    assert [o.kind for o in sim.programs["compute"]] == ["record", "h2d"]
+    assert fake.calls == ["submit_forward", "sync_forward"]
+    assert "side" not in sim.programs and kl._SIDE_EVENTS == []
+
+
+def test_a_stale_join_is_cleared_by_an_eager_route(monkeypatch, sim):
+    """Capture, then an eager forward: the previous capture's join must not
+    survive into that forward's merge (sglang 18c8b21e3 clears it in
+    pre-dispatch for every path, not only the forked one)."""
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(9)
+    rt.route(hs, w, ids, in_profile_run=False)
+    assert rt._pending_join is not None
+    sim.capturing = False
+    rt.route(hs, w, ids, in_profile_run=False)  # eager, no merge in between
+    assert rt._pending_join is None
 
 
 def test_captured_overlap_records_fork_side_work_and_join(monkeypatch, sim):
@@ -285,6 +355,11 @@ def test_captured_overlap_records_fork_side_work_and_join(monkeypatch, sim):
     # the event objects the graph's nodes point at are kept for the process
     assert len(kl._SIDE_EVENTS) == 1 and len(kl._SIDE_EVENTS[0]) == 2
     assert len(kl._CAPTURED_PAYLOADS) == 1
+    # kt got int64 ids from a buffer that predates the capture, so its
+    # .to(torch.long) is the identity: nothing allocates inside the side-stream
+    # context, where an allocation would not belong to the capture stream.
+    assert fake.ids_seen and all(t.dtype == torch.int64 for t in fake.ids_seen)
+    assert all(t is rt._ids_i64[t.shape[0]] for t in fake.ids_seen)
 
 
 def test_capture_that_does_not_reach_the_side_stream_is_refused(monkeypatch, sim):
@@ -449,3 +524,178 @@ def test_stale_output_fingerprint_of_the_unpropagated_capture(monkeypatch, sim):
     """The F1 shape specifically: one CPU output reused for every replay."""
     _, out_o, _, _ = _arms(monkeypatch, sim, _capture_not_propagated)
     assert len(set(out_o)) == 1, f"expected one frozen value, got {out_o}"
+
+
+# ---------------------------------------------------------------------------
+# 3. several layers sharing kt's pinned slots, with the host running ahead
+#
+# What the tests above could not see, and the 2026-09-20 A/B did (38/50 GSM8K
+# answers differed with overlap on): kt keeps ONE pair of pinned buffers per
+# batch size and hands layer L the slot ``L % 2``. The pinned output of layer L
+# is read by an ASYNC H2D on the compute stream, and the CPU task of layer L+2
+# writes that same buffer -- from the host, the moment it is submitted. Nothing
+# orders those two unless something waits for the device.
+#
+# In the serial path kt's own submit_forward calls torch.npu.synchronize()
+# before submitting, which is what supplied that ordering (its comment only
+# claims to protect the input D2H; it protects the output slot too). The first
+# side-stream implementation replaced it with side.synchronize(), which waits
+# for the side stream only -- so the host ran ahead of the pending H2D.
+#
+# Everything above this line is single-layer or single-stream-order, i.e. zero
+# coverage for slot reuse: with fewer than three layers no two layers share a
+# slot, and with the device drained at every step the host can never run ahead.
+# ---------------------------------------------------------------------------
+
+DEPTH = 2  # kt's KExpertsCPUBuffer.buffer_depth
+
+
+class KtBuffers:
+    """kt's class-level pinned buffers: one set per batch size, ``L % 2`` slots."""
+
+    def __init__(self):
+        self.by_bs: dict[int, dict] = {}
+
+    def get(self, bs: int) -> dict:
+        return self.by_bs.setdefault(
+            bs, {"in": [None] * DEPTH, "out": [None] * DEPTH, "gpu": [torch.zeros(1) for _ in range(DEPTH)]}
+        )
+
+
+class SlotKT:
+    """kt wrapper with the real buffer ownership: slot = layer_idx % 2, shared by bs."""
+
+    _layer_has_pending_deferred: dict = {}
+
+    def __init__(self, sim, buffers: KtBuffers, layer_idx: int, device_in: Box):
+        self.sim, self.buffers, self.layer_idx, self.device_in = sim, buffers, layer_idx, device_in
+        self.cpu_infer = SimpleNamespace(sync=lambda allow: None)
+
+    def _slot(self, bs):
+        return self.buffers.get(bs), self.layer_idx % DEPTH
+
+    # -- serial path (what M2 ships): kt syncs the whole device first
+    def submit_forward(self, hs, ids, w, stream):
+        self.sim.drain()  # kt's _wait_device -> torch.npu.synchronize(device)
+        buf, s = self._slot(hs.shape[0])
+        buf["in"][s] = self.device_in.value
+        buf["out"][s] = 3 * buf["in"][s]
+
+    def sync_forward(self, hs, stream):
+        self.sim.drain()
+        return self.copy_forward_output_to_device(hs)
+
+    # -- captured / overlap path
+    def copy_inputs_to_cpu_buffers(self, hs, ids, w):
+        buf, s = self._slot(hs.shape[0])
+
+        def d2h():
+            buf["in"][s] = self.device_in.value
+
+        self.sim.enqueue(self.sim.current, Op("d2h", d2h, 5.0))
+
+    def forward_on_pinned_buffers(self, hs, stream):
+        # host-side submit: the CPU experts write the pinned output NOW
+        buf, s = self._slot(hs.shape[0])
+        buf["out"][s] = 3 * buf["in"][s]
+
+    def run_pinned_forward_sync(self, shape_ref, stream):
+        buf, s = self._slot(shape_ref.shape[0])
+        buf["out"][s] = 3 * buf["in"][s]
+
+    def copy_forward_output_to_device(self, hs):
+        buf, s = self._slot(hs.shape[0])
+        gpu = buf["gpu"][s]
+
+        def h2d():
+            gpu.fill_(float("nan") if buf["out"][s] is None else buf["out"][s])
+
+        self.sim.enqueue(self.sim.current, Op("h2d", h2d, 5.0))
+        return gpu
+
+
+def _layer_runtime(monkeypatch, sim, buffers, layer_idx, device_in, *, overlap, graph):
+    plan = build_plan([[0, 3]] * 8, NEXP)
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=overlap)
+    vcfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(hidden_size=H, moe_intermediate_size=4, num_experts_per_tok=TOPK),
+            model="/m",
+            enforce_eager=not graph,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="FULL_DECODE_ONLY" if graph else "NONE"),
+            cudagraph_capture_sizes=[1] if graph else [],
+        ),
+    )
+    rt = kl.KTLayerOffload(cfg, plan.layer(layer_idx), layer_idx, vcfg)
+    wrapper = SlotKT(sim, buffers, layer_idx, device_in)
+    monkeypatch.setattr(rt, "_build_wrapper", lambda: wrapper)
+    monkeypatch.setattr(rt, "_prepare_capture_buffers", lambda device: None)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(torch.ones(plan.num_slots, 3), requires_grad=False)
+    rt.after_weights_loaded(layer)
+    rt._ids_i64 = {bs: torch.zeros(bs, TOPK, dtype=torch.int64) for bs in (1, 2, 4, 8)}
+    return rt
+
+
+def _run_model(monkeypatch, sim, *, overlap, graph, layers=4, steps=3, batch_sizes=(1, 1, 1)):
+    """Drive several layers per step the way forward_impl does; return each layer's CPU output."""
+    buffers = KtBuffers()
+    # one device-side hidden-states buffer per layer (each layer has its own
+    # tensor; a single shared Box would be read at execution time and hide the
+    # very reordering these tests look for)
+    ins = [Box(0.0) for _ in range(layers)]
+    rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=overlap, graph=graph) for i in range(layers)]
+    seen: list[float] = []
+    for step in range(steps):
+        bs = batch_sizes[step % len(batch_sizes)]
+        for i, rt in enumerate(rts):
+            ins[i].value = 100.0 * (step + 1) + i  # this layer's hidden states, this step
+            hs = torch.zeros(bs, H, dtype=torch.bfloat16)
+            ids = torch.zeros(bs, TOPK, dtype=torch.int32)
+            w = torch.ones(bs, TOPK)
+            if graph:
+                sim.capturing = True
+            rt.route(hs, w, ids, in_profile_run=False)
+            sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
+            rt.merge(torch.zeros(bs, H, dtype=torch.bfloat16))
+            sim.capturing = False
+            expect = 3 * (100.0 * (step + 1) + i)
+            # the merge's add is a compute-stream op after the H2D: it sees the
+            # device-side CPU output as of that moment.
+            gpu = buffers.get(bs)["gpu"][i % DEPTH]
+            sim.enqueue(sim.compute, Op("consume", lambda g=gpu, e=expect: seen.append((float(g[0]), e)), 1.0))
+        sim.drain()
+        sim.reset_programs()
+    return seen
+
+
+def test_multi_layer_serial_is_correct(monkeypatch, sim):
+    """Positive control: overlap off, the same four layers and shared slots."""
+    seen = _run_model(monkeypatch, sim, overlap=False, graph=False)
+    assert seen and all(got == want for got, want in seen), seen[:6]
+
+
+def test_multi_layer_overlap_keeps_every_layers_cpu_output(monkeypatch, sim):
+    """The regression: with the host running ahead, layer L+2 must not overwrite
+    layer L's pinned output before its H2D has read it."""
+    seen = _run_model(monkeypatch, sim, overlap=True, graph=False)
+    wrong = [(got, want) for got, want in seen if got != want]
+    assert not wrong, f"{len(wrong)}/{len(seen)} layers read another layer's CPU output: {wrong[:4]}"
+
+
+def test_multi_layer_overlap_captured_path_is_safe(monkeypatch, sim):
+    """The captured path orders the same reuse through the graph's nodes."""
+    seen = _run_model(monkeypatch, sim, overlap=True, graph=True)
+    wrong = [(got, want) for got, want in seen if got != want]
+    assert not wrong, f"captured overlap corrupted {len(wrong)}/{len(seen)}: {wrong[:4]}"
+
+
+def test_multi_layer_overlap_under_changing_batch_size(monkeypatch, sim):
+    """Batch size alternates (concurrent requests): a new bs means new kt buffers,
+    and the old ones must not be written while an H2D still reads them."""
+    seen = _run_model(monkeypatch, sim, overlap=True, graph=False, batch_sizes=(1, 2, 1))
+    wrong = [(got, want) for got, want in seen if got != want]
+    assert not wrong, f"{len(wrong)}/{len(seen)} wrong with a changing batch size: {wrong[:4]}"

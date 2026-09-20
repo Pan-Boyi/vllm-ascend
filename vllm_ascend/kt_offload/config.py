@@ -81,7 +81,8 @@ class KTOffloadConfig:
     # M3: hand the CPU-expert submit to a side stream so the resident NPU
     # experts overlap it (sglang's KT_SIDE_STREAM). Off by default: with it on,
     # the two arms must produce bit-identical output (a capture that does not
-    # propagate to the side stream is faster and wrong).
+    # propagate to the side stream is faster and wrong). Applies to captured
+    # (graph) forwards only; eager forwards keep kt's own submit either way.
     overlap_side_stream: bool = False
 
     @model_validator(mode="after")
@@ -96,11 +97,6 @@ class KTOffloadConfig:
             raise ValueError(
                 f"kt_offload_config.numa_nodes lists {len(self.numa_nodes)} node(s) "
                 f"but threadpool_count is {self.threadpool_count}."
-            )
-        if self.overlap_side_stream and self.force_sync_submit is False:
-            raise ValueError(
-                "kt_offload_config.overlap_side_stream needs force_sync_submit (the overlap path drives "
-                "kt's submit itself; kt's own stream-callback submit would enqueue a second time)."
             )
         if self.chunked_prefill_size < 0:
             raise ValueError("kt_offload_config.chunked_prefill_size must be >= 0.")

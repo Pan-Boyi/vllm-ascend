@@ -158,6 +158,7 @@ class KTLayerOffload:
 
     def __init__(self, cfg, placement: LayerPlacement, layer_idx: int, vllm_config):
         self.cfg = cfg
+        self._ids_i64: dict[int, torch.Tensor] = {}
         self.placement = placement
         self.layer_idx = layer_idx
         hf = vllm_config.model_config.hf_text_config
@@ -244,18 +245,19 @@ class KTLayerOffload:
             if not self._overlap_supported():
                 raise RuntimeError(
                     "kt_offload: overlap_side_stream needs kt's copy_inputs_to_cpu_buffers / "
-                    "forward_on_pinned_buffers / copy_forward_output_to_device and cpu_infer.sync; "
+                    "run_pinned_forward_sync / copy_forward_output_to_device; "
                     f"this kt build ({type(self.wrapper).__name__}) does not have them."
                 )
         if self.graph_enabled:
             self._prepare_capture_buffers(device)
 
     def _overlap_supported(self) -> bool:
+        """The captured overlap path needs only the graph-mode kt entry points."""
         w = self.wrapper
         return all(
             hasattr(w, name)
-            for name in ("copy_inputs_to_cpu_buffers", "forward_on_pinned_buffers", "copy_forward_output_to_device")
-        ) and hasattr(getattr(w, "cpu_infer", None), "sync")
+            for name in ("copy_inputs_to_cpu_buffers", "run_pinned_forward_sync", "copy_forward_output_to_device")
+        )
 
     def _prepare_capture_buffers(self, device: torch.device) -> None:
         """Register every capture size with kt and allocate its buffers now.
@@ -279,6 +281,15 @@ class KTLayerOffload:
         type(self.wrapper).set_capture_batch_sizes(list(self.capture_sizes))
         for bs in self.capture_sizes:
             kt_buffer.get_buffer(torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device=device), self.top_k)
+        # kt casts the ids to int64 before its D2H. Under capture that cast
+        # would allocate on whichever stream we are enqueueing to; on the side
+        # stream the allocation is not the capture stream's, so whether it comes
+        # from the graph's private pool is not ours to assume. Hand kt ids that
+        # are already int64, from a buffer allocated here, before any capture:
+        # kt's .to(torch.long) is then the identity and allocates nothing.
+        self._ids_i64 = {
+            bs: torch.empty((bs, self.top_k), dtype=torch.int64, device=device) for bs in self.capture_sizes
+        }
         missing = [bs for bs in self.capture_sizes if bs not in kt_buffer.capture_buffers]
         if missing:
             raise RuntimeError(f"kt_offload: kt did not keep capture buffers for sizes {missing}")
@@ -353,6 +364,10 @@ class KTLayerOffload:
                 )
         self._pending = None
         self._pending_captured = False
+        # Clear any join left by a previous capture on every route, not only in
+        # the captured branch: a forward that captured and then runs eager would
+        # otherwise carry that stale cross-stream dependency (sglang 18c8b21e3).
+        self._pending_join = None
         if self.wrapper is not None and hidden_states.shape[0] > 0:
             if hidden_states.dtype != torch.bfloat16:
                 raise TypeError(f"kt_offload: kt takes bf16 activations, got {hidden_states.dtype}")
@@ -366,11 +381,11 @@ class KTLayerOffload:
                     self._submit_captured(hs, topk_ids, topk_weights)
                 self._pending, self._pending_captured = hs, True
             elif not (in_profile_run and self.cfg.skip_cpu_in_profile_run):
+                # Eager is never forked, whatever overlap_side_stream says (the
+                # reference implementation does the same, and see the note on
+                # _submit_eager_forked for why a fork buys nothing here).
                 hs = hidden_states.contiguous()
-                if self.overlap:
-                    self._submit_eager_forked(hs, topk_ids, topk_weights)
-                else:
-                    self.wrapper.submit_forward(hs, topk_ids, topk_weights, _stream_handle(hs.device))
+                self.wrapper.submit_forward(hs, topk_ids, topk_weights, _stream_handle(hs.device))
                 self._pending = hs
         return split_routing(
             topk_ids,
@@ -393,11 +408,6 @@ class KTLayerOffload:
             self._join_side_stream(hs.device)
             # H2D from the pinned output the host-func node filled; stream
             # order puts it after that node at every replay.
-            cpu_out = self.wrapper.copy_forward_output_to_device(hs)
-        elif self.overlap:
-            # Eager overlap: the CPU task was submitted on this host thread,
-            # so only the WorkerPool has to be drained -- no device sync.
-            self.wrapper.cpu_infer.sync(self._allow_pending())
             cpu_out = self.wrapper.copy_forward_output_to_device(hs)
         else:
             cpu_out = self.wrapper.sync_forward(hs, _stream_handle(hs.device))
@@ -426,27 +436,16 @@ class KTLayerOffload:
 
     # -- side-stream overlap (cfg.overlap_side_stream) ----------------------
 
-    def _allow_pending(self) -> int:
-        """kt's own flag for a deferred task still in flight (0 with max_deferred=0)."""
-        pending = getattr(type(self.wrapper), "_layer_has_pending_deferred", {})
-        return 1 if pending.get(self.layer_idx, False) else 0
-
-    def _submit_eager_forked(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
-        """Eager overlap: D2H on the side stream, then submit; no device-wide sync.
-
-        kt's own ``submit_forward`` calls ``torch.npu.synchronize()`` to be sure
-        the input D2H landed, which also waits for the resident experts and
-        removes every overlap. Here only the side stream is waited on.
-        """
-        device = hs.device
-        compute, side = torch.npu.current_stream(device), _side_stream(device)
-        fork = _new_event(device)
-        fork.record(compute)
-        side.wait_event(fork)  # the D2H must not read hidden_states before it exists
-        with _stream_ctx(side, device):
-            self.wrapper.copy_inputs_to_cpu_buffers(hs, topk_ids, topk_weights)
-        side.synchronize()  # host-side: the pinned input is complete
-        self.wrapper.forward_on_pinned_buffers(hs, _handle_of(side))
+    # Why there is no eager fork (2026-09-20). A first version forked the eager
+    # path too, replacing kt's device-wide torch.npu.synchronize() with
+    # side.synchronize(). It buys nothing: the side stream's first op is a wait
+    # on an event recorded on the compute stream *after* the previous layer's
+    # H2D, so waiting for the side stream transitively waits for the compute
+    # stream to reach that point anyway (tests/ut/kt_offload/
+    # test_side_stream_overlap.py models it). It also puts kt's pinned-slot
+    # reuse (slot = layer_idx % 2) and its temp-buffer reallocation on a bs
+    # change outside the protection of that device sync. The reference
+    # implementation forks only in the captured path; so do we.
 
     def _submit_captured_forked(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
         """Capture the D2H + host-func on the side stream, to be joined in merge()."""
@@ -470,6 +469,7 @@ class KTLayerOffload:
         shape_ref = torch.empty(tuple(hs.shape), dtype=hs.dtype, device="meta")
         payload = (self.wrapper, shape_ref, _handle_of(side), self.layer_idx)
         _CAPTURED_PAYLOADS.append(payload)
+        ids_for_kt = self._ids_for_kt(topk_ids)
         with _stream_ctx(side, device):
             # The capture follows the event wait onto the side stream. If it did
             # not, everything below would run once, at capture time, and every
@@ -482,9 +482,26 @@ class KTLayerOffload:
                     "output). Run with overlap_side_stream=false, or with a torch_npu whose capture follows "
                     "an event wait onto another stream."
                 )
-            self.wrapper.copy_inputs_to_cpu_buffers(hs, topk_ids, topk_weights)
+            self.wrapper.copy_inputs_to_cpu_buffers(hs, ids_for_kt, topk_weights)
             _launch_host_func(side, _kt_host_forward, payload)
         self._pending_join = (join, side, compute)
+
+    def _ids_for_kt(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """int64 ids in a buffer that predates the capture (see _prepare_capture_buffers).
+
+        The copy is enqueued on the caller's stream (the compute stream), not
+        inside the side-stream context, so nothing allocates or writes there.
+        """
+        if topk_ids.dtype == torch.int64:
+            return topk_ids
+        buf = self._ids_i64.get(topk_ids.shape[0])
+        if buf is None:
+            raise RuntimeError(
+                f"kt_offload: no preallocated int64 id buffer for {topk_ids.shape[0]} tokens "
+                f"(prepared: {sorted(self._ids_i64)}); a cast inside the capture would allocate."
+            )
+        buf.copy_(topk_ids)
+        return buf
 
     def _join_side_stream(self, device) -> None:
         """Make the compute stream wait for this layer's side-stream work."""
