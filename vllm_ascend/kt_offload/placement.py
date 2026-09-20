@@ -94,18 +94,23 @@ class LayerPlacement:
         return [i for i, s in enumerate(self._l2s) if s == CPU_SLOT]
 
     # -- tables ---------------------------------------------------------------
+    # Every factory call below names ``device="cpu"``. These tables are built
+    # while the model loads, and the loader's default device is the NPU: a
+    # factory call that omits the device lands on the accelerator, where kt's
+    # gpu_experts_mask must not be and where a CPU unit test would never
+    # notice (its default device is the CPU).
     def resident_mask(self) -> torch.Tensor:
         """``[num_experts]`` bool, True = on the NPU. This is kt's gpu_experts_mask."""
-        m = torch.zeros(self.num_experts, dtype=torch.bool)
+        m = torch.zeros(self.num_experts, dtype=torch.bool, device="cpu")
         m[list(self.resident_ids)] = True
         return m
 
     def logical_to_slot(self) -> torch.Tensor:
-        return torch.tensor(self._l2s, dtype=torch.int64)
+        return torch.tensor(self._l2s, dtype=torch.int64, device="cpu")
 
     def slot_to_logical(self) -> torch.Tensor:
-        out = torch.full((self.num_slots,), CPU_SLOT, dtype=torch.int64)
-        out[: self.num_resident] = torch.tensor(self.resident_ids, dtype=torch.int64)
+        out = torch.full((self.num_slots,), CPU_SLOT, dtype=torch.int64, device="cpu")
+        out[: self.num_resident] = torch.tensor(self.resident_ids, dtype=torch.int64, device="cpu")
         return out
 
     def safe_slot_table(self, dtype: torch.dtype = torch.int32) -> torch.Tensor:
@@ -316,7 +321,7 @@ def load_frequency_table(path: str) -> torch.Tensor:
             data = json.load(f)
         if isinstance(data, Mapping):
             data = data.get("counts", data.get("freq"))
-        data = torch.tensor(data)
+        data = torch.tensor(data, device="cpu")
     else:
         raise ValueError(f"unsupported frequency table format: {path}")
     if not isinstance(data, torch.Tensor):

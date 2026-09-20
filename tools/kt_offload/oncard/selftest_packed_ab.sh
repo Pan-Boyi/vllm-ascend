@@ -5,7 +5,7 @@
 # a judge that cannot fail is not a judge.
 set -u
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-TMP="$(mktemp -d /tmp/packed_ab_selftest.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/packed_ab_selftest.XXXXXX")"
 PASS=0; FAIL=0
 ok()  { echo "  [PASS] $1"; PASS=$((PASS+1)); }
 bad() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
@@ -33,7 +33,11 @@ pa_lease_still_held "$held" 3 dsv41_vllm_singlecard && ok "a held lease is detec
 pa_lease_still_held "$free" 3 dsv41_vllm_singlecard && bad "a free lease read as held" || ok "a free lease reads as free"
 pa_lease_still_held "$held" 3 someone_else && bad "another owner read as ours" || ok "another owner is not ours"
 pa_group_alive "" && bad "empty pgid read as alive" || ok "empty pgid is not alive"
-pa_group_alive "$$" && ok "our own group reads as alive" || bad "our own group read as dead"
+# our own *process group*, not $$: this script is not always its group
+# leader (it is not when a tool launches it inside another group), and
+# kill -0 on a pid that is no group id reads as dead
+self_pgid=$(ps -o pgid= -p $$ | tr -d " ")
+pa_group_alive "$self_pgid" && ok "our own group reads as alive" || bad "our own group read as dead"
 why=$(pa_card_returned "$held" 3 dsv41_vllm_singlecard 65000 ""); rc=$?
 chk "$rc" 1 "card NOT returned when the lease is still held"
 echo "$why" | command grep -q "lease still held" && ok "it names why" || bad "it does not name why"

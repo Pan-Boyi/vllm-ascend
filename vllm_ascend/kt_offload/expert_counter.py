@@ -204,7 +204,7 @@ def dump() -> str | None:
     rank = s["rank"] if s["rank"] is not None else "x"
     out = {
         "counts": {b: t.detach().cpu() for b, t in s["counts"].items()},
-        "tokens": {b: torch.tensor(v, dtype=torch.int64) for b, v in s["tokens"].items()},
+        "tokens": {b: torch.tensor(v, dtype=torch.int64, device="cpu") for b, v in s["tokens"].items()},
         "skipped": dict(s["skipped"]),
         "steps": s["steps"],
         "topk": TOPK,

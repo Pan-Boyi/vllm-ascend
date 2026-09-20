@@ -450,7 +450,10 @@ class KTLayerOffload:
             swiglu_limit=self.swiglu_limit,
         )
         # kt indexes experts by logical id; with EPLB off physical == logical.
-        wrapper.load_weights(torch.arange(self.placement.num_experts, dtype=torch.int64))
+        # device="cpu" is explicit: this runs while the model loads, where the
+        # default device is the NPU, and kt's argument is a *host* map
+        # (physical_to_logical_map_cpu).
+        wrapper.load_weights(torch.arange(self.placement.num_experts, dtype=torch.int64, device="cpu"))
         return wrapper
 
     # -- forward ------------------------------------------------------------
