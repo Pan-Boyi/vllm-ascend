@@ -222,6 +222,64 @@ def is_deepseek_v41_text(hf_text_config) -> bool:
         "deepseek_v41")
 
 
+def is_deepseek_v41_model(vllm_config) -> bool:
+    """Is the model this impl was built for a V4.1 one?
+
+    ``is_deepseek_v41_text`` above asks a single config object for its
+    ``model_type``. That is the right question where it is used -- a
+    descriptor built from the target's text config -- and the wrong one here,
+    because the one way a V4.1 checkpoint reaches this class is the
+    speculative-decoding path, and upstream's dspark branch *overwrites* the
+    draft instance's ``model_type`` with ``"deepseek_v4"``
+    (``vllm/config/speculative.py``, the ``method == "dspark"`` branch). The
+    field that would be read is exactly the field that was rewritten.
+
+    So three signals are tried, none of which that rewrite touches:
+
+      * ``kv_source_layer_ids``: the structural one, and the same field
+        ``attends_compressed_stream`` below already uses to recognise the
+        V4.1 topology "whatever it calls itself". V4.1 names its four
+        kv-source layers; V4.0 has no such key.
+      * the ``model_type`` of the config and of the text config, for a config
+        that has not been through the rewrite (``"deepseek_v41"`` /
+        ``"deepseek_v41_text"``).
+      * ``type(hf_config).model_type``: the *class* attribute
+        (``DeepseekV41Config.model_type == "deepseek_v41"``), which an
+        assignment to the instance leaves alone.
+
+    A V4.0 config answers no to all three, so every V4.0 caller keeps the
+    behaviour it has today.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "kv_source_layer_ids", None) is not None:
+        return True
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    return (is_deepseek_v41_text(hf_config)
+            or is_deepseek_v41_text(hf_text_config)
+            or is_deepseek_v41_text(type(hf_config))
+            or is_deepseek_v41_text(type(hf_text_config)))
+
+
+def applies_dsa_q_rms(vllm_config) -> bool:
+    """Does this checkpoint want the second, weightless per-head q RMSNorm?
+
+    V4.0 does: after ``wq_b`` its q goes through a weightless RMSNorm before
+    RoPE, which is what ``DeviceOperator.apply_dsa_q_rms`` performs.
+
+    V4.1 does not. Its reference implementation goes ``wq_b`` straight to
+    ``apply_rotary_emb`` (inference/model.py, ``Attention.forward``);
+    upstream's fused prolog is called with ``apply_q_norm=False`` at every
+    V4.1 dtype branch; the official v27 Ascend V4.1 DSpark attention sets
+    ``impl.apply_q_norm = False`` with the comment "V4.1 applies Q LoRA
+    RMSNorm only"; and this tree's own V4.1 attention path skips it
+    (``vllm_ascend/models/deepseek_v4_1/qkv_prolog.py``). Applying it anyway
+    normalises q a second time -- no shape changes and nothing raises, so it
+    would be a silent accuracy defect.
+    """
+    return not is_deepseek_v41_model(vllm_config)
+
+
 def attends_compressed_stream(compress_ratio: int, vllm_config) -> bool:
     """Does this layer's attention read a compressed stream?
 
@@ -1467,9 +1525,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # An empty dict leaves V4.0's hard-coded values in place. V4.1 computes
         # them with the same functions its call site uses, so the two cannot
         # drift.
+        #
+        # Asked by identity (is_deepseek_v41_model), not by reading
+        # ``hf_text_config.model_type``: that field is exactly what upstream's
+        # dspark branch overwrites with "deepseek_v4" on the draft instance
+        # (vllm/config/speculative.py). This was the builder's ONLY version
+        # discriminator, so a rewritten config would have silently taken the
+        # V4.0 descriptor branch for a V4.1 model -- an empty sas_mask_kwargs
+        # means V4.0's hard-coded mask mode and has_cmp_kv=False, which is the
+        # descriptor/call disagreement this comment warns about.
         sas_mask_kwargs: dict = {}
         seqused_cmp_kv = None
-        if is_deepseek_v41_text(self.model_config.hf_text_config):
+        if is_deepseek_v41_model(self.vllm_config):
             from vllm_ascend.models.deepseek_v4_1.sparse_attn_args import (
                 is_plain_sliding_window, ori_mask_mode_for,
                 select_ori_sparse_indices)
@@ -1925,6 +1992,13 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         self.wkv = kwargs["wkv"]
         self.q_norm = kwargs["q_norm"]
         self.q_norm_without_weight = kwargs["q_norm_without_weight"]
+        # V4.0 applies the second, weightless per-head q RMSNorm; V4.1 must
+        # not (see applies_dsa_q_rms). Kept as a settable attribute, the name
+        # the official v27 uses, so a model class that knows better can still
+        # override it -- but it is *derived from the config* rather than
+        # defaulted to True, because the only way a V4.1 checkpoint gets here
+        # is through a model class that did not set it.
+        self.apply_q_norm = applies_dsa_q_rms(self.vllm_config)
         self.kv_norm = kwargs["kv_norm"]
 
         # CV wrapper: split wq_a/wkv/wq_b into quantize(Vector) + matmul(Cube)
@@ -2240,7 +2314,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             qr = self.q_norm(q_a)
             q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
             qr_pertoken_scale = None
-        q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
+        if self.apply_q_norm:
+            q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
@@ -2414,7 +2489,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 e_tail_overlap_done = torch.npu.current_stream().record_event()
             tail_overlap_output = overlap_result, e_tail_overlap_done
 
-        q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
+        if self.apply_q_norm:
+            q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
             cos,

@@ -26,6 +26,7 @@ from vllm_ascend.attention.dsa_v1 import (
     _dsa_layout_kv,
     _dsa_swa_only_cmp_ratio,
     _has_weight_scale,
+    applies_dsa_q_rms,
     build_dspark_swa_indices,
     get_dspark_sparse_sas_window,
 )
@@ -1456,6 +1457,14 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
 
         self.vllm_config = kwargs.get("vllm_config", get_current_vllm_config())
 
+        # Same decision as AscendDSAImpl (dsa_v1): V4.0 applies the second,
+        # weightless per-head q RMSNorm after wq_b, V4.1 must not. This class
+        # has its own __init__ and does NOT inherit AscendDSAImpl, so the flag
+        # has to be derived here too -- a fix made only in dsa_v1 would leave
+        # the legacy-DSACP impl applying it. (AscendDSAPCPImpl does subclass
+        # AscendDSAImpl and therefore inherits the flag.)
+        self.apply_q_norm = applies_dsa_q_rms(self.vllm_config)
+
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
@@ -1834,7 +1843,8 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
 
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
 
-        q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
+        if self.apply_q_norm:
+            q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
             local_cos,
