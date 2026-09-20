@@ -262,8 +262,11 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 - **不是拍脑袋选的 128**：Ascend 自己的 **V4.0 路径**在同一个 `AscendDSASWABackend`、同一个
   `AscendSlidingWindowMLASpec` 上就用 `DSV4_BLOCK_SIZES[128][0][1] = 128`（`models/deepseek_v4/model.py:124`）。
   V4.1 之所以是 32，只因为上游把它写死在构造点，而 Ascend 子类只覆盖了 `get_kv_cache_spec` 没覆盖块大小。
-- CPU 单测 31 个（17 ledger + 14 switch，另 2 个跑真 planner），含 **8 个变异臂**；
-  全树回归：改动前后失败集合逐条相同（30 个既有失败），新增 17 个全过。
+- CPU 单测 **34 个**（17 个字节账 + 17 个开关，后者含 2 个直接跑本树 planner 的），含 **9 个变异臂**
+  （6 个打坏字节账的机制常数、3 个打坏开关的判据）；`pytest tests/ut/models/test_deepseek_v4_1_swa_block_size.py
+  tests/ut/kt_offload/test_kv_budget.py` 34 过。
+  全树回归（tests/ut/models + kt_offload + attention）：改动前后失败集合逐条相同（30 个既有失败，
+  1219→1236 通过），新增全过。
 
 ### 4.5.5 上卡验证方案（交回协调方排卡）
 
