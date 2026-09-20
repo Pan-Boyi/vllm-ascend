@@ -301,6 +301,30 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 | R5 | L5（mnbt 4096→2048）是纯配置、1.92× 白拿 | 但 engram staging 缓冲按 mnbt 构造期分配、prefill 分块也减半 ⇒ **是性能变量**，要单独 A/B，不能和 L3 混在一发里。 |
 | R6 | 收益表的 CPU 轴继承 §4.3 的「带宽硬底」前提 | §4.5 那条重算触发条件原样适用。 |
 
+## 4.6 整网 bring-up 实测（2026-09-20，卡 3，N=100 prefix）
+
+**产物**：`build_artifacts/moe_offload_ref/bringup_0920_034907`（eager）、`bringup_graph_0920_040749`（图）、`prof_0920_045212`（算子 profile）、`build_artifacts/m1_run/perf_singlecard_offload_N100_graph_0920_041940`（perf）。
+
+| 项 | 实测 | 多卡基线 |
+|---|---|---|
+| 起服务 | 约 2 分钟（kt 每层 ~1.6 s × 40） | — |
+| GSM8K 50 题 eager / graph | **50/50 / 50/50**，err 0、截断 0 | 1319 题 96.97% |
+| **bs1 TPOT（图，n=3）** | **40.47 ± 0.38 ms**，吞吐 22.9 tok/s，TTFT 831 ms | **26.84 ms** |
+| bs32（⚠️ 我们 MAXSEQS=8，不可比） | TPOT 105.9 ms，70.5 tok/s，TTFT 89 s | 54.97 ms / 563 tok/s（MAXSEQS 256） |
+| HBM | 权重 82.14（⇒ **KT_DEVICE_FACTOR=1.024**）/ KV 27.34（42,733 token，5.22×）/ 激活 1.21 / 非 torch 0.15 / 图 0.24 | — |
+| 异常 | 无 10701x、无 AICore、无 507018、无 EngineCore fatal | — |
+
+**算子级 profile（bs=1 稳态 decode，8 s 窗口 182 token，`prof_0920_045212/op_breakdown_bs1.txt`）**
+- 区间并集：**device 真实忙 57.1%**，每 token 忙 24.96 ms、**空隙 18.73 ms**（相加法 57.0%，说明流间重叠可忽略）。
+- **>100 µs 的空隙每 token 43 个（= 40 层 + 少数）合计 17.91 ms/token** ⇒ 这就是**完全暴露的 host offload 等待**；其中 kt 纯计算约 10.4 ms，**剩余约 7.5 ms 是 D2H/H2D + 回调开销**。
+- Top 算子（每 token）：QuantBatchMatmulV3 4.16 ms / GroupedMatmul 1.79 ms（驻留专家）/ MhcPre+MhcSinkhorn 1.72 ms / SparseFlashMla 0.82 ms / MoeInitRoutingV3 0.51 ms。
+- ⚠️ `prof_decode_breakdown.py` 按"图 Model ID"锚定，本发无该标记 ⇒ 它拒绝出结果；上表是直接聚合 `kernel_details.csv` 得到。
+- ⚠️ profile 期每 token 44.08 ms（vs 无 profile 40.47）⇒ profiling 自带约 9% 开销，绝对值别直接引。
+
+🔴 **对 M3 的含义**：40.47 − 26.84 = 13.6 ms 的差，与"暴露的 host 等待 17.9 ms"同量级 ⇒ **侧流重叠是唯一的大头**，且天花板由「fork 到 join 之间 NPU 有多少活」决定：本发 NPU 每层约 0.62 ms（24.96/40），而 host 每层约 0.45 ms ⇒ 理论上可藏住大部分，但要先把 7.5 ms 的搬运/回调开销压下来。
+
+⚠️ **eager vs graph 逐题输出**：50 题里 **34 题生成文本不同**（都是贪心）。两臂都 50/50 全对。**尚无对照**判断这是否属正常量级 —— 已向 flash_dev 要多卡同口径的 eager-vs-graph 分歧率。⚪ 我第一次比对用了不存在的字段 `output`（两边都是 None）读成"0 处不同"，加阳性对照才发现 —— **比较字段必须先证明有区分力**。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -360,3 +384,6 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
   实现 L3（`VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE`，默认关）：容量 3.85× 或省 20.2 GiB；
   L4 撤回——ring 槽位用全局池块号，缩区会越界写。上卡方案见 §4.5.5（1 卡 / 2.5–3.5 h）。
 - 2026-09-20：起飞闸干跑通过（N=100：HBM 80.4/90.2，主机 239.9/450.2，两 NUMA 各 99.5 够）。新增 §4.4 专家数账、§4.5 KV 回收（review 交办，排在 bring-up 之后，收益按并发轴报而非 TPOT）。确认单卡 MoE 走 ALLGATHER 且 DP=1 下集合通信全被 dp_size>1 守卫挡掉（prepare_finalize.py:471/:511/:570）⇒ 无 MC2、无 HCCL，省下 HCCL_BUFFSIZE 的 3.61 GiB。
+- 2026-09-20 整网 bring-up（见 §4.6）。起飞链补丁：DP=1 下 engram 守卫用 2 个测试进程（740085d43）。
+  🔴 **§4.4 的两个常数错了（已由 KV agent 在实测上更正）**：卡可用不是 128×0.9=115.2 而是 **110.84**（卡报 123.16 GiB）；单卡工作区不是推断的 7.8 而是**实测 1.36 GiB**；专家+KV 额度 = **99.08 GiB**（原写 97.0 是两个方向相反的错误差点抵消出来的巧合）。
+  🔴 **"单卡每 token KV 655 KiB、比多卡差 1.9×"这条要更正**：重算是 **670.7 KiB**，且 1.95× 的来源**不是"单卡"而是 max-model-len 8192 vs 16384**（SWA 每请求预留 ~257 块与长度无关，分母翻倍分子不动）⇒ 正确说法是「**短 max-model-len 摊得差**」。
