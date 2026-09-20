@@ -18,10 +18,17 @@ somebody else's service and its output looks completely normal.
 from __future__ import annotations
 
 import atexit
-import logging
 import threading
 
-logger = logging.getLogger(__name__)
+# The ``vllm`` logger, not ``logging.getLogger(__name__)``: in the worker
+# process only ``configure_ascend_file_logging()`` runs (worker.py), which adds
+# a file handler to the ``vllm_ascend`` logger but never sets its level, so that
+# logger's effective level is the root's WARNING. A ``vllm_ascend.*`` name
+# therefore loses INFO at the level gate, and its WARNING/ERROR reach only
+# ~/ascend/log/vllm_ascend/*.log, never serve.log. ``init_logger(__name__)``
+# would not change that: it is ``getLogger`` plus patched methods
+# (vllm/logger.py:204-214). 132 files in this tree use the import below.
+from vllm.logger import logger
 
 _MONITOR: threading.Thread | None = None
 _STOP = threading.Event()

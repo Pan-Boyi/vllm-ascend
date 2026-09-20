@@ -31,12 +31,21 @@ being captured (the same predicate the engram host gather uses):
 from __future__ import annotations
 
 import inspect
-import logging
 import os
 import re
 from typing import Any
 
 import torch
+
+# The ``vllm`` logger, not ``logging.getLogger(__name__)``: in the worker
+# process only ``configure_ascend_file_logging()`` runs (worker.py), which adds
+# a file handler to the ``vllm_ascend`` logger but never sets its level, so that
+# logger's effective level is the root's WARNING. A ``vllm_ascend.*`` name
+# therefore loses INFO at the level gate, and its WARNING/ERROR reach only
+# ~/ascend/log/vllm_ascend/*.log, never serve.log. ``init_logger(__name__)``
+# would not change that: it is ``getLogger`` plus patched methods
+# (vllm/logger.py:204-214). 132 files in this tree use the import below.
+from vllm.logger import logger
 
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
@@ -48,8 +57,6 @@ from vllm_ascend.kt_offload.placement import (
     plan_from_config,
     split_routing,
 )
-
-logger = logging.getLogger(__name__)
 
 # One plan per process: placement is a whole-model decision made once.
 _PLAN: OffloadPlan | None = None

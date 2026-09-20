@@ -26,6 +26,36 @@ from vllm_ascend.kt_offload.placement import build_plan, check_split
 H, TOPK = 8, 2
 
 
+@pytest.fixture
+def our_logs():
+    """Capture what *our* logger emits.
+
+    Not ``caplog``: we log through ``vllm.logger``'s logger, and vLLM's
+    dictConfig sets ``propagate: False`` on the ``vllm`` logger, so no record
+    of ours ever reaches the root handler caplog installs. The failure
+    direction is safe (caplog reads empty and the test goes red), but the test
+    has to attach to the object it is judging.
+    """
+    import logging
+
+    records: list[str] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage() % () if not record.args else record.getMessage())
+
+    handler = Collect()
+    previous = kl.logger.level
+    kl.logger.addHandler(handler)
+    kl.logger.setLevel(logging.DEBUG)
+    try:
+        yield records
+    finally:
+        kl.logger.removeHandler(handler)
+        kl.logger.setLevel(previous)
+
+
+
 class FakeKTBuffer:
     """Stands in for kt's class-level KExpertsCPUBuffer."""
 
@@ -216,7 +246,7 @@ def test_replay_recomputes_from_current_inputs(cap, monkeypatch):
     assert torch.all(captured_out == 0)
 
 
-def test_host_func_errors_are_logged_not_raised(cap, monkeypatch, caplog):
+def test_host_func_errors_are_logged_not_raised(cap, monkeypatch, our_logs):
     rt, fake = _runtime(monkeypatch)
     hs, ids, w = _inputs(2, 4)
     cap.on = True
@@ -229,7 +259,8 @@ def test_host_func_errors_are_logged_not_raised(cap, monkeypatch, caplog):
 
     monkeypatch.setattr(fake, "run_pinned_forward_sync", boom)
     fn(payload)  # must not raise into ACL
-    assert "NOT this step's" in caplog.text and kl.HOST_FUNC_CALLS.get(0, 0) == 0
+    assert any("NOT this step's" in m for m in our_logs), our_logs
+    assert kl.HOST_FUNC_CALLS.get(0, 0) == 0
 
 
 def test_eager_built_layer_refuses_capture(cap, monkeypatch):
@@ -291,12 +322,12 @@ def test_mutation_stale_output_fingerprint_is_red(cap, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_capture_probe_installed_when_kt_has_hook(monkeypatch, caplog):
+def test_capture_probe_installed_when_kt_has_hook(monkeypatch, our_logs):
     got = []
     kl._install_capture_probe(SimpleNamespace(set_capture_probe=got.append))
     assert got == [kl._capturing]
     kl._install_capture_probe(SimpleNamespace())
-    assert "set_capture_probe" in caplog.text
+    assert any("set_capture_probe" in m for m in our_logs), our_logs
 
 
 def test_graph_env_for_kt(cap, monkeypatch):

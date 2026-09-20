@@ -37,6 +37,7 @@ import os
 import re
 
 import torch
+from vllm.logger import logger  # the vllm logger: a vllm_ascend.* name loses INFO in the worker
 
 from vllm_ascend import envs
 
@@ -76,6 +77,15 @@ def _state(device) -> dict:
         }
         os.makedirs(OUT_DIR, exist_ok=True)
         atexit.register(dump)
+        # Evidence that the counter is actually live in *this* process: the
+        # env var being set only shows it was asked for.
+        logger.info(
+            "kt_offload expert counter on: %d layers x %d experts, device %s, out_dir %s",
+            N_LAYERS,
+            N_EXPERTS,
+            device,
+            OUT_DIR,
+        )
     return _S
 
 
@@ -214,4 +224,12 @@ def dump() -> str | None:
     path = output_path(rank)
     torch.save(out, path + ".tmp")
     os.replace(path + ".tmp", path)
+    logger.info(
+        "kt_offload expert counter dumped %s: %d steps, %d decode + %d prefill tokens on layer 0, skipped %s",
+        path,
+        s["steps"],
+        s["tokens"]["decode"][0],
+        s["tokens"]["prefill"][0],
+        dict(s["skipped"]) or "nothing",
+    )
     return path
