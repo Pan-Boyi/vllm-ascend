@@ -337,7 +337,14 @@ if [ "${SKIP_SHM_GATE:-0}" = "1" ]; then
   echo "     放弃的保证：表是全量、N 个 rank 真的共享一份。"
   echo "     只有诊断飞行可以这么做；本次读数不得用来下'共享生效'一类的结论。"
 else
-python3 "$ROOT/build_artifacts/verify_shm_sharing.py" --ranks "$DP" --require-full || {
+# 单卡(DP=1)：守卫要求 --ranks >= 2，因为【一个进程永远只有一份，分不出共享和独占】。
+#   DP=1 下"N 个 rank 共享一份"这个性质【不存在】，所以它不是本发的承重判据；
+#   承重的那一半是 --require-full（表是全量），它与 rank 数无关：切片在日志里和全量长得一样，
+#   而下游 mmap 到截断张量不报错、只算错。
+#   ⇒ 用 2 个【测试进程】跑，比单卡实际需要的更严（顺带把共享也验了），不降低 --require-full。
+#   不要改成 --ranks 1：那会让守卫自己 exit 1；也不要加 SKIP_SHM_GATE 绕过——那放弃的是全量这一半。
+KT_SHM_RANKS="$DP"; [ "$KT_SHM_RANKS" -lt 2 ] && KT_SHM_RANKS=2
+python3 "$ROOT/build_artifacts/verify_shm_sharing.py" --ranks "$KT_SHM_RANKS" --require-full || {
   echo "❌ engram 表检查未过（不是全量 / 共享没生效 / 目录不存在）—— 拒绝启动"
   echo "   重铺: python3 $ROOT/build_artifacts/stage_engram_shm.py --full --i-have-user-approval"
   exit 1; }
