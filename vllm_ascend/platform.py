@@ -1290,11 +1290,15 @@ def _require_validated_dsv41_graph_mode(vllm_config: VllmConfig) -> None:
     from vllm.config.compilation import CUDAGraphMode
 
     from vllm_ascend import envs as envs_ascend
-    from vllm_ascend.attention.dsa_v1 import is_deepseek_v41_text
+    # 🔴 用 is_deepseek_v41_model(vllm_config)，不是 is_deepseek_v41_text(
+    # hf_text_config)。后者读的 model_type 正是 vllm/config/speculative.py 在
+    # dspark draft 实例上改写成 "deepseek_v4" 的那个字段（这就是 R37 修的东西）:
+    # 被改写的 config 会让这个闸**提前 return**，于是它要防的那种发次反而放行,
+    # 而且是静默的 —— 守卫被它要防的同一个改写绕过去。
+    # is_deepseek_v41_model 够到 config 的类和 kv_source_layer_ids，改写碰不到。
+    from vllm_ascend.attention.dsa_v1 import is_deepseek_v41_model
 
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    if hf_text_config is None or not is_deepseek_v41_text(hf_text_config):
+    if not is_deepseek_v41_model(vllm_config):
         return
 
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
