@@ -320,6 +320,8 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 - Top 算子（每 token）：QuantBatchMatmulV3 4.16 ms / GroupedMatmul 1.79 ms（驻留专家）/ MhcPre+MhcSinkhorn 1.72 ms / SparseFlashMla 0.82 ms / MoeInitRoutingV3 0.51 ms。
 - ⚠️ `prof_decode_breakdown.py` 按"图 Model ID"锚定，本发无该标记 ⇒ 它拒绝出结果；上表是直接聚合 `kernel_details.csv` 得到。
 - ⚠️ profile 期每 token 44.08 ms（vs 无 profile 40.47）⇒ profiling 自带约 9% 开销，绝对值别直接引。
+- **怎么采（本版 vLLM）**：`VLLM_TORCH_PROFILER_DIR` **不被识别**（日志 "Unknown vLLM environment variable"，`/start_profile` 返回 404）；要用启动参数
+  `EXTRA_ARGS='--profiler-config {"profiler":"torch","torch_profiler_dir":"<dir>"}'`。⚠️ `prof_decode_capture.py` 在 404 的情况下**照样打印"✅ steady decode captured"**（它的判据不看产物）⇒ 采完必须自己数 `<dir>/*_ascend_pt` 目录个数。
 
 🔴 **对 M3 的含义**：40.47 − 26.84 = 13.6 ms 的差，与"暴露的 host 等待 17.9 ms"同量级 ⇒ **侧流重叠是唯一的大头**，且天花板由「fork 到 join 之间 NPU 有多少活」决定：本发 NPU 每层约 0.62 ms（24.96/40），而 host 每层约 0.45 ms ⇒ 理论上可藏住大部分，但要先把 7.5 ms 的搬运/回调开销压下来。
 
