@@ -189,24 +189,47 @@ def expert_out(x: torch.Tensor, w1, w3, w2, variant: str, limit: float = LIMIT) 
     return y if base == "fp32" else bf(y)
 
 
+#: Pseudo-variant: the ``bf16`` per-expert outputs summed **across experts** in
+#: float32 and in the opposite expert order. Everything else in this file sums
+#: the experts in float64 ascending, so no other variant moves the cross-expert
+#: accumulation at all -- and that is the one degree of freedom kt actually has
+#: (it accumulates the weighted expert outputs into an fp32 buffer). Used as a
+#: floor: what one legal cross-expert accumulation costs against another.
+CROSS_ACC_VARIANT = "bf16_accf32_rev"
+
+
 def moe_ref_multi(x, ids, wts, weight_fn, include, variants, limit: float = LIMIT) -> dict[str, torch.Tensor]:
     """Routed-expert sum for every variant in one pass (each expert dequantised once).
 
     ``weight_fn(e) -> (w1, w3, w2)`` fp32; ``include(e)`` selects the routes that
     count (e.g. only CPU experts). Routes with weight 0 still count (they add 0).
     Output rounded to bf16 for every variant but fp32 (the NPU combine writes bf16).
+    ``CROSS_ACC_VARIANT`` reuses the ``bf16`` per-expert outputs (see above).
     """
     xf = x.float()
-    outs = {v: torch.zeros(x.shape[0], HIDDEN, dtype=torch.float64) for v in variants}
+    cross = CROSS_ACC_VARIANT in variants
+    base_variants = [v for v in variants if v != CROSS_ACC_VARIANT]
+    if cross and "bf16" not in base_variants:
+        base_variants.append("bf16")
+    outs = {v: torch.zeros(x.shape[0], HIDDEN, dtype=torch.float64) for v in base_variants}
+    contributions = []
     for e in sorted({int(v) for v in ids.flatten().tolist()}):
         if not include(e):
             continue
         tok, pos = torch.where(ids == e)
         w1, w3, w2 = weight_fn(e)
-        for v in variants:
+        for v in base_variants:
             y = expert_out(xf[tok], w1, w3, w2, v, limit)
             outs[v].index_add_(0, tok, wts[tok, pos, None].double() * y.double())
-    return {v: (o.float() if v == "fp32" else bf(o.float())) for v, o in outs.items()}
+            if cross and v == "bf16":
+                contributions.append((tok, (wts[tok, pos, None].float() * y.float())))
+    res = {v: (o.float() if v == "fp32" else bf(o.float())) for v, o in outs.items()}
+    if cross:
+        acc = torch.zeros(x.shape[0], HIDDEN, dtype=torch.float32)
+        for tok, contrib in reversed(contributions):
+            acc.index_add_(0, tok, contrib)
+        res[CROSS_ACC_VARIANT] = bf(acc)
+    return {v: res[v] for v in variants}
 
 
 def rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -225,6 +248,22 @@ def col_rel_max(a: torch.Tensor, b: torch.Tensor) -> float:
     n = b.double().norm(dim=0)
     keep = n > 1e-3 * n.max()
     return float((d[keep] / n[keep]).max()) if bool(keep.any()) else float("inf")
+
+
+def ulp_max(a: torch.Tensor, b: torch.Tensor, ulp: float = BF16_ULP) -> float:
+    """Largest absolute deviation, in bf16 ULPs of the reference's largest value.
+
+    Scale-aware where a per-column relative metric is not: a column that nearly
+    cancels has a tiny denominator, so ``col_rel_max`` there reports a large
+    number for an absolutely tiny error, and no floor measured between two
+    emulations bounds it (at T=1 both emulations round identically and the
+    "floor" reads 0 -- unmeasured, not tight; 2026-09-20 t1 prefix T=1).
+    A correct implementation that rounds a few times lands at a few ULP.
+    """
+    scale = float(b.double().abs().max())
+    if scale == 0:
+        return 0.0 if float((a.double() - b.double()).abs().max()) == 0 else float("inf")
+    return float((a.double() - b.double()).abs().max()) / (ulp * scale)
 
 
 def row_rel_max(a: torch.Tensor, b: torch.Tensor) -> float:

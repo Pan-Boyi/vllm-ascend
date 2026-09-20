@@ -109,6 +109,30 @@ bad = C.moe_ref_multi(xs, ids, wts, wfn_mut, lambda e: True, ("mx8",))["mx8"]
 red = not (C.rel_l2(bad, refs["bf16"]) <= tau and C.row_rel_max(bad, refs["bf16"]) <= tau_row)
 v.must_be_red(red, f"T0 gate: one expert's w2 scale +1 in every row ({C.rel_l2(bad, refs['bf16']):.3e} vs tau {tau:.3e})")
 
+# -- tier-B floor: the cross-expert accumulation variant must actually move -----------
+#    A floor measured with a variant that cannot move the metric reads as 0 and turns
+#    the threshold into "2*ULP", which is not a floor at all (2026-09-20 t1 prefix T=1).
+_fl = C.moe_ref_multi(xs, ids, wts, lambda e: experts[e][:3], lambda e: True,
+                      ("bf16", "bf16_acc64", C.CROSS_ACC_VARIANT))
+v.check(set(_fl) == {"bf16", "bf16_acc64", C.CROSS_ACC_VARIANT}, "moe_ref_multi returns exactly the variants asked for")
+_d_acc = C.rel_l2(_fl["bf16"], _fl["bf16_acc64"])
+_d_cross = C.rel_l2(_fl["bf16"], _fl[C.CROSS_ACC_VARIANT])
+v.check(_fl[C.CROSS_ACC_VARIANT].dtype == _fl["bf16"].dtype and _fl[C.CROSS_ACC_VARIANT].shape == _fl["bf16"].shape,
+        "cross-accumulation floor variant has the reference's dtype and shape")
+v.check(_d_cross < 1e-2 and _d_acc < 1e-2,
+        f"emulation floors stay at rounding scale (cross {_d_cross:.3e}, acc64 {_d_acc:.3e}) -- floors, not bugs")
+# ulp_max: the tier-B per-column metric. It must read 0 for an identical tensor,
+# count ULPs of the reference's largest value, and stay finite where a per-column
+# ratio blows up (one near-zero column with a rounding-sized absolute error).
+v.check(C.ulp_max(_fl["bf16"], _fl["bf16"]) == 0.0, "ulp_max(x, x) == 0")
+_b = torch.tensor([[1.0, 5e-3]])  # one column 200x smaller, still inside col_rel_max's keep guard
+_a = _b.clone()
+_a[0, 1] += 3 * C.BF16_ULP  # 3 ULP of the largest value (1.0), landing on the small column
+v.check(abs(C.ulp_max(_a, _b) - 3.0) < 1e-6, f"ulp_max counts ULPs of the max ({C.ulp_max(_a, _b):.3f})")
+v.check(C.col_rel_max(_a, _b) > 2.0, f"the per-column ratio reads {C.col_rel_max(_a, _b):.3e} for the same "
+                                     "3-ULP error -- why tier B stopped using it at small T")
+v.check(C.ulp_max(_b * 2, _b) > 100, "ulp_max still separates a wrong tensor by a mile")
+
 # -- T1: explicit set and the split contract with the real placement code ------------
 try:
     sys.path.insert(0, HERE)

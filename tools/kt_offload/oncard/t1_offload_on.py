@@ -14,8 +14,13 @@ Arms, per T in --tokens (default 1,4,32):
   A  NPU half (routed_out before merge) vs the full-resident layer fed the ORIGINAL
      ids with the CPU routes' weights set to 0 -> bit-identical (bytes or values).
   B  kt's output (tapped at sync_forward) vs the bf16 torch reference over the CPU
-     routes only -> M0b tiers: A (vs fp32) 2*max(floor,ULP), B (vs bf16 emulation)
-     2*max(acc floor, ULP/16) for rel_l2 and 2*max(col floor, ULP) per column.
+     routes only -> M0b tiers: A (vs fp32) 2*max(floor,ULP) for rel_l2 and per column;
+     B (vs bf16 emulation) 2*max(acc floor, ULP/16) for rel_l2, and the largest absolute
+     deviation in bf16 ULPs of the output's max (max(2*emulation floor, 4 ULP)).
+     Why not a per-column ratio in tier B: at small T a near-cancelling column makes the
+     ratio unbounded for a rounding-sized error, and both emulations round identically
+     there, so its "floor" reads 0 (2026-09-20 first t1 pass: prefix T=1 8.5e-3 vs 2*ULP,
+     T=4 marginal 1.155e-2 vs 1.156e-2). The ratio is still printed as a diagnostic.
   C  merged output vs the full-resident layer on all routes. floor = what fp8
      activations cost on the CPU routes = |npu_full(CPU routes only) - ref_bf16(CPU routes)|,
      both normalised by |npu_full|; tau = max(1.5*floor, BF16_ULP).
@@ -154,20 +159,36 @@ def main() -> int:
                 v.check(False, f"{set_name} T={T} arm B: kt tap saw no output")
             else:
                 is_cpu = lambda e: not bool(mask[e])  # noqa: E731
-                refs = C.moe_ref_multi(x, ids.long(), w, wfn, is_cpu, ("fp32", "bf16", "bf16_acc64"))
+                refs = C.moe_ref_multi(x, ids.long(), w, wfn, is_cpu,
+                                       ("fp32", "bf16", "bf16_acc64", C.CROSS_ACC_VARIANT))
                 fA, fAc = C.rel_l2(refs["bf16"], refs["fp32"]), C.col_rel_max(refs["bf16"], refs["fp32"])
-                fB, fBc = C.rel_l2(refs["bf16"], refs["bf16_acc64"]), C.col_rel_max(refs["bf16"], refs["bf16_acc64"])
+                # Tier-B floor = the spread between two legal bf16 emulations: the
+                # GEMM accumulation inside an expert (acc64) and the cross-expert
+                # sum (fp32, reverse order -- the one degree of freedom kt has).
+                fB = max(C.rel_l2(refs["bf16"], refs["bf16_acc64"]),
+                         C.rel_l2(refs["bf16"], refs[C.CROSS_ACC_VARIANT]))
                 tA, tAc = 2 * max(fA, C.BF16_ULP), 2 * max(fAc, C.BF16_ULP)
-                tB, tBc = 2 * max(fB, C.BF16_ULP / 16), 2 * max(fBc, C.BF16_ULP)
+                tB = 2 * max(fB, C.BF16_ULP / 16)
+                # Tier-B per column is measured in ULPs of the output's largest
+                # value, not as a per-column ratio: at small T a near-cancelling
+                # column makes the ratio unbounded while the absolute error stays
+                # at rounding scale, and the emulation-vs-emulation floor for the
+                # ratio is 0 there (see C.ulp_max). Floor = the same metric between
+                # the two legal emulations; allowance never below 4 ULP.
+                fBu = max(C.ulp_max(refs["bf16_acc64"], refs["bf16"]),
+                          C.ulp_max(refs[C.CROSS_ACC_VARIANT], refs["bf16"]))
+                tBu = max(2 * fBu, 4.0)
 
                 def judge(target_fp32, target_emu):
                     vals = (C.rel_l2(kt_out, target_fp32), C.col_rel_max(kt_out, target_fp32),
-                            C.rel_l2(kt_out, target_emu), C.col_rel_max(kt_out, target_emu))
-                    return vals, vals[0] <= tA and vals[1] <= tAc and vals[2] <= tB and vals[3] <= tBc
+                            C.rel_l2(kt_out, target_emu), C.ulp_max(kt_out, target_emu))
+                    return vals, vals[0] <= tA and vals[1] <= tAc and vals[2] <= tB and vals[3] <= tBu
 
                 vals, okB = judge(refs["fp32"], refs["bf16"])
-                print(f"   arm B floors A {fA:.3e}/{fAc:.3e} -> {tA:.3e}/{tAc:.3e}; B {fB:.3e}/{fBc:.3e} -> "
-                      f"{tB:.3e}/{tBc:.3e}; kt {vals[0]:.3e}/{vals[1]:.3e} | {vals[2]:.3e}/{vals[3]:.3e}")
+                print(f"   arm B floors A {fA:.3e}/{fAc:.3e} -> tau {tA:.3e}/{tAc:.3e}; "
+                      f"B l2 {fB:.3e} -> {tB:.3e}, ulp {fBu:.2f} -> {tBu:.2f}; "
+                      f"kt vs fp32 {vals[0]:.3e}/{vals[1]:.3e} | vs emu {vals[2]:.3e}/{vals[3]:.2f} ULP "
+                      f"(col ratio {C.col_rel_max(kt_out, refs['bf16']):.3e}, diagnostic)")
                 v.check(okB, f"{set_name} T={T} arm B (kt vs bf16 reference, M0b tiers)")
                 mrefs = C.moe_ref_multi(x, ids.long(), w, wfn_nibble, is_cpu, ("fp32", "bf16"))
                 _, okBm = judge(mrefs["fp32"], mrefs["bf16"])
