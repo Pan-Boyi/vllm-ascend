@@ -982,13 +982,20 @@ def test_build_req_metadata_preserves_zero_max_sequence_lengths(compressor_ratio
     builder._build_sas_metadata = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
     builder._build_qli_metadata = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
 
-    metadata = builder.build_req_metadata(
-        common_attn_metadata=common_attn_metadata,
-        seq_lens_cpu=torch.zeros(2, dtype=torch.int32),
-        num_actual_reqs=None,
-        cos=torch.empty(0),
-        sin=torch.empty(0),
-    )
+    # ratio 4 走到压缩器那一支，它会去取 c4 的 RoPE 组，而这个 builder 没注册过
+    # ⇒ 真实现会 KeyError。同文件里另一条 ratio 4 的用例（见 test 里对
+    # build_req_metadata 的调用）用的就是这个补丁，这里照搬，断言本身不受影响。
+    with patch(
+        "vllm_ascend.attention.dsa_v1.get_full_cos_and_sin_dsa",
+        return_value=(torch.ones(1), torch.zeros(1)),
+    ):
+        metadata = builder.build_req_metadata(
+            common_attn_metadata=common_attn_metadata,
+            seq_lens_cpu=torch.zeros(2, dtype=torch.int32),
+            num_actual_reqs=None,
+            cos=torch.empty(0),
+            sin=torch.empty(0),
+        )
 
     sas_kwargs = builder._build_sas_metadata.call_args.kwargs
     assert sas_kwargs["max_seqlen_q"] == 0
