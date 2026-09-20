@@ -166,6 +166,138 @@ review 拆解：每 token 计费 343.6 KiB，**98.18% 是 40 个单层 SWA 组�
 🔁 **此结论的前提（变了要重算）**：CPU 侧是内存带宽硬底——实测 428 GB/s = 本机双路上限 495 GB/s 的 86%，下放量按比例决定字节数。**触发重算的条件**：换搬运路径（例如权重不再每 token 从 DDR 全读、加缓存/预取/常驻重排）、权重再压缩（读的字节变少）、换主机（带宽不同）、或 kt 后端改动使 T(k) 曲线斜率变化。任一条成立 ⇒ §4.5 的收益量级与「不值得排在侧流之前」这句一起作废，要用新曲线重算。
 步骤：① 读我们自己那一发服务日志（是否同样 40 个单层组、ring 区占比），判据作用在**实际分配字节**；② L3 先小用例（kernel 支持 ≠ 分配/回收路径安全）；③ 收益链每步带读数。不改 clean。
 
+### 4.5.1 机制核实（2026-09-20，本线自己的两发日志，未上卡）
+
+工具 `tools/kt_offload/kv_budget_singlecard.py`（只读，解析日志 + 独立重算 + 逐项断言）。
+另在 `tests/ut/models/test_deepseek_v4_1_swa_block_size.py` 里**直接跑本树被 patch 过的 planner**
+（`_get_kv_cache_groups_uniform_groups` + `_get_kv_cache_config_deepseek_v4_main`），不是模型的复刻。
+
+两发（eager `bringup_0920_034907` / 图 `bringup_graph_0920_040749`）**读数完全一致**，重算逐项对上：
+
+| 量 | 值 | 来源 |
+|---|---|---|
+| 组结构 | 43 组 `[128, 256, 32×40, 8]`，lcm 256 | 日志 kv_cache_utils.py:732/733，重算一致 |
+| 池块字节 | (131072+16896)×3 + 3×32768 = **542,208 B** | 重算；planner 实跑同值 |
+| num_blocks | **54,131** | 反解 tokens=42,733 + available 区间相交 |
+| 实际分配 | **29,350,261,248 B = 27.3346 GiB** | 重算；日志 27.34(eager)/27.33(图)，两发跨 27.335 的打印边界 |
+| 每请求块数 | 64 + 32 + 40×257 + 1 = **10,377** | 重算；concurrency 5.2154→日志 5.22x，token 42,733 逐个吻合 |
+| **每 token 计费** | **670.7 KiB**（686,828 B） | = 10,377 × 542,208 / 8192 |
+| SWA 占比 | **99.07%**（10,280/10,377 块，5.574 GB/请求） | 放大链：页 padding 4.00× × 池块计费 4.137× = 16.55× |
+| ring 区 | 98,304 B/块 × 54,131 = **4.956 GiB = 池子 18.13%**；每请求只用 1 块，max_num_seqs=8 ⇒ 实际碰到 0.0148% | |
+| in-flight | 2×4096=8192（async scheduling 开）。取 4096 只能算出 14.27 GiB ⇒ 判据有区分力 | |
+
+🔴 **三条更正**（都与「单卡 655 KiB / 差 1.9×」这句有关）：
+1. **655 KiB 复现不出来**。同一算法算多卡是 24.54/74,872 = 343.7 KiB（与协调方 343.8 一致），算单卡是
+   27.34 GiB / 42,733 = **670.7–671.0 KiB**，不是 655（低 2.4%，疑似转抄）。倍数是 **1.95×** 不是 1.9×。
+2. **这 1.95× 与「单卡」无关，是 `max-model-len` 8192 vs 16384**。SWA 每请求预留 =
+   `cdiv(min(127+in_flight, L), 32)+1`，in-flight 固定 8192 ⇒ L=8192 时 257 块、L=16384 时才 261 块：
+   **分母翻倍而分子几乎不动**。同一公式在 L=16384 下算出 343.7 KiB，与多卡逐位吻合。
+   ⇒ 「固定预留在单卡摊得更差」这句要改成「在短 max-model-len 上摊得更差」；单卡开 16384 就和多卡一样。
+3. **§4.4 的两个常数都不对，但方向相反、差点互相抵消**（数值巧合不是交叉验证）：
+   卡可用不是 `128×0.9=115.2` 而是日志的 **110.84**（`0.9×123.16`，卡报 123.16 GiB 不是 128）；
+   单卡工作区不是推断的 7.8 GiB 而是实测 **1.36 GiB**（激活 1.21 + non-torch 0.15；图模式再 +0.24，
+   且那 0.24 是压在 util 预算**之上**的）。⇒ 专家+KV 额度 = 110.84 − 10.4 − 1.36 = **99.08 GiB**（§4.4 写 97.0）。
+✅ **旁证**：日志 weights 82.14 GiB − 非专家 10.4 = 71.74 = 100 × 0.7004 × **1.0243** ⇒ §4.1 待回报的
+   `KT_DEVICE_FACTOR` 就地落实为 **1.024**（实测，本发）。
+
+### 4.5.2 与「理论 KV」的对账（回答「bf16 是不是 ×4」）
+
+**不是 ×4，是 ×3.25。** 按 card 那张表的口径逐项重算（重算 card 侧得 890 B/token，口径对得上）：
+
+| 项 | card（FP4 + e4m3/16） | 本发 bf16 | 倍数 |
+|---|---|---|---|
+| compress_kv（4 源层，3×256 + 512 元素） | 720 B | 2,560 B | 3.56× |
+| index_k（4 源层，3×64 + 128 元素） | 170 B | 330 B | **1.94×** |
+| 合计 | **890 B/token** | **2,890 B/token** | **3.25×** |
+
+- 主 cache：bf16 2 B/元素 vs FP4 0.5 + 1/16 scale = 0.5625 B/元素 ⇒ 3.556×（不是 4×，FP4 自带 scale 字节）。
+- index_k **不是 bf16**：本发走 fp8_e4m3(1B) + 每 state 一个 fp32 scale = 132 B/state，vs MXFP4 68 B/state ⇒ 只 1.94×。
+- 定长滑窗：card 口径 40 层×128 位×512 维×1B = 2.62 MB/序列，本发 bf16 = **5.24 MB/序列**（card 表写 43 层是 V4.0）。
+- 上下文容量（纯内容）：4K 11.8 MB / 8K 23.7 MB / 32K 94.7 MB / 128K 378.8 MB。
+
+🔴 **理论内容 vs 池子实际计费（同一发，L=8192，每请求）**：
+
+| | 理论内容 | 池子实际计费 | 倍数 |
+|---|---|---|---|
+| 随上下文增长（4 源层） | 23.7 MB | 52.1 MB | 2.20× |
+| 定长滑窗（40 层） | 5.24 MB | **5,574 MB** | **1,063×** |
+
+滑窗那 1,063× 拆开是：admission 公式按 `min(127+in_flight, L)` 预留 **64×** 窗口本身（in-flight 8192 主导，
+不是 128 位窗口）× 页 padding 4.00× × 池块计费 4.137×。
+⇒ 全发 27.33 GiB 里只有 **0.51%** 是理论上需要留的内容字节。
+
+### 4.5.3 两条改法的收益（同一发 27.33 GiB，L=8192）
+
+A 轴 **容量（主轴）** / B 轴 专家与 CPU 时间（保住 42,733 token 不变，省下的 GiB 换常驻专家）：
+
+| 改法 | KV token | 倍数 | 8192 并发 | 省 GiB | ΔN | N | CPU ms/token |
+|---|---|---|---|---|---|---|---|
+| 基线 | 42,733 | 1.00× | 5.22x | — | — | 100 | 10.47 |
+| **L3 SWA block 32→128** | **164,420** | **3.85×** | 20.07x | **20.2** | +28 | 128 | 9.70（−0.77） |
+| L3' 32→64 | 84,352 | 1.97× | 10.30x | 13.5 | +18 | 118 | 9.98 |
+| L4 ring 定长 | 52,201 | 1.22× | 6.37x | 4.96 | +6 | 106 | 10.31 |
+| L3+L4 | 200,904 | 4.70× | 24.52x | 21.5 | +30 | 130 | 9.65 |
+| L5 mnbt 4096→2048（**只改配置**） | 81,861 | 1.92× | 9.99x | 13.1 | +18 | 118 | 9.98 |
+| L6 SWA 每组 5 层（改分组） | 133,240 | 3.12× | 16.26x | 18.6 | +25 | 125 | 9.79 |
+| L3+L5 | 304,352 | 7.12× | 37.15x | 23.5 | +32 | 132 | 9.59 |
+
+结论与 §4.5 开头一致并更强：**B 轴最多买到 −0.96 ms（10.47→9.51），主轴是 A 轴**。
+L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并发不变时腾出 20.2 GiB。
+
+⛔ **L4 不可直接实现（review 的「4.45 GiB 易得」要撤）**：ring 的槽位是
+`slot = block_table[req][0] × CAPACITY + pos % CAPACITY`（`vllm/models/deepseek_v4_1/compressor.py:61-79`），
+`block` 是**全局池块号**，取值域 [0, num_blocks)。把 ring 区缩到 max_num_seqs 块会越界写。
+要做必须先给 ring 组做块号重映射（改 triton kernel + block table），风险远高于 L3，收益只有 1.22×。⇒ 不做。
+
+### 4.5.4 实现（L3，默认关）
+
+- `VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE`（`vllm_ascend/envs.py`，默认 `0` = 关，行为与改动前逐字节相同）。
+- `AscendDeepseekV41SWACache.__init__` 里用 `resolve_swa_block_size()` 重解析
+  （`vllm_ascend/models/deepseek_v4_1/caches.py`）。写在 `self.block_size` 上而**不只是 spec 上**：
+  prolog 会核 `swa_kv_cache.shape[1:] == (metadata.block_size, head_dim)`，JIT 预热按
+  `swa_cache_layer.block_size` 注册 kernel —— 只改 spec 会让三者不一致而**不报错**。
+- 两条硬拦截（不静默回退）：① 值必须**逐字面**出现在该 cache 自己的 backend 的
+  `get_supported_kernel_block_sizes()` 里（不是「整除」：`select_common_block_size` 会悄悄退到更小的一档）；
+  ② 不得超过主 cache 的 storage block size（否则 planner 的裸 `assert` 在深处炸，不点名）。
+- **不是拍脑袋选的 128**：Ascend 自己的 **V4.0 路径**在同一个 `AscendDSASWABackend`、同一个
+  `AscendSlidingWindowMLASpec` 上就用 `DSV4_BLOCK_SIZES[128][0][1] = 128`（`models/deepseek_v4/model.py:124`）。
+  V4.1 之所以是 32，只因为上游把它写死在构造点，而 Ascend 子类只覆盖了 `get_kv_cache_spec` 没覆盖块大小。
+- CPU 单测 31 个（17 ledger + 14 switch，另 2 个跑真 planner），含 **8 个变异臂**；
+  全树回归：改动前后失败集合逐条相同（30 个既有失败），新增 17 个全过。
+
+### 4.5.5 上卡验证方案（交回协调方排卡）
+
+**1 张卡，两臂，预计 2.5–3.5 h**（含起停与 GSM8K）。两臂同配置、只差
+`VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE`（A 臂不设 / B 臂 128）。基线配置照 `bringup_0920_034907`：
+`MAXLEN=8192 --block-size 128 --kv-cache-dtype bfloat16 --no-enable-prefix-caching
+--max-num-batched-tokens 4096 --max-num-seqs 8`，KT_OFFLOAD=1 N=100。
+
+| # | 判据 | A 臂期望 | B 臂期望 | 怎么判 |
+|---|---|---|---|---|
+| ①容量 | `kv cache group sizes` | `[128,256,32×40,8]` | `[128,256,128×40,8]` | 日志行 |
+| | `GPU KV cache size` | 42,733 token / 5.22x | **164,420 token / 20.07x** | 日志行 |
+| | 实际分配字节 | 54,131 × 542,208 | 同样 54,131 × 542,208（池不变） | 跑 `kv_budget_singlecard.py --log <新 serve.log>`，**它自己会 raise** |
+| ②正确性 | 同一批 50 题 GSM8K，贪心、`temperature=0`、同 seed | — | **逐题配对输出必须一致**（不是分数一致） | 两臂 diff 逐题生成文本 |
+| | 长序列覆盖 | — | 至少 1 条 prompt+max_tokens 接近 8192 | 单独一条长请求，两臂逐 token 比 |
+| ③回收路径 | 必须真的踩到块回收 | — | — | 并发 8 条 × 每条 ≥2048 token 连续跑 ≥5 min，看 `GPU KV cache usage` 上升后回落；只跑短请求 = 零覆盖 |
+
+- 时长拆：起服务 ×2 各约 6 min（本发实测 04:07→04:14 起到就绪）；50 题 GSM8K ×2 各约 25–40 min；
+  长序列 + 并发浸泡 ×2 各约 15 min；日志判据与比对 20 min。
+- 失败即停保留现场（`run_oncard.sh` 那套）；起飞前 5 min 内不要紧接着上一发拆除（dmesg 闸，坑 P16）。
+- ⚠️ B 臂第一次跑会**重新编译 SWA 的 triton kernel**（`_COMPUTE_SWA_INDICES_AND_LENS_KERNEL`
+  按 `block_size` 特化注册），冷启动会慢；`TMPDIR=TMP=/dev/shm/dsv41_tmp`。
+
+### 4.5.6 风险与未决
+
+| # | 风险 | 现状 |
+|---|---|---|
+| R1 | `get_supported_kernel_block_sizes()` 里有 128 ≠ 分配/回收路径安全 | 已把「kernel 列了」和「planner 接受」分开验：planner 在 CPU 上实跑过 32/128 两档，页 131072 无 padding、组数/lcm/池块/num_blocks 全不变。**回收路径只能上卡验**（判据 ③）。 |
+| R2 | block_size 变化影响 attention kernel 的 plan 选择？ | 未见。`resolve_dsv4_cache_dtype` 的 plan 选择看 `--kv-cache-dtype`（承重参数，指南 L301），与 SWA 块大小无关；运行期 kernel 从 `swa_metadata.block_size` 取页大小，prolog 还有显式形状核对会 raise。⚠️ triton kernel 按 block_size 特化编译 ⇒ 需要一张起得来的卡。 |
+| R3 | prefix cache 关着的前提 | 本发 `enable_prefix_caching=False`。开了会走 `hash_block_size = gcd(group block sizes)`，32→128 后 gcd 仍是 8（ring 的 8 决定），lcm 仍是 256 ⇒ 调度块大小不变。**但没验过**，改法不覆盖 prefix cache 开的情形。 |
+| R4 | N3 守卫（max-model-len ≤16384）与 block_size 有交互？ | **无交互**（读了源码）：`assert_candidate_mask_is_vacuous` 只吃 `max_seq_len / compress_ratio / candidate_topk_blocks / candidate_block_size`（后者来自 hf_config，是 8），没有 KV 块大小这一项。反向看 L3 还让启动 admission 更松（4.29→1.12 GiB）。 |
+| R5 | L5（mnbt 4096→2048）是纯配置、1.92× 白拿 | 但 engram staging 缓冲按 mnbt 构造期分配、prefill 分块也减半 ⇒ **是性能变量**，要单独 A/B，不能和 L3 混在一发里。 |
+| R6 | 收益表的 CPU 轴继承 §4.3 的「带宽硬底」前提 | §4.5 那条重算触发条件原样适用。 |
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -216,4 +348,12 @@ review 拆解：每 token 计费 343.6 KiB，**98.18% 是 40 个单层 SWA 组�
 - 2026-09-20 上卡（卡 3，三发各自持租约、用完即放）：t0/t1/t2 全 PASS（产物 oncard_runs/20260920_024812_t0、_031221_t1、_031441_t2）。
   🔴 **上卡抓到生产缺陷**：`route()` 返回 (ids, weights)，**所有调用点按 (weights, ids) 接**，生产 forward_impl 亦然 ⇒ 整网路由全错；CPU 单测按返回顺序解包，照不到调用点绑定。修：具名返回 + 入口 dtype 契约（就地 raise，不 `.to()` 静默纠正）+ 禁止位置解包的 AST 检查（165f73d2d）。**教训：同一个函数的返回顺序，测试和调用点都用同一个假设时，测试就不是独立证人。**
   ⚪ 判据变更（dc6dba7ec，红之后改的，协调方已复核）：arm B tier-B 由"逐列相对误差"改为"最大绝对偏差 / 参考最大值的 bf16 ULP"，允许量 max(2×地板, 4 ULP)。理由：T 小时列内近抵消 ⇒ 分母趋 0，同一发里该度量自己的地板读到 1.333(133%)；而两个合法仿真在 T=1 舍入一致 ⇒ 地板读 0（"没测到"不是"很紧"）。复核要点：kt 实测最大 0.72 ULP，允许量 4 ULP ⇒ **余量 5.5×，取 2 ULP 也能过 ⇒ 常数不是为通过而调**；变异臂 6/6 仍红；tier A 未改；旧比值保留为诊断。
+- 2026-09-20：§4.5 KV 回收评估完成（未上卡，只读日志 + CPU）。机制在我们自己的两发上核实并逐项对账
+  （43 组 / 40 个单层 SWA 组 / 池块 542,208 B / 54,131 块 / 29,350,261,248 B，token 与 concurrency 逐个吻合），
+  另用本树被 patch 的 planner 在 CPU 上实跑 32 与 128 两档。三条更正：655 KiB 复现不出（实为 670.7 KiB，倍数 1.95×）；
+  这 1.95× 是 max-model-len 8192 vs 16384 造成的，与单卡/多卡无关；§4.4 的 115.2 与 7.8 两个常数都不对
+  （实测 110.84 与 1.36，方向相反差点抵消）。KT_DEVICE_FACTOR 就地实测为 1.024。
+  与理论 KV 对账：bf16 是 ×3.25 不是 ×4（index_k 走 fp8+fp32 scale 只 ×1.94）。
+  实现 L3（`VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE`，默认关）：容量 3.85× 或省 20.2 GiB；
+  L4 撤回——ring 槽位用全局池块号，缩区会越界写。上卡方案见 §4.5.5（1 卡 / 2.5–3.5 h）。
 - 2026-09-20：起飞闸干跑通过（N=100：HBM 80.4/90.2，主机 239.9/450.2，两 NUMA 各 99.5 够）。新增 §4.4 专家数账、§4.5 KV 回收（review 交办，排在 bring-up 之后，收益按并发轴报而非 TPOT）。确认单卡 MoE 走 ALLGATHER 且 DP=1 下集合通信全被 dp_size>1 守卫挡掉（prepare_finalize.py:471/:511/:570）⇒ 无 MC2、无 HCCL，省下 HCCL_BUFFSIZE 的 3.61 GiB。
