@@ -45,7 +45,7 @@ import t4_model as M  # noqa: E402
 
 PLAN = """T4 plan (one layer, T=1 decode shape, timing only):
   arms, eager    : serial | sglang-shape (side stream fork/join) | formC-shape (one stream, submit..wait)
-  arms, graph    : no-node | 1 empty node | 2 empty nodes (form C placement) | 1 node with a kt submit
+  arms, graph    : no-node | 1 empty node | 2 empty nodes (form C placement)
                  | 1 deliberately fat node (instrument control) | sglang-shape capture (may raise 107025)
   numbers        : node_us, window_us, ceiling = min(cpu_us, window_us) - node_us
   required checks: negative control (graph no-node ~= eager NPU-only), instrument control (fat node
@@ -64,8 +64,6 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=24)
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--numa", default="1")
-    ap.add_argument("--packed", action="store_true",
-                    help="build the layer with packed_transfer on; the 'node does one kt submit' arm needs it")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fat-us", type=float, default=500.0, help="instrument control: a node that burns this long")
     ap.add_argument("--tol", type=float, default=0.35, help="negative-control tolerance")
@@ -100,7 +98,7 @@ def main() -> int:
     ck = C.Ckpt()
     L, T = args.layer, args.tokens
     numa = [int(s) for s in args.numa.split(",")]
-    cfg = N.kt_cfg("prefix", args.n, None, args.threads, numa, graph=True, packed=args.packed)
+    cfg = N.kt_cfg("prefix", args.n, None, args.threads, numa, graph=True)
     off, _ = N.make_offload(cfg, L, capture_sizes=[T])
     pl = off.placement
     raw = N.load_raw_layer(ck, L, list(pl.resident_ids))
@@ -199,30 +197,12 @@ def main() -> int:
         while time.perf_counter() < end:
             pass
 
-    pending = {"task": None}
-
-    def kt_submit(_payload):
-        """One kt submit, no sync: the sync happens on the host after the
-        replay, outside the timed window.
-
-        Production keeps the submit and the sync in the same node on purpose
-        (kt's FIFO worker re-raises a task's exception only at the next sync,
-        so a submit-only node would hide its own errors). This arm is a
-        measurement, drained every round, and is not a shape anyone may ship.
-        """
-        wrapper = off.wrapper
-        buf = off._packed_buffers(T, dev)
-        task = wrapper.moe.forward_task(
-            buf["bsz"].data_ptr(),
-            buf["pin_ids"].shape[-1],
-            buf["pin_ids"].data_ptr(),
-            buf["pin_weights"].data_ptr(),
-            buf["pin_hidden"].data_ptr(),
-            buf["pin_out"].data_ptr(),
-            False,
-        )
-        wrapper.cpu_infer.submit(task)
-        pending["task"] = task
+    # The "node does one kt submit" arm is deliberately absent: it would leave
+    # a task submitted inside a replay and synced on the host afterwards, and
+    # kt has not confirmed that is legal for its FIFO worker (production keeps
+    # submit and sync in one node so a task's exception is re-raised). An extra
+    # number is not worth risking kt's state; the empty-node arms give the
+    # node cost, which is what the decision needs.
 
     def build(nodes) -> tuple:
         g = torch.npu.NPUGraph()
@@ -243,8 +223,6 @@ def main() -> int:
         "g_two": {"before": [noop], "after": [noop]},
         "g_fat": {"before": [fat]},
     }
-    if off.packed:
-        wanted["g_submit"] = {"before": [kt_submit]}
     for name, nodes in wanted.items():
         try:
             graphs[name] = build(nodes)
@@ -258,9 +236,6 @@ def main() -> int:
         def run():
             g.replay()
             torch.npu.synchronize()
-            if name == "g_submit" and pending["task"] is not None:
-                off.wrapper.cpu_infer.sync(0)  # untimed: after synchronize, drains the FIFO
-                pending["task"] = None
 
         return run
 
@@ -283,10 +258,6 @@ def main() -> int:
     per_node_from_two = d_two["median"] / 2.0
     add_ok = abs(per_node_from_two - d_one["median"]) <= max(20.0, 0.5 * max(per_node_from_two, d_one["median"]))
     v.check(add_ok, f"additivity: 1 node {d_one['median']:.1f} us vs half of 2 nodes {per_node_from_two:.1f} us")
-    d_submit = M.paired_delta(gr["g_submit"], gr["g_none"]) if "g_submit" in gr else None
-    if d_submit:
-        print(f"  node with one kt submit: {d_submit['median']:.1f} us "
-              f"(p10 {d_submit['p10']:.1f}, p90 {d_submit['p90']:.1f})", flush=True)
 
     # ---- sglang's shape, in a graph ---------------------------------------
     sg = {"captured": None, "error": None, "where": None}
@@ -351,7 +322,7 @@ def main() -> int:
         "eager_saved_vs_serial": {"sglang": saved_sglang, "formC": saved_formc},
         "graph_us": graph_stats,
         "graph_build_errors": build_errors,
-        "node_cost_us": {"one_empty": d_one, "two_empty": d_two, "fat": d_fat, "kt_submit": d_submit},
+        "node_cost_us": {"one_empty": d_one, "two_empty": d_two, "fat": d_fat},
         "numbers": {"node_us": node_us, "window_us": window_us, "cpu_us": cpu_us},
         "ceiling": ceil,
         "verdict": verdict,

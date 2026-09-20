@@ -58,7 +58,15 @@ def budget(tokens: int, layers: int, hidden: int, topk: int, gbps: float) -> dic
 
 
 def fixed_cost_per_op(observed_us: float, layers: int, ops_per_layer: int = 3) -> float:
-    """If the bytes are free, what per-operation cost would explain the number."""
+    """If the bytes are free, what per-operation cost would explain the number.
+
+    🔴 Arithmetic only, and the model it belongs to is retired (2026-09-20):
+    dividing an aggregate by an operation count produced 62.5 us at 120
+    operations and 37.5 us at 200, while the profile measures 1.168 us of
+    device time per memcpy. A figure derived this way is not a price and
+    cannot arbitrate between operation counts. Kept because the division is
+    still the right way to *state* an assumption -- never as a measurement.
+    """
     return observed_us / (layers * ops_per_layer)
 
 

@@ -60,9 +60,22 @@ echo "── report: missing arms, and the fixtures"
 python3 "$HERE/packed_ab_report.py" "$TMP/nothing" >/dev/null 2>&1; chk $? 1 "missing arm dirs -> fail, not crash"
 python3 "$HERE/make_packed_ab_fixture.py" "$TMP/good" identical || bad "fixture builder failed"
 python3 "$HERE/packed_ab_report.py" "$TMP/good" > "$TMP/good.txt" 2>&1; chk $? 0 "identical arms -> pass"
-command grep -q "C = 62" "$TMP/good.txt" && ok "C is solved from the arms (fixture is built for 62 us)" \
+command grep -q "implied C = 62" "$TMP/good.txt" && ok "C is solved from the arms (fixture is built for 62 us)" \
   || { bad "C not solved as expected"; command grep -i "C = " "$TMP/good.txt" | sed 's/^/     /'; }
-command grep -q "the model holds" "$TMP/good.txt" && ok "the C verdict is printed" || bad "no C verdict"
+command grep -q "model is retired" "$TMP/good.txt" && ok "the report says the unit-price model is retired" \
+  || bad "the retired-model note is missing"
+command grep -q "the model holds" "$TMP/good.txt" && bad "the report still endorses the retired model" \
+  || ok "the report no longer compares C against 62.5 as if it were a target"
+command grep -q "no measured window given" "$TMP/good.txt" \
+  && ok "without --window-us it refuses to say whether a node eats the window" \
+  || bad "it drew a form-C conclusion with no measured window"
+python3 "$HERE/packed_ab_report.py" "$TMP/good" --window-us 40 > "$TMP/good_w40.txt" 2>&1
+command grep -q "not worth implementing" "$TMP/good_w40.txt" \
+  && ok "C above the measured window -> form C not worth implementing" || bad "window comparison did not fire"
+python3 "$HERE/packed_ab_report.py" "$TMP/good" --window-us 4000 > "$TMP/good_w4k.txt" 2>&1
+command grep -q "stays a candidate" "$TMP/good_w4k.txt" \
+  && ok "C well below the window -> still a candidate (decided by t4, not here)" \
+  || bad "the both-directions arm did not fire"
 
 python3 "$HERE/make_packed_ab_fixture.py" "$TMP/onechar" onechar || bad "fixture builder failed"
 python3 "$HERE/packed_ab_report.py" "$TMP/onechar" > "$TMP/onechar.txt" 2>&1; chk $? 1 "one character changed -> FAIL"
@@ -74,8 +87,10 @@ command grep -q "comparison of nothing" "$TMP/empty.txt" && ok "it says the comp
 
 python3 "$HERE/make_packed_ab_fixture.py" "$TMP/slow" nogain || bad "fixture builder failed"
 python3 "$HERE/packed_ab_report.py" "$TMP/slow" > "$TMP/slow.txt" 2>&1
-command grep -q "does NOT match" "$TMP/slow.txt" && ok "a delta that contradicts the model is called out" \
-  || { bad "the model-mismatch branch did not fire"; command grep -i "model" "$TMP/slow.txt" | sed 's/^/     /'; }
+command grep -q "implied C" "$TMP/slow.txt" && ok "a no-gain arm still reports its implied C (no silent skip)" \
+  || { bad "the no-gain fixture produced no C line"; command grep -i "C = " "$TMP/slow.txt" | sed 's/^/     /'; }
+command grep -q "model is retired" "$TMP/slow.txt" && ok "and repeats that the model behind it is retired" \
+  || bad "the retired-model note is missing on the no-gain arm"
 
 python3 "$HERE/make_packed_ab_fixture.py" "$TMP/dead" deadlayers || bad "fixture builder failed"
 python3 "$HERE/packed_ab_report.py" "$TMP/dead" > "$TMP/dead.txt" 2>&1

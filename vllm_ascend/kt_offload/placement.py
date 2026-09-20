@@ -446,8 +446,14 @@ def host_ops_per_layer(packed: bool) -> dict[str, int]:
     kt's own path: three input copies (hidden, ids, weights), the host-func
     node, and the output copy back. Packed: one input copy instead of three
     (the three device-side fills that precede it are ordinary device work, not
-    host-device operations). 2026-09-20 measurement to beat: 7.5 ms per token
-    of transport+callback, i.e. ~62.5 us per operation at 120 operations.
+    host-device operations).
+
+    This function counts operations and nothing else. The per-operation price
+    once quoted here (7.5 ms / 120 operations = 62.5 us) is retired: the
+    2026-09-20 profile measured 1.168 us of device time per memcpy, so that
+    figure was an aggregate divided by a count, not a price. What an operation
+    costs is only visible as its effect on step time (the packed A/B) or on a
+    graph replay (t4).
     """
     d2h = 1 if packed else 3
     return {"d2h": d2h, "host_func": 1, "h2d": 1, "total": d2h + 2}

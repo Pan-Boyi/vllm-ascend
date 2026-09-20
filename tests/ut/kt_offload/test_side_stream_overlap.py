@@ -421,7 +421,10 @@ def _capture_schedule(monkeypatch, sim, boxes, *, overlap: bool):
     hs, ids, w = _inputs(7)
     rt.route(hs, w, ids, in_profile_run=False)
     # the resident experts, between route and merge: the work the side stream is
-    # supposed to hide behind (on card ~0.62 ms/layer against ~0.45 ms of host)
+    # supposed to hide behind. (The "~0.62 ms/layer" once written here is
+    # retired; the measured per-layer GMM is 44.7 us and the whole-layer window
+    # is what t4 item 2 measures. The simulated 30 us below is a fixture, not a
+    # claim about the card.)
     sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
     sim.capturing = False

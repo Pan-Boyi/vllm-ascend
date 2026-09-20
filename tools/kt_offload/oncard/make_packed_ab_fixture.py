@@ -4,7 +4,10 @@
 
 Modes: identical | onechar | emptyfield | nogain | deadlayers
 The gap fixtures are built so the arithmetic has a known answer: arm A gets
-80 extra gaps of 62.5 us per token, so C must come out at 62.5.
+80 extra gaps of 62.5 us per token, so the judge's implied C must come out at
+62.5. That 62.5 is a fixture constant chosen to make the division checkable --
+NOT a claim about the real per-operation cost, whose model the 2026-09-20
+profile retired (see packed_ab_report.RETIRED_PRICE_US).
 """
 from __future__ import annotations
 

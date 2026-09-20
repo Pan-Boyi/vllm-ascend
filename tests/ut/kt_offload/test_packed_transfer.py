@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """packed_transfer: one host-device input copy per layer instead of three.
 
-The target is the measured 7.5 ms per token of transport + callback on card
-(~62.5 us x 120 operations, 2026-09-20). kt fills three separate pinned
+The target is the transport + callback cost on card (once recorded as 7.5 ms
+per token). 🔴 The "~62.5 us x 120 operations" reading of it is retired: the
+2026-09-20 profile measures 1.168 us of device time per memcpy, so that figure
+was an aggregate divided by a count. What packed actually buys is the A/B's
+TPOT delta; what this file asserts is the operation count and bit-identity,
+both of which stand on their own. kt fills three separate pinned
 allocations, so a layer pays three host-device copies for the inputs; one
 combined buffer with the same three regions pays one. The switch also gives
 each layer its own buffers, which removes kt's ``layer_idx % 2`` slot sharing.
@@ -282,3 +286,48 @@ def test_buffers_are_dtype_and_contiguity_checked(monkeypatch):
     })
     with pytest.raises(RuntimeError):  # a view of the wrong size cannot be built
         rt._packed_buffers(1, torch.device("cpu"))
+
+
+# ---------------------------------------------------------------------------
+# hard constraint: nothing crosses a layer boundary
+# ---------------------------------------------------------------------------
+
+
+def test_a_kt_build_that_defers_experts_is_refused(monkeypatch):
+    """Deferring part of a token's CPU experts to a later layer/step is
+    forbidden for this deployment. kt's default is 0, but a default is a
+    policy: the guard reads the built wrapper and refuses."""
+    w = FakeWrapper({})
+    w.max_deferred_experts_per_token = 2
+    with pytest.raises(RuntimeError, match="forbidden"):
+        kl._refuse_cross_layer(w, 7)
+    w.max_deferred_experts_per_token = 0
+    kl._refuse_cross_layer(w, 7)  # the shipped configuration
+
+
+def test_a_build_without_the_attribute_is_flagged_not_waved_through(monkeypatch):
+    """Absence of the knob is not evidence that deferral is off: say so."""
+    said = []
+    monkeypatch.setattr(kl.logger, "warning", lambda *a, **k: said.append(a[0] % a[1:] if len(a) > 1 else a[0]))
+    kl._refuse_cross_layer(SimpleNamespace(), 3)
+    assert any("unverified" in m for m in said), said
+
+
+def test_the_guard_runs_when_the_wrapper_is_built(monkeypatch):
+    """The check has to sit on the path that actually builds kt, or it is a
+    function nobody calls."""
+    import inspect
+
+    src = inspect.getsource(kl.KTLayerOffload._build_wrapper)
+    assert "_refuse_cross_layer(" in src, src
+
+
+def test_every_forward_task_call_overwrites_rather_than_accumulates():
+    """The other half of the same constraint: incremental=True would read the
+    output back and accumulate, which is how a deferred expert's contribution
+    would arrive a layer late."""
+    import inspect
+
+    src = inspect.getsource(kl)
+    assert "False,  # incremental: no deferred experts" in src, "the packed call no longer pins incremental=False"
+    assert "incremental=True" not in src, [ln for ln in src.splitlines() if "incremental" in ln]

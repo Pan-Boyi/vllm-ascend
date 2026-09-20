@@ -12,6 +12,7 @@ ONCARD_DIR="$D"
 # shellcheck source=oncard_lib.sh
 source "$D/oncard_lib.sh"
 W="$(mktemp -d "${TMPDIR:-/tmp}/oncard_selftest.XXXXXX")"
+ROOT_VLLM_ASCEND="$(cd "$D/../../.." && pwd)/vllm_ascend"
 N=0; F=0
 ok() { N=$((N+1)); if [ "$1" = 0 ]; then echo "  [PASS] $2"; else F=$((F+1)); echo "  [FAIL] $2"; fi; }
 
@@ -117,6 +118,21 @@ except ValueError:
 print("t4_model positive controls all red where they must be")
 PY
 [ $r -eq 0 ]; ok $? "t4 decision model: every control goes red when it must ($(tail -n 1 "$W/t4model.out"))"
+
+echo "== 8. t5 (auto_dispatch_capture): refuses a run that could not tell a stale replay from a fresh one"
+ONCARD_DRY=1 python3 "$D/t5_auto_dispatch.py" > "$W/t5dry.out" 2>&1; r=$?
+[ $r -eq 0 ]; ok $? "t5 dry run exits 0 without touching a device (rc $r)"
+command grep -q "no device was touched" "$W/t5dry.out"; ok $? "t5 dry run says it touched nothing"
+command grep -q "positive control" "$W/t5dry.out"; ok $? "t5 plan names the positive control arm"
+command grep -q "capture success alone is NOT a pass" "$W/t5dry.out"; ok $? "t5 separates capture from replay"
+python3 "$D/t5_auto_dispatch.py" --inputs 2 > "$W/t5few.out" 2>&1; r=$?
+[ $r -eq 2 ]; ok $? "t5 refuses fewer than 3 inputs (rc $r)"
+python3 "$D/t5_auto_dispatch.py" --layers 1 > "$W/t5lay.out" 2>&1; r=$?
+[ $r -eq 2 ]; ok $? "t5 refuses fewer than 3 layers, so kt slot reuse stays covered (rc $r)"
+command grep -q "auto_dispatch_capture=auto" "$D/t5_auto_dispatch.py"; ok $? "t5 passes the parameter it is testing"
+! command grep -q "auto_dispatch_capture" "$ROOT_VLLM_ASCEND/compilation/acl_graph.py" 2>/dev/null \
+  || command grep -q "auto_dispatch_capture=True" "$ROOT_VLLM_ASCEND/compilation/acl_graph.py" 2>/dev/null
+ok $? "production capture path untouched by this test (acl_graph.py still takes the default)"
 
 bash "$D/run_oncard.sh" x t0 > /dev/null 2>&1; r=$?; [ $r -eq 2 ]; ok $? "bad card -> usage rc $r"
 bash "$D/run_oncard.sh" 0 t9 > /dev/null 2>&1; r=$?; [ $r -eq 2 ]; ok $? "unknown test -> usage rc $r"

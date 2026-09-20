@@ -461,6 +461,7 @@ class KTLayerOffload:
         # default device is the NPU, and kt's argument is a *host* map
         # (physical_to_logical_map_cpu).
         wrapper.load_weights(torch.arange(self.placement.num_experts, dtype=torch.int64, device="cpu"))
+        _refuse_cross_layer(wrapper, self.layer_idx)
         return wrapper
 
     # -- forward ------------------------------------------------------------
@@ -785,6 +786,45 @@ def _subscribe_stream(stream) -> None:
             raise
     _REPORT_SUBSCRIBED.add(key)
 
+
+
+def _refuse_cross_layer(wrapper, layer_idx: int) -> None:
+    """Hard constraint (user, 2026-09-20): nothing may cross a layer boundary.
+
+    Deferring part of a token's CPU experts to a later layer or step is
+    forbidden -- not deferred, forbidden -- so kt's deferral must be off. It
+    defaults to 0 and we never ask for it, but a default is a policy and this
+    is meant to be enforcement: read it off the object that would do the
+    deferring, at the moment it exists, and refuse rather than discover it in
+    an output.
+
+    The other half of the same constraint, ``incremental=False`` on every
+    forward_task call, is asserted where that call is made (and in
+    tests/ut/kt_offload/test_packed_transfer.py).
+    """
+    seen = {}
+    for attr in ("max_deferred_experts_per_token", "num_deferred_experts_per_token", "deferred_experts"):
+        value = getattr(wrapper, attr, None)
+        if value is None:
+            continue
+        seen[attr] = value
+        try:
+            nonzero = int(value) != 0
+        except (TypeError, ValueError):
+            nonzero = bool(value)
+        if nonzero:
+            raise RuntimeError(
+                f"kt_offload: layer {layer_idx}: kt reports {attr}={value!r}, which defers part of a token's "
+                "CPU experts past this layer. Crossing a layer boundary is forbidden for this deployment "
+                "(design doc, hard constraint): the CPU contribution must be merged in the same layer that "
+                "routed it."
+            )
+    if not seen:
+        logger.warning(
+            "kt_offload: layer %d: this kt build exposes no deferral attribute to check; the no-cross-layer "
+            "constraint is unverified on this build (looked for max_deferred_experts_per_token and friends)",
+            layer_idx,
+        )
 
 def _launch_host_func(stream, fn, payload) -> None:
     import torch_npu

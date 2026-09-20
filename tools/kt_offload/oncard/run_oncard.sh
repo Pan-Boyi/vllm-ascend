@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4
+#  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t5
 #
 #  The only way the single-layer on-card checks touch a card. The shell enforces:
 #   1. lease first: build_artifacts/card_lease.sh acquire <card> dsv41_vllm_singlecard
@@ -32,7 +32,7 @@ ROOT=/workspace/code/dsv4_single_card/vllm_project
 OWNER=dsv41_vllm_singlecard
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
-usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4> [test args...]"; exit 2; }
+usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5> [test args...]"; exit 2; }
 [[ "$CARD" =~ ^[0-9]+$ ]] || usage
 case "$TEST" in
   t0) PY=t0_offload_off.py; DEF_TIMEOUT=2400;;
@@ -40,6 +40,7 @@ case "$TEST" in
   t2) PY=t2_graph.py;       DEF_TIMEOUT=2400;;
   t3) PY=t3_side_stream.py; DEF_TIMEOUT=2400;;
   t4) PY=t4_overlap_ceiling.py; DEF_TIMEOUT=1800;;
+  t5) PY=t5_auto_dispatch.py; DEF_TIMEOUT=1800;;
   *) usage;;
 esac
 

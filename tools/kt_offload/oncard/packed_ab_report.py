@@ -41,7 +41,12 @@ import sys
 
 GAP_US = 100.0
 OPS_SAVED_PER_TOKEN = 80  # 40 layers x (5 - 3) host-device operations
-C_INFERRED_US = 62.5
+# 🔴 RETIRED (2026-09-20, profile_ops.py on the armA profile): 62.5 us was
+# 7.5 ms / 120 operations, and 37.5 us the same aggregate over 200. The
+# profile measures 1.168 us of device time per memcpy, so neither is a price,
+# and a number built from one operation count cannot arbitrate between counts.
+# Kept only so this report can say what the old figure was.
+RETIRED_PRICE_US = 62.5
 
 
 # ---------------------------------------------------------------- answers ---
@@ -164,37 +169,39 @@ def gap_table(arm: str) -> dict:
     return out
 
 
-def solve_c(a: dict, b: dict) -> dict:
-    """C from the two arms, and which of the three outcomes it is."""
+def solve_c(a: dict, b: dict, window_us: float | None = None) -> dict:
+    """What the two arms actually moved, and the per-operation figure it implies.
+
+    This is no longer a test of the "fixed cost x operation count" model: the
+    profile retired that model (see RETIRED_PRICE_US). Delta is the result;
+    the implied C is a derived number whose only remaining use is as one of
+    the two independent sources for a host-func node's cost -- the other being
+    t4's measured node delta. Agreeing is what makes either usable.
+    """
     if not a or not b or math.isnan(a.get("big_ms_per_token", float("nan"))):
         return {"ok": False, "why": "a gap table is missing"}
     delta_ms = a["big_ms_per_token"] - b["big_ms_per_token"]
     c_us = delta_ms * 1000 / OPS_SAVED_PER_TOKEN
-    predicted_ms = OPS_SAVED_PER_TOKEN * C_INFERRED_US / 1000
-    # the model's own prediction, against what the arms actually moved
-    ratio = delta_ms / predicted_ms if predicted_ms else float("nan")
-    if c_us >= 300:
-        verdict = ("C >= 300 us: one extra callback would eat the 0.62 ms GMM window "
-                   "-> form C is not worth implementing; keep reducing operations")
-    elif 30 <= c_us <= 130:
-        verdict = f"C = {c_us:.0f} us, near the inferred 62.5 -> the model holds; form C is worth implementing"
+    if window_us is not None:
+        verdict = (
+            f"implied C = {c_us:.0f} us against a measured window of {window_us:.0f} us: "
+            + ("one extra node would eat the window -> form C is not worth implementing"
+               if c_us >= window_us
+               else "an extra node still leaves part of the window -> form C stays a candidate, "
+                    "decide on t4's own node measurement, not on this one")
+        )
     else:
-        verdict = (f"C = {c_us:.0f} us is far from the inferred 62.5 and outside the band this test can "
-                   "explain -> treat 'fixed cost x operation count' as unproven")
-    model_ok = 0.5 <= ratio <= 2.0 if not math.isnan(ratio) else False
+        verdict = (f"implied C = {c_us:.0f} us; no measured window given (--window-us, from t4 item 2), "
+                   "so this cannot say whether an extra node eats it")
     return {
         "ok": True,
         "delta_big_ms_per_token": delta_ms,
         "C_us": c_us,
-        "predicted_ms_at_62.5us": predicted_ms,
-        "delta_over_predicted": ratio,
-        "model_holds": model_ok,
+        "retired_price_us": RETIRED_PRICE_US,
         "verdict": verdict,
         "model_note": (
-            "delta matches the model within 2x"
-            if model_ok
-            else "🔴 delta does NOT match 80 x C: the 'fixed cost x operation count' model is wrong, "
-            "and the 7.5 ms attribution has to be redone per operation kind (D2H / H2D / host-func)"
+            "the 'fixed cost x operation count' model is retired (profile: 1.168 us of device time per "
+            "memcpy); do not compare C against 62.5/37.5 us, compare it against t4's measured node cost"
         ),
     }
 
@@ -235,10 +242,17 @@ def read_int(path: str) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    argv = sys.argv[1:]
+    window_us = None
+    if "--window-us" in argv:  # t4 item 2, when it has been measured
+        i = argv.index("--window-us")
+        window_us = float(argv[i + 1])
+        del argv[i : i + 2]
+    if len(argv) != 1:
         print(__doc__)
+        print("usage: packed_ab_report.py <run dir> [--window-us <t4 item 2, us>]")
         return 2
-    run = sys.argv[1]
+    run = argv[0]
     arms = {name: os.path.join(run, f"arm{name}") for name in ("A", "B")}
     missing = [n for n, p in arms.items() if not os.path.isdir(p)]
     if missing:
@@ -287,16 +301,14 @@ def main() -> int:
               f">{GAP_US:.0f}us {g['big_per_token']:.2f}/tok totalling {g['big_ms_per_token']:.2f} ms "
               f"(median {g['big_median_us']:.0f} us)")
 
-    print("\n=== 4. per-operation cost C, solved from the arms")
-    c = solve_c(gt.get("A", {}), gt.get("B", {}))
+    print("\n=== 4. per-operation cost C, solved from the arms (model retired; see the note)")
+    c = solve_c(gt.get("A", {}), gt.get("B", {}), window_us)
     if not c["ok"]:
         print(f"  not solvable: {c['why']}")
         fails.append("C could not be solved")
     else:
         print(f"  delta(>100us ms/token) = {c['delta_big_ms_per_token']:+.2f} ms over {OPS_SAVED_PER_TOKEN} operations")
-        print(f"  C = {c['C_us']:.1f} us   (inferred was {C_INFERRED_US})")
-        print(f"  the model predicted {c['predicted_ms_at_62.5us']:.2f} ms; measured/predicted = "
-              f"{c['delta_over_predicted']:.2f}")
+        print(f"  implied C = {c['C_us']:.1f} us   (the retired figure was {c['retired_price_us']}, do not compare)")
         print(f"  ⇒ {c['verdict']}")
         print(f"  ⇒ {c['model_note']}")
 

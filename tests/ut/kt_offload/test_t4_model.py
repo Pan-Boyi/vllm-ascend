@@ -137,14 +137,28 @@ def test_ceiling_is_bound_by_whichever_side_is_shorter():
     assert npu_bound["bound_by"] == "npu_window" and npu_bound["per_layer_us"] == pytest.approx(95.0)
 
 
-def test_a_node_at_or_above_the_void_threshold_kills_form_c():
-    ceil = M.ceiling(cpu_us=400.0, window_us=100.0, node_us=M.NODE_VOID_US, layers=40)
-    out = M.verdict(ceil)
-    assert out["worth_it"] is False and "void" in out["why"]
+def test_a_node_as_big_as_the_measured_window_kills_form_c():
+    """The rule is relative to this run's measured window -- there is no
+    absolute per-operation threshold any more (the price it came from is
+    retired), so the same node cost decides differently on different cards."""
+    kills = M.verdict(M.ceiling(cpu_us=400.0, window_us=100.0, node_us=100.0, layers=40))
+    assert kills["worth_it"] is False and "eats the window" in kills["why"]
+    # the identical node against a bigger measured window is not fatal
+    survives = M.verdict(M.ceiling(cpu_us=400.0, window_us=900.0, node_us=100.0, layers=40))
+    assert survives["worth_it"] is None and "300.0 us/layer" in survives["why"]  # cpu-bound: 400 - 100
 
 
-def test_a_node_that_eats_the_window_kills_form_c_even_below_the_threshold():
-    out = M.verdict(M.ceiling(cpu_us=400.0, window_us=30.0, node_us=40.0, layers=40))
+def test_the_model_has_no_absolute_price_constant_left():
+    assert not hasattr(M, "NODE_VOID_US"), "an absolute threshold came back; it was built on a retired price"
+    src = (Path(M.__file__).read_text() if getattr(M, "__file__", None) else MODEL.read_text())
+    for retired in ("62.5", "37.5", "0.62 ms"):
+        assert retired not in src, f"{retired} is back in the decision model"
+
+
+def test_a_node_bigger_than_the_cpu_side_kills_it_even_with_a_wide_window():
+    """The other way round: plenty of NPU work to hide behind, but the CPU
+    finishes sooner than the node costs, so there is nothing to overlap."""
+    out = M.verdict(M.ceiling(cpu_us=30.0, window_us=900.0, node_us=40.0, layers=40))
     assert out["worth_it"] is False and "nothing left to win" in out["why"]
 
 
@@ -152,12 +166,12 @@ def test_the_verdict_compares_against_the_measured_packed_gain_when_there_is_one
     ceil = M.ceiling(cpu_us=400.0, window_us=100.0, node_us=5.0, layers=40)  # 3.8 ms/step
     assert M.verdict(ceil, packed_gain_ms=1.0)["worth_it"] is True
     loses = M.verdict(ceil, packed_gain_ms=9.0)
-    assert loses["worth_it"] is False and "reducing operations (packed)" in loses["why"]
+    assert loses["worth_it"] is False and "the other route" in loses["why"]
 
 
 def test_the_verdict_refuses_to_decide_with_nothing_to_compare_against():
     out = M.verdict(M.ceiling(cpu_us=400.0, window_us=100.0, node_us=5.0, layers=40))
-    assert out["worth_it"] is None and "no measured packed gain" in out["why"]
+    assert out["worth_it"] is None and "no measured alternative" in out["why"]
 
 
 def test_the_mutation_arm_t4_runs_on_card_flips_the_verdict():

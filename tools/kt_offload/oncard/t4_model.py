@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import math
 
-# A host-func node costing this much or more eats the whole window: form C is
-# void at that point whatever else holds.
-NODE_VOID_US = 100.0
+# No absolute threshold here on purpose. "A node costing >= 100 us kills it"
+# was a rule of thumb built on a per-operation price the 2026-09-20 profile
+# retired; what decides is the node against *this run's measured* window and
+# CPU time, which is what ceiling() already computes.
 
 
 def stats(samples) -> dict:
@@ -120,13 +121,18 @@ def ceiling(cpu_us: float, window_us: float, node_us: float, layers: int) -> dic
 
 
 def verdict(ceil: dict, packed_gain_ms: float | None = None) -> dict:
-    """Worth building, or not. One sentence, and the reason it rests on."""
+    """Worth building, or not. One sentence, and the measurement it rests on.
+
+    Everything is relative to this run's measured numbers: the node against
+    the window it has to fit inside, and the result against whatever the other
+    route actually bought. No absolute per-operation price appears anywhere.
+    """
     node_us, per_layer, per_step = ceil["node_us"], ceil["per_layer_us"], ceil["per_step_ms"]
-    if node_us >= NODE_VOID_US:
+    if node_us >= ceil["window_us"]:
         return {
             "worth_it": False,
-            "why": f"one host-func node costs {node_us:.1f} us >= {NODE_VOID_US:.0f} us: it eats the whole "
-            f"window ({ceil['window_us']:.1f} us). Form C is void on this measurement alone.",
+            "why": f"one host-func node costs {node_us:.1f} us and the whole window between submit and wait "
+            f"is {ceil['window_us']:.1f} us: the node eats the window it was supposed to hide behind.",
         }
     if per_layer <= 0:
         return {
@@ -140,7 +146,7 @@ def verdict(ceil: dict, packed_gain_ms: float | None = None) -> dict:
         f"minus {node_us:.1f} us of node)"
     )
     if packed_gain_ms is not None:
-        cheaper = "form C" if per_step > packed_gain_ms else "reducing operations (packed)"
-        line += f"; measured packed gain {packed_gain_ms:.2f} ms/step, so {cheaper} is the bigger of the two"
+        cheaper = "form C" if per_step > packed_gain_ms else "the other route"
+        line += f"; measured alternative gain {packed_gain_ms:.2f} ms/step, so {cheaper} is the bigger of the two"
         return {"worth_it": per_step > packed_gain_ms, "why": line}
-    return {"worth_it": None, "why": line + "; no measured packed gain to compare against yet"}
+    return {"worth_it": None, "why": line + "; no measured alternative to compare against yet"}
