@@ -364,6 +364,62 @@ weights fp32）+ H2D 10,240 B = 20,552 B；40 层 = 822 KB/token ⇒ 20 GB/s 下
 两个捕获尺寸交替 replay、每次 replay 逐层核 `HOST_FUNC_CALLS +1`、输出与串行臂**逐位**比。
 它能把"某些层的侧流工作没进图"和"进了图但算错"分开，而整网 A/B 分不开。T3 绿了再排整网 A/B。
 
+## k.3 2026-09-20 定位：护栏读的是代理；侧流捕获这条路在本平台不通
+
+### ① 护栏为什么没响（定位到行）
+护栏在 `vllm_ascend/kt_offload/layer.py` 的 `_submit_captured_forked` 里：侧流上下文内 `if not _capturing(): raise`，
+而 `_capturing()`（同文件末尾）读的是 `torch.npu.is_current_stream_capturing()`。
+**它读的是代理**：「当前有捕获在进行」≠「这条流上的工作会进图」。
+T3 的产物就是证据：**护栏放行了**，随后 ACL 在 `capture_end` 拒绝（107025）。服务那一发同样放行、且没有任何东西拒绝。
+⇒ 护栏从来没有判断过它声称判断的那件事。
+
+**修法（已实现）**：`probe_side_stream_capture()` —— 启用侧流且图模式时，在 `after_weights_loaded` 里
+**捕获一个微型的同形图**（fork → 侧流上一次 D2H + 一个 host-func 节点 → join → H2D），然后**用两个不同输入各重放一次**，
+要求 (a) 捕获不抛错、(b) host-func 节点每次重放各跑一次、(c) 图搬回来的值随输入变化。
+三条都读**被判断的那个对象**（这张图到底会不会重放侧流上的工作）。两次真实失效都会被它拦下：
+T3 那种在 (a) 抛错，服务那种在 (b)/(c) 不成立。不通就**拒绝启动**并说清换回 `overlap_side_stream=false`。
+
+**与原有变异臂的差别**（协调方要求说明）：原来的 `capture not propagated` 变异是**事后手改调度**（把 side 那一列删掉），
+测的是判据能不能看出结果不对；真实失效是**平台自己说"在捕获"却不记录侧流节点**。新测试用一个这样的假平台
+（`sim.capture_records_side=False`），并在同一个测试里断言**旧的代理谓词仍然返回 True** —— 非等价性因此是可执行的。
+
+### ② 为什么 T3 报错、服务静默
+- 不是上层吞错误码：`vllm/compilation/breakable_cudagraph.py` 的 `_end_segment` 没有 try/except；
+  `torch.cuda.CUDAGraph` 在 `vllm_ascend/worker/model_runner_v1.py:6056` 被换成 `torch.npu.NPUGraph`，
+  也就是同一个 C++ `capture_end`；那一段 shim 里唯一的 try/except 包的是 **runner 初始化**，不是捕获。
+- 剩下的差异是**捕获的形状**：T3 把 3 层放进**一个**捕获（3 对 fork/join）；服务是 breakable，
+  **每个注意力算子断一次图**（`vllm_ascend/ops/mla.py:207` / `ops/dsa.py:171` 上的 `@eager_break_during_capture`，
+  `vllm/compilation/breakable_cudagraph.py:59` 起），所以每段里只有一层、只有一对 fork/join。
+  ⇒ 待验假设：107025 与「一次捕获里多对 fork/join」有关；一对就不报错，但侧流节点没有被有效重放。
+  判据（下次窗口，几十秒）：`run_oncard.sh <card> t3 -- --layers 1` 与 `--graphs per-layer`。
+  现在启动探针会先拦，所以这两发要在探针失败的报文里读结论（探针本身就是同形最小用例）。
+
+### ③ 在现有产物上验「复用旧输出」指纹（不靠推断）
+从两臂的 `kernel_details.csv` 自己算（步数用 `MoeInitRoutingV3`/40）：
+
+| | A（侧流关） | B（侧流开） |
+|---|---|---|
+| 步数 / 步时 | 181 / 44.32 ms | 236 / 33.94 ms |
+| device 忙（并集）/步 | 25.6 ms | 27.1 ms |
+| >100 µs 空隙/步 | **44.1 段 × 406 µs = 17.90 ms** | **15.3 段 × 379 µs = 5.80 ms** |
+| 每步空隙段数分布 | 144/181 步正好 43 段（均匀） | **双峰**：约 210 步是 6–14 段、约 26 步是 42–51 段 |
+
+判据与读数：
+- 「重叠在所有层生效」预测 步时 ≈ 44.32 − 17.90 = **26.4 ms**、大空隙 ≈ **0** ⇒ **与观测不符**（33.94 ms / 5.80 ms）⇒ **排除**。
+- 「CPU 工作在 N 层上没有发生、其余不变」解出 **N ≈ 29.8（按空隙）/ 25.5（按步时）**，两条独立读数一致。
+- 且**存活的空隙尺寸和 A 一样**（379 vs 406 µs，中位 279 vs 348）⇒ 不是「被盖住变短」，是「整段不见了」。
+- 每步段数**双峰**：约 26 步仍是 43 段（= eager 步，prefill/未捕获尺寸，与 A 同形），其余步只有 ~10 段。
+  ⇒ **缺陷只在捕获路径**，eager 路径那一发是好的（这也说明我上一轮把 eager 分叉当首要嫌疑是错的方向）。
+⇒ 指纹成立：**重放时大部分层的 CPU 工作没有执行，那些层用的是捕获那一刻的 pinned 输出。**
+
+### ④ 段数复核（协调方要求单独报）
+`@eager_break_during_capture` 的断点判据**只看有没有 breakable 捕获在进行**，不看 FULL/PIECEWISE
+（`vllm/compilation/breakable_cudagraph.py:94-115`）。DSV4.1 每层一次 `dsa_forward`/`mla_forward` 都带这个装饰器
+⇒ **`VLLM_USE_BREAKABLE_CUDAGRAPH=1` 下，即使 decode 走 FULL，注意力也是 eager 段，每个捕获描述符 ≈41 段**（40 断点）。
+而 `VLLM_USE_BREAKABLE_CUDAGRAPH=0`（t2 那一发用的 `ACLGraphWrapper`）没有断点机制，注意力**在图内**，每个描述符 1 张图。
+⇒ 两种说法各自成立于各自的开关状态；本次 A/B 用的是 `=1`。「分段捕获是最大结构差异」这条**仍然是推测**，
+现在它的地位是 ② 里的待验假设，不是既成事实。
+
 ## 上卡 A/B 方案（M3 侧流，1 张卡；两臂只差一个开关）
 
 两臂：`overlap_side_stream: false`（现状）与 `true`。**同一构建、同一配置、同一套仪器**，只切这个开关。

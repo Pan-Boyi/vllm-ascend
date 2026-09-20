@@ -48,8 +48,14 @@ def main() -> int:
     ap.add_argument("--numa", default="1")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=os.environ.get("ONCARD_RUN_DIR", "."))
+    ap.add_argument("--graphs", choices=("one", "per-layer"), default="one",
+                    help="one graph over all layers (T3's original shape), or one graph per layer "
+                         "(what the breakable wrapper does in the service: an attention break, hence a "
+                         "capture_begin/end pair, around every layer)")
+    ap.add_argument("--probe-only", action="store_true",
+                    help="build one offload layer and stop: runs the startup capture probe alone")
     args = ap.parse_args()
-    if args.inputs < 3 or args.layers < 3:
+    if args.inputs < 3 or (args.layers < 3 and not args.probe_only):
         ap.error("--inputs and --layers must be >= 3 (slot reuse needs L and L+2)")
 
     import npu_moe as N
@@ -87,7 +93,17 @@ def main() -> int:
             out = merged if out is None else out + merged
         return out
 
-    print(f"===== T3 layers {layer_ids}, capture sizes {sizes} =====", flush=True)
+    print(f"===== T3 layers {layer_ids}, capture sizes {sizes}, graphs={args.graphs} =====", flush=True)
+    if args.probe_only:
+        # KTLayerOffload.after_weights_loaded runs probe_side_stream_capture();
+        # if the platform cannot replay side-stream work it raises there.
+        try:
+            build(overlap=True)
+        except RuntimeError as exc:
+            v.check(False, f"startup capture probe refused overlap: {str(exc)[:300]}")
+            return v.finish(os.path.join(args.out, "t3_result.json"), {"probe": KL._SIDE_CAPTURE_PROBE})
+        v.check(KL._SIDE_CAPTURE_PROBE == "ok", f"startup capture probe: {KL._SIDE_CAPTURE_PROBE}")
+        return v.finish(os.path.join(args.out, "t3_result.json"), {"probe": KL._SIDE_CAPTURE_PROBE})
     serial = build(overlap=False)
     pl = serial[0][0].placement
     inputs = {}
@@ -123,14 +139,26 @@ def main() -> int:
     for T in sizes:
         sx, sids, sw = (t.clone() for t in inputs[T][0])
         calls0 = dict(KL.HOST_FUNC_CALLS)
-        g = torch.npu.NPUGraph()
         try:
-            with torch.npu.graph(g):
-                sout = run_stack(stack, sx, sids, sw)
+            if args.graphs == "one":
+                g = torch.npu.NPUGraph()
+                with torch.npu.graph(g):
+                    sout = run_stack(stack, sx, sids, sw)
+                g = [g]
+            else:
+                # one capture_begin/end pair per layer, like the breakable
+                # wrapper's segments around every attention op
+                g, sout = [], None
+                for off, lay, comm in stack:
+                    gi = torch.npu.NPUGraph()
+                    with torch.npu.graph(gi):
+                        _, merged, _ = N.offload_forward(off, lay, comm, sx, sw, sids)
+                    g.append(gi)
+                    sout = merged if sout is None else sout + merged
         except RuntimeError as exc:
-            v.check(False, f"T={T} capture with overlap raised: {str(exc)[:300]}")
+            v.check(False, f"T={T} capture ({args.graphs}) with overlap raised: {str(exc)[:300]}")
             return v.finish(os.path.join(args.out, "t3_result.json"),
-                            {"host_func_calls": dict(KL.HOST_FUNC_CALLS)})
+                            {"host_func_calls": dict(KL.HOST_FUNC_CALLS), "graphs": args.graphs})
         torch.npu.synchronize()
         ran = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - calls0.get(lid, 0) for lid in layer_ids}
         v.check(all(n == 0 for n in ran.values()), f"T={T} capture ran no host-func node (ran {ran})")
@@ -143,7 +171,8 @@ def main() -> int:
             x, ids, w = inputs[T][k]
             sx.copy_(x), sids.copy_(ids), sw.copy_(w)
             before = dict(KL.HOST_FUNC_CALLS)
-            graphs[T].replay()
+            for gi in graphs[T]:
+                gi.replay()
             torch.npu.synchronize()
             grew = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - before.get(lid, 0) for lid in layer_ids}
             v.check(all(n == 1 for n in grew.values()),
@@ -162,7 +191,8 @@ def main() -> int:
                 v.check(not C.bit_identical(replays[T][i], replays[T][j])[0], f"T={T} replay {i} != replay {j}")
 
     return v.finish(os.path.join(args.out, "t3_result.json"),
-                    {"host_func_calls": dict(KL.HOST_FUNC_CALLS), "layers": layer_ids, "sizes": sizes})
+                    {"host_func_calls": dict(KL.HOST_FUNC_CALLS), "layers": layer_ids, "sizes": sizes,
+                     "graphs": args.graphs, "probe": KL._SIDE_CAPTURE_PROBE})
 
 
 if __name__ == "__main__":

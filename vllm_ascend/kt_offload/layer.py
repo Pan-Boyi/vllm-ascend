@@ -64,6 +64,8 @@ HOST_FUNC_CALLS: dict[int, int] = {}
 _CAPTURE_BUFFERS_READY: tuple | None = None
 # One side stream for the whole process, created outside any capture.
 _SIDE_STREAM = None
+# Result of the capture self-probe (None = not probed yet).
+_SIDE_CAPTURE_PROBE: str | None = None
 # A captured graph keeps record/wait nodes pointing at these event objects, so
 # every pair stays alive for the life of the process (sglang lost a capture to
 # collected events).
@@ -242,6 +244,7 @@ class KTLayerOffload:
             side = _side_stream(device)
             if self.graph_enabled:
                 _subscribe_stream(side)
+                probe_side_stream_capture(device)
             if not self._overlap_supported():
                 raise RuntimeError(
                     "kt_offload: overlap_side_stream needs kt's copy_inputs_to_cpu_buffers / "
@@ -518,6 +521,87 @@ class KTLayerOffload:
         compute.wait_event(join)
 
 
+def probe_side_stream_capture(device) -> None:
+    """Refuse the side-stream form unless a captured graph really replays it.
+
+    This reads the subject rather than a proxy. ``_capturing()`` only answers
+    "is a capture in progress"; it said yes on the side stream in both failures
+    of 2026-09-20 -- T3, where ACL then rejected the capture at capture_end
+    (107025), and the 50-question service, where nothing was rejected and
+    ~30 of 40 layers' CPU-expert work simply did not run at replay (the profile
+    arithmetic: 44.1 exposure gaps/step at 406 us in the serial arm against
+    15.3 at 379 us with overlap on, i.e. the surviving gaps are full length and
+    the rest are absent, not shortened).
+
+    So capture a miniature version of the real pattern -- fork, a D2H and a
+    host-func node on the side stream, join, H2D -- and then *replay it twice
+    with different inputs*, requiring that the host-func node runs once per
+    replay and that the value the graph moves changes with the input. A
+    platform that refuses the capture raises here; one that silently drops the
+    side-stream nodes fails the counter or the value.
+    """
+    global _SIDE_CAPTURE_PROBE
+    if _SIDE_CAPTURE_PROBE == "ok":
+        return
+    if _SIDE_CAPTURE_PROBE is not None:
+        raise RuntimeError(_SIDE_CAPTURE_PROBE)
+
+    side = _side_stream(device)
+    src = torch.zeros(1, dtype=torch.int32, device=device)
+    dst = torch.zeros(1, dtype=torch.int32, device=device)
+    pin = _pinned_scalar()
+    runs = [0]
+
+    def host(payload) -> None:
+        buf, counter = payload
+        counter[0] += 1
+        buf.add_(1)  # the host contribution the graph must carry back
+
+    payload = (pin, runs)
+    _CAPTURED_PAYLOADS.append(payload)
+    fork, join = _new_event(device), _new_event(device)
+    _SIDE_EVENTS.append((fork, join))
+
+    def fail(reason: str) -> None:
+        global _SIDE_CAPTURE_PROBE
+        _SIDE_CAPTURE_PROBE = (
+            f"kt_offload: overlap_side_stream is not usable on this platform: {reason}. "
+            "The CPU-expert work would not be replayed with the graph and every replay would reuse "
+            "the capture run's output (faster and silently wrong). Set overlap_side_stream=false."
+        )
+        raise RuntimeError(_SIDE_CAPTURE_PROBE)
+
+    graph = _new_graph()
+    try:
+        with _graph_ctx(graph):
+            fork.record(torch.npu.current_stream(device))
+            side.wait_event(fork)
+            with _stream_ctx(side, device):
+                _probe_copy(pin, src)
+                _launch_host_func(side, host, payload)
+            join.record(side)
+            torch.npu.current_stream(device).wait_event(join)
+            _probe_copy(dst, pin)
+    except Exception as exc:  # noqa: BLE001
+        fail(f"capturing the fork/join pattern raised {type(exc).__name__}: {str(exc)[:200]}")
+
+    for value in (5, 9):
+        src.fill_(value)
+        before = runs[0]
+        try:
+            _graph_replay(graph)
+            _device_sync(device)
+        except Exception as exc:  # noqa: BLE001
+            fail(f"replaying the fork/join pattern raised {type(exc).__name__}: {str(exc)[:200]}")
+        if runs[0] != before + 1:
+            fail(f"the host-func node on the side stream ran {runs[0] - before} times per replay, want 1")
+        got = int(dst.item())
+        if got != value + 1:
+            fail(f"the replay moved {got}, want {value + 1} (input {value} plus the host func's +1)")
+    _SIDE_CAPTURE_PROBE = "ok"
+    logger.info("kt_offload: side-stream capture probe passed (host-func node replays, value follows the input)")
+
+
 def _kt_host_forward(payload) -> None:
     """Graph-node callback: run this layer's CPU experts on the pinned buffers.
 
@@ -607,6 +691,32 @@ def _stream_ctx(stream, device):
 
 def _handle_of(stream) -> int:
     return int(stream.npu_stream)
+
+
+def _probe_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """One async copy of the probe, on the current stream (a graph node)."""
+    dst.copy_(src, non_blocking=True)
+
+
+def _pinned_scalar() -> torch.Tensor:
+    """One pinned int32 element: the probe's stand-in for kt's pinned buffers."""
+    return torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
+
+
+def _new_graph():
+    return torch.npu.NPUGraph()
+
+
+def _graph_ctx(graph):
+    return torch.npu.graph(graph)
+
+
+def _graph_replay(graph) -> None:
+    graph.replay()
+
+
+def _device_sync(device) -> None:
+    torch.npu.synchronize(device)
 
 
 def _kt_buffer_class():
