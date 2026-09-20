@@ -18,6 +18,7 @@ from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTo
 # sigmoid + renormalize=False (no hash table is involved), which is why that
 # rule lives here and is left as it is.
 #
+#
 # The sqrtsoftplus + norm_topk_prob=False case deliberately does NOT get a rule
 # here, although it is also unsupported. Returning False for it would route
 # DeepSeek-V4 hash MoE to AscendGroupedTopKRouter, which is never given tid2eid
@@ -25,6 +26,13 @@ from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTo
 # route. It is rejected instead, with a raise, by
 # ``reject_unrenormalizable_hash_routing`` (fused_topk_router.py), called from
 # the constructor of the router that actually calls the operator.
+#
+# Note the two rules are unsupported for unrelated reasons, which is a second
+# argument for keeping them apart. The sigmoid one is a branch limitation. The
+# sqrtsoftplus one is that moe_gating_top_k_hash ties the normalisation to
+# norm_type (!=0 always normalises) and reads its `renorm` attribute nowhere at
+# all -- so there is no value of any argument that would make it honour
+# norm_topk_prob=false.
 def check_npu_moe_gating_top_k(
     top_k: int,
     renormalize: bool,

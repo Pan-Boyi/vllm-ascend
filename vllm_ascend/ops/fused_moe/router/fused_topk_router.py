@@ -83,17 +83,41 @@ def reject_unrenormalizable_hash_routing(
 ) -> None:
     """Refuse a checkpoint the hash routing operator would silently renormalize.
 
-    ``moe_gating_top_k_hash`` normalises the selected top-k weights on every
-    call. Its ``renorm`` attribute is not a switch: the host tiling accepts
-    ``renorm == 0`` and nothing else
-    (``csrc/moe/moe_gating_top_k_hash/op_host/moe_gating_top_k_hash_tiling.cpp``
-    :239 and ``..._tiling_arch35.h``:255, which is the A5 path), the operator's
-    own prototype documents ``renorm`` as choosing the ORDER of norm and top-k
-    (``moe_gating_top_k_hash_proto.cpp``:41), and all four kernel variants run
-    ReduceSum -> Div -> Muls with no test on ``renorm_`` at all
-    (``..._e_k_fullload.h``:295-307, ``..._generalized.h``:533-543,
-    ``..._without_group.h``:257-267, ``..._regbase.h``:1110-1113). ``renorm_``
-    is declared in two kernels and read in none.
+    WHAT DECIDES THE NORMALISATION IS ``norm_type``, NOT ``renorm``.
+
+    ``renorm`` cannot switch it on and cannot switch it off, because no kernel
+    variant reads ``renorm`` at all. On A5 the only reachable kernel is
+    ``MoeGatingTopKHashRegbase`` -- ``moe_gating_top_k_hash_def.cpp``:141
+    registers ``ascend950`` with ``regbaseCfg`` and the arch35 tiling keys are
+    10000-10004 -- and ``renorm`` has zero references in
+    ``..._kernel/moe_gating_top_k_hash_regbase.h``. In the two non-A5 kernels
+    that mention it (``..._e_k_fullload.h``, ``..._generalized.h``) it is a
+    member that is declared and then never assigned and never read. That is
+    why the host tiling rejects every value except 0 instead of implementing
+    it (``..._tiling_arch35.h``:255 for A5, ``..._tiling.cpp``:239 otherwise):
+    there is nothing behind the attribute.
+
+    ``norm_type`` is the switch, and the regbase kernel branches on it in all
+    six gather variants (``..._regbase.h``:161/654/703/1081/1133/1226/1299):
+
+      ``norm_type == 0``  (SOFTMAX)   -> NO post-top-k normalisation, only
+                                         ``Muls(routed_scaling_factor)``
+      ``norm_type != 0``  (SIGMOID=1, SOFTPLUS=2)
+                                      -> ``ReduceSum -> Adds(eps) -> Div ->
+                                         Muls``, unconditionally
+
+    THIS GUARD'S SCOPE IS THE ``norm_type != 0`` SIDE ONLY. The mapping it
+    depends on is not a function of ``scoring_func``: the one call site below
+    passes ``norm_type=2`` as a LITERAL, inside the ``sqrtsoftplus`` branch, so
+    every call this file makes to ``moe_gating_top_k_hash`` takes the
+    normalising branch and ``norm_topk_prob=false`` is unsatisfiable on it.
+    (The ``norm_type = 0 if softmax else 1`` line further down belongs to a
+    DIFFERENT operator, ``DeviceOperator.moe_gating_top_k``, which is not
+    judged here.) If that literal ever becomes derived, or a second hash call
+    site appears with ``norm_type=0``, then ``norm_topk_prob=false`` is legal
+    on that path and this guard would be a FALSE KILL on it -- which is why
+    ``test_operator_is_called_with_a_normalising_norm_type`` pins the literal
+    rather than leaving the scope as prose.
 
     So for ``scoring_func == "sqrtsoftplus"`` a checkpoint that asks for
     ``norm_topk_prob=false`` gets renormalised weights anyway. Nothing raises,
@@ -114,19 +138,23 @@ def reject_unrenormalizable_hash_routing(
        ``True``, this guard sees ``True`` and stays silent. It cannot detect a
        broken resolver, only a hostile configuration.
     2. It does not cover the non-hash path. ``scoring_func`` softmax/sigmoid go
-       through ``DeviceOperator.moe_gating_top_k``, a different operator that
-       does honour ``renorm``; those are not judged here.
-    3. It is a construction-time check, so it cannot know the shapes. When
+       through ``DeviceOperator.moe_gating_top_k``, a different operator with
+       its own ``renorm`` handling; those are not judged here.
+    3. It does not read ``norm_type`` -- it infers it from ``scoring_func``,
+       which is only sound while the call site below keeps the literal. See
+       the scope paragraph above; the test arm is what makes that assumption
+       fail loudly instead of silently.
+    4. It is a construction-time check, so it cannot know the shapes. When
        ``is_fused_supported()`` is false at forward time this router delegates
        to ``AscendGroupedTopKRouter``, which honours ``renormalize`` correctly
        -- for such a (degenerate-shape) model this guard raises although the
        run would have been right. That is the conservative direction and it is
        on purpose; a loose guard issues a safety certificate nobody rechecks.
-    4. It does not check the ``renorm=`` argument actually passed at the call
-       site below. If someone changes that call to ``renorm=1`` the tiling
-       rejects it on the device, not here.
     5. It says nothing about ``routed_scaling_factor`` or the ``eps`` added to
-       the sum inside the kernel. Those are separate numerical questions.
+       the sum inside the kernel. Those are separate numerical questions. Nor
+       about ``norm_type=2`` combined with ``group_count > 1``, which the
+       arch35 tiling does not check at all while the non-arch35 one rejects it
+       -- that is an open question that only a run can answer.
     6. It is the Ascend router only. CPU/CUDA/310p routers are elsewhere and
        reach different operators.
 
@@ -150,14 +178,23 @@ def reject_unrenormalizable_hash_routing(
         "vllm/models/deepseek_v4/nvidia/model.py:1003 as "
         "renormalize=config.norm_topk_prob, and it arrives here as "
         f"renormalize={renormalize!r} with scoring_func={scoring_func!r})\n"
-        "  operator behaviour: torch.ops._C_ascend.moe_gating_top_k_hash "
-        "divides the selected top-k weights by their sum on EVERY call. Its "
-        "`renorm` attribute selects the order of norm and top-k, not whether "
-        "to normalise -- the tiling accepts renorm==0 only "
-        "(csrc/moe/moe_gating_top_k_hash/op_host/"
-        "moe_gating_top_k_hash_tiling.cpp:239, ..._tiling_arch35.h:255) and "
-        "every kernel variant runs ReduceSum->Div unconditionally "
-        "(..._e_k_fullload.h:295-307).\n"
+        "  operator behaviour: in torch.ops._C_ascend.moe_gating_top_k_hash "
+        "the normalisation is decided by norm_type, and the `renorm` "
+        "attribute decides nothing -- no kernel variant reads it (zero "
+        "references in moe_gating_top_k_hash_regbase.h, the only kernel A5 "
+        "reaches; a declared-but-never-assigned member in the other two), "
+        "which is why the tiling rejects every value but 0 rather than "
+        "implementing it (csrc/moe/moe_gating_top_k_hash/op_host/"
+        "moe_gating_top_k_hash_tiling_arch35.h:255 on A5, "
+        "..._tiling.cpp:239 otherwise). What norm_type does: norm_type==0 "
+        "(SOFTMAX) skips the post-top-k normalisation and only applies "
+        "routed_scaling_factor; norm_type!=0 (SIGMOID=1, SOFTPLUS=2) runs "
+        "ReduceSum->Adds(eps)->Div->Muls unconditionally, in all six gather "
+        "variants (..._kernel/moe_gating_top_k_hash_regbase.h:654, 703, "
+        "1081, 1133, 1226, 1299). This router's only call to that operator "
+        "passes norm_type=2 (SOFTPLUS) as a literal, so it always takes the "
+        "normalising branch and norm_topk_prob=false cannot be honoured on "
+        "it.\n"
         "  consequence if this were allowed to run: weights this checkpoint "
         "did not ask for, with no error and no log line. The only symptom is "
         "an accuracy shift.\n"
@@ -167,10 +204,14 @@ def reject_unrenormalizable_hash_routing(
         "V4.1 multimodal config). DeepSeek-V4.1-Flash ships "
         "norm_topk_prob=true and is unaffected.\n"
         "    (b) operator side -- if the model really is NOT renormalised, "
-        "this needs a moe_gating_top_k_hash variant that leaves the top-k "
-        "weights alone. Ask the operator owner for it, then relax this "
-        "check. Do not force renormalize=True here: that silently changes "
-        "the model, which is the failure this raise exists to prevent."
+        "this needs a norm_type that scores with softplus WITHOUT the "
+        "ReduceSum->Div, which no current norm_type provides (norm_type "
+        "couples the scoring function and the normalisation; 0 gives you "
+        "softmax, not softplus). Ask the moe_gating_top_k_hash owner for it, "
+        "then widen this check's scope. Do not force renormalize=True here "
+        "and do not pass norm_type=0 to dodge the normalisation: both "
+        "silently change the model, which is the failure this raise exists "
+        "to prevent."
     )
 
 
@@ -313,14 +354,23 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 eps=1e-20,
                 group_select_mode=1,
                 # renorm=0 is the only value the tiling accepts, and it does
-                # not mean "do not renormalise": the kernel divides the
-                # selected weights by their sum either way. Nothing is applied
-                # in Python afterwards and nothing needs to be -- the operator
-                # has already done it. This is only correct because the
-                # constructor refused every checkpoint that asked for
-                # norm_topk_prob=False; see
-                # reject_unrenormalizable_hash_routing above.
+                # not mean "do not renormalise": no kernel variant reads
+                # `renorm` at all. The normalisation is decided by norm_type
+                # below.
                 renorm=0,
+                # 2 = SOFTPLUS, and on this operator norm_type couples the
+                # scoring function to the normalisation: != 0 means the
+                # kernel runs ReduceSum -> Adds(eps) -> Div -> Muls on the
+                # selected weights. So nothing is applied in Python
+                # afterwards and nothing needs to be -- the operator has
+                # already done it.
+                #
+                # This literal is load-bearing twice over. It is the premise
+                # reject_unrenormalizable_hash_routing is built on (see its
+                # scope paragraph), and changing it to 0 would not merely
+                # skip the normalisation, it would change the scoring
+                # function to softmax. Both halves are pinned by
+                # test_operator_is_called_with_a_normalising_norm_type.
                 norm_type=2,
                 out_flag=False,
             )
