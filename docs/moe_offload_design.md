@@ -420,6 +420,69 @@ T3 那种在 (a) 抛错，服务那种在 (b)/(c) 不成立。不通就**拒绝�
 ⇒ 两种说法各自成立于各自的开关状态；本次 A/B 用的是 `=1`。「分段捕获是最大结构差异」这条**仍然是推测**，
 现在它的地位是 ② 里的待验假设，不是既成事实。
 
+## k.4 2026-09-20 收敛：平台结论只到这一句 + 回扫被推翻的假设
+
+### 平台结论（收窄，别外推）
+**成立**：把工作 **fork 到另一条流**再 join 回去、并要求它进捕获，在这套 torch_npu 上 `capture_end` 报 **ACL 107025**。
+证据三发独立：3 层一次捕获、每层一次捕获（`--graphs per-layer`）、以及整网 A/B 那一发的捕获路径。
+**不成立（不要这么写）**：「host 工作不能进图」。反例都在生产路径上：
+- engram 的 host gather 就是图内节点（`vllm_ascend/models/deepseek_v4_1/engram_embedding.py` 的
+  `torch_npu.npu._launch_host_func(stream, _engram_host_gather, payload)`，`ENGRAM_OUT_OF_GRAPH` 默认留在图里），
+  过了 10 个数据集精度 + 8.86 h 浸泡；
+- 我们自己的 A 臂（overlap=off）就是在**捕获流**上跑 host-func，50/50 全对；t2 也验过每 replay 执行一次、值随输入变。
+⇒ 三种机制别混：`graph_task_group` 改**设备任务参数**；`ExternalEvent` 管**跨流排序**；**host 工作进图用 `_launch_host_func`**。
+
+### 护栏：探针已删，开关改为直接拒绝
+`probe_side_stream_capture()`（上一轮写的启动探针）**是假绿灯**：它捕获同样的 fork/join 模式，但只搬一个 int32 标量、
+host 侧只 `buf.add_(1)` —— 在真实层捕获全部失败的平台上它**通过**。⇒ 替身比被测对象弱，判据就会在该拦时放行
+（与「读代理」同族的第二种形态）。已删除；`overlap_side_stream=true` 现在在 `init_ascend_config` 里**直接拒绝**。
+若将来还要探针，元判据是：**它必须能复现已知的两种真实失效**（107025 与静默不重放），否则不算护栏。
+（测试用的对象仍可直接构造 config 绕过拒绝，供上卡二分。）
+
+### 🔴 回扫：基于「多对 fork/join 才失败」的结论一律作废
+| 上一轮写的 | 现状 |
+|---|---|
+| 「107025 与一次捕获里多对 fork/join 有关；一对就不报错」 | **作废**（`--graphs per-layer` 一对也报 107025） |
+| 「服务每段一对，所以捕获成功了、只是没重放」 | **作废**（它的前提就是上一条） |
+| 「分段捕获是最大结构差异」 | **降级为无关**：段数不是原因；仍待解释的是「服务为什么没报错」 |
+| 「T3 `--graphs per-layer` 是判别多对/一对的判据」 | 已执行并**否证**了那个假设；开关保留，语义改为「同形于服务的段结构」 |
+| 「eager 路径在 B 臂是好的」 | **仍成立**，但理由换了：不是「段结构」，而是侧流第一条指令等的 fork event 记录在上一层 H2D 之后（模拟器验证），所以 eager 分叉根本不省时间、也没造成错 |
+| 「指纹 = 重放没跑侧流工作」 | **仍成立**（§k.3 的空隙算术与双峰直方图不依赖 pair 假设） |
+| 「N ≈ 25–30 层丢了 CPU 工作」 | **降为两读之一**：另一读是「捕获步里 CPU 工作全丢（40 层），剩下的 ~10 段大空隙是 breakable 在 replay 期 eager 跑注意力的开销」。两者都与现有产物一致 ⇒ 需要服务内**逐层 HOST_FUNC_CALLS** 才能分开（下次窗口几秒钟） |
+
+**服务为什么没报 107025（新的首要假设，未验证）**：捕获期 `_capturing()` 返回 False ⇒ route 走了**eager 分支**
+（当时那是"eager 分叉"版），于是 CPU 工作在捕获那一刻**在图外执行一次**、没有任何节点进图、也没有跨流捕获 ⇒
+既不报错又每次 replay 复用那一次的 pinned 输出。判据：服务内打印每层每步的 `HOST_FUNC_CALLS`（图内节点才会 +1）。
+
+## k.5 减操作数（`packed_transfer`，默认关；不占卡，已实现）
+
+靶子：实测每 token 7.5 ms 的搬运+回调（≈62.5 µs × 120 个操作，2026-09-20；每操作成本是**推断**，未直接测量）。
+
+kt 的输入放在**三块独立 pinned 内存**里（`input_tensor_cpu` / `immediate_experts_ids_cpu` / `weights_cpu`），
+所以一层要付**三次** host-device 拷贝。`packed_transfer=true` 改成：
+- 一块合并缓冲（`placement.packed_layout`：hidden bf16 / ids int64 / weights fp32 三段，各段 512 字节对齐），
+  **设备侧三次填充**（普通设备工作）+ **一次** host-device 拷贝；
+- 输出也用我们自己的 pinned/设备对，**每层各一份** ⇒ 顺带去掉 kt 的 `layer_idx % 2` 槽位共享；
+- CPU 任务用 kt 的 `moe.forward_task(...)` + `cpu_infer.submit/sync` 直接读我们的指针（kt 版本没有这两个入口就**拒绝启用**）；
+- eager 路径不再用 kt 的 `submit_forward`/`sync_forward`（各含一次 `torch.npu.synchronize(device)`，等全设备、每层两次），
+  改成一次 `event.record + event.synchronize()`（只等本流已入队的工作）。
+操作数：每层 5 → **3**；40 层 200 → **120**（`placement.host_ops_per_layer`，被单测钉住）。
+判据（与上卡相同）：**开关两态输出逐位相同** + 操作数下降。收益上卡再量，这里不断言速度。
+变异臂（全红）：三段各拷一次（把节省撤掉）/ 复用 `layer%2` 的共享缓冲 / 漏掉输出回拷。
+⚫ 待 kt 侧确认：`moe.forward_task` 的参数顺序与 `cpu_infer.sync(allow_pending)` 语义（本线是按 `experts_base.py` 现有调用抄的）。
+
+## k.6 形态 C（下一项，排在 k.5 之后）
+
+= **engram 的形态**：在**正被捕获的那条流**上 `_launch_host_func`，不碰侧流。一层两个节点：
+① GMM 之前：合并 D2H + 节点①只做 kt 的**提交**（`sync_cpu_only` 之前的那一半，立即返回）；
+② 驻留专家 GMM 照常在图内；③ merge 处节点②只等 CPU（kt `033ea76` 新增的 `sync_cpu_only()` / `has_pending_deferred()`，
+不碰设备），然后一次 H2D。重叠量 = GMM 那段时间。**不需要任何跨流捕获**，因此绕开 107025。
+必须连带抄 engram 的三条约束：① 缓冲在**构造期**分配（构造是唯一保证早于捕获的时点）；
+② **replay 读捕获期记录的地址** ⇒ 每步新分配即被烘死；③ 容量按 `max_num_batched_tokens` 定死，超了**拒绝**而不是重分配。
+（k.5 的 packed 缓冲已经是这三条：构造期分配、地址固定、超尺寸拒绝。）
+依赖：`kt_site` 现在是 `292be81`，**不含** `sync_cpu_only()` ⇒ 要实现形态 C 需重建 wheel（约 4 分钟，纯 Python），
+重建要在窗口之外做，**两臂必须同构建**。
+
 ## 上卡 A/B 方案（M3 侧流，1 张卡；两臂只差一个开关）
 
 两臂：`overlap_side_stream: false`（现状）与 `true`。**同一构建、同一配置、同一套仪器**，只切这个开关。

@@ -78,12 +78,22 @@ class KTOffloadConfig:
     # Eager (M1): run kt's synchronous submit/sync path rather than ACL
     # stream callbacks. Sets KT_FORCE_SYNC_SUBMIT=1 for the process.
     force_sync_submit: bool = True
-    # M3: hand the CPU-expert submit to a side stream so the resident NPU
-    # experts overlap it (sglang's KT_SIDE_STREAM). Off by default: with it on,
-    # the two arms must produce bit-identical output (a capture that does not
-    # propagate to the side stream is faster and wrong). Applies to captured
-    # (graph) forwards only; eager forwards keep kt's own submit either way.
+    # M3, REFUSED (2026-09-20). Narrowly: forking work onto a SECOND stream
+    # and joining it back inside a capture fails at capture_end with ACL
+    # 107025 -- three independent on-card runs (three layers in one capture,
+    # one capture per layer, and the whole-model A/B whose captured path then
+    # served 34/50 GSM8K with 38/50 answers different from the serial arm).
+    # This says nothing against host work *in* a graph: a host-func node on the
+    # stream being captured is a delivered production path (engram's host
+    # gather, models/deepseek_v4_1/engram_embedding.py, and our own overlap=off
+    # arm, 50/50). init_ascend_config rejects this switch; the code path and
+    # its tests are kept for whatever mechanism replaces it. A test harness may
+    # still build the config object directly to bisect the limit (tools/.../t3).
     overlap_side_stream: bool = False
+    # Fold kt's three separate host-device input copies into one, and use our
+    # own pinned buffers instead of kt's slot-reuse pair. Off by default; the
+    # criterion is bit-identical output with the switch flipped.
+    packed_transfer: bool = False
 
     @model_validator(mode="after")
     def _validate_values(self):
@@ -114,6 +124,16 @@ class KTOffloadConfig:
         """Parallel/runtime settings the M1 implementation depends on."""
         if not self.enabled:
             return
+        if self.overlap_side_stream:
+            raise ValueError(
+                "kt_offload_config.overlap_side_stream is refused: forking the CPU-expert submit onto a "
+                "SECOND stream and joining it back inside a capture fails at capture_end with ACL 107025 "
+                "(2026-09-20, three independent on-card runs), and the one whole-model run that came up served "
+                "34/50 GSM8K with 38/50 answers different from the serial arm. This is not a limit on host work "
+                "in a graph -- a host-func node on the captured stream is a production path here. A start-up "
+                "probe is not an acceptable substitute either: the miniature graph it captured passed while "
+                "every real-layer capture failed. Leave it false."
+            )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

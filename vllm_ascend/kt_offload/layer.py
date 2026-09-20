@@ -43,6 +43,8 @@ from vllm_ascend.kt_offload.placement import (
     NpuRouting,
     OffloadPlan,
     assert_routing_dtypes,
+    host_ops_per_layer,
+    packed_layout,
     plan_from_config,
     split_routing,
 )
@@ -64,8 +66,6 @@ HOST_FUNC_CALLS: dict[int, int] = {}
 _CAPTURE_BUFFERS_READY: tuple | None = None
 # One side stream for the whole process, created outside any capture.
 _SIDE_STREAM = None
-# Result of the capture self-probe (None = not probed yet).
-_SIDE_CAPTURE_PROBE: str | None = None
 # A captured graph keeps record/wait nodes pointing at these event objects, so
 # every pair stays alive for the life of the process (sglang lost a capture to
 # collected events).
@@ -177,6 +177,8 @@ class KTLayerOffload:
         self._pending_captured = False
         self._pending_join: tuple | None = None
         self.overlap = bool(getattr(cfg, "overlap_side_stream", False))
+        self.packed = bool(getattr(cfg, "packed_transfer", False))
+        self._packed: dict[int, dict] = {}
         # Graph mode: capture sizes are known from the config before any
         # capture; kt needs them registered and their buffers allocated first.
         mc, cc = vllm_config.model_config, getattr(vllm_config, "compilation_config", None)
@@ -244,15 +246,98 @@ class KTLayerOffload:
             side = _side_stream(device)
             if self.graph_enabled:
                 _subscribe_stream(side)
-                probe_side_stream_capture(device)
             if not self._overlap_supported():
                 raise RuntimeError(
                     "kt_offload: overlap_side_stream needs kt's copy_inputs_to_cpu_buffers / "
                     "run_pinned_forward_sync / copy_forward_output_to_device; "
                     f"this kt build ({type(self.wrapper).__name__}) does not have them."
                 )
+        if self.packed:
+            if not self._packed_supported():
+                raise RuntimeError(
+                    "kt_offload: packed_transfer needs kt's moe.forward_task and cpu_infer.submit/sync; "
+                    f"this kt build ({type(self.wrapper).__name__}) does not expose them."
+                )
+            # Graph mode: every capture size up front (nothing may allocate
+            # inside a capture). Eager: lazily, on first use.
+            for bs in self.capture_sizes:
+                self._packed_buffers(bs, device)
         if self.graph_enabled:
             self._prepare_capture_buffers(device)
+
+    # -- packed transfer (cfg.packed_transfer) ------------------------------
+
+    def _packed_supported(self) -> bool:
+        moe = getattr(self.wrapper, "moe", None)
+        infer = getattr(self.wrapper, "cpu_infer", None)
+        return all(
+            (
+                moe is not None and hasattr(moe, "forward_task"),
+                infer is not None and hasattr(infer, "submit") and hasattr(infer, "sync"),
+            )
+        )
+
+    def _packed_buffers(self, bs: int, device) -> dict:
+        """One combined input buffer per batch size, and our own output pair.
+
+        Own buffers on purpose: kt hands layer L the pinned slot ``L % 2``, so
+        two layers share one buffer and the ordering between one layer's output
+        H2D and the other's CPU write is something the caller has to maintain.
+        Per-layer buffers remove that coupling, and one combined input region
+        turns kt's three input copies into one (placement.host_ops_per_layer).
+        """
+        buf = self._packed.get(bs)
+        if buf is not None:
+            return buf
+        lay = packed_layout(bs, self.hidden_size, self.top_k)
+        dev = torch.empty(lay["nbytes"], dtype=torch.uint8, device=device)
+        pin = torch.empty(lay["nbytes"], dtype=torch.uint8, device="cpu", pin_memory=True)
+
+        def view(store, region, dtype, shape):
+            off, nbytes = lay[region]
+            return store[off : off + nbytes].view(dtype).view(*shape)
+
+        buf = {
+            "layout": lay,
+            "dev": dev,
+            "pin": pin,
+            "dev_hidden": view(dev, "hidden", torch.bfloat16, (bs, self.hidden_size)),
+            "dev_ids": view(dev, "ids", torch.int64, (bs, self.top_k)),
+            "dev_weights": view(dev, "weights", torch.float32, (bs, self.top_k)),
+            "pin_hidden": view(pin, "hidden", torch.bfloat16, (bs, self.hidden_size)),
+            "pin_ids": view(pin, "ids", torch.int64, (bs, self.top_k)),
+            "pin_weights": view(pin, "weights", torch.float32, (bs, self.top_k)),
+            "pin_out": torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device="cpu", pin_memory=True),
+            "dev_out": torch.empty((bs, self.hidden_size), dtype=torch.bfloat16, device=device),
+            "bsz": torch.full((1,), bs, dtype=torch.int32, device="cpu", pin_memory=True),
+        }
+        self._packed[bs] = buf
+        return buf
+
+    def _packed_submit(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> dict:
+        """Fill the combined buffer on the device, then one host-device copy."""
+        buf = self._packed.get(hs.shape[0])
+        if buf is None:
+            if _capturing():
+                raise RuntimeError(
+                    f"kt_offload: capturing {hs.shape[0]} tokens with packed_transfer but no buffer was "
+                    f"prepared for that size (prepared: {sorted(self._packed)}); allocating inside a capture "
+                    "is not possible."
+                )
+            buf = self._packed_buffers(hs.shape[0], hs.device)
+        _device_fill(buf["dev_hidden"], hs)  # device-side fills: ordinary device work
+        _device_fill(buf["dev_ids"], topk_ids)
+        _device_fill(buf["dev_weights"], topk_weights)
+        _host_copy(buf["pin"], buf["dev"])  # the one host-device copy
+        return buf
+
+    def _packed_payload(self, bs: int) -> tuple:
+        buf = self._packed[bs]
+        return (self.wrapper, buf, self.layer_idx)
+
+    def host_ops(self) -> dict[str, int]:
+        """Host-device operations this layer costs per step (for the accounting)."""
+        return host_ops_per_layer(self.packed)
 
     def _overlap_supported(self) -> bool:
         """The captured overlap path needs only the graph-mode kt entry points."""
@@ -378,7 +463,15 @@ class KTLayerOffload:
                 # No runtime condition here (not even the profile flag): a
                 # branch the capture run skips is missing from every replay.
                 hs = hidden_states.contiguous()
-                if self.overlap:
+                if self.packed:
+                    self._packed_submit(hs, topk_ids, topk_weights)
+                    stream = torch.npu.current_stream(hs.device)
+                    _subscribe_stream(stream)
+                    payload = self._packed_payload(hs.shape[0])
+                    _CAPTURED_PAYLOADS.append(payload)
+                    _launch_host_func(stream, _kt_packed_forward, payload)
+                    self._pending, self._pending_captured = hs, True
+                elif self.overlap:
                     self._submit_captured_forked(hs, topk_ids, topk_weights)
                 else:
                     self._submit_captured(hs, topk_ids, topk_weights)
@@ -388,7 +481,18 @@ class KTLayerOffload:
                 # reference implementation does the same, and see the note on
                 # _submit_eager_forked for why a fork buys nothing here).
                 hs = hidden_states.contiguous()
-                self.wrapper.submit_forward(hs, topk_ids, topk_weights, _stream_handle(hs.device))
+                if self.packed:
+                    self._packed_submit(hs, topk_ids, topk_weights)
+                    # Wait for our own copy only: kt's submit_forward calls
+                    # torch.npu.synchronize(device), which waits for every
+                    # stream on the device, twice per layer (again in
+                    # sync_forward). One event on this stream is enough, and
+                    # our per-layer buffers remove the slot-reuse reason for
+                    # the wider wait.
+                    _wait_for_copy(hs.device)
+                    _kt_packed_forward(self._packed_payload(hs.shape[0]))
+                else:
+                    self.wrapper.submit_forward(hs, topk_ids, topk_weights, _stream_handle(hs.device))
                 self._pending = hs
         return split_routing(
             topk_ids,
@@ -411,11 +515,19 @@ class KTLayerOffload:
             self._join_side_stream(hs.device)
             # H2D from the pinned output the host-func node filled; stream
             # order puts it after that node at every replay.
-            cpu_out = self.wrapper.copy_forward_output_to_device(hs)
+            cpu_out = self._packed_output(hs) if self.packed else self.wrapper.copy_forward_output_to_device(hs)
+        elif self.packed:
+            cpu_out = self._packed_output(hs)
         else:
             cpu_out = self.wrapper.sync_forward(hs, _stream_handle(hs.device))
         # One rounding to the activation dtype instead of two.
         return (routed_out.float() + cpu_out.float()).to(routed_out.dtype)
+
+    def _packed_output(self, hs: torch.Tensor) -> torch.Tensor:
+        """H2D of our own pinned output; ordered after the host-func node."""
+        buf = self._packed[hs.shape[0]]
+        _host_copy(buf["dev_out"], buf["pin_out"])
+        return buf["dev_out"]
 
     def _submit_captured(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
         """Record D2H + host-func for this layer into the graph being captured."""
@@ -521,85 +633,45 @@ class KTLayerOffload:
         compute.wait_event(join)
 
 
-def probe_side_stream_capture(device) -> None:
-    """Refuse the side-stream form unless a captured graph really replays it.
+# There is no start-up probe any more. The one written on 2026-09-20 captured
+# the same fork/join *pattern* with a scalar copy and a trivial host function,
+# and it PASSED on the platform where every real-layer capture failed with
+# 107025 -- a stand-in weaker than its subject passes where the subject fails,
+# which is the second shape of "the guard reads something else" (the first was
+# reading torch.npu.is_current_stream_capturing() as if it meant "this stream's
+# work is in the graph"). The switch is refused in config instead; a probe may
+# come back only if it can reproduce both known failures (107025 and the silent
+# no-replay) -- that meta-criterion is the price of having one at all.
 
-    This reads the subject rather than a proxy. ``_capturing()`` only answers
-    "is a capture in progress"; it said yes on the side stream in both failures
-    of 2026-09-20 -- T3, where ACL then rejected the capture at capture_end
-    (107025), and the 50-question service, where nothing was rejected and
-    ~30 of 40 layers' CPU-expert work simply did not run at replay (the profile
-    arithmetic: 44.1 exposure gaps/step at 406 us in the serial arm against
-    15.3 at 379 us with overlap on, i.e. the surviving gaps are full length and
-    the rest are absent, not shortened).
 
-    So capture a miniature version of the real pattern -- fork, a D2H and a
-    host-func node on the side stream, join, H2D -- and then *replay it twice
-    with different inputs*, requiring that the host-func node runs once per
-    replay and that the value the graph moves changes with the input. A
-    platform that refuses the capture raises here; one that silently drops the
-    side-stream nodes fails the counter or the value.
+def _kt_packed_forward(payload) -> None:
+    """Run this layer's CPU experts straight on our combined pinned buffer.
+
+    kt's own entry points read its three pinned allocations; here the same C++
+    task is handed our three pointers into one buffer, so the step paid one
+    host-device copy instead of three. Exceptions must not escape a graph node.
     """
-    global _SIDE_CAPTURE_PROBE
-    if _SIDE_CAPTURE_PROBE == "ok":
-        return
-    if _SIDE_CAPTURE_PROBE is not None:
-        raise RuntimeError(_SIDE_CAPTURE_PROBE)
-
-    side = _side_stream(device)
-    src = torch.zeros(1, dtype=torch.int32, device=device)
-    dst = torch.zeros(1, dtype=torch.int32, device=device)
-    pin = _pinned_scalar()
-    runs = [0]
-
-    def host(payload) -> None:
-        buf, counter = payload
-        counter[0] += 1
-        buf.add_(1)  # the host contribution the graph must carry back
-
-    payload = (pin, runs)
-    _CAPTURED_PAYLOADS.append(payload)
-    fork, join = _new_event(device), _new_event(device)
-    _SIDE_EVENTS.append((fork, join))
-
-    def fail(reason: str) -> None:
-        global _SIDE_CAPTURE_PROBE
-        _SIDE_CAPTURE_PROBE = (
-            f"kt_offload: overlap_side_stream is not usable on this platform: {reason}. "
-            "The CPU-expert work would not be replayed with the graph and every replay would reuse "
-            "the capture run's output (faster and silently wrong). Set overlap_side_stream=false."
-        )
-        raise RuntimeError(_SIDE_CAPTURE_PROBE)
-
-    graph = _new_graph()
+    wrapper, buf, layer_idx = payload
     try:
-        with _graph_ctx(graph):
-            fork.record(torch.npu.current_stream(device))
-            side.wait_event(fork)
-            with _stream_ctx(side, device):
-                _probe_copy(pin, src)
-                _launch_host_func(side, host, payload)
-            join.record(side)
-            torch.npu.current_stream(device).wait_event(join)
-            _probe_copy(dst, pin)
-    except Exception as exc:  # noqa: BLE001
-        fail(f"capturing the fork/join pattern raised {type(exc).__name__}: {str(exc)[:200]}")
-
-    for value in (5, 9):
-        src.fill_(value)
-        before = runs[0]
-        try:
-            _graph_replay(graph)
-            _device_sync(device)
-        except Exception as exc:  # noqa: BLE001
-            fail(f"replaying the fork/join pattern raised {type(exc).__name__}: {str(exc)[:200]}")
-        if runs[0] != before + 1:
-            fail(f"the host-func node on the side stream ran {runs[0] - before} times per replay, want 1")
-        got = int(dst.item())
-        if got != value + 1:
-            fail(f"the replay moved {got}, want {value + 1} (input {value} plus the host func's +1)")
-    _SIDE_CAPTURE_PROBE = "ok"
-    logger.info("kt_offload: side-stream capture probe passed (host-func node replays, value follows the input)")
+        task = wrapper.moe.forward_task(
+            buf["bsz"].data_ptr(),
+            buf["pin_ids"].shape[-1],
+            buf["pin_ids"].data_ptr(),
+            buf["pin_weights"].data_ptr(),
+            buf["pin_hidden"].data_ptr(),
+            buf["pin_out"].data_ptr(),
+            False,  # incremental: no deferred experts
+        )
+        wrapper.cpu_infer.submit(task)
+        wrapper.cpu_infer.sync(0)
+        HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+    except BaseException as exc:  # noqa: BLE001
+        logger.error(
+            "kt_offload packed host-func for layer %d raised: %r. The CPU-expert output of this step is "
+            "NOT this step's -- the device reads whatever the pinned buffer held.",
+            layer_idx,
+            exc,
+        )
 
 
 def _kt_host_forward(payload) -> None:
@@ -693,32 +765,6 @@ def _handle_of(stream) -> int:
     return int(stream.npu_stream)
 
 
-def _probe_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """One async copy of the probe, on the current stream (a graph node)."""
-    dst.copy_(src, non_blocking=True)
-
-
-def _pinned_scalar() -> torch.Tensor:
-    """One pinned int32 element: the probe's stand-in for kt's pinned buffers."""
-    return torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
-
-
-def _new_graph():
-    return torch.npu.NPUGraph()
-
-
-def _graph_ctx(graph):
-    return torch.npu.graph(graph)
-
-
-def _graph_replay(graph) -> None:
-    graph.replay()
-
-
-def _device_sync(device) -> None:
-    torch.npu.synchronize(device)
-
-
 def _kt_buffer_class():
     from kt_kernel.experts_base import KExpertsCPUBuffer
 
@@ -739,6 +785,23 @@ def _install_capture_probe(kt_wrapper_cls) -> None:
         )
         return
     setter(_capturing)
+
+
+def _device_fill(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """A device-side copy into the combined buffer (not a host-device operation)."""
+    dst.copy_(src)
+
+
+def _host_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """One host-device copy: the operation whose count we are reducing."""
+    dst.copy_(src, non_blocking=True)
+
+
+def _wait_for_copy(device) -> None:
+    """Host waits for the work already enqueued on this stream, nothing wider."""
+    event = _new_event(device)
+    event.record(torch.npu.current_stream(device))
+    event.synchronize()
 
 
 def _stream_handle(device: torch.device) -> int:

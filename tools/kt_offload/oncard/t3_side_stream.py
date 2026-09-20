@@ -53,10 +53,17 @@ def main() -> int:
                          "(what the breakable wrapper does in the service: an attention break, hence a "
                          "capture_begin/end pair, around every layer)")
     ap.add_argument("--probe-only", action="store_true",
-                    help="build one offload layer and stop: runs the startup capture probe alone")
+                    help="build the offload layers and stop (no capture): checks only that the layers "
+                         "come up with the switch on")
     args = ap.parse_args()
-    if args.inputs < 3 or (args.layers < 3 and not args.probe_only):
-        ap.error("--inputs and --layers must be >= 3 (slot reuse needs L and L+2)")
+    if args.inputs < 3:
+        ap.error("--inputs must be >= 3 (the stale-output fingerprint needs three different inputs)")
+    if args.layers < 1:
+        ap.error("--layers must be >= 1")
+    if args.layers < 3:
+        print(f"⚠️  --layers {args.layers}: fewer than 3 layers, so no two layers share kt's "
+              f"layer_idx % 2 slot -- slot reuse is NOT covered by this run (boundary bisection only).",
+              flush=True)
 
     import npu_moe as N
 
@@ -95,15 +102,16 @@ def main() -> int:
 
     print(f"===== T3 layers {layer_ids}, capture sizes {sizes}, graphs={args.graphs} =====", flush=True)
     if args.probe_only:
-        # KTLayerOffload.after_weights_loaded runs probe_side_stream_capture();
-        # if the platform cannot replay side-stream work it raises there.
+        # No capture here: building the layers only says the objects come up.
+        # The 2026-09-20 lesson is that a miniature capture says nothing about
+        # a real-layer capture, so this mode makes no claim about capturing.
         try:
             build(overlap=True)
         except RuntimeError as exc:
-            v.check(False, f"startup capture probe refused overlap: {str(exc)[:300]}")
-            return v.finish(os.path.join(args.out, "t3_result.json"), {"probe": KL._SIDE_CAPTURE_PROBE})
-        v.check(KL._SIDE_CAPTURE_PROBE == "ok", f"startup capture probe: {KL._SIDE_CAPTURE_PROBE}")
-        return v.finish(os.path.join(args.out, "t3_result.json"), {"probe": KL._SIDE_CAPTURE_PROBE})
+            v.check(False, f"building overlap layers raised: {str(exc)[:300]}")
+        else:
+            v.check(True, "overlap layers built (says nothing about capturing: see --graphs)")
+        return v.finish(os.path.join(args.out, "t3_result.json"), {"probe_only": True})
     serial = build(overlap=False)
     pl = serial[0][0].placement
     inputs = {}
@@ -192,7 +200,7 @@ def main() -> int:
 
     return v.finish(os.path.join(args.out, "t3_result.json"),
                     {"host_func_calls": dict(KL.HOST_FUNC_CALLS), "layers": layer_ids, "sizes": sizes,
-                     "graphs": args.graphs, "probe": KL._SIDE_CAPTURE_PROBE})
+                     "graphs": args.graphs})
 
 
 if __name__ == "__main__":

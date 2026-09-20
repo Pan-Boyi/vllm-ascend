@@ -254,54 +254,6 @@ def sim(monkeypatch):
 
     monkeypatch.setattr(kl, "_launch_host_func", host_func)
 
-    # --- the capture self-probe's platform hooks ----------------------------
-    # s.capture_records_side=False models a platform that reports "capturing"
-    # on the side stream but records none of its work (the silent failure of
-    # 2026-09-20); s.capture_end_raises models the one that rejects the capture
-    # (T3's 107025).
-    s.capture_records_side = True
-    s.capture_end_raises = False
-
-    class FakeGraph:
-        def __init__(self):
-            self.recorded: dict[str, list] = {}
-
-    def new_graph():
-        return FakeGraph()
-
-    def graph_ctx(graph):
-        class Ctx:
-            def __enter__(_self):
-                s.reset_programs()
-                s.capturing = True
-
-            def __exit__(_self, *a):
-                s.capturing = False
-                if a[0] is not None:
-                    return False
-                if s.capture_end_raises:
-                    raise RuntimeError("capture_end: AclmdlRICaptureEnd error code is 107025")
-                graph.recorded = {
-                    name: list(ops)
-                    for name, ops in s.programs.items()
-                    if s.capture_records_side or name != "side"
-                }
-                s.reset_programs()
-                return False
-
-        return Ctx()
-
-    monkeypatch.setattr(kl, "_new_graph", new_graph)
-    monkeypatch.setattr(kl, "_graph_ctx", graph_ctx)
-    monkeypatch.setattr(kl, "_graph_replay", lambda g: s.run({k: list(v) for k, v in g.recorded.items()}))
-    monkeypatch.setattr(kl, "_device_sync", lambda device: None)
-    monkeypatch.setattr(kl, "_pinned_scalar", lambda: torch.zeros(1, dtype=torch.int32))
-    monkeypatch.setattr(
-        kl,
-        "_probe_copy",
-        lambda dst, src: s.enqueue(s.current, Op("copy", lambda d=dst, x=src: d.copy_(x), 1.0)),
-    )
-    monkeypatch.setattr(kl, "_SIDE_CAPTURE_PROBE", None)
     fake_npu = SimpleNamespace(current_stream=lambda device=None: s.compute)
     monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
     s.capture_propagates = True
@@ -753,63 +705,37 @@ def test_multi_layer_overlap_under_changing_batch_size(monkeypatch, sim):
 
 
 # ---------------------------------------------------------------------------
-# 4. the startup probe: a guard that reads the subject, not a proxy
+# 4. the switch is refused in production
 #
-# 2026-09-20, both failures: `_capturing()` answered True on the side stream,
-# so the old guard passed -- and then ACL rejected the capture in T3 (107025)
-# while the 50-question service was not rejected at all and ~30 of 40 layers'
-# CPU work never ran at replay. "Is a capture in progress" is not "will this
-# stream's work be in the graph"; the probe captures the real pattern and
-# REPLAYS it, which is the property we actually depend on.
-#
-# The old mutation arm (test_mutants_are_faster_and_wrong[capture not
-# propagated]) is not the same shape: there the schedule was mutated by hand
-# after the fact. Here the platform itself reports "capturing" and drops the
-# side stream's nodes, which is what the card did.
+# 2026-09-20, in order: (a) the guard read torch.npu.is_current_stream_capturing()
+# as if it meant "this stream's work is in the graph" -- it does not; (b) the
+# replacement was a start-up probe that captured the same fork/join *pattern*
+# with a scalar copy and a trivial host function: it PASSED on the platform
+# where every real-layer capture failed with 107025. A stand-in weaker than its
+# subject passes where the subject fails. So there is no probe: the switch is
+# refused, and these tests keep the mechanism's contract for whatever replaces
+# it (the simulator arms above still cover join/event/propagation shapes).
 # ---------------------------------------------------------------------------
 
 
-def _build_with_probe(monkeypatch, sim):
+def test_production_refuses_the_switch():
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=True)
+    vcfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1, pipeline_parallel_size=1, enable_eplb=False
+        ),
+        model_config=SimpleNamespace(enforce_eager=False),
+        speculative_config=None,
+    )
+    with pytest.raises(ValueError, match="107025"):
+        cfg._validate_preconditions(vcfg)
+    vcfg.model_config.enforce_eager = True
+    with pytest.raises(ValueError, match="SECOND stream"):
+        cfg._validate_preconditions(vcfg)  # eager too: it would be a no-op there anyway
+
+
+def test_the_object_can_still_be_built_for_bisection(monkeypatch, sim):
+    """The on-card harness constructs the config directly to bisect the limit."""
     boxes = _boxes()
-    return _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
-
-
-def test_probe_passes_on_a_platform_that_replays_side_stream_work(monkeypatch, sim):
-    rt, _ = _build_with_probe(monkeypatch, sim)
-    assert kl._SIDE_CAPTURE_PROBE == "ok" and rt.overlap is True
-
-
-def test_probe_catches_the_silent_platform(monkeypatch, sim):
-    """Reports "capturing" on the side stream, records none of its nodes."""
-    sim.capture_records_side = False
-    with pytest.raises(RuntimeError, match="not usable on this platform"):
-        _build_with_probe(monkeypatch, sim)
-    # and the old proxy guard would have been happy: inside a capture the
-    # predicate says True on the side stream in this very platform model
-    sim.capturing = True
-    with kl._stream_ctx(sim.side, None):
-        assert kl._capturing() is True, "the proxy the old guard read says 'capturing'"
-
-
-def test_probe_catches_the_rejecting_platform(monkeypatch, sim):
-    """T3's shape: capture_end refuses the capture (107025)."""
-    sim.capture_end_raises = True
-    with pytest.raises(RuntimeError, match="107025"):
-        _build_with_probe(monkeypatch, sim)
-    assert "not usable on this platform" in kl._SIDE_CAPTURE_PROBE
-
-
-def test_probe_result_is_remembered_and_refuses_later_layers(monkeypatch, sim):
-    sim.capture_records_side = False
-    with pytest.raises(RuntimeError, match="not usable"):
-        _build_with_probe(monkeypatch, sim)
-    # a second layer must not silently come up with overlap on
-    with pytest.raises(RuntimeError, match="not usable"):
-        _build_with_probe(monkeypatch, sim)
-
-
-def test_probe_is_skipped_when_overlap_is_off(monkeypatch, sim):
-    sim.capture_end_raises = True  # would fail the probe if it ran
-    boxes = _boxes()
-    rt, _ = _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes)
-    assert rt.overlap is False and kl._SIDE_CAPTURE_PROBE is None
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    assert rt.overlap is True  # no probe, no refusal at this level

@@ -408,6 +408,48 @@ def plan_from_config(cfg, num_layers: int, num_experts: int, top_k: int) -> Offl
     return build_plan(sets, num_experts, report)
 
 
+#: kt reads its three inputs from three separate pinned allocations, so filling
+#: them costs three host-device copies per layer. One combined buffer with the
+#: same three regions costs one -- the regions keep 512-byte alignment so each
+#: pointer is one kt expects (and so a partial copy cannot straddle two).
+PACK_ALIGN = 512
+
+
+def packed_layout(tokens: int, hidden: int, topk: int) -> dict:
+    """Byte offsets of the hidden / ids / weights regions in one buffer.
+
+    hidden bf16 [T, hidden], ids int64 [T, topk], weights fp32 [T, topk] --
+    the layout kt's C++ task reads through the three pointers it is given.
+    """
+
+    def align(n: int) -> int:
+        return (n + PACK_ALIGN - 1) // PACK_ALIGN * PACK_ALIGN
+
+    h_bytes, i_bytes, w_bytes = tokens * hidden * 2, tokens * topk * 8, tokens * topk * 4
+    hidden_off = 0
+    ids_off = align(h_bytes)
+    w_off = ids_off + align(i_bytes)
+    return {
+        "hidden": (hidden_off, h_bytes),
+        "ids": (ids_off, i_bytes),
+        "weights": (w_off, w_bytes),
+        "nbytes": w_off + align(w_bytes),
+    }
+
+
+def host_ops_per_layer(packed: bool) -> dict[str, int]:
+    """Host-device operations one layer costs per step, by configuration.
+
+    kt's own path: three input copies (hidden, ids, weights), the host-func
+    node, and the output copy back. Packed: one input copy instead of three
+    (the three device-side fills that precede it are ordinary device work, not
+    host-device operations). 2026-09-20 measurement to beat: 7.5 ms per token
+    of transport+callback, i.e. ~62.5 us per operation at 120 operations.
+    """
+    d2h = 1 if packed else 3
+    return {"d2h": d2h, "host_func": 1, "h2d": 1, "total": d2h + 2}
+
+
 def resident_bytes_per_slot(hidden_size: int, intermediate_size: int, group_size: int = 32) -> int:
     """NPU bytes one resident expert costs in one layer (MXFP4 + E8M0 scales).
 
