@@ -21,6 +21,8 @@ import math
 
 import torch
 
+from vllm_ascend.aclnn_availability import require_aclnn_op
+
 #: Only the trailing ``rope_head_dim`` dimensions are rotated; the rest of the
 #: head passes through untouched, which makes a useful free self-check.
 NOPE_HEAD_DIM = 448
@@ -101,20 +103,99 @@ def _inverse_rope_operator_enabled() -> bool:
 
 _PARTIAL_ROTARY_OP = None
 
+#: The three names of the same operator. None of them is derivable from
+#: another, so all three are READ off csrc rather than transformed:
+#:   * the torch schema           csrc/torch_binding.cpp   ops.def("...")
+#:   * the aclnn API              csrc/torch_binding.cpp   EXEC_NPU_CMD(...)
+#:   * the OpType, which is also the ops-info registry key, verbatim
+#:                                .../inplace_partial_rotary_mul_def.cpp
+#:                                OP_ADD(InplacePartialRotaryMul)
+#: A guessed pair here would make the guard below judge a DIFFERENT operator
+#: and still come out green.
+_PARTIAL_ROTARY_TORCH_NAME = "inplace_partial_rotary_mul"
+_PARTIAL_ROTARY_ACLNN_API = "aclnnInplacePartialRotaryMul"
+_PARTIAL_ROTARY_OP_TYPE = "InplacePartialRotaryMul"
+
+#: Operator arguments ``csrc/torch_binding.cpp`` passes to EXEC_NPU_CMD
+#: (x, r1, r2, rotary_mode, partial_slice); the workspace/executor/stream tail
+#: is appended by the macro and is not part of this count. It is a literal
+#: copied out of another repository file, so the R53 suite re-derives it from
+#: that EXEC_NPU_CMD at the revision under test -- if somebody edits the call,
+#: the test goes red rather than this constant going quietly stale.
+_PARTIAL_ROTARY_MUL_ARG_COUNT = 5
+
 
 def _partial_rotary_op():
-    """``torch.ops._C_ascend.inplace_partial_rotary_mul``, loading its library.
+    """``torch.ops._C_ascend.inplace_partial_rotary_mul``, if it can actually RUN.
 
-    On A5 ``enable_custom_op()`` returns False, so nothing imports
-    ``vllm_ascend.vllm_ascend_C`` on purpose; the op is registered only if some
-    other module happened to import it (today ``device_allocator/camem.py``).
-    Without that the flag-on path failed with a bare host error that names
-    neither the library nor the flag. Load it here, and say so if it cannot be.
+    Two different questions are asked here, in order, because they have
+    different answers and different owners.
+
+    **Is the torch schema reachable at all?** On A5 ``enable_custom_op()``
+    returns False, so nothing imports ``vllm_ascend.vllm_ascend_C`` on purpose;
+    the op is registered only if some other module happened to import it
+    (today ``device_allocator/camem.py``). Without that the flag-on path failed
+    with a bare host error that names neither the library nor the flag, so the
+    import is done here and the two ways it can fail say which is which.
+
+    **Is the operator PATH walkable?** That is a different question, and the
+    check that used to stand here could not ask it: it stopped at
+    ``hasattr(torch.ops._C_ascend, ...)``. ``csrc/torch_binding.cpp`` registers
+    this schema with no condition that has anything to do with the operator:
+    the only ``#if`` around it is the ``#ifdef ASCEND_PLATFORM_310P`` /
+    ``#else`` that picks which of two whole ``TORCH_LIBRARY_EXPAND`` blocks a
+    build compiles, and every A5 build takes the ``#else``. So on any A5
+    installation where the C extension imports at all, that ``hasattr`` is
+    True whether or not the operator was ever compiled into the operator
+    package. A check that passes on every machine is not evidence; it is a
+    check that LOOKS like one. Worse, it passed silently in the three shapes
+    that matter most here:
+
+    * the aclnn entry points do not resolve at all (the operator was dropped
+      from the package's SoC list) -- the call would have died inside
+      EXEC_NPU_CMD with a message naming ``libopapi.so``, which is not the
+      library at fault;
+    * they resolve out of **CANN's own** ``libopapi.so``. This is not
+      hypothetical for this operator: CANN 9.2 exports
+      ``aclnnInplacePartialRotaryMul`` and its ``GetWorkspaceSize`` itself, at
+      the same 5-argument signature, so dlsym succeeds, no TORCH_CHECK fires,
+      and a stranger runs in place of the operator card A4 measured;
+    * the package answers but registers no kernel for the OpType (aclnn stubs,
+      prototype and tiling are built SoC-independently; kernels are not).
+
+    ``require_aclnn_op`` asks all of that and produces a different attribution
+    for each. What it cannot judge -- argument ORDER and MEANING of whatever
+    resolved, and which SoC this process will run on -- it logs rather than
+    folds into the pass.
+
+    Notes on the shape of this function:
+
+    * ``torch_npu`` is deliberately NOT offered as a source. The block above
+      has already established that the name is in ``torch.ops._C_ascend``,
+      which ``find_torch_op`` tries first, so the level-(1) branch of the probe
+      is unreachable from here and no namespace but ``_C_ascend`` is ever
+      consulted. Accepting a torch_npu-supplied attribute of the same name
+      would be the very failure this change is about: the probe reports that
+      case as UNCHECKED and passes.
+    * the verdict is memoised in ``_PARTIAL_ROTARY_OP``, exactly as before, so
+      the per-token cost of the flag-on path is unchanged: after the first
+      call this function is one ``is not None`` test and a return, as it was.
+      A refusal is NOT memoised -- only the op is -- so a raise re-checks.
+    * requiring a package of ours is safe on A5 only because the search path
+      is settled before the first forward, and NOT by the route the comment
+      above might suggest: ``enable_custom_op()`` returns False on this SoC
+      before it reaches ``bootstrap_custom_op_env`` at all. The prepend to
+      ASCEND_CUSTOM_OPP_PATH comes from
+      ``AscendPlatform.import_kernels()``, which vLLM calls while importing
+      ``vllm._custom_ops``. If that chain is ever broken, GetOpApiFuncAddr
+      falls through to CANN's ``libopapi.so`` for every custom operator and
+      this guard refuses instead of silently running CANN's -- which is the
+      intended direction, but it is a behaviour change and not a no-op.
     """
     global _PARTIAL_ROTARY_OP
     if _PARTIAL_ROTARY_OP is not None:
         return _PARTIAL_ROTARY_OP
-    if not hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul"):
+    if not hasattr(torch.ops._C_ascend, _PARTIAL_ROTARY_TORCH_NAME):
         try:
             import vllm_ascend.vllm_ascend_C  # noqa: F401  registers _C_ascend ops
         except ImportError as e:
@@ -124,13 +205,24 @@ def _partial_rotary_op():
                 "registered by vllm_ascend.vllm_ascend_C, and that library "
                 f"could not be imported ({e}). Build/install vllm_ascend_C or "
                 "set the flag to 0.") from e
-        if not hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul"):
+        if not hasattr(torch.ops._C_ascend, _PARTIAL_ROTARY_TORCH_NAME):
             raise RuntimeError(
                 "vllm_ascend.vllm_ascend_C was imported but did not register "
                 "_C_ascend::inplace_partial_rotary_mul (the built library is "
                 "older than this code?). Set "
                 "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR=0 or rebuild.")
-    _PARTIAL_ROTARY_OP = torch.ops._C_ascend.inplace_partial_rotary_mul
+    _PARTIAL_ROTARY_OP = require_aclnn_op(
+        torch,
+        None,  # see the docstring: _C_ascend is already established above
+        torch_name=_PARTIAL_ROTARY_TORCH_NAME,
+        aclnn_api=_PARTIAL_ROTARY_ACLNN_API,
+        op_type=_PARTIAL_ROTARY_OP_TYPE,
+        feature=("DSV4.1 inverse RoPE operator "
+                 "(VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR=1; "
+                 "0 selects the torch form in this same module)"),
+        expected_arg_count=_PARTIAL_ROTARY_MUL_ARG_COUNT,
+        require_vendor_package=True,
+    )
     return _PARTIAL_ROTARY_OP
 
 
