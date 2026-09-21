@@ -18,7 +18,8 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 
 from vllm_ascend.models.deepseek_v4_1.indexer_select import (
-    assert_candidate_mask_is_vacuous, compressed_lengths, select_topk)
+    MXFP4_SCALE_DTYPE, MXFP4_VALUE_DTYPE, assert_candidate_mask_is_vacuous,
+    compressed_lengths, paired_e8m0_scale, select_topk)
 
 #: Upstream's "no token here" sentinel in topk_indices_buffer.
 NO_TOKEN = -1
@@ -97,33 +98,22 @@ def unpack_indexer_cache(kv_cache):
     (``AscendDeepseekV41IndexerCache``), so it does not have V4.0's seven-tuple
     shape and the V4.0 unpackers do not apply.
 
-    The runner allocates a single packed tensor: upstream's ``head_dim`` for
-    this cache already includes the fp8 scale padding
-    (``index_head_dim + index_head_dim // 128 * 4`` = 132 bytes), and
-    ``indexer_cache_view.split_indexer_cache`` splits it at the operator's
-    byte offsets. A ``(values, scales)`` pair is accepted as-is.
+    Which form arrives is decided by that spec, not here. Since batch 1 the
+    spec carries ``scale_dim != 0``, and a non-zero ``scale_dim`` is what
+    switches the runner from binding one packed tensor to binding the planes
+    already split (``worker/model_runner_v1.py:5078-5106``) -- three of them
+    on a DSV4_COMPRESSED_CACHE part, the third being the whole page again.
+    ``indexer_cache_view.planes_from_bound_cache`` takes all three forms and
+    is the only place that knows where the value/scale boundary is.
     """
-    if isinstance(kv_cache, (tuple, list)):
-        if len(kv_cache) == 2:
-            return kv_cache[0], kv_cache[1]
-        raise ValueError(
-            f"the V4.1 indexer cache came back as {len(kv_cache)} tensors; "
-            "this expects (values, scales). V4.0's seven-tuple unpackers do "
-            "not apply -- the V4.1 indexer is its own cache group with its own "
-            "spec. Shapes: "
-            f"{[tuple(t.shape) for t in kv_cache if hasattr(t, 'shape')]}")
-    if isinstance(kv_cache, torch.Tensor):
-        from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import \
-            split_indexer_cache
+    if isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2:
+        # Kept ahead of the shared resolver so the pair is handed on
+        # unexamined, as it always has been.
+        return kv_cache[0], kv_cache[1]
+    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import \
+        planes_from_bound_cache
 
-        return split_indexer_cache(kv_cache)
-
-    raise ValueError(
-        f"the V4.1 indexer cache came back as {type(kv_cache).__name__}, "
-        "which is neither a (values, scales) pair nor the packed single "
-        "tensor this knows how to address. npu_quant_lightning_indexer_v2 "
-        "takes key and key_dequant_scale as two arguments and there is "
-        "nothing here to derive them from.")
+    return planes_from_bound_cache(kv_cache)
 
 
 class AscendSparseAttnIndexer(SparseAttnIndexer):
@@ -170,7 +160,33 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
                              else (q_quant, None))
         seqused_k, cmp_residual_k = compressed_lengths(req.seq_lens,
                                                        self.compress_ratio)
-        key_dequant_scale = scales.squeeze(-2) if scales.ndim > 2 else scales
+        # 🔴 **Do not squeeze the k_n axis here.** Modes 3 and 5 want the scale
+        # to carry *one more* axis than k, not the same number:
+        #   doc quant_lightning_indexer.md:132
+        #     quant_mode 为 3/5 时，layout_k 为 PA_BBND 时 shape 为
+        #     (block_num, block_size, k_n, d/64, 2)          <- 5 axes
+        #     其他场景分别为 (block_num, block_size, k_n)     <- 3 axes
+        #
+        # The squeeze that used to be here was **correct for fp8** (mode 1
+        # wants exactly those 3 axes) and became wrong the moment batch 1
+        # moved this call to mode 5 -- the pairing adds one axis back, but the
+        # squeeze had already taken a different one away, so the rank happened
+        # to look plausible at 4.
+        # ⚠ Nothing downstream would notice: the bytes and their order are
+        # unchanged, so the operator reads the same memory with a different
+        # block-to-scale mapping.
+        # ⚠ The comment below has been sitting here, correct, above code that
+        # contradicted it.
+        key_dequant_scale = paired_e8m0_scale(scales)
+        if key_dequant_scale.ndim != values.ndim + 1:
+            raise ValueError(
+                f"the key dequant scale is {tuple(key_dequant_scale.shape)} "
+                f"({key_dequant_scale.ndim} axes) for a key of "
+                f"{tuple(values.shape)} ({values.ndim} axes). Modes 3 and 5 "
+                "take exactly one axis more than the key "
+                "(quant_lightning_indexer.md:132: (block_num, block_size, "
+                "k_n, d/64, 2)). An axis short is not rejected -- the bytes "
+                "are the same and only the block-to-scale mapping changes.")
 
         topk_idxs = select_topk(
             query=q_values[:num_tokens],
@@ -208,11 +224,18 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         compressed_lengths for why that gate was not widened and what would
         make merging the two worthwhile.
 
-        The quant mode here comes from the hardware profile while the call
-        derives it from the cache dtypes; the two must agree (they do on A5).
+        🔴 The mode here has to be the mode of the call this describes -- a
+        metadata blob that disagrees with its call is not rejected; it shows
+        up as an aicore exception with tilingKey 0. It used to come from
+        ``dsv4_indexer_qk_dtype`` / ``dsv4_indexer_scale_dtype``, which mirror
+        **V4.0's** indexer cache spec (``AscendSFAIndexerCache``, fp8 + fp32)
+        and are shared with ``dsa_v1``/``dsa_cp``. Those two agreed with V4.1
+        while both caches were fp8; batch 1 moved V4.1's cache to MXFP4 and
+        left V4.0's alone, so they no longer describe this call at all. The
+        dtypes are passed in from the same tensors the call is assembled from
+        instead.
         """
-        from vllm_ascend.attention.dsa_attn_kv_plan import (
-            dsv4_indexer_qk_dtype, dsv4_indexer_scale_dtype, qli_v2_quant_mode)
+        from vllm_ascend.attention.dsa_attn_kv_plan import qli_v2_quant_mode
 
         ratio = max(self.compress_ratio, 1)
         return torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
@@ -220,8 +243,8 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
             num_heads_k=1,
             head_dim=self.head_dim,
             topk=self.topk_tokens,
-            quant_mode=qli_v2_quant_mode(dsv4_indexer_qk_dtype(),
-                                         dsv4_indexer_scale_dtype()),
+            quant_mode=qli_v2_quant_mode(MXFP4_VALUE_DTYPE,
+                                         MXFP4_SCALE_DTYPE),
             cu_seqlens_q=req.query_start_loc,
             seqused_k=seqused_k,
             cmp_residual_k=cmp_residual_k,

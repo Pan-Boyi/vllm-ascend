@@ -182,6 +182,19 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
     operator working from different page sizes with nothing raised. The
     measured case is ratio 2 on the C4 backend -- it passes at cache block
     sizes 64 and 128 and only fails at 32, and 128 is the default.
+
+    The row is MXFP4: ``logical_width // 2`` bytes of packed E2M1 values and
+    ``logical_width // 32`` bytes of E8M0 scales, 68 per token for a 128-wide
+    key, where upstream's fp8 row is 132 (128 values + one fp32 scale). The
+    scales are a ``scale_dim`` plane rather than padding inside the value row,
+    so ``real_page_size_bytes`` adds the two segments instead of taking one
+    width -- the formula is unchanged, both of its terms are now non-zero.
+    A page is therefore ``storage_block_size * 68`` bytes.
+
+    🔴 This is a whole-cache format, not a per-layer one. MLA specs cannot be
+    page-padded (``vllm/v1/core/kv_cache_utils.py:1392-1397`` raises), so every
+    index-K layer has to report the same row; there is no configuration in
+    which some layers are fp8 and some are MXFP4.
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -190,6 +203,10 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
         from vllm_ascend.device.hardware_profile import (
             HardwareCapability, get_current_hardware_profile)
         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+        from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (
+            logical_width_from_head_dim, scale_bytes_per_token,
+            value_bytes_per_token)
 
         compressed = get_current_hardware_profile().supports(
             HardwareCapability.DSV4_COMPRESSED_CACHE)
@@ -204,15 +221,31 @@ class AscendDeepseekV41IndexerCache(DeepseekV4IndexerCache):
         # fail: select_common_block_size treats 0 as divisible by every
         # supported size and silently picks the largest.
         states_ratio = max(self.compress_ratio, 1)
+        # The logical key width, recovered from the packed row upstream sized
+        # this cache with. ``dsa_indexer_uses_fp4`` is False on Ascend -- it
+        # raises outside Blackwell -- so ``self.head_dim`` is always upstream's
+        # fp8 row (132 for a 128-wide key), whatever this cache then stores.
+        logical_width = logical_width_from_head_dim(self.head_dim)
         return AscendMLAAttentionSpec(
             block_size=storage_block_size * states_ratio,
             num_kv_heads=1,
-            head_size=self.head_dim,
-            dtype=self.dtype,
+            # MXFP4, two planes: ``logical_width // 2`` bytes of packed E2M1
+            # values and ``logical_width // 32`` bytes of E8M0 scales -- 64 + 4
+            # against the fp8 row's 128 + 4. Both numbers are derived, not
+            # written: index_head_dim moves them together or not at all.
+            #
+            # Both are byte planes, so both dtypes are uint8. The dtypes that
+            # say what the bytes *mean* (float4_e2m1fn_x2 / float8_e8m0fnu)
+            # are put on at the operator call rather than here, because the
+            # runner's allocation path -- torch.zeros, .view(), as_strided,
+            # get_dtype_size, the memory profiler -- only ever sees byte
+            # dtypes today. See indexer_select.select_topk.
+            head_size=value_bytes_per_token(logical_width),
+            dtype=torch.uint8,
             model_version="deepseek_v4",
             cache_dtype_str=self.cache_config.cache_dtype,
-            scale_dim=1 if self.head_dim == 128 else 0,
-            scale_dtype=torch.float if compressed else torch.float16,
+            scale_dim=scale_bytes_per_token(logical_width),
+            scale_dtype=torch.uint8,
             tokens_per_state=states_ratio,
             # states_ratio is the clamped page divisor; this is the ratio the
             # layer was configured with, 0 kept as 0.

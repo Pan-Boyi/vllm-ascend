@@ -12,10 +12,15 @@ What V4.1 hands us:
 * ``k`` is ``None`` and ``skip_k_cache_insert`` is ``True``, because the layer
   has already written the indexer K cache itself; this reads the cache and
   selects.
-* ``q_quant`` arrives already quantised, with the per-token q scale **folded
-  into weights** on the FP8 path -- so the operator's mandatory
-  ``query_dequant_scale`` is ones, not a dropped argument. See
-  ``_query_dequant_scale``.
+* ``q_quant`` arrives already quantised, as a ``(values, scales)`` pair.
+  MXFP4 scales are per 32-element block and travel with the Q values, so --
+  unlike the fp8 path this replaced -- there is no per-token scalar folded
+  into ``weights``, and the operator's mandatory ``query_dequant_scale`` is
+  those scales rather than ones. See ``_query_dequant_scale``.
+* both the cache and the Q packer hand over **byte planes** (``uint8``). The
+  dtypes that say what the bytes mean are put on here, just before the call,
+  because ``qli_v2_quant_mode`` keys on them: there is no ``quant_mode``
+  literal on this path, and getting the dtypes right is what makes the mode 5.
 * The result travels by mutation of ``topk_indices_buffer``; the return value
   is discarded by the caller.
 """
@@ -25,6 +30,23 @@ from __future__ import annotations
 import torch
 
 from vllm_ascend.attention.dsa_attn_kv_plan import qli_v2_quant_mode
+from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import SCALE_PAIR
+
+#: The dtypes that say what the MXFP4 bytes mean. The cache and the Q packer
+#: both hand over ``uint8``, because a byte plane carries no interpretation,
+#: and ``qli_v2_quant_mode`` keys on the dtype pair -- so the reinterpretation
+#: has to happen **before** the mode is derived, not after. There is no
+#: literal ``quant_mode`` anywhere on this path: getting these two right is
+#: what makes the mode 5.
+#:
+#: 🔴 Passing them through is also the only thing that can reach acl's
+#: ACL_FLOAT4_E2M1 / ACL_FLOAT8_E8M0 from here. CANN's own binding rewrites
+#: the acl dtype for modes 4 and 5 in ``FixQLIV2AclDtypes()``; **our**
+#: ``csrc/torch_binding.cpp`` has no equivalent, so whatever torch_npu maps
+#: these dtypes to is what the kernel sees. That mapping has not been
+#: exercised on a card (o_ds41_qli_vs_ours.md §3.4).
+MXFP4_VALUE_DTYPE = torch.float4_e2m1fn_x2
+MXFP4_SCALE_DTYPE = torch.float8_e8m0fnu
 
 #: What the V4.1 checkpoint calls the two-level candidate filter's knobs.
 #: Read from the config at runtime: the released checkpoint sets them.
@@ -134,16 +156,118 @@ def collect_candidate_guards(model, hf_config) -> "CandidateGuards | None":
 
 def _query_dequant_scale(q_quant, q_scale, num_tokens: int, num_heads: int,
                          device, dtype: torch.dtype) -> torch.Tensor:
-    """The scale the operator requires, including when nothing scaled it.
+    """The scale the operator requires.
 
-    ``query_dequant_scale`` is mandatory in the operator schema, but V4.1's
-    FP8 path folds the per-token q scale into ``weights`` (upstream and
-    ``indexer_q.py`` alike) and passes ``None``. The logit is linear in that
-    scale, so passing ones after the fold is exact.
+    The fp8 path folded the per-token q scale into ``weights`` and passed
+    ``None`` here; the logit is linear in a single per-token scalar, so ones
+    were exact after that fold.
+
+    **MXFP4 has no such scalar.** Its scales are per 32-element block and
+    travel with the Q values (``indexer_q.fused_indexer_q_rope_quant_ascend``
+    returns them), so ones would not be "the fold already applied" -- they
+    would be every block exponent thrown away, and the operator would run and
+    return garbage. The ones branch is therefore refused rather than kept as a
+    default that is no longer exact.
     """
     if q_scale is not None:
         return q_scale
-    return torch.ones((num_tokens, num_heads), dtype=dtype, device=device)
+    raise ValueError(
+        "the V4.1 indexer got no query dequant scale. On the MXFP4 path the "
+        "per-32-element E8M0 block scales are produced alongside the packed "
+        "Q values and are not folded into weights, so there is no per-token "
+        "scalar that ones could stand in for. A None here means the Q "
+        "producer is still the fp8 one (it returned a bare tensor rather than "
+        "a (values, scales) pair) while the key cache is MXFP4 -- and every "
+        "shape downstream stays valid either way.")
+
+
+def paired_e8m0_scale(scale: torch.Tensor) -> torch.Tensor:
+    """A flat per-token scale row given the trailing ``(D/64, 2)`` axis.
+
+    Modes 3 and 5 give the dequant scales one more dimension than q/k
+    (``dsa_attn_kv_plan`` :47-50; the operator's README :56-59). The bytes and
+    their order are unchanged -- ``(..., 4)`` becomes ``(..., 2, 2)`` -- which
+    is why nothing downstream would notice the axis missing: the operator
+    would read the same memory with a different block-to-scale mapping.
+    """
+    last = int(scale.shape[-1])
+    if last % SCALE_PAIR:
+        raise ValueError(
+            f"the dequant scale row is {last} bytes, which is not a whole "
+            f"number of {SCALE_PAIR}-scale pairs. Modes 3 and 5 read it as "
+            f"(D/{32 * SCALE_PAIR}, {SCALE_PAIR}).")
+    return scale.reshape(*scale.shape[:-1], last // SCALE_PAIR, SCALE_PAIR)
+
+
+def _as_operator_dtype(t: torch.Tensor, dtype: torch.dtype,
+                       what: str) -> torch.Tensor:
+    """``t`` reinterpreted as ``dtype``. Bytes are never touched.
+
+    Only a ``uint8`` tensor is reinterpreted, and only into the one dtype this
+    path expects for it. Accepting anything else would let an fp8 cache reach
+    ``qli_v2_quant_mode`` wearing MXFP4's dtype, which is the one mistake the
+    mode table cannot catch -- the kernel validates the q/k dtype against the
+    mode but not the scale, so a wrong mode with a plausible dtype runs.
+    """
+    if t.dtype is dtype:
+        return t
+    if t.dtype is not torch.uint8:
+        raise ValueError(
+            f"{what} is {t.dtype}; the MXFP4 path takes the byte plane "
+            f"(uint8) and reinterprets it as {dtype} for the operator. "
+            "Anything else is a different cache format reaching a mode-5 "
+            "call.")
+    return t.view(dtype)
+
+
+#: One line, once per process, naming the mode this read actually used.
+#: Grepping a serve log for "fp4" does **not** answer this question: the MoE
+#: quantiser logs ``expert_dtype resolved to 'fp4'`` (quant_config.py:75) and
+#: has nothing to do with the index K cache. This prefix belongs to this path
+#: and to nothing else.
+_READ_EVIDENCE_PREFIX = "DSV41-INDEXK-READ"
+_read_evidence_logged = False
+
+
+def _log_read_evidence(quant_mode: int, key_cache: torch.Tensor,
+                       key_dequant_scale: torch.Tensor,
+                       query: torch.Tensor,
+                       q_scale: torch.Tensor) -> None:
+    """Report the arguments as they are about to be passed, once.
+
+    ``quant_mode`` is the value being passed, not a recomputation of it: the
+    caller derives it once and hands both the log and the operator the same
+    object. A check bit that cannot change with the thing it checks is a green
+    light that means nothing.
+
+    ``vllm.logger.logger``, not ``init_logger(__name__)``: under
+    ``vllm_ascend`` the latter attaches to root at WARNING and an INFO line
+    disappears without a trace.
+    """
+    global _read_evidence_logged
+    if _read_evidence_logged:
+        return
+    _read_evidence_logged = True
+    from vllm.logger import logger
+
+    # 🔴 ``q_*`` fields are **appended**, never inserted before the existing
+    # ones: verify_mxfp4_batch1.py matches this line by prefix, and moving a
+    # field would silently stop matching while the line still looks right.
+    #
+    # ⚠ Why q is here at all: the 2026-09-20 mxfp4 flight failed with
+    # "Parameter q of QuantLightningIndexerV2 has incorrect shape
+    # [256, 32, 64] ... head dim of q only supports 128", and this line
+    # reported key/scale but **not q** -- so the log could not say whether q
+    # had reached the operator as float4 (torch_npu does not widen it) or as
+    # uint8 (we forgot to reinterpret it). It took reading the source to tell
+    # those apart, and they call for opposite fixes. A check bit that omits
+    # the argument the error names is a coverage gap, not a formatting detail.
+    logger.info(
+        "%s quant_mode=%s key_dtype=%s scale_dtype=%s "
+        "q_dtype=%s q_shape=%s q_scale_dtype=%s q_scale_shape=%s",
+        _READ_EVIDENCE_PREFIX, quant_mode, key_cache.dtype,
+        key_dequant_scale.dtype, query.dtype, tuple(query.shape),
+        q_scale.dtype, tuple(q_scale.shape))
 
 
 def select_topk(
@@ -170,6 +294,15 @@ def select_topk(
     ``cmp_ratio`` comes from the layer: V4.1 carries 0, 1 and 2, and 0 ("no
     compression") is passed to the operator as 1.
     """
+    from vllm_ascend.models.deepseek_v4_1.call_counter import (
+        mark_branch, record)
+
+    # See ``call_counter``: counted at the entry, before the parameter raises
+    # below, because "did this Python execute" is the question. The read side
+    # is counted **separately** from the write side on purpose -- if the two
+    # magnitudes disagree, that is itself the finding: one of them is inside
+    # the captured graph and the other is not.
+    record("read", query.shape)
     if op is None:
         op = torch.ops._C_ascend.npu_quant_lightning_indexer_v2
     if max(compress_ratio, 1) == 1 and cmp_residual_k is not None:
@@ -182,18 +315,41 @@ def select_topk(
             "\"Cmp_ratio is 1 or sparse_mode is 0, cmp_residual_k must be "
             "null\" -- and it is refused at tiling, before the kernel runs.")
     num_tokens, num_heads = query.shape[0], query.shape[1]
+    q_scale = _query_dequant_scale(query, q_scale, num_tokens, num_heads,
+                                   query.device, None)
+    # The byte planes, reinterpreted as what they hold. Both the cache
+    # (caches.py) and the Q packer (indexer_q.py) hand over uint8; this is
+    # where the bytes get their meaning, and it is upstream of the mode.
+    query = _as_operator_dtype(query, MXFP4_VALUE_DTYPE, "query")
+    key_cache = _as_operator_dtype(key_cache, MXFP4_VALUE_DTYPE, "key cache")
+    q_scale = _as_operator_dtype(q_scale, MXFP4_SCALE_DTYPE,
+                                 "query dequant scale")
+    key_dequant_scale = _as_operator_dtype(key_dequant_scale,
+                                           MXFP4_SCALE_DTYPE,
+                                           "key dequant scale")
+    for name, scale in (("query", q_scale), ("key", key_dequant_scale)):
+        if int(scale.shape[-1]) != SCALE_PAIR:
+            raise ValueError(
+                f"the {name} dequant scale is {tuple(scale.shape)}; modes 3 "
+                f"and 5 read it with a trailing (D/{32 * SCALE_PAIR}, "
+                f"{SCALE_PAIR}) axis (see paired_e8m0_scale). Without it the "
+                "operator reads the same bytes with a different "
+                "block-to-scale mapping and nothing is raised.")
+    # The kernel validates only the q/k dtype of the mode, so a wrong mode
+    # runs and returns garbage; derive it from the tensors in hand. Derived
+    # once: the value below is the one the operator gets and the one the
+    # evidence line reports.
+    quant_mode = qli_v2_quant_mode(key_cache.dtype, key_dequant_scale.dtype)
+    _log_read_evidence(quant_mode, key_cache, key_dequant_scale, query,
+                       q_scale)
     topk_idxs, _ = op(
         query=query,
         key=key_cache,
         weights=weights,
-        query_dequant_scale=_query_dequant_scale(
-            query, q_scale, num_tokens, num_heads, query.device,
-            key_dequant_scale.dtype),
+        query_dequant_scale=q_scale,
         key_dequant_scale=key_dequant_scale,
         topk=index_topk,
-        # The kernel validates only the q/k dtype of the mode, so a wrong
-        # mode runs and returns garbage; derive it from the tensors in hand.
-        quant_mode=qli_v2_quant_mode(key_cache.dtype, key_dequant_scale.dtype),
+        quant_mode=quant_mode,
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=seqused_k,
         cmp_residual_k=cmp_residual_k,
@@ -205,6 +361,7 @@ def select_topk(
         cmp_ratio=max(compress_ratio, 1),
         return_value=0,
     )
+    mark_branch("read", "op")
     return topk_idxs
 
 

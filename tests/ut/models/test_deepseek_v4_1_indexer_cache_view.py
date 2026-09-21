@@ -6,6 +6,10 @@ then every token's scales. The obvious alternative -- each token owning
 ``cache_width`` contiguous bytes -- produces tensors of the same shape, the
 same dtype and plausible strides, and returns other tokens' numbers.
 
+The row is MXFP4 since batch 1: two E2M1 values per byte plus one E8M0 byte
+per 32 values, so a token of ``d`` logical values occupies ``d // 2 + d // 32``
+bytes. The segmentation rule is the one it always was.
+
 So the test that matters writes distinguishable marks into known places and
 reads them back through the views. A shape assertion cannot tell the two
 readings apart; a round trip can.
@@ -15,11 +19,13 @@ import pytest
 import torch
 
 from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (
-    SCALE_BYTES, SCALE_GROUP, split_indexer_cache, value_width)
+    SCALE_BYTES, SCALE_GROUP, VALUES_PER_BYTE, split_indexer_cache,
+    value_width)
 
 BLOCKS, TOKENS = 3, 8
-D = SCALE_GROUP                      # values per token
-WIDTH = D + SCALE_BYTES              # one scale column
+D = SCALE_GROUP                          # values per token: one scale group
+VALUE_BYTES = D // VALUES_PER_BYTE       # packed E2M1 bytes per token
+WIDTH = VALUE_BYTES + SCALE_BYTES        # one scale column
 
 
 def _cache():
@@ -31,7 +37,7 @@ def _cache():
 def test_the_value_width_is_inverted_from_upstreams_own_formula():
     """attention.py:90 -- head_dim = index_head_dim + index_head_dim//128*4."""
     assert value_width(WIDTH) == D
-    assert value_width(2 * SCALE_GROUP + 2 * SCALE_BYTES) == 2 * SCALE_GROUP
+    assert value_width(2 * VALUE_BYTES + 2 * SCALE_BYTES) == 2 * SCALE_GROUP
 
 
 def test_a_width_that_is_not_values_plus_scales_is_refused():
@@ -45,7 +51,8 @@ def test_the_formula_is_not_written_as_todays_numbers():
     from vllm_ascend.models.deepseek_v4_1 import indexer_cache_view
 
     body = inspect.getsource(indexer_cache_view.value_width)
-    assert "132" not in body and "128" not in body, body
+    for literal in ("132", "128", "68", "64"):
+        assert literal not in body, (literal, body)
 
 
 # ------------------------------------------------- the layout, by round trip
@@ -55,8 +62,8 @@ def test_each_token_reads_back_its_own_values_and_its_own_scale():
 
     Marks are written at the byte offsets the operator's kernel computes:
 
-        value of token t  ->  block*blockStride + t*d
-        scale of token t  ->  block*blockStride + tokens*d + t*4
+        value of token t  ->  block*blockStride + t*valueBytes
+        scale of token t  ->  block*blockStride + tokens*valueBytes + t*scaleCol
 
     Under the per-token reading ("cache_width contiguous bytes each") token 1
     would come back holding token 1's tail and token 2's head, and the scale
@@ -66,19 +73,19 @@ def test_each_token_reads_back_its_own_values_and_its_own_scale():
     flat = cache.view(-1)
     block_stride = TOKENS * WIDTH
 
-    scales = torch.arange(1, BLOCKS * TOKENS + 1, dtype=torch.float32) * 0.5
+    scale_marks = [200 + (b * TOKENS + t) for b in range(BLOCKS)
+                   for t in range(TOKENS)]
     for b in range(BLOCKS):
         for t in range(TOKENS):
             mark = b * TOKENS + t + 1
-            flat[b * block_stride + t * D:b * block_stride + (t + 1) * D] = mark
-            start = b * block_stride + TOKENS * D + t * SCALE_BYTES
-            flat[start:start + SCALE_BYTES] = torch.tensor(
-                [scales[b * TOKENS + t]], dtype=torch.float32).view(
-                    torch.uint8)
+            flat[b * block_stride + t * VALUE_BYTES:
+                 b * block_stride + (t + 1) * VALUE_BYTES] = mark
+            start = b * block_stride + TOKENS * VALUE_BYTES + t * SCALE_BYTES
+            flat[start:start + SCALE_BYTES] = scale_marks[b * TOKENS + t]
 
     key, scale = split_indexer_cache(cache)
-    assert key.shape == (BLOCKS, TOKENS, 1, D)
-    assert scale.shape == (BLOCKS, TOKENS, 1, 1)
+    assert key.shape == (BLOCKS, TOKENS, 1, VALUE_BYTES)
+    assert scale.shape == (BLOCKS, TOKENS, 1, D // SCALE_GROUP)
 
     for b in range(BLOCKS):
         for t in range(TOKENS):
@@ -87,8 +94,7 @@ def test_each_token_reads_back_its_own_values_and_its_own_scale():
                 f"block {b} token {t} read back {key[b, t, 0, :4].tolist()} "
                 f"instead of {mark}; the value segment is being addressed as "
                 "if each token owned cache_width contiguous bytes")
-            assert float(scale[b, t, 0, 0]) == pytest.approx(
-                float(scales[b * TOKENS + t]))
+            assert int(scale[b, t, 0, 0]) == scale_marks[b * TOKENS + t]
 
 
 def test_the_per_token_reading_would_have_disagreed():
@@ -98,10 +104,10 @@ def test_the_per_token_reading_would_have_disagreed():
     flat = cache.view(-1)
     block_stride = TOKENS * WIDTH
     for t in range(TOKENS):
-        flat[t * D:(t + 1) * D] = t + 1
+        flat[t * VALUE_BYTES:(t + 1) * VALUE_BYTES] = t + 1
 
     key, _ = split_indexer_cache(cache)
-    wrong = cache[:, :, :D]          # "each token owns WIDTH bytes"
+    wrong = cache[:, :, :VALUE_BYTES]   # "each token owns WIDTH bytes"
     assert not torch.equal(key[0, :, 0, :], wrong[0]), (
         "the segmented and per-token readings agree on this fixture, so the "
         "round trip above is not distinguishing them")
@@ -128,8 +134,8 @@ def test_the_scale_segment_starts_one_whole_value_segment_in():
     key, scale = split_indexer_cache(cache)
     offset_bytes = scale.storage_offset() * SCALE_BYTES - \
         key.storage_offset() * key.element_size()
-    assert offset_bytes == TOKENS * D
-    assert offset_bytes != D, "this is the per-token reading's offset"
+    assert offset_bytes == TOKENS * VALUE_BYTES
+    assert offset_bytes != VALUE_BYTES, "this is the per-token reading's offset"
 
 
 def test_writing_through_a_view_reaches_the_cache():
@@ -148,5 +154,5 @@ def test_a_rank_it_cannot_place_the_boundary_in_is_refused():
 def test_the_unit_head_axis_is_accepted_if_binding_left_it_on():
     cache = torch.zeros(BLOCKS, TOKENS, 1, WIDTH, dtype=torch.uint8)
     key, scale = split_indexer_cache(cache)
-    assert key.shape == (BLOCKS, TOKENS, 1, D)
-    assert scale.shape == (BLOCKS, TOKENS, 1, 1)
+    assert key.shape == (BLOCKS, TOKENS, 1, VALUE_BYTES)
+    assert scale.shape == (BLOCKS, TOKENS, 1, D // SCALE_GROUP)

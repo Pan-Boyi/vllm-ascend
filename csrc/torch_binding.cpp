@@ -1152,12 +1152,118 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_v2_npu(
     char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
 
     if (key_layout_str == "PA_BSND" || key_layout_str == "PA_BBND") {
-        auto contiguous_axes_result_key = is_contiguous_axes(key);
-        TORCH_CHECK(contiguous_axes_result_key[1] && contiguous_axes_result_key[2],
-                    "key must be contiguous on all axes except axis 0");
-        auto contiguous_axes_result_key_scale = is_contiguous_axes(key_dequant_scale);
-        TORCH_CHECK(contiguous_axes_result_key_scale[1] && contiguous_axes_result_key_scale[2],
-                    "key_dequant_scale must be contiguous on all axes except axis 0");
+        // 🔴 The doc says **axis 0 only**, not "axes 1 and 2":
+        //   quant_lightning_indexer.md:129 (k) and :132 (k_descale), same
+        //   sentence: 数据格式为ND，仅PA_BBND场景下0轴支持非连续。
+        // The previous form checked [1] && [2] and left the rest unchecked --
+        // which was invisible while every tensor here was 4-D and the last
+        // axis happened to be contiguous. Batch 1 makes k_descale **5-D**, so
+        // "the axes after 2" stopped being an empty set.
+        // ⚠ Verified before tightening, not after: production's key
+        // (8,128,1,64) stride (8704,64,64,1) and k_descale (8,128,1,2,2)
+        // stride (8704,4,4,2,1) are both contiguous on axes 1..N-1. Tightening
+        // first would have risked refusing our own flight, with "operator does
+        // not support this" as the symptom.
+        // 🔴 报覆盖量，零覆盖判失败。
+        //    这条守卫此前查的是 [1] && [2]，而当时所有张量都是 4 维、最后一轴
+        //    恰好连续 ⇒「轴 2 之后」是【空集】⇒ 它和一条查全了的守卫【读数完全相同】，
+        //    并且以「一直是绿的」的形式积累信任。批次 1 把 k_descale 变成 5 维，
+        //    那个集合才第一次非空。
+        //    ⇒ 一条覆盖范围为空的检查，和一条通过的检查，长得一模一样。
+        auto check_tail_contiguous = [](const at::Tensor &t, const char *what) {
+            auto flags = is_contiguous_axes(t);
+            int64_t checked = 0;
+            for (size_t i = 1; i < flags.size(); ++i) {
+                ++checked;
+                TORCH_CHECK(flags[i], what,
+                            " must be contiguous on every axis except axis 0 "
+                            "(quant_lightning_indexer.md:129,:132); axis ", i,
+                            " is not, for shape ", t.sizes(), " stride ", t.strides(),
+                            " [checked_axes=", checked, "]");
+            }
+            TORCH_CHECK(checked > 0,
+                        "DSV41-CONTIG-ZERO-COVERAGE: ", what, " is ",
+                        t.sizes().size(), "-D, so this guard examined **zero** "
+                        "axes and would have passed no matter what the strides "
+                        "were. A check with an empty scope reads exactly like a "
+                        "check that passed. shape=", t.sizes());
+            return checked;
+        };
+        const int64_t key_axes = check_tail_contiguous(key, "key");
+        const int64_t scale_axes = check_tail_contiguous(key_dequant_scale,
+                                                         "key_dequant_scale");
+        // 覆盖量对下游可见：mode 3/5 下 scale 比 key 多一根轴（:132），
+        // 所以查过的轴数也应当多一根。两者相等 ⇒ 要么 scale 少了一根
+        // （N1 那个缺陷），要么这两条守卫看的不是我们以为的对象。
+        //
+        // 🔴 **这条守卫本来能提前抓到哪个真实缺陷**（一条守卫最该记录的就是
+        //   这个）：N1 —— sparse_indexer.py 里的 `scales.squeeze(-2)` 把
+        //   k_n 那根轴丢掉了，于是 k_descale 是 4 维而 mode 3/5 要求 5 维。
+        //   那个 squeeze 在 fp8 下是**对的**，换到 mode 5 才错，而且它今天
+        //   仍然是绿的 —— 因为配对（paired_e8m0_scale）又加回一根轴，
+        //   squeeze 减一根，**净维数看起来正常**。
+        //   如果这条守卫当初就在，N1 会在**第一次 mode-5 调用**时就红；
+        //   实际是靠回头重扫文档才偶然发现的。
+        if (quant_mode == 3 || quant_mode == 5) {
+            TORCH_CHECK(scale_axes == key_axes + 1,
+                        "DSV41-CONTIG-ZERO-COVERAGE: modes 3/5 give the dequant "
+                        "scale one axis more than the key "
+                        "(quant_lightning_indexer.md:132), so this guard should "
+                        "have examined one more axis on it; it examined ",
+                        scale_axes, " vs ", key_axes, ". key=", key.sizes(),
+                        " scale=", key_dequant_scale.sizes());
+        }
+    }
+
+    // 🔴 文档判非法的参数组合，显式拒绝（只加 raise，**不改默认值**）。
+    //   quant_lightning_indexer.md:179 原文：
+    //     当传入的cmp_ratio > 1且mask_mode = 3时，必须传入cmp_residual_k，其余情况不传入。
+    // ⚠ 我们 schema 的默认值 cmp_ratio=4 + mask_mode=3 正好落在这个组合里，
+    //   而 cmp_residual_k 默认是 None ⇒ **任何靠默认值的调用方直接落进非法组合**。
+    // 🔴 这里只加拦截，不改默认值：改默认值是批次 1 之外的作用域，而且
+    //   **拦截比正确的默认值更值钱 —— 默认值改错了是静默的，raise 改错了是吵的**。
+    // ⚠ 另记：默认 cmp_ratio=4 是 **V4.0 的比例**，V4.1 只有 1 和 2。
+    //   这是一个跨版本残留的默认值，最容易被当成「本来就该是这样」。
+    TORCH_CHECK(!(cmp_ratio > 1 && mask_mode == 3 && !cmp_residual_k.has_value()),
+                "cmp_ratio=", cmp_ratio, " (>1) with mask_mode=3 requires "
+                "cmp_residual_k, which was not given "
+                "(quant_lightning_indexer.md:179). This combination is exactly "
+                "what the schema defaults produce, so a caller that relies on "
+                "the defaults lands here.");
+    TORCH_CHECK(!(!(cmp_ratio > 1 && mask_mode == 3) && cmp_residual_k.has_value()),
+                "cmp_residual_k was given but cmp_ratio=", cmp_ratio,
+                " / mask_mode=", mask_mode, " is not the (cmp_ratio>1 && "
+                "mask_mode==3) case; the operator requires it absent there "
+                "(quant_lightning_indexer.md:179).");
+
+    // 🔴 The semantic check belongs **here**, not in ConvertType.
+    // ``float4_e2m1fn_x2`` and a packed ``uint8`` are indistinguishable from
+    // everything ConvertType can see: same element_size (1), same sizes, same
+    // nbytes. CANN's own reference accepts both and sets the acl dtype at the
+    // *call site* for exactly that reason -- it is the layer that knows what
+    // the bytes mean. ConvertType must never guess "this uint8 is really fp4";
+    // guessing there is how a byte plane silently becomes arithmetic (this
+    // project has already lost 70M scale values to that shape once).
+    if (quant_mode == 5) {
+        TORCH_CHECK(query.scalar_type() == at::kFloat4_e2m1fn_x2,
+                    "quant_mode 5 (MXFP4) needs query declared as "
+                    "torch.float4_e2m1fn_x2; got ", query.scalar_type(),
+                    ". A packed uint8 carries the same bytes and the same shape, "
+                    "so nothing downstream can tell the difference -- it would be "
+                    "described with half the head dim and read the wrong rows.");
+        TORCH_CHECK(key.scalar_type() == at::kFloat4_e2m1fn_x2,
+                    "quant_mode 5 (MXFP4) needs key declared as "
+                    "torch.float4_e2m1fn_x2; got ", key.scalar_type(),
+                    ". The operator additionally requires key headDim == query "
+                    "headDim and reports only that the two disagree, never which "
+                    "side is wrong -- so this is checked on each side separately.");
+        TORCH_CHECK(query_dequant_scale.scalar_type() == at::kFloat8_e8m0fnu &&
+                        key_dequant_scale.scalar_type() == at::kFloat8_e8m0fnu,
+                    "quant_mode 5 needs both dequant scales as torch.float8_e8m0fnu; "
+                    "got ", query_dequant_scale.scalar_type(), " / ",
+                    key_dequant_scale.scalar_type(),
+                    ". The scale plane is one byte per element, not sub-byte: it is "
+                    "the one plane that must NOT be widened.");
     }
 
     EXEC_NPU_CMD(aclnnQuantLightningIndexerV2, query, key, weights, query_dequant_scale, key_dequant_scale,

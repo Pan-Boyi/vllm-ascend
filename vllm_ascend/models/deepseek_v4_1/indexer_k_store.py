@@ -7,11 +7,16 @@ and on triton-ascend a per-token paged store is a pointer-arithmetic shape that
 aborts the compiler (``abort()``, not an exception), so an equivalent route is
 taken instead.
 
-The quantisation and the paged store are not rebuilt here: A5 has a fused
-operator for both, ``indexer_compress_epilog_v2``, already used by the V4.0
-path in ``vllm_ascend/device/device_op.py``. What this file adds is the part
-upstream fuses in and the operator has no notion of -- the group gate, the
-norm, and the rotation.
+The quantisation and the paged store are not rebuilt here: CANN has fused
+operators for both. Since batch 1 the cache row is MXFP4 (64 bytes of packed
+E2M1 values + 4 E8M0 scale bytes per token) and the writer is
+``cann_ops_transformer.indexer_quant_cache`` with ``quant_mode="mxfp4"``;
+``indexer_compress_epilog_v2``, which writes the fp8 row (128 values + one
+fp32 scale = 132 bytes) and is what the V4.0 path in
+``vllm_ascend/device/device_op.py`` uses, is kept only for a rollback to that
+row and refuses an MXFP4 cache. What this file adds is the part upstream fuses
+in and neither operator has a notion of -- the group gate, the norm, and the
+rotation.
 
 Five details are silent if wrong:
 
@@ -45,14 +50,6 @@ INDEX_ROPE_HEAD_DIM = 64
 
 #: What the fused A5 store operator treats as "skip this token".
 SKIP_SLOT = -1
-
-_MXFP4_UNREACHABLE = (
-    "MXFP4 indexer keys are not implemented on Ascend, and upstream cannot "
-    "reach them either: resolve_indexer_kv_dtype defaults to 'fp8' and the "
-    "mxfp4 value is gated to Blackwell datacenter parts "
-    "(is_device_capability_family(100)) with a ValueError for everything else. "
-    "If this raises, something selected mxfp4 on hardware upstream would have "
-    "refused, and the question is why -- not how to add the branch.")
 
 
 def group_boundary_slots(kv_slot_mapping: torch.Tensor,
@@ -273,12 +270,30 @@ def indexer_k_norm_rope_store_ascend(
 
     Same signature and same ``None`` return as upstream's, so it can be bound
     over the name the V4.1 layer already calls.
-    """
-    if use_fp4_cache:
-        raise NotImplementedError(_MXFP4_UNREACHABLE)
 
+    ``use_fp4_cache`` is upstream's flag and is **not** what selects the format
+    here. It comes from ``dsa_indexer_uses_fp4``, which raises outside
+    Blackwell, so on Ascend it is always False -- while the cache this writes
+    into is MXFP4 unconditionally. Branching on it would leave the MXFP4 store
+    permanently unreachable, which is what the removed ``NotImplementedError``
+    did. It is accepted and ignored so the signature still matches the name
+    this is bound over.
+    """
+    from vllm_ascend.models.deepseek_v4_1.call_counter import (
+        mark_branch, record)
     from vllm_ascend.models.deepseek_v4_1.compressed_slots import (
         check_per_token, layer_owning, per_token_compressed_slots)
+
+    # 🔴 Counted here, at the entry, **before every early return and every
+    # raise**: the question the count answers is "did this Python execute",
+    # and a call that returns early still executed. Which store path it took
+    # afterwards is ``mark_branch``'s job -- there are two of them, and
+    # counting inside one would report zero while the other ran.
+    #
+    # Why a count at all: the evidence line below is log-once, and a log-once
+    # line reads **identically** whether this runs inside the captured graph
+    # or outside it. A count does not -- see ``call_counter``.
+    record("write", k_pre.shape)
 
     # Kept under its own name: the rebuild below is matched to the metadata
     # object by identity, and flattening makes a new tensor.
@@ -296,6 +311,7 @@ def indexer_k_norm_rope_store_ascend(
             f"[num_tokens, 2] (block, offset); got "
             f"{tuple(handed.shape)}.")
     if num_tokens == 0:
+        mark_branch("write", "empty")
         return
 
     if compress_ratio > 1:
@@ -326,47 +342,142 @@ def indexer_k_norm_rope_store_ascend(
                                INDEX_ROPE_HEAD_DIM)
 
     # Quantisation, value store and scale store, in one operator. The layout
-    # matches upstream's fp8 branch byte for byte: whole-block values first,
-    # then the per-token fp32 scales.
+    # matches upstream's MXFP4 branch byte for byte: whole-block packed E2M1
+    # values first, then the per-token E8M0 scale bytes.
     # Bound once so the guard checks the same tensor the operator receives.
     x = k.to(torch.bfloat16)
     if indexer_quant_cache_enabled():
-        # Same x, same slots, same packed cache; only the quantiser changes.
+        # Same x, same slots, same cache; only the quantiser changes.
         store_with_indexer_quant_cache(k_cache, x, slots)
+        mark_branch("write", "quant_cache")
         return
+    _refuse_epilog_on_an_mxfp4_row(k_cache)
     torch.ops._C_ascend.indexer_compress_epilog_v2(
         indexer_compress_cache=_checked_cache(k_cache, x),
         x=x,
         slot_mapping=slots,
         layout=2,
     )
+    mark_branch("write", "epilog")
+
+
+def _refuse_epilog_on_an_mxfp4_row(k_cache) -> None:
+    """Name the flag when the fp8 writer meets an MXFP4 cache.
+
+    Three states reach the flag-off branch, and a bool does not hold them:
+
+    * an fp8 row and the flag off -- the epilog writer is correct, and this
+      returns so it runs. That is the rollback path, and it is why the branch
+      is still here rather than deleted;
+    * an MXFP4 row and the flag off -- refused here;
+    * an MXFP4 row and the flag on -- never reaches this function.
+
+    ``check_epilog_cache`` would already refuse the second case, on the width:
+    "this x needs 132 = 128 quantised values + 4 bytes x 1 scale column(s)".
+    That report is a symptom one level below the cause. What is actually
+    missing is ``VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE=1``, which batch 1 made
+    mandatory (``envs.py``), and someone reading a width mismatch looks at the
+    cache spec instead.
+    """
+    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (
+        UPSTREAM_FP8_SCALE_BYTES, UPSTREAM_FP8_SCALE_GROUP)
+
+    split_by_the_runner = isinstance(k_cache, (tuple, list))
+    if not split_by_the_runner:
+        row = int(k_cache.shape[-1]) * k_cache.element_size()
+        fp8_group = UPSTREAM_FP8_SCALE_GROUP + UPSTREAM_FP8_SCALE_BYTES
+        if row > 0 and row % fp8_group == 0:
+            return
+    raise RuntimeError(
+        "the V4.1 index K cache is MXFP4 -- 64 bytes of packed E2M1 values "
+        "plus 4 E8M0 scale bytes per token, in two planes -- and the only "
+        "writer that produces that is indexer_quant_cache, which "
+        "VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE=0 turns off. "
+        "indexer_compress_epilog_v2 quantises to fp8 and lays out 128 values "
+        "plus one fp32 scale (132 bytes per token); it would be writing a "
+        "132-byte row into a 68-byte one. The flag is not optional on this "
+        "cache format. If it has to be off, the cache spec has to go back to "
+        "fp8 in the same change: a half-rollback leaves two page sizes in one "
+        "group and MLA specs cannot be page-padded "
+        "(vllm/v1/core/kv_cache_utils.py:1392-1397).")
 
 
 # ---------------------------------------------------------------------------
-# F9: the same store through CANN's indexer_quant_cache
+# F9: the store through CANN's indexer_quant_cache
 # (VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE=1).
 #
-# The call is the one card A6 ran and judged by bytes
+# 🔴 Since batch 1 this is the *only* writer: the cache is MXFP4 and the
+# epilog operator cannot produce that row. The flag's default moved to "1"
+# with it (envs.py); it is no longer a performance choice.
+#
+# The fp8 shape of this call is the one card A6 ran and judged by bytes
 # (unit_tests/card_A/a6_indexer_quant_cache.py, CARD_RESULTS.md §A6): the
-# packed fp8 cache split into its value and scale views by
+# packed cache split into its value and scale views by
 # ``split_indexer_cache``, x bf16 [T, 128], the int32 slots from
-# ``group_boundary_slots``, quant_mode="fp8", round_scale=True, x_scale=1.0.
-# On that call the operator wrote exactly the slots != -1 (357/357, 178/178),
-# every scale was a power of two, and the bytes equalled upstream's quantiser
-# except for an all-zero row (upstream floors amax at 1e-4: scale 2^-22;
-# this operator writes scale 0; the values are 0 either way).
+# ``group_boundary_slots``, round_scale=True, x_scale=1.0. On that call the
+# operator wrote exactly the slots != -1 (357/357, 178/178), every scale was a
+# power of two, and the bytes equalled upstream's quantiser except for an
+# all-zero row.
+#
+# ⚠ What carries over from A6 is the *call shape* -- which tensors, which
+# slots, which sentinel. A6 ran ``quant_mode="fp8"``. **"mxfp4" has not been
+# run on a card**, by A6 or by anything else; the value written here is
+# upstream's (snapshot_v27 indexer.py:113-119) and the byte layout it produces
+# is read off the kernel, not measured.
 #
 # Only the quantiser changes. k_norm, RoPE, the group gate and the slot
 # rebuild above are still ours, so the rebind of upstream's Triton K producer
 # (apply_indexer_k_store_patch, platform patch #7) is still what keeps the
-# Triton kernel from running, flag on or off.
+# Triton kernel from running.
 # ---------------------------------------------------------------------------
 
-#: The cache element type A6 ran. The Ascend indexer cache is allocated with
-#: it on A5 (``AscendDeepseekV41IndexerCache``, DSV4_COMPRESSED_CACHE). Any
-#: other type means a different cache configuration -- the non-compressed
-#: profile carries fp16 scales -- and the fp8 call has not been run on it.
-QUANT_CACHE_DTYPE = torch.float8_e4m3fn
+#: The quantiser this asks ``indexer_quant_cache`` for. MXFP4: two E2M1 values
+#: per byte plus one E8M0 byte per 32 values. Upstream's V4.1 reference passes
+#: the same string (``snapshot_v27/.../deepseek_v41/indexer.py:118``).
+QUANT_CACHE_MODE = "mxfp4"
+
+#: The cache element type this writes into. Both MXFP4 planes are byte planes
+#: (see ``indexer_cache_view``), so both views are uint8; anything else means
+#: the spec and this writer have come apart.
+QUANT_CACHE_DTYPE = torch.uint8
+
+#: 🔴 What ``indexer_quant_cache`` requires the **scale** plane to be declared
+#: as, which is *not* the same as how we store it. We store a byte plane
+#: (``QUANT_CACHE_DTYPE``); the operator refuses it and takes E8M0.
+#:
+#: Verbatim from the operator's own doc (``cann92/.../cann_ops_transformer/
+#: docs/zh/indexer_quant_cache.md:135``):
+#:     cache 与 cache_scale 的数据类型组合需与 quant_mode 匹配：fp8/hifloat8
+#:     模式 cache_scale 为 float；mxfp8/mxfp4 模式 cache_scale 为 float8_e8m0；
+#:     mxfp4 模式 cache 为 FP4（uint8 打包）。
+#:
+#: ⇒ ``cache`` stays uint8 (the doc says so), only ``cache_scale`` is
+#: reinterpreted. Passing the uint8 scale is what made the first mxfp4 flight
+#: die with ``EZ1009 ... inconsistent with the operator prototype OpDef`` and
+#: ``Cannot find binary for op IndexerQuantCache`` -- the symptom names the
+#: dtype, the traceback names the op, and **neither names the scale plane**.
+QUANT_CACHE_SCALE_OP_DTYPE = torch.float8_e8m0fnu
+
+#: 🔴 And the same for the **value** plane. We store bytes; the operator takes
+#: FP4. Both planes are reinterpreted, neither is converted.
+#:
+#: 🔴 The authority for this is the **binList**, not the doc's parameter table.
+#: ``cann92/.../kernel/config/ascend950/ops_transformer/indexer_quant_cache.json``
+#: has 14 variants over ``cache | cache_scale | x | slot_mapping``::
+#:
+#:      1   float4_e2m1    float8_e8m0   bfloat16   int32    <- the one we need
+#:      0   uint8          float32       float16    int32
+#:      8   uint8          float32       bfloat16   int32
+#:
+#: ``uint8`` appears **only** paired with ``float32``. The combination
+#: ``uint8 | float8_e8m0 | bfloat16 | int32`` is **not in the table at all**.
+#:
+#: ⚠ The doc's per-parameter dtype table said ``cache`` may be uint8, and that
+#: is true -- **as a union across every quant_mode**. A per-parameter list
+#: answers "what can this argument be"; the binList answers "can these go
+#: together". The former is always wider, and it is wider **without leaving a
+#: trace**. Two flights died between those two readings.
+QUANT_CACHE_OP_DTYPE = torch.float4_e2m1fn_x2
 
 
 def indexer_quant_cache_enabled() -> bool:
@@ -399,63 +510,168 @@ def _indexer_quant_cache_op():
             "indexer_compress_epilog_v2.") from exc
 
 
-def quant_cache_views(k_cache: torch.Tensor, x: torch.Tensor):
-    """``(key, key_scale)`` views of the packed cache, as A6 passed them.
+def quant_cache_views(k_cache, x: torch.Tensor):
+    """``(key, key_scale)`` views of the cache, as the operator takes them.
 
-    Refuses what A6 did not run rather than adapting to it. All checks read
-    only shapes, dtypes and strides, so nothing here syncs the device or
-    breaks a graph capture.
+    Refuses what has not been established rather than adapting to it. All
+    checks read only shapes, dtypes and strides, so nothing here syncs the
+    device or breaks a graph capture.
+
+    ``k_cache`` is whatever the runner bound: the packed tensor, or the planes
+    the runner already split for a ``scale_dim != 0`` spec. Both forms go
+    through ``planes_from_bound_cache``, which is the one place that knows
+    where the boundary is.
     """
-    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import \
-        split_indexer_cache
+    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (
+        planes_from_bound_cache, scale_bytes_per_token, value_width)
     from vllm_ascend.models.deepseek_v4_1.kv_binding import HEAD_AXIS
 
-    if k_cache.dtype != QUANT_CACHE_DTYPE:
-        raise ValueError(
-            f"indexer k cache is {k_cache.dtype}; the indexer_quant_cache "
-            f"path was verified (card A6) on the {QUANT_CACHE_DTYPE} packed "
-            "cache the A5 compressed profile allocates. Another element type "
-            "is another cache configuration, and quant_mode='fp8' has not "
-            "been run on it. Unset VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE.")
-    # The unit head axis, if the binding left it on (see with_head_axis).
-    packed = k_cache.squeeze(HEAD_AXIS) if (
-        k_cache.ndim == 4 and k_cache.shape[HEAD_AXIS] == 1) else k_cache
-    if packed.ndim != 3:
-        raise ValueError(
-            f"indexer k cache is {tuple(k_cache.shape)}; expected the packed "
-            "[num_blocks, tokens_per_block, width] (optionally with a unit "
-            "head axis) that A6 ran.")
-    tokens_per_block, width = int(packed.shape[1]), int(packed.shape[2])
-    # split_indexer_cache places block b at b * tokens_per_block * width, and
-    # so does the reader. A different block stride would put this writer and
-    # the reader in different places.
-    if packed.shape[0] > 1 and int(packed.stride(0)) != tokens_per_block * width:
-        raise ValueError(
-            f"indexer k cache block stride {packed.stride(0)} is not "
-            f"{tokens_per_block} x {width}; split_indexer_cache (and the "
-            "reader) assume back-to-back blocks, so the operator would write "
-            "where nothing reads.")
-    if packed.stride(2) != 1 or packed.stride(1) != width:
-        raise ValueError(
-            f"indexer k cache is not contiguous within a block (strides "
-            f"{tuple(packed.stride())}); indexer_quant_cache accepts "
-            "non-contiguity only across blocks.")
-    key, scale = split_indexer_cache(packed)
+    if isinstance(k_cache, torch.Tensor):
+        if k_cache.dtype != QUANT_CACHE_DTYPE:
+            raise ValueError(
+                f"indexer k cache is {k_cache.dtype}; the MXFP4 row is two "
+                f"byte planes and this writer takes them as "
+                f"{QUANT_CACHE_DTYPE}. Another element type means the cache "
+                "spec (caches.py) and this writer have come apart, and every "
+                "shape below stays valid either way.")
+        # The unit head axis, if the binding left it on (see with_head_axis).
+        packed = k_cache.squeeze(HEAD_AXIS) if (
+            k_cache.ndim == 4 and k_cache.shape[HEAD_AXIS] == 1) else k_cache
+        if packed.ndim != 3:
+            raise ValueError(
+                f"indexer k cache is {tuple(k_cache.shape)}; expected the "
+                "packed [num_blocks, tokens_per_block, width] (optionally "
+                "with a unit head axis).")
+        tokens_per_block, width = int(packed.shape[1]), int(packed.shape[2])
+        # split_indexer_cache places block b at b * tokens_per_block * width,
+        # and so does the reader. A different block stride would put this
+        # writer and the reader in different places.
+        if packed.shape[0] > 1 and int(
+                packed.stride(0)) != tokens_per_block * width:
+            raise ValueError(
+                f"indexer k cache block stride {packed.stride(0)} is not "
+                f"{tokens_per_block} x {width}; split_indexer_cache (and the "
+                "reader) assume back-to-back blocks, so the operator would "
+                "write where nothing reads.")
+        if packed.stride(2) != 1 or packed.stride(1) != width:
+            raise ValueError(
+                f"indexer k cache is not contiguous within a block (strides "
+                f"{tuple(packed.stride())}); indexer_quant_cache accepts "
+                "non-contiguity only across blocks.")
+        k_cache = packed
+
+    key, scale = planes_from_bound_cache(k_cache)
+    # The logical width the two planes agree on, recovered from the value
+    # plane rather than written down: 64 bytes of E2M1 is 128 values.
+    logical_width = value_width(
+        int(key.shape[-1]) + int(scale.shape[-1]) * scale.element_size())
     if x.ndim != 2 or x.dtype != torch.bfloat16 or \
-            int(x.shape[1]) != int(key.shape[-1]):
+            int(x.shape[1]) != logical_width:
         raise ValueError(
-            f"x is {x.dtype} {tuple(x.shape)}; the verified call writes bf16 "
-            f"[T, {int(key.shape[-1])}] into this cache. The operator only "
+            f"x is {x.dtype} {tuple(x.shape)}; this writes bf16 "
+            f"[T, {logical_width}] into this cache -- the *logical* width, "
+            f"which is twice the {int(key.shape[-1])} bytes of the value "
+            "plane because MXFP4 packs two values per byte. The operator only "
             "requires headDim >= d, so a narrower x would be written short "
             "rather than refused.")
-    if int(scale.shape[-1]) != 1:
+    expected_scale_cols = scale_bytes_per_token(logical_width)
+    if int(scale.shape[-1]) != expected_scale_cols:
         raise ValueError(
-            f"the scale view has {int(scale.shape[-1])} columns; fp8 mode "
-            "writes one float32 scale per token.")
+            f"the scale view has {int(scale.shape[-1])} columns; MXFP4 writes "
+            f"{expected_scale_cols} E8M0 bytes for a {logical_width}-wide "
+            "key, one per 32 values.")
+    # 🔴 Scope: this checks how the planes are **stored**, which is before
+    # ``_as_operator_planes`` reinterprets them. Both stored planes are byte
+    # planes; the operator gets ``QUANT_CACHE_OP_DTYPE`` /
+    # ``QUANT_CACHE_SCALE_OP_DTYPE``. Do not "relax" this to accept those --
+    # it would stop being a check on the cache spec and start being a check
+    # on nothing.
+    if key.dtype != QUANT_CACHE_DTYPE or scale.dtype != QUANT_CACHE_DTYPE:
+        raise ValueError(
+            f"the cache planes are stored as {key.dtype} / {scale.dtype}; "
+            f"both MXFP4 planes are byte planes and this writer stores "
+            f"{QUANT_CACHE_DTYPE} for both. (What the operator receives is "
+            f"different: {QUANT_CACHE_OP_DTYPE} / "
+            f"{QUANT_CACHE_SCALE_OP_DTYPE}, see _as_operator_planes.)")
     return key, scale
 
 
-def store_with_indexer_quant_cache(k_cache: torch.Tensor, x: torch.Tensor,
+#: One line, once per process, naming what this writer actually asked for.
+#: Grepping a serve log for "fp4" does **not** answer this question: the MoE
+#: quantiser logs ``expert_dtype resolved to 'fp4'`` (quant_config.py:75) and
+#: has nothing to do with the index K cache. This prefix belongs to this path
+#: and to nothing else.
+_WRITE_EVIDENCE_PREFIX = "DSV41-INDEXK-WRITE"
+_write_evidence_logged = False
+
+
+def _as_operator_dtype(plane: torch.Tensor, want: torch.dtype,
+                       what: str) -> torch.Tensor:
+    """``plane`` reinterpreted as the dtype the operator declares.
+
+    Bytes are never touched. Every dtype here is one byte wide, so the view
+    keeps the shape: 64 columns stay 64 columns. (A wrong dtype would not:
+    a ``float16`` view of the same buffer halves the last dimension -- that
+    is the negative control for "this really is an equal-width reinterpret".)
+
+    Only ``QUANT_CACHE_DTYPE`` is accepted, and only into the one dtype this
+    mode wants. Reinterpreting anything else would hand the operator a
+    *different* cache format wearing MXFP4's dtype -- and the operator matches
+    the whole tuple against its binList, so a wrong plane with a plausible
+    dtype is exactly the case that fails with ``Cannot find binary for op``
+    while naming neither the plane nor the reason.
+    """
+    if plane.dtype is want:
+        return plane
+    if plane.dtype is not QUANT_CACHE_DTYPE:
+        raise ValueError(
+            f"the indexer {what} plane is {plane.dtype}; this writer stores "
+            f"it as {QUANT_CACHE_DTYPE} and hands the operator {want}. "
+            "Anything else means the cache spec and this writer have come "
+            "apart -- fix the spec, do not convert here.")
+    return plane.view(want)
+
+
+def _as_operator_planes(key: torch.Tensor,
+                        scale: torch.Tensor) -> tuple[torch.Tensor,
+                                                      torch.Tensor]:
+    """Both stored byte planes, reinterpreted for the operator.
+
+    🔴 **Both**, not one. Handing over ``uint8 | float8_e8m0`` matched no
+    binList variant and died the same way the all-uint8 call did -- the fix
+    for one plane looked like it had worked because the symptom is identical.
+    """
+    return (_as_operator_dtype(key, QUANT_CACHE_OP_DTYPE, "value"),
+            _as_operator_dtype(scale, QUANT_CACHE_SCALE_OP_DTYPE, "scale"))
+
+
+def _log_write_evidence(quant_mode: str, cache: torch.Tensor,
+                        cache_scale: torch.Tensor) -> None:
+    """Report the arguments as they are about to be passed, once.
+
+    Every value here is read off the object that goes to the operator, not off
+    a config and not off a literal: a check bit that cannot change with the
+    thing it checks is a green light that means nothing.
+
+    ``vllm.logger.logger``, not ``init_logger(__name__)``: under
+    ``vllm_ascend`` the latter attaches to root at WARNING and an INFO line
+    disappears without a trace.
+    """
+    global _write_evidence_logged
+    if _write_evidence_logged:
+        return
+    _write_evidence_logged = True
+    from vllm.logger import logger
+
+    row_bytes = (int(cache.shape[-1]) * cache.element_size()
+                 + int(cache_scale.shape[-1]) * cache_scale.element_size())
+    logger.info(
+        "%s quant_mode=%s cache_dtype=%s scale_dtype=%s row_bytes=%d",
+        _WRITE_EVIDENCE_PREFIX, quant_mode, cache.dtype, cache_scale.dtype,
+        row_bytes)
+
+
+def store_with_indexer_quant_cache(k_cache, x: torch.Tensor,
                                    slots: torch.Tensor) -> None:
     """Quantise ``x`` and store it at ``slots`` through indexer_quant_cache.
 
@@ -472,12 +688,19 @@ def store_with_indexer_quant_cache(k_cache: torch.Tensor, x: torch.Tensor,
             f"{tuple(x.shape)}; indexer_quant_cache takes int32 [T], one "
             "per row of x.")
     key, scale = quant_cache_views(k_cache, x)
+    quant_mode = QUANT_CACHE_MODE
+    # Reinterpret the scale byte plane as the dtype the operator declares.
+    # Metadata only -- both are one byte, not a value is touched. The log
+    # below reports the tensor that actually goes to the operator, so it
+    # reports the reinterpreted dtype and not the one we store.
+    key, scale = _as_operator_planes(key, scale)
+    _log_write_evidence(quant_mode, key, scale)
     _indexer_quant_cache_op()(
         cache=key,
         cache_scale=scale,
         x=x,
         slot_mapping=slots,
-        quant_mode="fp8",
+        quant_mode=quant_mode,
         round_scale=True,
         x_scale=1.0,
     )

@@ -182,13 +182,27 @@ env_variables: dict[str, Callable[[], Any]] = {
     # bit-exactly (card A4). On by default since the 2026-09-19 4-card A/B
     # (together with the mHC pre operator).
     "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR", "1"),
-    # DeepSeek-V4.1 indexer K write: "1" quantises and stores through CANN's
-    # indexer_quant_cache (fp8 mode, round_scale=True: power-of-two scales,
-    # byte-equal to upstream's quantiser, card A6) instead of
-    # indexer_compress_epilog_v2 (scale absmax/448, not a power of two; N5).
-    # k_norm/RoPE/slot gating are unchanged either way. Off until GSM8K and
-    # TPOT are compared on the card (CARD_TEST_TABLE 戊).
-    "VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE", "0"),
+    # DeepSeek-V4.1 indexer K write: quantise and store through CANN's
+    # indexer_quant_cache instead of indexer_compress_epilog_v2.
+    # k_norm/RoPE/slot gating are unchanged either way.
+    #
+    # 🔴 Default "1" since the MXFP4 index K cache (batch 1). This is no
+    # longer a performance choice: the cache row is 68 bytes (64 packed E2M1
+    # values + 4 E8M0 scales) and indexer_quant_cache with
+    # quant_mode="mxfp4" is the only writer that produces it.
+    # indexer_compress_epilog_v2 writes the fp8 row (128 values + one fp32
+    # scale = 132 bytes) and refuses this cache rather than filling it
+    # (indexer_k_store._refuse_epilog_on_an_mxfp4_row).
+    #
+    # ⚠ So "0" is not a rollback on its own -- it has to move together with
+    # the cache spec in caches.py, in one change. Half of it leaves two page
+    # sizes in one KV cache group, and MLA specs cannot be page-padded
+    # (vllm/v1/core/kv_cache_utils.py:1392-1397 raises).
+    #
+    # The earlier default was "0" pending a GSM8K/TPOT comparison on the card
+    # (CARD_TEST_TABLE 戊); that comparison was of fp8-vs-fp8 quantisers and
+    # no longer decides this flag.
+    "VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE", "1"),
     # DeepSeek-V4.1 graph mode without VLLM_USE_BREAKABLE_CUDAGRAPH=1: "1"
     # allows it, anything else refuses to start. Default "0". Not a
     # performance switch -- it is the deliberate opt-out for the preflight in
