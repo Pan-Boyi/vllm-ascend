@@ -63,6 +63,8 @@ RUN="$ONCARD_RUN_DIR"; HERE="$RUN/code"
 ONCARD_DIR="$HERE"
 # shellcheck source=oncard_lib.sh
 source "$HERE/oncard_lib.sh"
+# shellcheck source=packed_ab_lib.sh
+source "$HERE/packed_ab_lib.sh"   # pa_card_state / pa_classify / pa_advice: one implementation
 LOG="$RUN/test.log"; SUM="$RUN/summary.txt"
 say() { echo "$*" | tee -a "$SUM"; }
 say "▶ run_oncard card=$CARD test=$TEST run=$RUN pid=$$ argv=[$ONCARD_ARGV]"
@@ -194,7 +196,11 @@ cleanup() {
         hbm_busy=1   # unreadable: wait rather than hand over a card we cannot read
       fi
       [ "$still_listed" = 0 ] && [ "$hbm_busy" = 0 ] && break
-      [ $((waited % 60)) -eq 0 ] && say "⚪ card $CARD teardown: pid listed=$still_listed HBM=${hbm:-?}% waited ${waited}s"
+      if [ $((waited % 60)) -eq 0 ]; then
+        st=$(pa_card_state "$CARD" "${ONCARD_BUSY_SAMPLES:-3}" 1)
+        say "⚪ card $CARD teardown: pid listed=$still_listed HBM=${hbm:-?}% state=$st waited ${waited}s"
+        [ "$waited" -eq 0 ] || say "   $(pa_advice "$st")"
+      fi
       sleep 5; waited=$((waited + 5))
     done
     timeout 20 npu-smi info -t usages -i "$CARD" > "$RUN/card_after.txt" 2>&1
@@ -232,9 +238,19 @@ timeout 20 npu-smi info -t usages -i "$CARD" > "$RUN/card_before.txt" 2>&1 || { 
 timeout 20 npu-smi info -t proc-mem -i "$CARD" >> "$RUN/card_before.txt" 2>&1
 PCT=$(awk -F: '/HBM Usage Rate/{gsub(/ /,"",$2); print $2; exit}' "$RUN/card_before.txt")
 [[ "$PCT" =~ ^[0-9]+$ ]] || { say "❌ cannot parse HBM usage of card $CARD"; RC=5; exit 5; }
-[ "$PCT" -lt "${IDLE_PCT:-20}" ] || { say "❌ card $CARD HBM ${PCT}% busy before start"; RC=5; exit 5; }
-if command grep -qE "Process id *: *[0-9]+|Process id:[0-9]+" "$RUN/card_before.txt"; then
-  say "❌ card $CARD process table not empty before start"; RC=5; exit 5
+# Three dimensions, not two. HBM alone cannot tell "someone is running on this
+# card" from "a teardown has not finished": on 2026-09-21 four cards sat at 92%
+# HBM for 12 minutes while aicore moved 7..77% -- a live deployment in ANOTHER
+# CONTAINER, whose pids do not exist in ours. The two states call for opposite
+# actions, so the gate names which one it saw.
+CARD_STATE=$(pa_card_state "$CARD" "${ONCARD_BUSY_SAMPLES:-3}" "${ONCARD_BUSY_SLEEP:-2}")
+say "⚪ card $CARD state=$CARD_STATE  ($PA_LAST_SAMPLES)"
+echo "state=$CARD_STATE $PA_LAST_SAMPLES" >> "$RUN/card_before.txt"
+if [ "$CARD_STATE" != free ]; then
+  say "❌ card $CARD is not free before start: $(pa_advice "$CARD_STATE")"
+  say "   NOTE: the lease table is a convention INSIDE this container. Another container cannot see it,"
+  say "   so a lease can never answer 'is somebody else on this card' -- only these readings can."
+  RC=5; exit 5
 fi
 dmesg 2>/dev/null | tail -n 200 > "$RUN/dmesg_before.txt"
 if [ "${ONCARD_SKIP_DMESG_GATE:-0}" = "1" ]; then

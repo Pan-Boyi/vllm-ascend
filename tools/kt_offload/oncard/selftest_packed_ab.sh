@@ -78,6 +78,31 @@ command grep -q "EXCEEDS the drift floor" "$TMP/fl_realgain.out"; ok "a 5 ms del
 python3 "$HERE/packed_ab_report.py" "$TMP/good" > "$TMP/onerounds.out" 2>&1
 command grep -q "drift floor: NOT MEASURED" "$TMP/onerounds.out"; ok "one round per arm -> the floor is reported as not measured"
 
+echo "── card busy: three dimensions (HBM alone cannot tell 'running' from 'residue')"
+# Recorded shapes, 2026-09-21: four cards at 92% HBM for 12 minutes while aicore
+# moved 7..77% (a live deployment in another container) vs a teardown holding
+# HBM with aicore flat at 0.
+[ "$(pa_classify 1 "92,92,92" "7,0,77")" = running ]; ok "HBM high + aicore fluctuating -> running"
+[ "$(pa_classify 1 "92,92,92" "0,0,0")" = residue ]; ok "HBM high + aicore flat zero -> residue"
+[ "$(pa_classify 0 "4,4,4" "0,0,0")" = free ]; ok "HBM low -> free"
+[ "$(pa_classify 1 "92,92,92" "0,?,0")" = running-unknown ]; ok "aicore unreadable -> treated as running (conservative)"
+[ "$(pa_classify 1 "92,92" "0,0")" = running-unknown ]; ok "fewer than 3 samples -> not called idle"
+[ "$(pa_classify 1 "4,4,4" "0,0,0")" = residue ]; ok "process table busy alone is still busy"
+# the missing dimension, as executable evidence: the old HBM-only rule gives the
+# SAME answer to the two states that need opposite actions
+old_running=$(pa_hbm_busy 92 && echo busy || echo free)
+old_residue=$(pa_hbm_busy 92 && echo busy || echo free)
+[ "$old_running" = "$old_residue" ]; ok "HBM-only cannot separate them (both read '$old_running') -- that is the missing dimension"
+[ "$(pa_classify 1 "92,92,92" "7,0,77")" != "$(pa_classify 1 "92,92,92" "0,0,0")" ]
+ok "with aicore they are different verdicts"
+pa_advice running | command grep -q "never kill, never reset"; ok "the 'running' advice forbids kill/reset"
+pa_advice residue | command grep -q "drain"; ok "the 'residue' advice is to let it drain"
+[ "$(pa_advice running)" != "$(pa_advice residue)" ]; ok "the two busy states advise different actions"
+command grep -q "pa_card_state" "$HERE/run_oncard.sh"; ok "run_oncard's pre-flight uses the three-dimension state"
+command grep -q "pa_advice" "$HERE/run_packed_ab.sh"; ok "run_packed_ab reports which kind of busy it waited on"
+command grep -q "lease table is a convention INSIDE this container" "$HERE/run_oncard.sh"
+ok "the gate says a lease cannot answer 'is somebody else on this card'"
+
 echo "── the fingerprint must watch the package that is loaded, not the shared baseline"
 python3 "$HERE/../build_fingerprint.py" capture > "$TMP/fp_now.json" 2>/dev/null
 python3 "$HERE/fp_object_check.py" "$TMP/fp_now.json" "$HERE/../build_fingerprint.py" > "$TMP/fp_obj.out" 2>&1; r=$?

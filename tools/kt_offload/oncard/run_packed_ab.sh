@@ -175,11 +175,15 @@ teardown() {  # $1 = arm dir, $2 = serve pgid
   # never matched npu-smi's "Process id", so this loop used to exit at once).
   local waited=0
   while [ "$waited" -lt "${PA_TEARDOWN_WAIT_S:-300}" ] && pa_card_busy "$CARD"; do
-    [ $((waited % 60)) -eq 0 ] && say "     ⚪ card $CARD still busy (process table or HBM), waited ${waited}s"
+    if [ $((waited % 60)) -eq 0 ]; then
+      say "     ⚪ card $CARD still busy: state=$PA_LAST_STATE ($PA_LAST_SAMPLES), waited ${waited}s"
+      say "        $(pa_advice "$PA_LAST_STATE")"
+    fi
     sleep 5; waited=$((waited + 5))
   done
   if pa_card_busy "$CARD"; then
-    say "     ❌ card $CARD still reads busy after ${waited}s -- not handing it to the next arm"
+    say "     ❌ card $CARD still reads busy after ${waited}s: state=$PA_LAST_STATE ($PA_LAST_SAMPLES)"
+    say "        $(pa_advice "$PA_LAST_STATE")"
     ok=0
   else
     say "     card free after ${waited}s (process table empty and HBM < ${PA_IDLE_HBM_PCT:-10}%)"
@@ -253,11 +257,13 @@ run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false, $3 = round (1-based)
   command grep -m1 "BREAKABLE_CUDAGRAPH" "$arm/serve.log" | sed 's/^/     /' | tee -a "$SUM" >/dev/null
 
   # ---- positive control for the busy reading: the service is up right now,
-  # so pa_card_busy MUST say busy. If it does not, every later "the card is
-  # free" reading is worthless, and the run says so instead of trusting it.
+  # so pa_card_busy MUST say busy, and it should say "running" (aicore non-zero)
+  # rather than "residue". If it does not, every later "the card is free"
+  # reading is worthless, and the run says so instead of trusting it.
   if pa_card_busy "$CARD"; then
-    echo "busy-while-serving: yes" > "$arm/card_busy_control.txt"
-    say "  busy-reading positive control: card reads BUSY while serving ✅"
+    echo "busy-while-serving: yes state=$PA_LAST_STATE $PA_LAST_SAMPLES" > "$arm/card_busy_control.txt"
+    say "  busy-reading positive control: card reads BUSY while serving ✅ (state=$PA_LAST_STATE)"
+    [ "$PA_LAST_STATE" = running ] || say "     ⚠ expected state=running while serving, got $PA_LAST_STATE"
   else
     echo "busy-while-serving: NO" > "$arm/card_busy_control.txt"
     say "  ❌ busy-reading positive control FAILED: the card reads free while the service is serving."
