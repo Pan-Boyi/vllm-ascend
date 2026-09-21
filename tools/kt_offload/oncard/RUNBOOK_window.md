@@ -1,8 +1,10 @@
 # 窗口执行单（A/A → t4 → t5，按此顺序，一条一条粘）
 
-三件同构建；`.so` 不换，用现值 `2b58b578e4fc720ef30f4528c5a974fa`。
-每条都带 `ONCARD_EXPECT_SO_MD5`：`.so` 不是这份就**拒绝起飞**（rc=3，什么都不碰），
-所以三件不可能落在换构建的中间。
+三件同构建；**本树**的 `.so` 不换，用现值 `2b58b578e4fc720ef30f4528c5a974fa`。
+`ONCARD_EXPECT_SO_MD5` 是**本树期望值**（`worktrees/moe-offload`）：闸只判**这棵树**的 `.so`，
+`.so` 不是这份就**拒绝起飞**（rc=3，什么都不碰）。起飞前会并排打印
+`tree=<被检查的树>`、`.so md5`、以及该树 `vendors` 的 `sha/files(regular)/bytes` ——
+**别的树（例如 clean）重编 `.so`、只换它自己的钉值，与这个期望值无关**，从读数上就看得出来。
 
 ```bash
 cd /workspace/code/dsv4_single_card/vllm_project

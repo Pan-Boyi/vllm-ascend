@@ -124,10 +124,24 @@ if python3 "$FPTOOL" stamp "$RUN" --label "packed_ab" > "$RUN/build_fingerprint.
 else
   say "❌ build fingerprint failed: $(tail -n 2 "$RUN/build_fingerprint.txt" | tr '\n' ' ')"; exit 3
 fi
-SO_MD5="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["so_primary_md5"] or "")' "$RUN/build_fingerprint.json")"
-if [ -n "${ONCARD_EXPECT_SO_MD5:-}" ] && [ "${ONCARD_EXPECT_SO_MD5}" != "$SO_MD5" ]; then
-  say "❌ vllm_ascend_C .so is $SO_MD5, expected ${ONCARD_EXPECT_SO_MD5}; refusing to run across a build swap."
-  exit 3
+FP_FACTS="$(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1])); v=d.get("vendors",{}); t=d.get("trees",{}).get("vllm_ascend",{})
+print("\t".join([d.get("so_primary_md5") or "", t.get("path") or "?", str(v.get("files")),
+                 str(v.get("files_regular")), str(v.get("bytes")), (d.get("vendors_sha256") or "?")[:12]]))
+' "$RUN/build_fingerprint.json")"
+SO_MD5="$(printf %s "$FP_FACTS" | cut -f1)"; EXPECT_TREE="$(printf %s "$FP_FACTS" | cut -f2)"
+say "  build under test: tree=$EXPECT_TREE  .so=$SO_MD5"
+say "    vendors(loaded)=$(printf %s "$FP_FACTS" | cut -f6) files=$(printf %s "$FP_FACTS" | cut -f3)"\
+"    (regular=$(printf %s "$FP_FACTS" | cut -f4)) bytes=$(printf %s "$FP_FACTS" | cut -f5)"
+if [ -n "${ONCARD_EXPECT_SO_MD5:-}" ]; then
+  if [ "${ONCARD_EXPECT_SO_MD5}" = "$SO_MD5" ]; then
+    say "  ✅ ONCARD_EXPECT_SO_MD5 matches THIS tree's .so (per-tree expectation; other trees may differ)"
+  else
+    say "❌ this tree's .so is $SO_MD5, expected ${ONCARD_EXPECT_SO_MD5} (tree=$EXPECT_TREE);"
+    say "   refusing to run across a build swap. Another tree's pin moving is a different fact."
+    exit 3
+  fi
 fi
 
 if [ "${ONCARD_DRY:-0}" = "1" ]; then

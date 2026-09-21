@@ -70,6 +70,24 @@ def write_log(arm: str, dead: bool) -> None:
 
 
 
+def _bf():
+    """The owning module, by path: fixtures read its constants, never copy them."""
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "build_fingerprint.py"), os.path.join(here, "..", "build_fingerprint.py")):
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location("build_fingerprint", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise SystemExit("build_fingerprint.py not found: a fixture cannot guess its constants")
+
+
+def _count_rule_id() -> str:
+    return _bf().COUNT_RULE_ID
+
+
 def _schema() -> str:
     """Read the current schema from build_fingerprint.py."""
     import importlib.util
@@ -100,6 +118,7 @@ def write_fingerprint(arm: str) -> None:
         "vendors_files": 759,
         "vendors_bytes": 118_000_000,
         "vendors_ok": True,
+        "vendors": {"count_rule": {"id": _count_rule_id()}},
         "kt_wheel_sha256": "d" * 64,
         "trees": {"vllm_ascend": {"head": "c" * 40}, "vllm": {"head": "b" * 40}},
         "backfilled": False,

@@ -70,6 +70,10 @@ SO_GLOBS = (
     os.path.join(ROOT, "vllm-ascend/vllm_ascend/vllm_ascend_C*.so"),
 )
 SCHEMA = "kt_offload/build_fingerprint/2"
+# The identity of the counting convention. Counts may only be compared when
+# this matches; a different value means "counted differently", never "the
+# package changed". Anything that writes a fingerprint reads this from here.
+COUNT_RULE_ID = "root=<recorded>;dirs=0;symlink=counted-as-link;deref=0;v2"
 FILENAME = "build_fingerprint.json"
 BACKFILL_NAME = "build_fingerprint.backfilled.json"
 # Every key here decides. The counts are in on purpose: the hash of an empty
@@ -138,7 +142,45 @@ def vendors_fingerprint(root: str = VENDORS, role: str = "loaded") -> dict:
     h = hashlib.sha256()
     for rel, size, digest in entries:
         h.update(f"{rel}\0{size}\0{digest}\n".encode())
-    out.update(files=len(entries), bytes=total, symlinks=links, unreadable=unreadable)
+    out.update(
+        files=len(entries),
+        bytes=total,
+        files_regular=len(entries) - links,
+        symlinks=links,
+        unreadable=unreadable,
+        # Say exactly what was counted, next to the number. Four counts of these
+        # two directories were in circulation on 2026-09-21 -- 787/786 for the
+        # shared baseline and 760/759 for this tree -- and the whole difference
+        # is this convention: `find -type f` counts regular files only, while
+        # this walker also counts the one symlink in each tree (759+1, 786+1,
+        # measured). Without the rule printed here, the right answer ("two
+        # conventions") reads as the wrong one ("a package was swapped").
+        # What was counted, in full. Four counts of "the operator package" were
+        # in circulation on 2026-09-21 and they are NOT one off-by-one: they
+        # name different objects (integration, 2026-09-21):
+        #   786  <tree>/.../vendors/custom_transformer, find -type f   <- clean's new pin
+        #   787  the same, counting the one symlink as well
+        #   787  one level up at _cann_ops_custom (adds a .gitkeep)
+        #   787  build/lib copy -- a DIFFERENT directory, where setuptools
+        #        dereferenced the symlink into a 3.25 MB regular file
+        # Aligning them would make two of the four wrong. So the rule is
+        # recorded, never inferred: root, whether directories count, whether
+        # symlinks count and how, and whether the upper .gitkeep is inside the
+        # root. Our own 760 vs flash_dev's 759 on this tree is the symlink item
+        # (759 + 1); and 760 happens to equal `find _cann_ops_custom -type f`
+        # as well, so the number alone cannot say which rule produced it.
+        count_rule={
+            "root": root,
+            "walk": "os.walk from root",
+            "include_dirs": False,
+            "include_symlinks": True,
+            "symlink_mode": "counted, hashed by target name, never dereferenced",
+            "includes_upper_gitkeep": os.path.basename(os.path.normpath(root)) != "vendors",
+            "equivalent_shell": f"find {root} \\( -type f -o -type l \\) | wc -l  == files",
+            "files_regular_equivalent": f"find {root} -type f | wc -l  == files_regular",
+            "id": COUNT_RULE_ID,
+        },
+    )
     if not entries:
         out.update(ok=False, why=f"0 files under {root}: an empty package hashes to the constant "
                                  f"{EMPTY_SHA256[:16]}, which would compare equal to any other empty read")
@@ -227,7 +269,10 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
         "vendors_source": vend.get("path"),
         "vendors_source_is_override": bool(os.environ.get("DSV41_VENDORS")),
         # context only: NOT part of the same-build decision (see the docstring)
-        "vendors_shared_baseline": {k: shared.get(k) for k in ("path", "role", "files", "bytes", "sha256", "ok")},
+        "vendors_shared_baseline": {
+            k: shared.get(k)
+            for k in ("path", "role", "files", "files_regular", "symlinks", "bytes", "sha256", "ok", "count_rule")
+        },
         "kt_wheel": {"path": wheels[-1] if wheels else None, "sha256": kt_sha},
         "kt_wheel_sha256": kt_sha,
         "trees": trees,
@@ -308,7 +353,26 @@ def same_build(a: dict | None, b: dict | None, strict_trees: bool = False) -> tu
                 "unread package"
             )
 
+    # Counts are only comparable within one counting convention. A different
+    # rule is not evidence that the package changed -- reporting it as
+    # "vendors_files differs" would be exactly the wrong conclusion (two of the
+    # four counts in circulation on 2026-09-21 would have been "fixed" into
+    # being wrong).
+    rule_a = (a.get("vendors", {}) or {}).get("count_rule", {})
+    rule_b = (b.get("vendors", {}) or {}).get("count_rule", {})
+    id_a = rule_a.get("id") if isinstance(rule_a, dict) else str(rule_a)
+    id_b = rule_b.get("id") if isinstance(rule_b, dict) else str(rule_b)
+    same_convention = id_a == id_b and id_a is not None
+    if not same_convention:
+        reasons.append(
+            f"CONVENTION the two artifacts counted the operator package by different rules "
+            f"({id_a!r} vs {id_b!r}): the counts are not comparable, and this is NOT evidence that the "
+            "package changed. Treated like an old schema: no difference may be computed."
+        )
+
     for key in BLOCKING:
+        if key in ("vendors_files", "vendors_bytes") and not same_convention:
+            continue  # comparing across conventions would read as a package change
         va, vb = a.get(key), b.get(key)
         if va is None and vb is None:
             reasons.append(f"ADVISORY {key} unknown on both sides (never recorded; not verified equal)")

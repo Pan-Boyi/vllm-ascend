@@ -45,6 +45,7 @@ def fp(so="a" * 32, vendors="v" * 64, kt="k" * 64, head="1" * 40, vllm_head="2" 
         "vendors_files": files,
         "vendors_bytes": nbytes,
         "vendors_ok": True,
+        "vendors": {"count_rule": {"id": FP.COUNT_RULE_ID}},
         "so_primary_md5": so,
         "so_primary_md5_short": so[:12],
         "vendors_sha256": vendors,
@@ -398,3 +399,48 @@ def test_every_suppressed_difference_says_so_and_why(tmp_path, capsys):
 
     numeric_delta = _re.search(r"(A-B|delta[^:]*) = [+-]?\d+\.\d", out)
     assert numeric_delta is None, f"a difference survived suppression: {numeric_delta.group(0)!r}"
+
+
+# -- counts are comparable only inside one counting convention -----------
+
+
+def test_the_counting_rule_states_all_of_its_choices(tmp_path):
+    """Four counts of "the operator package" were in circulation on
+    2026-09-21 and they name different objects, not one off-by-one. A count
+    without its rule cannot be told from another rule's count -- ours (760)
+    even coincides with `find _cann_ops_custom -type f`."""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "real").write_bytes(b"x" * 8)
+    (tmp_path / "link").symlink_to(tmp_path / "sub" / "real")
+    got = FP.vendors_fingerprint(str(tmp_path), role="loaded")
+    rule = got["count_rule"]
+    for key in ("root", "include_dirs", "include_symlinks", "symlink_mode", "includes_upper_gitkeep",
+                "equivalent_shell", "files_regular_equivalent", "id"):
+        assert key in rule, f"the rule does not say {key}"
+    assert rule["root"] == str(tmp_path)  # the root is recorded verbatim
+    assert got["files"] == 2 and got["files_regular"] == 1 and got["symlinks"] == 1
+    assert "never dereferenced" in rule["symlink_mode"]
+
+
+def test_counts_from_different_conventions_are_not_compared():
+    """A different rule must read as "not comparable", never as "the package
+    changed": two of the four counts would have been "fixed" into being wrong."""
+    a = fp(files=760)
+    b = fp(files=759)
+    a["vendors"] = {"count_rule": {"id": FP.COUNT_RULE_ID}}
+    b["vendors"] = {"count_rule": {"id": FP.COUNT_RULE_ID.replace("counted-as-link", "EXCLUDED")}}
+    ok, reasons = FP.same_build(a, b)
+    assert not ok
+    assert any(r.startswith("CONVENTION") for r in reasons)
+    assert any("NOT evidence that the package changed" in r for r in reasons)
+    # and the count itself is not reported as a difference
+    assert not any("vendors_files differs" in r for r in reasons), reasons
+
+
+def test_counts_do_decide_within_one_convention():
+    rule = {"count_rule": {"id": FP.COUNT_RULE_ID}}
+    a, b = fp(files=760), fp(files=700)
+    a["vendors"] = dict(rule)
+    b["vendors"] = dict(rule)
+    ok, reasons = FP.same_build(a, b)
+    assert not ok and any("vendors_files differs" in r for r in reasons)

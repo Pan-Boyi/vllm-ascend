@@ -24,8 +24,9 @@
 #      4 lease refused | 5 card not idle / dmesg gate | 20 anomaly | 124 timeout | other = test rc
 #  Env: ONCARD_TIMEOUT_S (default per test), ONCARD_SKIP_DMESG_GATE=1 (logged),
 #       ONCARD_DRY=1 (stop right before acquire: prints the plan; used by selftest).
-#       ONCARD_EXPECT_SO_MD5=<md5> (refuse to run if the .so is not that build; use it
-#         while a shared .so is being swapped, so no reading lands mid-swap).
+#       ONCARD_EXPECT_SO_MD5=<md5> (refuse to run unless THIS TREE's .so is that build; the
+#         value is per-tree -- another tree's pin moving is a different fact. The tree path
+#         and its operator package's counts are printed next to the md5).
 # ============================================================================
 set -u
 set -o pipefail
@@ -88,11 +89,31 @@ if "$PYBIN" "$HERE/build_fingerprint.py" stamp "$RUN" --label "$TEST" > "$RUN/bu
 else
   say "❌ build fingerprint failed: $(tail -n 2 "$RUN/build_fingerprint.txt" | tr '\n' ' ')"; exit 3
 fi
-SO_MD5="$("$PYBIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["so_primary_md5"] or "")' "$FP")"
-if [ -n "${ONCARD_EXPECT_SO_MD5:-}" ] && [ "${ONCARD_EXPECT_SO_MD5}" != "$SO_MD5" ]; then
-  say "❌ vllm_ascend_C .so is $SO_MD5, expected ${ONCARD_EXPECT_SO_MD5}."
-  say "   Refusing to run: a reading taken across a build swap cannot be compared with either side."
-  exit 3
+# An expectation that does not say which tree it judges is ambiguous the moment
+# another tree's pin changes (2026-09-21: clean's .so is being rebuilt and only
+# clean's pin moves; ours does not). Print the tree and its operator package
+# next to the md5, so "clean changed, we did not" is visible in the reading.
+FP_FACTS="$("$PYBIN" -c '
+import json,sys
+d=json.load(open(sys.argv[1])); v=d.get("vendors",{}); t=d.get("trees",{}).get("vllm_ascend",{})
+print("\t".join([d.get("so_primary_md5") or "", t.get("path") or "?", str(v.get("files")),
+                 str(v.get("files_regular")), str(v.get("bytes")), (d.get("vendors_sha256") or "?")[:12]]))' "$FP")"
+SO_MD5="$(printf %s "$FP_FACTS" | cut -f1)"
+EXPECT_TREE="$(printf %s "$FP_FACTS" | cut -f2)"
+V_FILES="$(printf %s "$FP_FACTS" | cut -f3)"; V_REG="$(printf %s "$FP_FACTS" | cut -f4)"
+V_BYTES="$(printf %s "$FP_FACTS" | cut -f5)"; V_SHA="$(printf %s "$FP_FACTS" | cut -f6)"
+say "  build under test: tree=$EXPECT_TREE"
+say "    .so md5=$SO_MD5"
+say "    vendors(loaded)=$V_SHA files=$V_FILES (regular=$V_REG, find -type f matches regular) bytes=$V_BYTES"
+if [ -n "${ONCARD_EXPECT_SO_MD5:-}" ]; then
+  if [ "${ONCARD_EXPECT_SO_MD5}" = "$SO_MD5" ]; then
+    say "  ✅ ONCARD_EXPECT_SO_MD5 matches THIS tree's .so (expectation is per-tree; other trees may differ)"
+  else
+    say "❌ this tree's vllm_ascend_C .so is $SO_MD5, expected ${ONCARD_EXPECT_SO_MD5}."
+    say "   tree=$EXPECT_TREE -- the expectation is about THIS tree only; another tree's pin moving is not this."
+    say "   Refusing to run: a reading taken across a build swap cannot be compared with either side."
+    exit 3
+  fi
 fi
 
 if [ "${ONCARD_DRY:-0}" = "1" ]; then

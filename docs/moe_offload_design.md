@@ -838,12 +838,80 @@ flash_dev 查清的机制：算子包**按被 import 的那棵树加载**，且 
    （**这条原来会误判为相同**）；只有共享基准不同 ⇒ 不阻断；`DSV41_VENDORS` 覆盖时以它为准并记下来源；
    旧 schema 不得相减。
 
-⚠️ `git diff --cached` 在这些仓里对某些索引条目失明（索引里有 6 项却 0 行、rc=0、无 stderr，和真正干净一模一样）。
-我方 kt_offload 的脚本与测试**零命中**（已全扫）。命中的是**上游文件**：
-`tools/check_long_functions.py:50` 用 `git diff --cached` 取"新增行"⇒ 在这里会读成"没有新增行"，
-那个 pre-commit 钩子于是**跳过检查**（偏松的方向）；`tools/check_repo.sh:24` 用 `git diff --quiet`（工作区，不是索引，
-同族但未被 flash_dev 实测）。两处都不是我的文件，未改动，转 flash_dev。判索引请用
-`git diff-index --cached --name-only HEAD` 或 `git status --porcelain`。
+### 🔴 `git diff --cached` 那条的作用域（2026-09-21 收窄；先前我这边写宽了）
+
+**成立的（flash_dev 现场证据）**：对那**6 个处于不一致状态的索引条目**，`git diff --cached` **看不见**——
+索引里的 blob 是**空 blob `e69de29b`**，而工作区的同名文件有 **7059 字节**；命令 rc=0、无 stderr、输出 0 行，
+**和真正干净一模一样**。
+**同时被证伪的（当场的阳性对照，必须一起写）**：`git add` 一个空文件和一个非空文件之后，
+`git diff --cached` 与 `git diff-index` **两条命令都看得见** ⇒ **这个命令不是普遍坏掉**。
+⇒ **不成立的说法**：「在这些仓里用 `git diff --cached` 取新增行是缺陷」。没有那条阳性对照，
+读者会以为整个命令坏了，然后去改一堆本来没问题的地方。
+**触发条件目前复现不出**，按"查到查不出为止"记录，**不补猜测的成因**。
+判索引若要稳，`git diff-index --cached --name-only HEAD` / `git status --porcelain` 是更直接的口径，
+但这是**偏好**，不是"另一条坏了"。
+
+**上游那两处暂不上报**（flash_dev 决定，协调方同意）。将来若报，要报的是**不依赖上面那个 git 机制**的另一件事：
+- `tools/check_long_functions.py:50`：**"零新增行"与"没有东西要查"读数相同**，而且**没有任何"本次检查了 N 行"的
+  覆盖量输出** ⇒ 失效方向偏松且**不留痕**。这属于"判据必须自报覆盖量、零覆盖要失败"，
+  **换成 `git diff-index` 一样查不出它有没有在工作**。
+- `tools/check_repo.sh:24`：用的是 `git diff --quiet`，判的是**工作区不是索引**，**我方未实测** ⇒
+  **不得与上一条打包**（打包会让没有证据的那条搭上有证据那条的可信度）。
+- 前置：**要报就先补一个复现脚本**（能把"零覆盖"和"无差异"分开的那种），否则报过去也只能得到"复现不出"。
+
+### 🔴 文件数的「差 1」不是一种数法差异，是三件不同的事（2026-09-21，integration 查清）
+
+不要去对齐。四个数各自指**不同对象**：
+
+| 数 | 对象 |
+|---|---|
+| **786** | `<tree>/…/vendors/custom_transformer`，`find -type f` ← **clean 新钉值用的就是这个** |
+| **787** | 同上，但**把那 1 个 symlink 也算进去**（`op_impl/ai_core/tbe/op_tiling/liboptiling.so`） |
+| **787** | 上一层 `_cann_ops_custom`（多一个 `.gitkeep`） |
+| **787** | `build/lib` 副本——**另一个目录**，setuptools 把 symlink **解引用**成 3,250,392 字节的实体文件 |
+
+⇒ **两个数都对，指的是不同对象**；"差 1"这个共同点把三件事合并成了一件。**去对齐会把其中两处改成错的。**
+（同族：数值巧合不是交叉验证。）
+
+**我方 760 vs flash_dev 759 差在哪（已实测，本树）**：
+```
+root=_cann_ops_custom   -type f 760   +symlink 761   （.gitkeep 在这一层）
+root=vendors            -type f 759   +symlink 760
+root=vendors/custom_transformer  -type f 759   +symlink 760
+唯一的 symlink: vendors/custom_transformer/op_impl/ai_core/tbe/op_tiling/liboptiling.so
+                -> lib/linux/x86_64/libcust_opmaster_rt2.0.so
+本树没有 build/ 目录（那份解引用副本不存在）
+```
+⇒ 差在 **symlink 这一项**：我们的 760 ＝ `root=vendors` 的常规文件 759 **+ 那 1 个 symlink**；
+flash_dev 的 759 ＝ 同一个 root 的 `find -type f`。**这不是包被换了。**
+⚠️ 而且 **760 恰好也等于 `find _cann_ops_custom -type f`** ⇒ **单看数字无法判断它是哪条规则产出的**，
+这正是必须把规则记在读数旁边的理由。
+
+**落地**：`build_fingerprint.py` 的 `count_rule` 现在写全所有选择——`root`（原样记录）、是否数目录、
+是否数 symlink（以及**按链接本身还是解引用**）、**上层 `.gitkeep` 是否在 root 内**，外加两条可复算的
+`find` 等价命令，以及一个 `id`（`COUNT_RULE_ID`，供**同口径**判定）。
+判定逻辑：`vendors_files`/`vendors_bytes` **只在同一口径内**参与判定；`count_rule.id` 不同 ⇒ 按
+**CONVENTION** 处理（等同 OLDSCHEMA：只提示不减法），并且**不把它报成"包变了"**——报成那样正是错的处置。
+单测三条：规则必须写全每一项且 root 原样；跨口径必须读成"不可比"且**不得出现 `vendors_files differs`**；
+同口径内计数差异**仍然**要判不同构建。
+
+### 通则：报任何差值/计数，先把「对谁」写在数字旁边
+
+今天两次"两个数打架"最后都是**同名不同物**：
+- 算子包 786/787/759/760（上表）；
+- "clean 领先 base 175 个 commit"（闸对 `dsv41-base` 输出）vs integration 量到的 47（对 `vllm-ascend` 当前 HEAD）——**两个都对**。
+⇒ 我方以后报差值或计数，**数字旁边必须写清对谁**（root / 基准 / 口径），否则"两个都对"会被读成"有一个错了"，
+而**正确的处置（说明口径）会被误判成错误的处置（改数字、或判定包被换了）**。
+
+### `ONCARD_EXPECT_SO_MD5` 是【本树】期望值（2026-09-21 紧急加）
+
+clean 已换钉值（**只有 `worktrees/clean`**：算子包 786 / 9.2.0-beta.2 / 指纹 `b7f2b59adb4829dc`、
+`.so` `85331298bdeffee0`）；**我们树与 `build_artifacts` 分发基准仍是 `2b58b578e4fc`，没有分发** ⇒ 期望值不改。
+但从"按树拆开钉值"那一刻起，**一个不声明判哪棵树的期望值就是歧义**（会被读成"共享钉值还是旧的"）。
+⇒ 两个 runner 起飞前都并排打印：`tree=<被检查的树路径>`、该树 `.so md5`、该树 `vendors` 的
+`sha/files(regular)/bytes`；匹配时说明"expectation is per-tree, other trees may differ"，
+不匹配时点名 tree 并拒绝起飞。RUNBOOK 里变量说明改成"**本树**期望值"。
+⇒ 「clean 换了、我没换」从**读数上**就看得出来，不靠谁记得。
 
 ## k.15 两条通则，已变成会红的检查（2026-09-21，协调方确认）
 
