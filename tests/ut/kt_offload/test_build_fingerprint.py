@@ -321,3 +321,80 @@ def test_the_old_schema_cannot_be_subtracted_from():
 
 def test_counts_are_part_of_the_decision():
     assert "vendors_files" in FP.BLOCKING and "vendors_bytes" in FP.BLOCKING
+
+
+# -- the two principles this round produced ------------------------------
+
+
+def test_the_current_schema_string_lives_in_exactly_one_place():
+    """Test data must not copy a constant of the code under test.
+
+    Both fixture builders once wrote ``schema: .../1`` as a literal. Bumping
+    the schema then turned every artifact they produce into "not comparable",
+    and eight downstream self-checks went red at once -- for a reason that had
+    nothing to do with what they check. A fixture has no business knowing what
+    the schema is; it reads it.
+
+    The rule enforced here: the CURRENT schema string appears only in
+    build_fingerprint.py. Historical values (``/1``) may be written literally
+    -- they are frozen, and a test about migration has to name the old one.
+    """
+    root = Path(__file__).resolve().parents[3]
+    owner = TOOLS / "build_fingerprint.py"
+    current = FP.SCHEMA
+    offenders = []
+    scanned = 0
+    for path in sorted(list((TOOLS / "oncard").glob("*.py")) + list(Path(__file__).parent.glob("*.py"))):
+        if path.resolve() == owner.resolve():
+            continue
+        scanned += 1
+        text = path.read_text()
+        if current in text:
+            offenders.append(str(path.relative_to(root)))
+    assert scanned >= 10, f"the scan only looked at {scanned} files; it is pointing at the wrong place"
+    assert not offenders, (
+        f"these files copy the current schema {current!r} instead of reading build_fingerprint.SCHEMA: "
+        f"{offenders}. Bump the schema and they will quietly declare every artifact incomparable."
+    )
+
+
+def test_fixtures_read_the_schema_rather_than_stating_it():
+    """The positive half of the same rule: the builders must actually read it."""
+    for name in ("make_packed_ab_fixture.py", "make_aa_fixture.py"):
+        text = (TOOLS / "oncard" / name).read_text()
+        assert "_schema()" in text, f"{name} does not read the schema from the tool"
+        assert "build_fingerprint" in text, f"{name} does not reference the owning module"
+
+
+def test_every_suppressed_difference_says_so_and_why(tmp_path, capsys):
+    """Fine-grained refusal only works if each hole is labelled.
+
+    Suppressing a difference silently looks like "that line happens to be
+    missing", which is how someone ends up computing it by hand instead.
+    """
+    run = _fixture_run(tmp_path, mode="realgain")
+    _write(run / "armA" / FP.FILENAME, fp(so="a" * 32))
+    _write(run / "armB" / FP.FILENAME, fp(so="b" * 32))
+    for r in (2,):
+        _write(run / f"armA_r{r}" / FP.FILENAME, fp(so="a" * 32))
+        _write(run / f"armB_r{r}" / FP.FILENAME, fp(so="b" * 32))
+    argv = sys.argv
+    sys.argv = ["packed_ab_report.py", str(run)]
+    try:
+        rc = REPORT.main()
+    finally:
+        sys.argv = argv
+    out = capsys.readouterr().out
+    assert rc == 1
+    # a reason, printed before the suppression, naming the differing key
+    assert "so_primary_md5 differs" in out
+    # every subtracting place is labelled
+    assert out.count("suppressed") >= 2, out
+    assert "⛔ skipped: a TPOT delta across builds" in out
+    assert "⛔ skipped: C is a difference between the arms" in out
+    # and the evidence that does not subtract is still there
+    assert "answers, bit-identical" in out and "identical" in out
+    import re as _re
+
+    numeric_delta = _re.search(r"(A-B|delta[^:]*) = [+-]?\d+\.\d", out)
+    assert numeric_delta is None, f"a difference survived suppression: {numeric_delta.group(0)!r}"
