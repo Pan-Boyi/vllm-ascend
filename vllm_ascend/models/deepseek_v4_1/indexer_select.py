@@ -136,22 +136,36 @@ def collect_candidate_guards(model, hf_config) -> "CandidateGuards | None":
         return None
     from vllm_ascend.models.deepseek_v4_1.sparse_indexer import (
         AscendSparseAttnIndexer)
-    # Same expressions as AscendSparseAttnIndexer.forward_oot passes.
-    entries = [(m.k_cache.prefix, m.compress_ratio,
-                m.candidate_blocks.shape[1]
-                if m.candidate_blocks is not None else 0,
-                m.candidate_block_size)
-               for m in model.modules()
-               if isinstance(m, AscendSparseAttnIndexer)]
-    if not entries:
+    indexers = [
+        m for m in model.modules()
+        if isinstance(m, AscendSparseAttnIndexer)
+    ]
+    if not indexers:
         raise RuntimeError(
             f"{model_type}: found no AscendSparseAttnIndexer in the built "
             "model, so the candidate-mask guard would check nothing. Either "
             "the indexer class changed or it is not the one being built.")
+    # 🔴 The guard is over the indexers that **cannot** express the candidate
+    # filter, which is now a question about the ds41 operators rather than a
+    # property of the model: with them the filter is applied and the ceiling
+    # is gone, without them the selection would silently be drawn from the
+    # whole context past 16k. An indexer with no candidate buffer at all
+    # (2/8/14) was never under the ceiling and is not under the guard.
+    # Same expressions as AscendSparseAttnIndexer.forward_oot passes.
+    entries = [(m.k_cache.prefix, m.compress_ratio,
+                m.candidate_blocks.shape[1]
+                if m.candidate_blocks is not None else 0,
+                m.candidate_block_size) for m in indexers
+               if not m.candidate_filtering_available()]
     from vllm.logger import logger
+    filtering = [m for m in indexers if m.candidate_blocks is not None]
     logger.info(
-        "candidate-mask guard: %d indexers, %d read a candidate mask",
-        len(entries), sum(1 for e in entries if e[2] > 0))
+        "candidate filter: %d indexers, %d take part (%d publish), "
+        "%d cannot express it and stay under the max_model_len guard",
+        len(indexers), len(filtering),
+        sum(1 for m in filtering if m.candidate_write), len(entries))
+    if not entries:
+        return None
     return CandidateGuards(entries)
 
 def _query_dequant_scale(q_quant, q_scale, num_tokens: int, num_heads: int,

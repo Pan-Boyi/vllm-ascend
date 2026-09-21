@@ -68,6 +68,10 @@ class _Indexer(AscendSparseAttnIndexer):
         self.head_dim = HEAD_DIM
         self.candidate_blocks = None
         self.candidate_block_size = 0
+        # Upstream sets this on every indexer; only the candidate source gets
+        # True. forward_oot reads it to pick a selection path, so a fixture
+        # without it would make the ratio-2 layers untestable here.
+        self.candidate_write = False
         self.topk_indices_buffer = torch.zeros(16, TOPK, dtype=torch.int32)
         self.k_cache = SimpleNamespace(prefix="layers.3.indexer.k_cache",
                                        kv_cache=None)
