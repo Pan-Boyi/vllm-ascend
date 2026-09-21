@@ -24,6 +24,8 @@
 #      4 lease refused | 5 card not idle / dmesg gate | 20 anomaly | 124 timeout | other = test rc
 #  Env: ONCARD_TIMEOUT_S (default per test), ONCARD_SKIP_DMESG_GATE=1 (logged),
 #       ONCARD_DRY=1 (stop right before acquire: prints the plan; used by selftest).
+#       ONCARD_EXPECT_SO_MD5=<md5> (refuse to run if the .so is not that build; use it
+#         while a shared .so is being swapped, so no reading lands mid-swap).
 # ============================================================================
 set -u
 set -o pipefail
@@ -52,6 +54,7 @@ if [ -z "${ONCARD_SNAPSHOT:-}" ]; then
   RUN="${ONCARD_RUNS_DIR:-$ROOT/build_artifacts/moe_offload_ref/oncard_runs}/${STAMP}_${TEST}"
   mkdir -p "$RUN/code" || { echo "❌ cannot create $RUN"; exit 3; }
   cp -p "$SRC_DIR"/*.sh "$SRC_DIR"/*.py "$RUN/code/" || { echo "❌ snapshot failed"; exit 3; }
+  cp -p "$SRC_DIR/../build_fingerprint.py" "$RUN/code/" || { echo "❌ snapshot failed (fingerprint tool)"; exit 3; }
   export ONCARD_SNAPSHOT=1 ONCARD_RUN_DIR="$RUN" ONCARD_SRC_DIR="$SRC_DIR" ONCARD_ARGV="$0 $CARD $TEST $*"
   exec bash "$RUN/code/run_oncard.sh" "$CARD" "$TEST" "$@"
 fi
@@ -74,8 +77,26 @@ KT_WHEEL=$(ls "$ROOT"/build_artifacts/moe_offload_ref/kt_wheel/kt_kernel-*.whl 2
 AVAIL_KB=$(oc_meminfo_avail_kb)
 NEED_KB=$(( ${ONCARD_MIN_AVAIL_GB:-150} * 1024 * 1024 ))
 [ "${AVAIL_KB:-0}" -ge "$NEED_KB" ] || { say "❌ preflight: MemAvailable $((AVAIL_KB/1048576)) GiB < ${ONCARD_MIN_AVAIL_GB:-150} GiB (plan §2 rule)"; exit 3; }
+PYBIN="${ONCARD_PYTHON:-/usr/local/python3.12.13/bin/python3}"
+
+# ---- build fingerprint (before anything: a reading without one cannot be
+# compared to anything later, and "I remember which .so this was" is a line of
+# defence that lives in someone's head)
+FP="$RUN/build_fingerprint.json"
+if "$PYBIN" "$HERE/build_fingerprint.py" stamp "$RUN" --label "$TEST" > "$RUN/build_fingerprint.txt" 2>&1; then
+  say "$(head -n 1 "$RUN/build_fingerprint.txt")"
+else
+  say "❌ build fingerprint failed: $(tail -n 2 "$RUN/build_fingerprint.txt" | tr '\n' ' ')"; exit 3
+fi
+SO_MD5="$("$PYBIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["so_primary_md5"] or "")' "$FP")"
+if [ -n "${ONCARD_EXPECT_SO_MD5:-}" ] && [ "${ONCARD_EXPECT_SO_MD5}" != "$SO_MD5" ]; then
+  say "❌ vllm_ascend_C .so is $SO_MD5, expected ${ONCARD_EXPECT_SO_MD5}."
+  say "   Refusing to run: a reading taken across a build swap cannot be compared with either side."
+  exit 3
+fi
+
 if [ "${ONCARD_DRY:-0}" = "1" ]; then
-  say "⚪ ONCARD_DRY=1: preflight passed; would acquire card $CARD as $OWNER (LEASE_PID=$$) and run $PY. Stopping before acquire."
+  say "⚪ ONCARD_DRY=1: preflight passed, build fingerprint written; would acquire card $CARD as $OWNER (LEASE_PID=$$) and run $PY. Stopping before acquire."
   exit 0
 fi
 
@@ -93,7 +114,6 @@ mkdir -p "$TMPDIR" "$TORCH_EXTENSIONS_DIR" "$TRITON_CACHE_DIR" || { say "❌ can
 export ASCEND_PROCESS_LOG_PATH="$RUN/ascend_log"; mkdir -p "$ASCEND_PROCESS_LOG_PATH"
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$KT_SITE"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=1
-PYBIN="${ONCARD_PYTHON:-/usr/local/python3.12.13/bin/python3}"
 ANOM="$(oc_anomaly_regex)" || { say "❌ cannot read anomaly patterns"; exit 3; }
 
 # ---- provenance (before the card: the record exists even if the run dies)
@@ -114,6 +134,7 @@ json.dump({
            "dirty_files": len([l for l in git(vl, "status", "--porcelain").splitlines() if l])},
   "kt_wheel": {"path": "$KT_WHEEL", "sha256": sha("$KT_WHEEL")},
   "kt_site": "$KT_SITE",
+  "build_fingerprint": json.load(open("$FP")),
   "code_snapshot_sha256": {f: sha(os.path.join(code, f)) for f in sorted(os.listdir(code))},
   "env": {k: os.environ.get(k) for k in ("ASCEND_RT_VISIBLE_DEVICES", "TMPDIR", "TMP", "TEMP", "TORCH_EXTENSIONS_DIR",
           "TRITON_CACHE_DIR", "ASCEND_PROCESS_LOG_PATH", "PYTHONPATH", "LD_PRELOAD", "DSV41_VLLM_TREE", "VLLM_VERSION")},

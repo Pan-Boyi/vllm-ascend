@@ -49,6 +49,44 @@ OPS_SAVED_PER_TOKEN = 80  # 40 layers x (5 - 3) host-device operations
 RETIRED_PRICE_US = 62.5
 
 
+
+# --------------------------------------------------------- build fingerprint ---
+
+
+def _fingerprint_module():
+    """The tool lives next to this file in a run snapshot, one level up in the
+    tree. Import by path so both layouts work."""
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "build_fingerprint.py"),
+                      os.path.join(here, "..", "build_fingerprint.py")):
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location("build_fingerprint", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+
+def build_gate(arm_dirs: dict) -> dict:
+    """May these two arms be subtracted at all?
+
+    A difference between two builds is not a weaker result, it is a different
+    question -- so this refuses rather than warning. It also refuses when a
+    fingerprint is missing: "no evidence of a mismatch" is not evidence of a
+    match.
+    """
+    fp_mod = _fingerprint_module()
+    if fp_mod is None:
+        return {"ok": False, "why": "build_fingerprint.py not found next to this script; cannot check builds",
+                "fingerprints": {}}
+    fps = {name: fp_mod.load(path) for name, path in arm_dirs.items()}
+    lines = {name: fp_mod.short(fp) for name, fp in fps.items()}
+    ok, reasons = fp_mod.same_build(fps.get("A"), fps.get("B"))
+    return {"ok": ok, "why": "; ".join(reasons) if reasons else "same build", "lines": lines,
+            "fingerprints": fps, "reasons": reasons}
+
 # ---------------------------------------------------------------- answers ---
 
 
@@ -260,7 +298,20 @@ def main() -> int:
         return 1
 
     fails: list[str] = []
-    print("=== 1. answers, bit-identical (the criterion; TPOT decides nothing until this passes)")
+    print("=== 0. build fingerprint (a difference across builds is not a result)")
+    gate = build_gate(arms)
+    for name in ("A", "B"):
+        print(f"  arm {name}: {gate.get('lines', {}).get(name, 'no fingerprint')}")
+    for reason in gate.get("reasons", []):
+        print(f"  {reason}")
+    if not gate["ok"]:
+        print(f"  ⛔ REFUSING to report differences: {gate['why']}")
+        print("     The two arms were not measured on the same build, so their difference answers no "
+              "question anyone asked. Re-run both arms inside one build.")
+        return 1
+    print("  ⇒ same build: the arms may be compared")
+
+    print("\n=== 1. answers, bit-identical (the criterion; TPOT decides nothing until this passes)")
     ans = {n: load_answers(p) for n, p in arms.items()}
     cmp_ = compare_answers(ans["A"], ans["B"])
     print(f"  {cmp_['identical']}/{cmp_['n']} identical, {len(cmp_['differ'])} differ: {cmp_['differ'][:8]}")

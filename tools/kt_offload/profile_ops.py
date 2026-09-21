@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import os
 import sys
 from collections import defaultdict
 
@@ -55,8 +56,18 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=None, help="default: the MODEL_EXECUTE count")
     ap.add_argument("--layers", type=int, default=40)
     ap.add_argument("--price-us", type=float, default=None, help="a claimed per-operation cost, to test")
+    ap.add_argument("--against", default=None, help="a second task_time.csv to compare; refused across builds")
     ap.add_argument("--claimed-total-ms", type=float, default=None, help="the aggregate that price came from")
     args = ap.parse_args()
+
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("build_fingerprint", os.path.join(here, "build_fingerprint.py"))
+    fpm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fpm)
+    mine = fpm.load(os.path.dirname(os.path.abspath(args.task_time_csv)))
+    print(f"{fpm.short(mine)}   <- the build these numbers were measured on\n")
 
     d = read(args.task_time_csv)
     if not d["rows"]:
@@ -99,6 +110,26 @@ def main() -> int:
             print(f"\nthe aggregate the price came from ({args.claimed_total_ms:g} ms/step) is "
                   f"{args.claimed_total_ms / max(tot_ms, 1e-9):.1f}x the measured transport+callback device time; "
                   "if that aggregate is real it is mostly NOT device time spent in those operations")
+    if args.against:
+        other = fpm.load(os.path.dirname(os.path.abspath(args.against)))
+        try:
+            advisories = fpm.require_same_build(mine, other, "a per-type difference between these two profiles")
+        except fpm.CrossBuildError as exc:
+            print(f"\n⛔ {exc}")
+            return 1
+        for a in advisories:
+            print("  " + a)
+        e = read(args.against)
+        steps2 = args.steps or e["n"].get("MODEL_EXECUTE", 0)
+        print(f"\nper-type difference vs {args.against} ({steps2} steps), same build:")
+        print(f"{'type':<22}{'n/step A':>10}{'n/step B':>10}{'ms/step A':>11}{'ms/step B':>11}{'delta ms':>10}")
+        for kind in sorted(set(d["n"]) | set(e["n"])):
+            na, nb = d["n"].get(kind, 0) / steps, e["n"].get(kind, 0) / max(steps2, 1)
+            ma = d["us"].get(kind, 0.0) / steps / 1000
+            mb = e["us"].get(kind, 0.0) / max(steps2, 1) / 1000
+            if max(ma, mb) >= 0.05:
+                print(f"{kind:<22}{na:>10.1f}{nb:>10.1f}{ma:>11.3f}{mb:>11.3f}{mb - ma:>+10.3f}")
+
     print("\ncaveat: this table cannot say which owner issued a task (no kernel names for these types), "
           "so every count above is all owners together.")
     return 0

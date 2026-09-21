@@ -69,8 +69,30 @@ def write_log(arm: str, dead: bool) -> None:
         f.write("")
 
 
+def write_fingerprint(arm: str) -> None:
+    """A real run is always stamped, so a fixture must be too -- otherwise the
+    judge refuses it for the right reason and every other check in the
+    self-test reads as broken. ``--no-fingerprint`` builds the unstamped case
+    on purpose."""
+    fp = {
+        "schema": "kt_offload/build_fingerprint/1",
+        "label": "fixture",
+        "so_primary_md5": "f" * 24 + "1234",
+        "so_primary_md5_short": ("f" * 24 + "1234")[:12],
+        "vendors_sha256": "e" * 64,
+        "kt_wheel_sha256": "d" * 64,
+        "trees": {"vllm_ascend": {"head": "c" * 40}, "vllm": {"head": "b" * 40}},
+        "backfilled": False,
+        "fixture": True,
+    }
+    with open(os.path.join(arm, "build_fingerprint.json"), "w") as f:
+        json.dump(fp, f, indent=1)
+
+
 def main() -> int:
-    run, mode = sys.argv[1], sys.argv[2]
+    argv = [a for a in sys.argv[1:] if a != "--no-fingerprint"]
+    stamp = "--no-fingerprint" not in sys.argv
+    run, mode = argv[0], argv[1]
     # arm A: 40 exposed gaps/token; arm B: 40 gaps shortened by 80 x 62.5 us / 40
     # per gap, i.e. the same count with each gap 125 us shorter -> delta 5.0 ms
     for name, gaps, extra, tpot in (("A", 40, 125.0, 39.8), ("B", 40, 0.0, 34.8)):
@@ -81,6 +103,8 @@ def main() -> int:
                       mode if name == "B" else ("emptyfield" if mode == "emptyfield" else "none"))
         write_perf(arm, tpot if mode != "nogain" else 39.8)
         write_log(arm, dead=(mode == "deadlayers" and name == "B"))
+        if stamp:
+            write_fingerprint(arm)
     if mode == "nogain":  # arm B saves almost nothing: the model does not hold
         arm = os.path.join(run, "armB")
         write_csv(os.path.join(arm, "prof_csv", "kernel_details.csv"), 40, 120.0)

@@ -55,6 +55,7 @@ if [ -z "${PACKED_AB_SNAPSHOT:-}" ]; then
   RUN="${PACKED_AB_RUNS_DIR:-$ROOT/build_artifacts/moe_offload_ref/packed_ab}/${STAMP}"
   mkdir -p "$RUN/code" || { echo "❌ cannot create $RUN"; exit 3; }
   cp -p "$SRC_DIR"/*.sh "$SRC_DIR"/*.py "$RUN/code/" || { echo "❌ snapshot failed"; exit 3; }
+  cp -p "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../build_fingerprint.py" "$RUN/code/" 2>/dev/null || true
   export PACKED_AB_SNAPSHOT=1 PACKED_AB_RUN="$RUN" PACKED_AB_ARGV="$0 $CARD"
   exec bash "$RUN/code/run_packed_ab.sh" "$CARD"
 fi
@@ -85,8 +86,22 @@ python3 -m py_compile "$HERE/packed_ab_report.py" || pf "packed_ab_report.py doe
 AVAIL_KB=$(oc_meminfo_avail_kb)
 [ "${AVAIL_KB:-0}" -ge $(( ${MIN_AVAIL_GB:-150} * 1024 * 1024 )) ] || pf "MemAvailable $((AVAIL_KB/1048576)) GiB < ${MIN_AVAIL_GB:-150} GiB"
 say "  preflight ok (MemAvailable $((AVAIL_KB/1048576)) GiB, kt_site $(sha256sum "$ROOT/build_artifacts/moe_offload_ref/kt_site/kt_kernel/experts.py" 2>/dev/null | cut -c1-12))"
+# ---- build fingerprint: the two arms are only comparable inside one build,
+# and so is any later comparison against this run
+FPTOOL="$HERE/build_fingerprint.py"; [ -f "$FPTOOL" ] || FPTOOL="$ROOT/worktrees/moe-offload/tools/kt_offload/build_fingerprint.py"
+if python3 "$FPTOOL" stamp "$RUN" --label "packed_ab" > "$RUN/build_fingerprint.txt" 2>&1; then
+  say "  $(head -n 1 "$RUN/build_fingerprint.txt")"
+else
+  say "❌ build fingerprint failed: $(tail -n 2 "$RUN/build_fingerprint.txt" | tr '\n' ' ')"; exit 3
+fi
+SO_MD5="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["so_primary_md5"] or "")' "$RUN/build_fingerprint.json")"
+if [ -n "${ONCARD_EXPECT_SO_MD5:-}" ] && [ "${ONCARD_EXPECT_SO_MD5}" != "$SO_MD5" ]; then
+  say "❌ vllm_ascend_C .so is $SO_MD5, expected ${ONCARD_EXPECT_SO_MD5}; refusing to run across a build swap."
+  exit 3
+fi
+
 if [ "${ONCARD_DRY:-0}" = "1" ]; then
-  say "⚪ ONCARD_DRY=1: preflight passed; would acquire card $CARD as $OWNER (LEASE_PID=$$) and run arms A,B. Stopping before acquire."
+  say "⚪ ONCARD_DRY=1: preflight passed, build fingerprint written; would acquire card $CARD as $OWNER (LEASE_PID=$$) and run arms A,B. Stopping before acquire."
   exit 0
 fi
 
@@ -129,6 +144,7 @@ teardown() {  # $1 = arm dir, $2 = serve pgid
 run_arm() {  # $1 = A|B, $2 = packed true|false
   local name="$1" packed="$2"
   local arm="$RUN/arm$name"; mkdir -p "$arm/cap"
+  cp -p "$RUN/build_fingerprint.json" "$arm/" 2>/dev/null || true
   local profdir="/dev/shm/dsv41_prof_packed_$name"
   rm -rf "$profdir"; mkdir -p "$profdir"
   cfg_json "$packed" > "$arm/cfg.json"

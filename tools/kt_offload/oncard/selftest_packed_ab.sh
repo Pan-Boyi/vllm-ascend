@@ -43,6 +43,25 @@ chk "$rc" 1 "card NOT returned when the lease is still held"
 echo "$why" | command grep -q "lease still held" && ok "it names why" || bad "it does not name why"
 pa_card_returned "$free" 3 dsv41_vllm_singlecard 65000 "" >/dev/null; chk $? 0 "card returned when nothing holds it"
 
+echo "── build fingerprint gate (cross-build comparison must be refused)"
+python3 "$HERE/make_packed_ab_fixture.py" "$TMP/fpsame" identical >/dev/null || bad "fixture builder failed"
+python3 "$HERE/packed_ab_report.py" "$TMP/fpsame" > "$TMP/fpsame.out" 2>&1; r=$?
+{ [ $r -eq 0 ] && command grep -q "same build" "$TMP/fpsame.out"; }
+ok $? "same build -> the arms are compared (rc $r)"
+command grep -qi "delta" "$TMP/fpsame.out"; ok $? "and a difference is actually reported"
+python3 "$HERE/make_packed_ab_fixture.py" "$TMP/fpdiff" identical >/dev/null || bad "fixture builder failed"
+python3 "$HERE/../build_fingerprint.py" backfill "$TMP/fpdiff/armB" --so-md5 ffffffffffffffffffffffffffffffff >/dev/null
+rm -f "$TMP/fpdiff/armB/build_fingerprint.json"
+python3 "$HERE/packed_ab_report.py" "$TMP/fpdiff" > "$TMP/fpdiff.out" 2>&1; r=$?
+[ $r -eq 1 ]; ok $? "different .so -> refused (rc $r)"
+command grep -q "REFUSING to report differences" "$TMP/fpdiff.out"; ok $? "it says it is refusing, not warning"
+command grep -q "ffffffffffff" "$TMP/fpdiff.out"; ok $? "it prints both fingerprints"
+! command grep -qi "delta" "$TMP/fpdiff.out"; ok $? "and no difference was printed anyway"
+python3 "$HERE/make_packed_ab_fixture.py" "$TMP/fpnone" identical --no-fingerprint >/dev/null || bad "fixture builder failed"
+python3 "$HERE/packed_ab_report.py" "$TMP/fpnone" > "$TMP/fpnone.out" 2>&1; r=$?
+{ [ $r -eq 1 ] && command grep -q "no build fingerprint" "$TMP/fpnone.out"; }
+ok $? "no fingerprint at all -> refused, not assumed equal (rc $r)"
+
 echo "── anomaly scan positive control"
 printf 'all good\naicore exception happened\n' > "$TMP/anom.log"
 SCAN="source '$HERE/oncard_lib.sh'; oc_scan_anomaly \"\$(oc_anomaly_regex)\""

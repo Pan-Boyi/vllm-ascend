@@ -608,7 +608,17 @@ MODEL_EXECUTE = 181 步，40 层）。实测：
 
 ## k.8 packed A/B 判定：无收益，默认关，长尾当缺陷记录（2026-09-20）
 
-两臂 GSM8K 各 50/50（逐位判据先过）。TPOT 中位 40.24 → 39.50（−0.74 ms），但**均值 40.36 → 41.37**，
+> 🔴 **更正（2026-09-21，我方复跑判读脚本得到）**：`packed_ab_report.py` 在这份产物上给出
+> **19/50 逐位相同、31/50 不同**——两臂各 50/50 指的是**答对题数**，不是逐位一致。跑的是贪心
+> （`--temperature 0 --top-p 1.0`），分歧发生在生成中途（例：`gsm8k-59` 前 266 字符相同，之后分叉，
+> 最终 `\boxed{187}` 仍相同），completion tokens 7269 vs 7151。
+> ⇒ **"逐位判据先过"这句不成立**，本节结论只由 TPOT 支撑。**但不能就此判 packed 数值错**：
+> harness 用 8 并发（`num_threads: 8`），批组成随发变化，贪心解码在服务层**本来就可能跨发不一致**。
+> 要归因必须补一条 **A/A 对照**（同构建、同配置、连跑两发 A 臂）：若 A/A 也差 ~31/50，
+> 说明这条服务级判据没有区分力，逐位一致只能在层级用例（t1/t2/t3 那种形状）上判；
+> 若 A/A 逐位相同而 A/B 不同，才是 packed 改了数值。⇒ **默认关这个结论不变，理由要加一条"数值未证一致"。**
+
+两臂 GSM8K 各 50/50（**答对题数**；逐位见上方更正）。TPOT 中位 40.24 → 39.50（−0.74 ms），但**均值 40.36 → 41.37**，
 p99 四轮 40.6/41.5/42.7/45.7 → 40.0/56.3/71.3/83.3（三轮翻倍），>3 ms 的等待段 6 → 125 个。
 ⇒ 中位的 0.74 ms 落在跨发漂移（~0.5 ms）量级内，**判为无收益**：`packed_transfer` 默认保持关闭，
 不作为优化项继续投入；**长尾按缺陷记录**（嫌疑：每层自有 pinned/设备输出缓冲带来的分配或页行为、
@@ -713,6 +723,49 @@ kt 的 pinned 槽位是 `layer_idx % 2`（:259）⇒ **第 L 层与第 L+2 层�
 
 ⚪ 两条排查用（不是判据）：`new Args{}` 无 `delete`，每次 `forward_task` 漏 72–80 B——长跑时症状**看起来像"跨层缓冲没释放"**，
 别误诊；任务异常**在下一次 sync 才重抛** ⇒ 报错会记在**下一层**账上，定位时要把层号往前推一格。
+
+
+
+## m. 方法论：判据的运行环境与被判对象的运行环境不同 ⇒ CPU 单测必然测不到
+
+规则本身与已知成员清单由 `MOE_OFFLOAD_PLAN.md` §4.14 持有（那份是用户的清单，改由那边改；这里只记**我方每条守卫用的是哪种应对**，避免同一条结论在两处各自漂移）。
+
+> 判据的运行环境与被判对象的运行环境不同时，CPU 单测必然测不到。
+> ⇒ 这类守卫**必须有一条在卡上跑的臂**，或**在 CPU 上把环境差异显式建模**；两者都没有＝零覆盖。
+
+| 成员 | 我方应对 | 在哪 |
+|---|---|---|
+| 默认工厂设备（CPU 默认 vs 加载期 NPU） | **CPU 建模**：`meta` 当默认设备 + 源码级变异（去掉 `device="cpu"` 在 CPU 默认下全绿、在 `meta` 下必须红且红因点名 meta）+ AST 扫描 15/15 调用点 | `tests/ut/kt_offload/test_load_time_default_device.py` |
+| 生产日志配置（pytest 挂 root handler vs worker 只挂 file handler 且不 setLevel） | **CPU 建模**：子进程里只调 `configure_ascend_file_logging()` 立起 worker 形态，三条阴性对照（旧写法静默／`init_logger` 写法静默／caplog 看不到） | `tests/ut/kt_offload/test_production_logging.py` |
+| 设备端 dtype 支持表（fp4 视图不支持设备内拷贝/reshape） | **当前不适用**：我方路径按 int8/uint8 搬字节，不建 fp4 视图；将来若用到 ⇒ 需卡上臂（CPU 上无法建模一张设备支持表） | — |
+| ACL 捕获对跨流的限制（107025） | **卡上臂**：t3/t5 在**真实层**上捕获；标量微型图给过假绿灯 ⇒ 替身必须与被测对象同规模同内容（这条本身也是一条通则） | `tools/kt_offload/oncard/t3_side_stream.py`、`t5_auto_dispatch.py` |
+| 构建（共享 `.so`／算子包／kt wheel 换了） | **产物指纹 + 判读拒绝**：运行期盖指纹，判读脚本在指纹不同时拒绝给差值（见 m.2） | `tools/kt_offload/build_fingerprint.py` |
+
+判定这类风险的问法不是"这个 bug 能不能在 CPU 上复现"，而是**"我的判据跑在哪个环境里，被判对象跑在哪个环境里"**——两者不同就先假设零覆盖，再去补卡上臂或补建模。
+
+## m.2 读数一律盖构建指纹，判读跨构建拒绝给差值
+
+政策与背景见 `MOE_OFFLOAD_PLAN.md` §4.13（共享 `.so` 于 2026-09-21 重建分发）。这里是**落地**：
+
+- `tools/kt_offload/build_fingerprint.py`：`capture` / `stamp <dir>` / `compare A B` / `backfill`。
+  内容＝`vllm_ascend_C*.so` 的 md5（含"运行时会导入哪一份"）＋算子包 `vendors/` 的**内容**指纹
+  （逐文件 md5 + 路径 + 大小的 sha256；**按内容不按 mtime**，`cp` 会刷新 mtime；符号链接按 `link:<target>` 记，
+  链接改指向也算变化）＋kt wheel sha256 ＋两棵树 HEAD/脏文件数。
+- 谁盖：`run_oncard.sh`（t0–t5，落 `build_fingerprint.json` 并进 `provenance.json`，**在 dry-run 之前**就盖，
+  所以自检也能验它）、`run_packed_ab.sh`（落在 run 与每个 arm 目录）、`profile_ops.py`（打印本次读数所属构建）。
+- 谁拦：`packed_ab_report.py` 的 **§0 闸**——两臂指纹不同就**拒绝给任何差值**（rc=1），打印两边指纹并说明"跨构建不可比"；
+  `profile_ops.py --against` 同理。阻断项＝`.so` md5／算子包指纹／kt wheel sha；两棵树 commit 只**提示**
+  （文档改动不该拦住一次合法比较），`strict_trees=True` 可升级为阻断。
+- **缺指纹也拒绝**：「没看到不一致」不是「一致」的证据。两份都是补盖的（只知道 `.so`）时，
+  未记录的项打 `ADVISORY ... unknown on both sides` 而不阻断——已知项已经把构建钉住了。
+- 起飞前可选闸：`ONCARD_EXPECT_SO_MD5=<md5>`，`.so` 不是那份就**拒绝起飞**（换 `.so` 期间用，避免读数落在换的中间）。
+- 单测 `tests/ut/kt_offload/test_build_fingerprint.py`（15 条）：同构建给差值／不同 `.so` 拒绝且不打印差值／
+  缺指纹拒绝／单侧未记录拒绝而双侧未记录只提示／树 commit 默认只提示且可升级／按内容而非 mtime／链接改指向能看出来。
+  `selftest_packed_ab.sh` 另有 7 条端到端（含"拒绝时确实一个差值都没打印"）。
+- 旧产物已**事后补盖**旧 `.so` md5 `2b58b578e4fc`（`packed_ab_0920_094053`、`prof_0920_045212`、
+  `m3_ab_0920_061531`、`cpu_bench/20260920_022930`、本轮 `cpu_bench/*_prod`），写成各自目录下的
+  `build_fingerprint.backfilled.json`，**不改原始 csv**，并在文件里写明"补盖的是出处、不是测量"：
+  算子包指纹当时没记，留空而不是拿今天的树补一个假的。
 
 
 ## 上卡 A/B 方案（M3 侧流，1 张卡；两臂只差一个开关）
