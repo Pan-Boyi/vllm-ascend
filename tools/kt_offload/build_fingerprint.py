@@ -118,6 +118,42 @@ def vendors_fingerprint(root: str = VENDORS) -> dict:
     }
 
 
+def host_facts() -> dict:
+    """CPU counts and the thread env, because one of the readings lies.
+
+    ``nproc`` returns min(affinity, $OMP_NUM_THREADS) and OMP_NUM_THREADS=1
+    here, so it reports 1 on a 256-core machine. An artifact that records only
+    that number reads as "the machine had one CPU", which looks like a major
+    finding rather than a units bug -- so record the true count, the misleading
+    one, and the variable that makes them differ, side by side.
+    """
+    def sh(*cmd) -> str:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    online = sh("getconf", "_NPROCESSORS_ONLN")
+    try:
+        with open("/proc/cpuinfo") as f:
+            cpuinfo = sum(1 for line in f if line.startswith("processor"))
+    except OSError:
+        cpuinfo = None
+    try:
+        with open("/proc/loadavg") as f:
+            loadavg = f.read().split()[:3]
+    except OSError:
+        loadavg = []
+    return {
+        "cpus_online_getconf": int(online) if online.isdigit() else None,
+        "cpus_in_cpuinfo": cpuinfo,
+        "nproc_reports": int(sh("nproc") or 0) or None,
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+        "note": "nproc = min(affinity, OMP_NUM_THREADS); use cpus_online_getconf as the machine's size",
+        "loadavg": loadavg,
+    }
+
+
 def _git(tree: str, *args: str) -> str:
     try:
         return subprocess.run(["git", "-C", tree, *args], capture_output=True, text=True, timeout=30).stdout.strip()
@@ -158,6 +194,7 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
         "kt_wheel": {"path": wheels[-1] if wheels else None, "sha256": kt_sha},
         "kt_wheel_sha256": kt_sha,
         "trees": trees,
+        "host": host_facts(),
         "captured_at": subprocess.run(["date", "-Is"], capture_output=True, text=True).stdout.strip(),
         "backfilled": False,
     }

@@ -50,6 +50,40 @@ RETIRED_PRICE_US = 62.5
 
 
 
+
+def arm_dir(run: str, name: str, round_no: int) -> str:
+    """Round 1 keeps the historical name; later rounds carry _rN."""
+    return os.path.join(run, f"arm{name}" if round_no == 1 else f"arm{name}_r{round_no}")
+
+
+def discover_rounds(run: str) -> set[int]:
+    rounds = set()
+    for entry in os.listdir(run) if os.path.isdir(run) else []:
+        m = re.fullmatch(r"arm([AB])(?:_r(\d+))?", entry)
+        if m:
+            rounds.add(int(m.group(2) or 1))
+    return rounds or {1}
+
+
+def drift_floor(arm_series: dict) -> dict | None:
+    """How much the SAME configuration moved between rounds.
+
+    This machine has been measured 2.5x slower on one commit 11 hours apart, so
+    a difference smaller than the same-arm spread says nothing about the switch.
+    The floor is the largest same-arm swing seen, not an average: it is the
+    thing a claimed benefit has to clear.
+    """
+    swings = {}
+    for name, series in arm_series.items():
+        if len(series) >= 2:
+            values = [series[r] for r in sorted(series)]
+            swings[name] = max(values) - min(values)
+    if not swings:
+        return None
+    worst = max(swings.values())
+    detail = ", ".join(f"{n} {v:+.2f}" for n, v in sorted(swings.items()))
+    return {"value": worst, "per_arm": swings, "line": f"{detail} ms/token -> floor {worst:.2f} ms/token"}
+
 # --------------------------------------------------------- build fingerprint ---
 
 
@@ -333,18 +367,59 @@ def main() -> int:
     if cmp_["differ"]:
         fails.append(f"{len(cmp_['differ'])} answers differ between the arms")
 
-    print("\n=== 2. TPOT (bs1)")
-    tp = {n: load_tpot(p) for n, p in arms.items()}
-    for n in ("A", "B"):
-        t = tp[n]
-        if not t["n"]:
-            print(f"  arm {n}: no samples")
-            fails.append(f"arm {n} has no TPOT samples")
-            continue
-        print(f"  arm {n}: median {t['median']:.2f} ms  mean {t['mean']:.2f} +- {t['stdev']:.2f}  "
-              f"min/max {t['min']:.2f}/{t['max']:.2f}  n={t['n']}  samples={[round(s, 2) for s in t['samples']]}")
-    if tp["A"]["n"] and tp["B"]["n"]:
-        print(f"  delta (A - B) = {tp['A']['median'] - tp['B']['median']:+.2f} ms/token")
+    print("\n=== 2. TPOT (bs1), paired by round -- and the machine's own drift")
+    rounds = discover_rounds(run)
+    print(f"  rounds found: {sorted(rounds)}")
+    per_round, arm_series = {}, {"A": {}, "B": {}}
+    for r in sorted(rounds):
+        row = {}
+        for name in ("A", "B"):
+            t = load_tpot(arm_dir(run, name, r))
+            row[name] = t
+            if t["n"]:
+                arm_series[name][r] = t["median"]
+        per_round[r] = row
+        parts = []
+        for name in ("A", "B"):
+            t = row[name]
+            parts.append(f"{name} {t['median']:.2f} (n={t['n']})" if t["n"] else f"{name} -")
+        delta = (row["A"]["median"] - row["B"]["median"]) if row["A"]["n"] and row["B"]["n"] else None
+        tail = f"  A-B = {delta:+.2f} ms/token" if delta is not None else "  A-B = n/a"
+        print(f"  round {r}: " + "  ".join(parts) + tail)
+        if not (row["A"]["n"] and row["B"]["n"]):
+            fails.append(f"round {r} is missing an arm's TPOT samples")
+
+    deltas = [
+        per_round[r]["A"]["median"] - per_round[r]["B"]["median"]
+        for r in sorted(rounds)
+        if per_round[r]["A"]["n"] and per_round[r]["B"]["n"]
+    ]
+    floor = drift_floor(arm_series)
+    if floor is None:
+        print("  drift floor: NOT MEASURED (only one round per arm) -- a single-round difference cannot be "
+              "told from this machine drifting; it has been seen 2.5x slower 11 hours apart")
+    else:
+        print(f"  drift floor (same arm, different rounds): {floor['line']}")
+    if deltas:
+        med = statistics.median(deltas)
+        print(f"  paired A-B deltas: {[round(d, 2) for d in deltas]}  median {med:+.2f} ms/token")
+        if floor is None and abs(med) > 0.05:
+            # a difference with no yardstick is the dangerous case: it reads
+            # like a benefit. No floor and no difference claims nothing, so it
+            # is only a note.
+            fails.append(
+                f"a {med:+.2f} ms/token difference was measured with no drift floor (one round per arm): "
+                "re-run with ROUNDS>=2 -- this machine has been 2.5x slower 11 hours apart, so the "
+                "difference cannot be told from the clock"
+            )
+        if floor is not None:
+            verdict = ("EXCEEDS the drift floor -> a real difference"
+                       if abs(med) > floor["value"]
+                       else "WITHIN the drift floor -> not distinguishable from the machine's own drift")
+            print(f"  ⇒ |median delta| {abs(med):.2f} vs floor {floor['value']:.2f}: {verdict}")
+    else:
+        print("  no paired deltas at all")
+        fails.append("no round produced both arms' TPOT")
 
     print("\n=== 3. gap table (union busy; the sum would double-count parallel streams)")
     gt = {n: gap_table(p) for n, p in arms.items()}

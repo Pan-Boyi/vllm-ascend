@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build a fake packed A/B run so the judge can be exercised without a card.
 
-Modes: identical | onechar | emptyfield | nogain | deadlayers
+Modes: identical | onechar | emptyfield | nogain | deadlayers | drift | realgain
 The gap fixtures are built so the arithmetic has a known answer: arm A gets
 80 extra gaps of 62.5 us per token, so the judge's implied C must come out at
 62.5. That 62.5 is a fixture constant chosen to make the division checkable --
@@ -89,6 +89,16 @@ def write_fingerprint(arm: str) -> None:
         json.dump(fp, f, indent=1)
 
 
+def write_round2(run: str, tpot_a: float, tpot_b: float, stamp: bool) -> None:
+    """A second interleaved round, so the drift floor has something to measure."""
+    for name, tpot in (("A", tpot_a), ("B", tpot_b)):
+        arm = os.path.join(run, f"arm{name}_r2")
+        os.makedirs(arm, exist_ok=True)
+        write_perf(arm, tpot)
+        if stamp:
+            write_fingerprint(arm)
+
+
 def main() -> int:
     argv = [a for a in sys.argv[1:] if a != "--no-fingerprint"]
     stamp = "--no-fingerprint" not in sys.argv
@@ -101,10 +111,22 @@ def main() -> int:
         write_csv(os.path.join(arm, "prof_csv", "kernel_details.csv"), gaps, extra)
         write_answers(os.path.join(arm, "gsm8k50", "output-rs0.jsonl"),
                       mode if name == "B" else ("emptyfield" if mode == "emptyfield" else "none"))
-        write_perf(arm, tpot if mode != "nogain" else 39.8)
+        if mode == "nogain":
+            write_perf(arm, 39.8)
+        elif mode == "drift":
+            write_perf(arm, 40.0 if name == "A" else 39.5)  # 0.5 ms apart
+        else:
+            write_perf(arm, tpot)
         write_log(arm, dead=(mode == "deadlayers" and name == "B"))
         if stamp:
             write_fingerprint(arm)
+    if mode == "drift":
+        # arm A moves by 3 ms between rounds while A-B is 0.5 ms: the benefit
+        # must read as "inside the machine's own drift"
+        write_round2(run, tpot_a=43.0, tpot_b=42.5, stamp=stamp)
+    if mode == "realgain":
+        # arm A barely moves (0.1) while A-B is 5 ms in both rounds
+        write_round2(run, tpot_a=40.1, tpot_b=35.1, stamp=stamp)
     if mode == "nogain":  # arm B saves almost nothing: the model does not hold
         arm = os.path.join(run, "armB")
         write_csv(os.path.join(arm, "prof_csv", "kernel_details.csv"), 40, 120.0)

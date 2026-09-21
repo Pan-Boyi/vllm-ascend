@@ -31,3 +31,38 @@ pa_card_returned() {  # <status text> <card> <owner> <port> <pgid>
   echo "$why"
   return 1
 }
+
+# Is the card still in use? Two independent readings; either one says "busy"
+# and we keep waiting.
+#
+# Why not one: the process-table reading is what this script had, spelled
+# `grep -qE "process id|pid"` in lower case. npu-smi prints `Process id` with a
+# capital P (see build_artifacts/wait_cards_free.sh:49 and card_owners.sh:43,
+# written independently of this file), and an idle card prints
+# `No process in device.` -- which matches neither pattern either. So the old
+# loop broke on its first iteration in both states: it waited on a busy card
+# for zero seconds and read as if the card were free. A wait that never waits
+# looks exactly like a wait that succeeded.
+#
+# Unreadable output counts as busy: the fail-safe direction for "release the
+# card to the next arm" is to wait, not to proceed.
+pa_card_busy() {  # <card> -> rc 0 = busy (keep waiting), 1 = looks free
+  local card="$1" out pct
+  out=$(timeout 20 npu-smi info -t proc-mem -i "$card" 2>/dev/null) || return 0
+  [ -n "$out" ] || return 0
+  pa_proc_table_busy "$out" && return 0
+  pct=$(timeout 20 npu-smi info -t usages -i "$card" 2>/dev/null \
+        | awk -F: '/HBM Usage Rate/{gsub(/ /,"",$2); print $2; exit}')
+  pa_hbm_busy "${pct:-}" && return 0
+  return 1
+}
+
+pa_proc_table_busy() {  # <proc-mem text> -> rc 0 = a process is listed
+  command grep -qE "Process id *: *[0-9]+|Process id:[0-9]+" <<< "${1:-}"
+}
+
+pa_hbm_busy() {  # <HBM usage percent> -> rc 0 = busy or unreadable
+  local pct="${1:-}"
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 0          # unreadable -> assume busy
+  [ "$pct" -ge "${PA_IDLE_HBM_PCT:-10}" ]
+}

@@ -152,7 +152,10 @@ def test_the_judge_refuses_and_prints_no_delta_across_builds(tmp_path, capsys):
 
 
 def test_the_judge_proceeds_within_one_build(tmp_path, capsys):
-    run = _fixture_run(tmp_path)
+    # "realgain": two interleaved rounds, so the drift floor exists. A
+    # single-round fixture is refused for a different reason (no yardstick for
+    # the difference), which would make this test pass or fail for the wrong one.
+    run = _fixture_run(tmp_path, mode="realgain")
     for arm in ("armA", "armB"):
         _write(run / arm / FP.FILENAME, fp())
     argv = sys.argv

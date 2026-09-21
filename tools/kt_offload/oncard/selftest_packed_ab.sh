@@ -6,6 +6,7 @@
 set -u
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/packed_ab_selftest.XXXXXX")"
+ROOT_ARTIFACTS=/workspace/code/dsv4_single_card/vllm_project/build_artifacts/moe_offload_ref
 PASS=0; FAIL=0
 ok()  { echo "  [PASS] $1"; PASS=$((PASS+1)); }
 bad() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
@@ -42,6 +43,40 @@ why=$(pa_card_returned "$held" 3 dsv41_vllm_singlecard 65000 ""); rc=$?
 chk "$rc" 1 "card NOT returned when the lease is still held"
 echo "$why" | command grep -q "lease still held" && ok "it names why" || bad "it does not name why"
 pa_card_returned "$free" 3 dsv41_vllm_singlecard 65000 "" >/dev/null; chk $? 0 "card returned when nothing holds it"
+
+echo "── the busy-card reading (a wait that never waits looks like a wait that worked)"
+source "$HERE/packed_ab_lib.sh"
+IDLE_SAMPLE="$(cat "$ROOT_ARTIFACTS/oncard_runs/20260920_024812_t0/card_before.txt" 2>/dev/null)"
+[ -n "$IDLE_SAMPLE" ] && ok "a recorded idle npu-smi sample is available" || bad "no recorded idle sample to test against"
+# The busy sample follows the format two independently written shared scripts
+# parse (build_artifacts/wait_cards_free.sh:49, card_owners.sh:43) -- not a
+# format invented here.
+BUSY_SAMPLE="$(printf '\tNPU ID                         : 3\n\tProcess id                     : 1234567\n\tProcess memory(MB)             : 88123\n')"
+pa_proc_table_busy "$IDLE_SAMPLE" && bad "the idle sample reads as busy" || ok "idle sample -> free"
+pa_proc_table_busy "$BUSY_SAMPLE" && ok "busy sample -> busy" || bad "the busy sample reads as free"
+echo "$BUSY_SAMPLE" | command grep -qE "process id|pid" \
+  && bad "the old lower-case pattern would have matched (then it was not the bug)" \
+  || ok "the old lower-case pattern MISSES a busy card -> it had no discriminating power"
+echo "$IDLE_SAMPLE" | command grep -q "No process in device" \
+  && ok "an idle card prints 'No process in device.' (neither pattern matches it either)" \
+  || bad "the idle sample does not say what we think it says"
+pa_hbm_busy 50 && ok "HBM 50% -> busy" || bad "HBM 50% read as free"
+pa_hbm_busy 4 && bad "HBM 4% read as busy" || ok "HBM 4% (a real idle reading) -> free"
+pa_hbm_busy "" && ok "unreadable HBM -> treated as busy (fail-safe direction)" || bad "unreadable HBM read as free"
+pa_hbm_busy "n/a" && ok "garbage HBM -> treated as busy" || bad "garbage HBM read as free"
+command grep -q 'grep -qE "process id|pid"' "$HERE/run_packed_ab.sh" \
+  && bad "the lower-case wait is still in run_packed_ab.sh" || ok "the lower-case wait is gone from the runner"
+command grep -q "busy-reading positive control" "$HERE/run_packed_ab.sh" \
+  && ok "the runner checks its busy reading against a serving card" || bad "no positive control for the busy reading"
+command grep -q "ROUNDS" "$HERE/run_packed_ab.sh" && ok "arms are interleaved in rounds" || bad "no rounds"
+for m in drift realgain; do
+  python3 "$HERE/make_packed_ab_fixture.py" "$TMP/fl_$m" "$m" >/dev/null || bad "fixture $m failed"
+  python3 "$HERE/packed_ab_report.py" "$TMP/fl_$m" > "$TMP/fl_$m.out" 2>&1
+done
+command grep -q "WITHIN the drift floor" "$TMP/fl_drift.out"; ok "a 0.5 ms delta under a 3 ms drift -> not distinguishable"
+command grep -q "EXCEEDS the drift floor" "$TMP/fl_realgain.out"; ok "a 5 ms delta over a 0.3 ms drift -> a real difference"
+python3 "$HERE/packed_ab_report.py" "$TMP/good" > "$TMP/onerounds.out" 2>&1
+command grep -q "drift floor: NOT MEASURED" "$TMP/onerounds.out"; ok "one round per arm -> the floor is reported as not measured"
 
 echo "── A/A control: MODE=aa and every branch of its decision table"
 out=$(MODE=aa ONCARD_DRY=1 PACKED_AB_RUNS_DIR="$TMP/aaruns" bash "$HERE/run_packed_ab.sh" 3 2>&1); rc=$?
@@ -111,7 +146,11 @@ command grep -q 'oc_scan_anomaly "$(oc_anomaly_regex)"' "$HERE/run_packed_ab.sh"
 echo "── report: missing arms, and the fixtures"
 python3 "$HERE/packed_ab_report.py" "$TMP/nothing" >/dev/null 2>&1; chk $? 1 "missing arm dirs -> fail, not crash"
 python3 "$HERE/make_packed_ab_fixture.py" "$TMP/good" identical || bad "fixture builder failed"
-python3 "$HERE/packed_ab_report.py" "$TMP/good" > "$TMP/good.txt" 2>&1; chk $? 0 "identical arms -> pass"
+python3 "$HERE/packed_ab_report.py" "$TMP/good" > "$TMP/good.txt" 2>&1; r=$?
+[ $r -eq 1 ]; ok "identical answers but ONE round and a 5 ms delta -> refused for lack of a drift floor (rc $r)"
+command grep -q "no drift floor" "$TMP/good.txt"; ok "and it names the missing yardstick"
+python3 "$HERE/make_packed_ab_fixture.py" "$TMP/twor" realgain >/dev/null || bad "fixture builder failed"
+python3 "$HERE/packed_ab_report.py" "$TMP/twor" > "$TMP/twor.txt" 2>&1; chk $? 0 "identical answers + two rounds + delta over the floor -> pass"
 command grep -q "implied C = 62" "$TMP/good.txt" && ok "C is solved from the arms (fixture is built for 62 us)" \
   || { bad "C not solved as expected"; command grep -i "C = " "$TMP/good.txt" | sed 's/^/     /'; }
 command grep -q "model is retired" "$TMP/good.txt" && ok "the report says the unit-price model is retired" \

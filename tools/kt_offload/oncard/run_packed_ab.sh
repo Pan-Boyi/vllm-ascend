@@ -64,10 +64,11 @@ NUMA="${NUMA:-0,1}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-1800}"
 MODE="${MODE:-ab}"
 case "$MODE" in
-  ab) AA_EVALS="${AA_EVALS:-c8}";;
-  aa) AA_EVALS="${AA_EVALS:-c8,c8b,c1}";;
+  ab) AA_EVALS="${AA_EVALS:-c8}"; ROUNDS="${ROUNDS:-2}";;
+  aa) AA_EVALS="${AA_EVALS:-c8,c8b,c1}"; ROUNDS="${ROUNDS:-1}";;
   *) echo "usage: MODE=ab|aa $0 <card>"; exit 2;;
 esac
+[ "$ROUNDS" -ge 1 ] || { echo "ROUNDS must be >= 1"; exit 2; }
 
 # ---- snapshot first: bash reads a script by byte offset, so editing this file
 #      while it runs corrupts that run. exec keeps the PID, so LEASE_PID=$$ is
@@ -96,6 +97,7 @@ if [ "$MODE" = "aa" ]; then
 fi
 say "  VLLM_USE_BREAKABLE_CUDAGRAPH=1 (explicit; the platform defaults it to 0 and O15 refuses graph mode without it)"
 say "  host-func sampling: VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=${HFLOG}s in BOTH arms (A is the baseline shape)"
+say "  rounds: ${ROUNDS} (arms interleaved A,B,A,B...; two same-arm rounds give the machine's drift floor)"
 say "  eval parameters (identical in both modes, one function): 50 questions, greedy (temperature 0, top-p 1.0), max-tokens 4096, thinking off"
 
 # ---- preflight: host only, before any lease -------------------------------
@@ -154,11 +156,20 @@ teardown() {  # $1 = arm dir, $2 = serve pgid
     fi
   fi
   for _ in $(seq 1 60); do pa_port_busy "$PORT" || break; sleep 1; done
-  # pid gone is not context freed: wait for the card's process table too
-  for _ in $(seq 1 60); do
-    npu-smi info -t proc-mem -i "$CARD" 2>/dev/null | command grep -qE "process id|pid" || break
-    sleep 2
+  # pid gone is not context freed: wait until BOTH the card's process table and
+  # its HBM say the card is free (pa_card_busy; the old lower-case grep here
+  # never matched npu-smi's "Process id", so this loop used to exit at once).
+  local waited=0
+  while [ "$waited" -lt "${PA_TEARDOWN_WAIT_S:-300}" ] && pa_card_busy "$CARD"; do
+    [ $((waited % 60)) -eq 0 ] && say "     ⚪ card $CARD still busy (process table or HBM), waited ${waited}s"
+    sleep 5; waited=$((waited + 5))
   done
+  if pa_card_busy "$CARD"; then
+    say "     ❌ card $CARD still reads busy after ${waited}s -- not handing it to the next arm"
+    ok=0
+  else
+    say "     card free after ${waited}s (process table empty and HBM < ${PA_IDLE_HBM_PCT:-10}%)"
+  fi
   bash "$ROOT/build_artifacts/card_lease.sh" release "$CARD" "$OWNER" >>"$arm/stop.log" 2>&1
   bash "$ROOT/build_artifacts/card_lease.sh" status > "$arm/lease_after.txt" 2>&1
   local why
@@ -186,9 +197,11 @@ run_evals() {  # $1 = arm dir. The ONLY place a GSM8K eval is launched.
   done
 }
 
-run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false
-  local name="$1" packed="$2"
-  local arm="$RUN/arm$name"; mkdir -p "$arm/cap"
+run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false, $3 = round (1-based)
+  local name="$1" packed="$2" round="${3:-1}"
+  local arm="$RUN/arm$name"
+  [ "$round" -gt 1 ] && arm="$RUN/arm${name}_r${round}"
+  mkdir -p "$arm/cap"
   cp -p "$RUN/build_fingerprint.json" "$arm/" 2>/dev/null || true
   local profdir="/dev/shm/dsv41_prof_packed_$name"
   rm -rf "$profdir"; mkdir -p "$profdir"
@@ -225,23 +238,41 @@ run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false
   say "  service ready after ${waited}s"
   command grep -m1 "BREAKABLE_CUDAGRAPH" "$arm/serve.log" | sed 's/^/     /' | tee -a "$SUM" >/dev/null
 
-  # ---- GSM8K 50, greedy, thinking off (same function in both modes)
-  run_evals "$arm" || { teardown "$arm" "${pgid:-}"; return 5; }
-  cp -p "$arm/gsm8k50.log" "$arm/gsm8k.log" 2>/dev/null || true
-
-  if [ "$MODE" = "aa" ]; then
-    # nothing in an A/A compares timing or kernels: skip perf and the profile
-    # rather than pay 6 minutes of window for numbers nobody will read
-    say "  (aa mode: perf and profile skipped)"
-    teardown "$arm" "${pgid:-}" || return 6
-    return 0
+  # ---- positive control for the busy reading: the service is up right now,
+  # so pa_card_busy MUST say busy. If it does not, every later "the card is
+  # free" reading is worthless, and the run says so instead of trusting it.
+  if pa_card_busy "$CARD"; then
+    echo "busy-while-serving: yes" > "$arm/card_busy_control.txt"
+    say "  busy-reading positive control: card reads BUSY while serving ✅"
+  else
+    echo "busy-while-serving: NO" > "$arm/card_busy_control.txt"
+    say "  ❌ busy-reading positive control FAILED: the card reads free while the service is serving."
+    say "     Every 'card returned' verdict in this run is therefore unproven (npu-smi format changed?)."
   fi
 
+  # ---- GSM8K 50, greedy, thinking off (same function in both modes).
+  # Correctness does not drift with the hour, so later rounds skip it and spend
+  # their minutes on the thing that does: the paired timing.
+  if [ "$round" -eq 1 ]; then
+    run_evals "$arm" || { teardown "$arm" "${pgid:-}"; return 5; }
+    cp -p "$arm/gsm8k50.log" "$arm/gsm8k.log" 2>/dev/null || true
+  else
+    say "  (round $round: GSM8K skipped -- answers do not drift with the clock, timing does)"
+  fi
+
+
   # ---- TPOT: same script, same cases, n=REPEAT
-  ( cd "$ROOT" && PORT="$PORT" LABEL="packed_arm$name" NOTE="packed_transfer=$packed" \
+  ( cd "$ROOT" && PORT="$PORT" LABEL="packed_arm${name}_r${round}" NOTE="packed_transfer=$packed round=$round" \
       CASES="bs1 1 16" REPEAT="$REPEAT" PERF_OUT="$arm/perf" \
       bash build_artifacts/perf_baseline.sh ) >"$arm/perf.log" 2>&1
   say "  perf rc=$? -> $arm/perf/summary.txt"
+
+  if [ "$MODE" = "aa" ] || [ "$round" -gt 1 ]; then
+    # A/A compares no kernels, and a later round only needs its perf numbers.
+    say "  (profile skipped: mode=$MODE round=$round)"
+    teardown "$arm" "${pgid:-}" || return 6
+    return 0
+  fi
 
   # ---- decode profile (the capture script prints success even on 404)
   ( cd "$ROOT" && python3 build_artifacts/eval_runners/prof_decode_capture.py \
@@ -286,9 +317,18 @@ if [ "$MODE" = "aa" ]; then
 else
   ARM_SPECS=("A false" "B true")
 fi
-for spec in "${ARM_SPECS[@]}"; do
-  set -- $spec
-  run_arm "$1" "$2" || { rc=$?; say "❌ arm $1 failed (rc=$rc); stopping before the next arm"; break; }
+# Interleaved, not blocked. This machine has been measured 2.5x slower 11 hours
+# apart on one commit, and the old shape put arm A at 09:48 and arm B at 10:28
+# -- 40 minutes during which the machine itself is a second variable. A,B,A,B
+# gives paired differences plus, from the two A rounds, a drift floor a real
+# benefit has to clear. Service restarts cannot be interleaved (the switch
+# lives in the config), so the round is the smallest unit that can be.
+for round in $(seq 1 "$ROUNDS"); do
+  for spec in "${ARM_SPECS[@]}"; do
+    set -- $spec
+    say "── round $round, arm $1"
+    run_arm "$1" "$2" "$round" || { rc=$?; say "❌ round $round arm $1 failed (rc=$rc); stopping"; break 2; }
+  done
 done
 
 say "── report"

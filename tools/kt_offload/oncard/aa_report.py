@@ -9,6 +9,12 @@ way:
   * the criterion is blunt -- two runs of the SAME configuration already
     differ, because 8 concurrent requests make batch composition vary and the
     reductions inside a batch are not associative;
+
+It also measures something the A/B needed and never had: with both arms
+identical, their TPOT difference IS this machine's drift over those ~20
+minutes (it has been measured 2.5x slower on one commit 11 hours apart). That
+number is printed as a noise floor, and any later A/B difference has to clear
+it.
   * or packed really changed the numbers.
 
 So: run the same arm twice, changing nothing, with the same harness (the
@@ -146,6 +152,21 @@ def main() -> int:
         within[name] = cmp_
         print(line(f"arm {name}: concurrency 8, eval 1 vs eval 2", cmp_))
 
+    print("\n=== 2.5 the machine's own drift, from these two arms (same configuration, ~20 min apart)")
+    tpot = {name: REPORT.load_tpot(arms[name]) for name in ("A1", "A2")}
+    for name in ("A1", "A2"):
+        t = tpot[name]
+        print(f"  arm {name}: " + (f"median {t['median']:.2f} ms  mean {t['mean']:.2f} +- {t['stdev']:.2f}  n={t['n']}"
+                                   if t["n"] else "no TPOT samples"))
+    if tpot["A1"]["n"] and tpot["A2"]["n"]:
+        floor = abs(tpot["A1"]["median"] - tpot["A2"]["median"])
+        print(f"  ⇒ NOISE FLOOR = {floor:.2f} ms/token. Two runs of the same configuration differ by this much,")
+        print("    so no A/B difference smaller than it means anything -- including the packed A/B's")
+        print("    -0.74 ms median, which was measured with the arms 40 minutes apart.")
+    else:
+        floor = None
+        print("  ⇒ no floor measurable (an arm has no perf samples); run aa mode without skipping perf")
+
     c8, c1 = cross.get("gsm8k50", {}), cross.get("gsm8k50_c1", {})
     print("\n=== 3. verdict")
     if not usable(c8) or not usable(c1):
@@ -216,6 +237,8 @@ def main() -> int:
                 "within_start": {k: {"identical": v["identical"], "n": v["n"], "differ": len(v["differ"])}
                                  for k, v in within.items()},
                 "verdict": verdict,
+                "tpot_ms": {k: {kk: v.get(kk) for kk in ("median", "mean", "stdev", "n")} for k, v in tpot.items()},
+                "noise_floor_ms": floor,
                 "criterion_discriminates_at_c8": not c8_differs,
                 "criterion_discriminates_at_c1": not c1_differs,
             },

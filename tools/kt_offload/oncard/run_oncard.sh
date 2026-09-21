@@ -157,10 +157,23 @@ cleanup() {
   if [ "$LEASED" = 1 ]; then
     # pid gone != device context freed: wait until the card's process table drops it.
     local waited=0
+    # Two readings, either one keeps us waiting: the process table (by our pid)
+    # and HBM occupancy. A pid can leave the table while its context is still
+    # being torn down (113 GiB x 4 has taken >20 minutes), and a reading that
+    # only knows one of the two answers "free" halfway through.
     while [ -n "$TEST_PID" ] && [ "$waited" -lt "${ONCARD_TEARDOWN_WAIT_S:-1800}" ]; do
       out=$(timeout 20 npu-smi info -t proc-mem -i "$CARD" 2>/dev/null) || break
-      command grep -qE "Process id *: *${TEST_PID}\b|Process id:${TEST_PID}\b" <<< "$out" || break
-      [ $((waited % 60)) -eq 0 ] && say "⚪ card $CARD still lists pid $TEST_PID (teardown), waited ${waited}s"
+      hbm=$(timeout 20 npu-smi info -t usages -i "$CARD" 2>/dev/null \
+            | awk -F: '/HBM Usage Rate/{gsub(/ /,"",$2); print $2; exit}')
+      still_listed=0; hbm_busy=0
+      command grep -qE "Process id *: *${TEST_PID}\b|Process id:${TEST_PID}\b" <<< "$out" && still_listed=1
+      if [[ "$hbm" =~ ^[0-9]+$ ]]; then
+        [ "$hbm" -ge "${ONCARD_IDLE_HBM_PCT:-10}" ] && hbm_busy=1
+      else
+        hbm_busy=1   # unreadable: wait rather than hand over a card we cannot read
+      fi
+      [ "$still_listed" = 0 ] && [ "$hbm_busy" = 0 ] && break
+      [ $((waited % 60)) -eq 0 ] && say "⚪ card $CARD teardown: pid listed=$still_listed HBM=${hbm:-?}% waited ${waited}s"
       sleep 5; waited=$((waited + 5))
     done
     timeout 20 npu-smi info -t usages -i "$CARD" > "$RUN/card_after.txt" 2>&1

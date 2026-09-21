@@ -96,11 +96,25 @@ def machine_load() -> dict:
             ["ps", "-eo", "pid,comm,pcpu,rss", "--sort=-pcpu"],
             capture_output=True, text=True, timeout=20,
         )
-        busiest = [l for l in top.stdout.splitlines()[1:11]]
+        busiest = list(top.stdout.splitlines()[1:11])
     except Exception as exc:  # noqa: BLE001
         busiest = [f"<ps failed: {exc}>"]
+    def _sh(*cmd) -> str:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    online = _sh("getconf", "_NPROCESSORS_ONLN")
     return {
         "loadavg": la[:3],
+        # nproc returns min(affinity, OMP_NUM_THREADS) and OMP_NUM_THREADS=1 in
+        # this container: it reports 1 on a 256-core machine. Record the true
+        # count and the misleading one together, or a later reader will take
+        # "1 CPU" for a finding.
+        "cpus_online_getconf": int(online) if online.isdigit() else None,
+        "nproc_reports": int(_sh("nproc") or 0) or None,
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
         "mem_available_kb": mem_available_kb(),
         "top10_by_cpu": busiest,
         "wallclock": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -113,6 +127,11 @@ def check_mem(stage: str, floor_kb: int) -> None:
         raise SystemExit(
             f"[gate] {stage}: MemAvailable {kb / 1e6:.1f} GB < floor {floor_kb / 1e6:.1f} GB -- stopping"
         )
+
+
+def _loadavg_now() -> str:
+    with open("/proc/loadavg") as f:
+        return f.read().split()[0]
 
 
 def pct(xs, q):
@@ -250,7 +269,7 @@ def main():
                 distinct_experts_p50=n_distinct,
                 implied_gbs=(distinct_bytes / (med * 1e-6) / 1e9) if med > 0 and k else 0.0,
                 mem_available_kb=mem_available_kb(),
-                loadavg=open("/proc/loadavg").read().split()[0],
+                loadavg=_loadavg_now(),
             )
             results.append(row)
             print(f"T={T:<3d} k_cpu={k}  p50={row['p50']:8.1f} us  "
