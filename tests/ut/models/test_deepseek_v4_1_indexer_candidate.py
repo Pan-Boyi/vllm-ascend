@@ -256,6 +256,18 @@ def _metadata(num_tokens=TOKENS, max_seq_len=64):
     return SimpleNamespace(req_metadata=req, max_seq_len=max_seq_len)
 
 
+@pytest.fixture(autouse=True)
+def ds41_present(monkeypatch):
+    """The operators are there, unless a test says otherwise.
+
+    Without this the wheels' absence would decide what these tests exercise:
+    every role test would silently take the v2 fallback and assert nothing
+    about the candidate path, on exactly the machines where the path is not
+    installed. The two tests that are *about* the fallback patch it back.
+    """
+    monkeypatch.setattr(mod, "load_ds41", lambda: True)
+
+
 @pytest.fixture
 def forward_context(monkeypatch):
     holder = SimpleNamespace(attn_metadata=None)
@@ -496,3 +508,30 @@ def test_a_candidate_copy_that_would_cross_the_host_is_refused(
 
     with pytest.raises(RuntimeError, match="through the host"):
         _run(indexer, forward_context)
+
+
+@pytest.mark.parametrize("role", ["publisher", "consumer"])
+def test_without_the_operators_every_layer_falls_back_to_v2(
+        forward_context, monkeypatch, role):
+    """🔴 Regression: the service refused to start at max_model_len 16384.
+
+    The guard passes at 16384 -- that length needs no candidate filtering at
+    all -- but the role dispatch sent layer 20 to the ds41 publisher anyway,
+    which is not installed in production. The failure surfaced at graph
+    capture during startup, several frames from anything mentioning
+    candidates, at a length where the feature is irrelevant.
+    """
+    monkeypatch.setattr(mod, "load_ds41", lambda: False)
+    indexer = _Indexer(candidate_blocks=_blocks(),
+                       candidate_write=(role == "publisher"))
+    seen = {}
+    monkeypatch.setattr(
+        mod, "select_topk", lambda **kw:
+        (seen.update(kw), torch.zeros(TOKENS, 1, TOPK,
+                                      dtype=torch.int32))[1])
+    monkeypatch.setattr(mod.AscendSparseAttnIndexer, "_qli_metadata",
+                        lambda *a, **k: "descriptor")
+
+    _run(indexer, forward_context)
+
+    assert seen["metadata"] == "descriptor"

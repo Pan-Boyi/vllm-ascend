@@ -376,6 +376,21 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         quantisation-mode encoding and the metadata descriptor, and nothing
         about the 16k ceiling comes from them.
         """
+        # 🔴 Role is not enough: without the ds41 operators there is nothing
+        # to publish *into* and nothing that can read a mask, so every layer
+        # falls back to v2 -- which the guard above has already established
+        # is exact at this length. Dispatching on role alone made layer 20
+        # call an operator that is not there, and the failure was at graph
+        # capture during startup, not at import: the service refused to come
+        # up at max_model_len 16384, a length that has nothing to do with
+        # candidates. Found by running the unchanged 16k configuration.
+        if not self.candidate_filtering_available():
+            return select_topk(
+                **common,
+                metadata=self._qli_metadata(req, seqused_k, cmp_residual_k,
+                                            metadata.max_seq_len,
+                                            num_heads_q=num_heads_q),
+            )
         if self.publishes_candidates:
             topk_idxs, candidate_indices, candidate_lengths = (
                 publish_candidates(
