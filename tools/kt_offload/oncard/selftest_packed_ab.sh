@@ -78,6 +78,14 @@ command grep -q "EXCEEDS the drift floor" "$TMP/fl_realgain.out"; ok "a 5 ms del
 python3 "$HERE/packed_ab_report.py" "$TMP/good" > "$TMP/onerounds.out" 2>&1
 command grep -q "drift floor: NOT MEASURED" "$TMP/onerounds.out"; ok "one round per arm -> the floor is reported as not measured"
 
+echo "── the fingerprint must watch the package that is loaded, not the shared baseline"
+python3 "$HERE/../build_fingerprint.py" capture > "$TMP/fp_now.json" 2>/dev/null
+python3 "$HERE/fp_object_check.py" "$TMP/fp_now.json" "$HERE/../build_fingerprint.py" > "$TMP/fp_obj.out" 2>&1; r=$?
+[ $r -eq 0 ]; ok "fingerprint watches the tree's own package ($(tail -n1 "$TMP/fp_obj.out"))"
+python3 "$HERE/fp_empty_check.py" "$HERE/../build_fingerprint.py" > "$TMP/fp_empty.out" 2>&1; r=$?
+[ $r -eq 0 ]; ok "an unread package is refused, not hashed to the empty constant ($(tail -n1 "$TMP/fp_empty.out"))"
+command grep -q "EMPTY_SHA256" "$HERE/../build_fingerprint.py"; ok "the empty-hash sentinel is named in the tool"
+
 echo "── A/A control: MODE=aa and every branch of its decision table"
 out=$(MODE=aa ONCARD_DRY=1 PACKED_AB_RUNS_DIR="$TMP/aaruns" bash "$HERE/run_packed_ab.sh" 3 2>&1); rc=$?
 chk "$rc" 0 "MODE=aa dry run stops before acquire"

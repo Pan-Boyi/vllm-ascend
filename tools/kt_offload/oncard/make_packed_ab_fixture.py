@@ -69,17 +69,37 @@ def write_log(arm: str, dead: bool) -> None:
         f.write("")
 
 
+
+def _schema() -> str:
+    """Read the current schema from build_fingerprint.py."""
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "build_fingerprint.py"), os.path.join(here, "..", "build_fingerprint.py")):
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location("build_fingerprint", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.SCHEMA
+    raise SystemExit("build_fingerprint.py not found: a fixture cannot guess the schema")
+
+
 def write_fingerprint(arm: str) -> None:
     """A real run is always stamped, so a fixture must be too -- otherwise the
     judge refuses it for the right reason and every other check in the
     self-test reads as broken. ``--no-fingerprint`` builds the unstamped case
     on purpose."""
+    # schema comes from the tool, not a literal: a fixture pinned to an old
+    # schema silently turns every downstream check into "not comparable"
     fp = {
-        "schema": "kt_offload/build_fingerprint/1",
+        "schema": _schema(),
         "label": "fixture",
         "so_primary_md5": "f" * 24 + "1234",
         "so_primary_md5_short": ("f" * 24 + "1234")[:12],
         "vendors_sha256": "e" * 64,
+        "vendors_files": 759,
+        "vendors_bytes": 118_000_000,
+        "vendors_ok": True,
         "kt_wheel_sha256": "d" * 64,
         "trees": {"vllm_ascend": {"head": "c" * 40}, "vllm": {"head": "b" * 40}},
         "backfilled": False,

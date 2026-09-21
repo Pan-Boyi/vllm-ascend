@@ -345,12 +345,16 @@ def main() -> int:
         print(f"  arm {name}: {gate.get('lines', {}).get(name, 'no fingerprint')}")
     for reason in gate.get("reasons", []):
         print(f"  {reason}")
-    if not gate["ok"]:
-        print(f"  ⛔ REFUSING to report differences: {gate['why']}")
-        print("     The two arms were not measured on the same build, so their difference answers no "
-              "question anyone asked. Re-run both arms inside one build.")
-        return 1
-    print("  ⇒ same build: the arms may be compared")
+    subtract_ok = gate["ok"]
+    if not subtract_ok:
+        blocking = [r for r in gate.get("reasons", []) if not r.startswith("ADVISORY ")]
+        print(f"  ⛔ NO DIFFERENCE WILL BE COMPUTED ({len(blocking)} blocking reason(s), listed above)")
+        print("     The comparisons that do not subtract (bit-identity of the answers, the host-func")
+        print("     counts, the anomaly scan) still run below and are still meaningful; every number")
+        print("     that would be a difference is suppressed, and this report exits non-zero.")
+        fails.append("builds not shown identical: no difference between these arms may be used")
+    else:
+        print("  ⇒ same build: the arms may be compared")
 
     print("\n=== 1. answers, bit-identical (the criterion; TPOT decides nothing until this passes)")
     ans = {n: load_answers(p) for n, p in arms.items()}
@@ -368,6 +372,8 @@ def main() -> int:
         fails.append(f"{len(cmp_['differ'])} answers differ between the arms")
 
     print("\n=== 2. TPOT (bs1), paired by round -- and the machine's own drift")
+    if not subtract_ok:
+        print("  ⛔ skipped: a TPOT delta across builds (or across fingerprint schemas) is not a result")
     rounds = discover_rounds(run)
     print(f"  rounds found: {sorted(rounds)}")
     per_round, arm_series = {}, {"A": {}, "B": {}}
@@ -384,7 +390,12 @@ def main() -> int:
             t = row[name]
             parts.append(f"{name} {t['median']:.2f} (n={t['n']})" if t["n"] else f"{name} -")
         delta = (row["A"]["median"] - row["B"]["median"]) if row["A"]["n"] and row["B"]["n"] else None
-        tail = f"  A-B = {delta:+.2f} ms/token" if delta is not None else "  A-B = n/a"
+        if not subtract_ok:
+            tail = "  A-B = suppressed (builds not shown identical)"
+        elif delta is None:
+            tail = "  A-B = n/a"
+        else:
+            tail = f"  A-B = {delta:+.2f} ms/token"
         print(f"  round {r}: " + "  ".join(parts) + tail)
         if not (row["A"]["n"] and row["B"]["n"]):
             fails.append(f"round {r} is missing an arm's TPOT samples")
@@ -400,7 +411,9 @@ def main() -> int:
               "told from this machine drifting; it has been seen 2.5x slower 11 hours apart")
     else:
         print(f"  drift floor (same arm, different rounds): {floor['line']}")
-    if deltas:
+    if deltas and not subtract_ok:
+        print("  paired A-B deltas: suppressed (builds not shown identical)")
+    elif deltas:
         med = statistics.median(deltas)
         print(f"  paired A-B deltas: {[round(d, 2) for d in deltas]}  median {med:+.2f} ms/token")
         if floor is None and abs(med) > 0.05:
@@ -435,7 +448,11 @@ def main() -> int:
               f"(median {g['big_median_us']:.0f} us)")
 
     print("\n=== 4. per-operation cost C, solved from the arms (model retired; see the note)")
-    c = solve_c(gt.get("A", {}), gt.get("B", {}), window_us)
+    if not subtract_ok:
+        print("  ⛔ skipped: C is a difference between the arms")
+        c = {"ok": False, "why": "builds not shown identical"}
+    else:
+        c = solve_c(gt.get("A", {}), gt.get("B", {}), window_us)
     if not c["ok"]:
         print(f"  not solvable: {c['why']}")
         fails.append("C could not be solved")

@@ -38,9 +38,13 @@ FP = _load("build_fingerprint", TOOLS / "build_fingerprint.py")
 REPORT = _load("packed_ab_report", TOOLS / "oncard" / "packed_ab_report.py")
 
 
-def fp(so="a" * 32, vendors="v" * 64, kt="k" * 64, head="1" * 40, vllm_head="2" * 40, backfilled=False):
+def fp(so="a" * 32, vendors="v" * 64, kt="k" * 64, head="1" * 40, vllm_head="2" * 40, backfilled=False,
+       files=759, nbytes=118_000_000):
     return {
-        "schema": "kt_offload/build_fingerprint/1",
+        "schema": FP.SCHEMA,
+        "vendors_files": files,
+        "vendors_bytes": nbytes,
+        "vendors_ok": True,
         "so_primary_md5": so,
         "so_primary_md5_short": so[:12],
         "vendors_sha256": vendors,
@@ -146,8 +150,15 @@ def test_the_judge_refuses_and_prints_no_delta_across_builds(tmp_path, capsys):
         sys.argv = argv
     out = capsys.readouterr().out
     assert rc == 1, out
-    assert "REFUSING to report differences" in out
-    assert "delta" not in out.lower(), "a number was still subtracted across builds"
+    assert "NO DIFFERENCE WILL BE COMPUTED" in out
+    # the sections that do not subtract still run (bit-identity, host-func
+    # counts): suppressing them would throw away evidence that is still valid.
+    assert "answers, bit-identical" in out
+    # ... but nothing was actually differenced
+    assert "paired A-B deltas: suppressed" in out or "skipped" in out
+    import re as _re
+
+    assert not _re.search(r"A-B = [+-]\d", out), "a delta was printed across builds"
     assert "a" * 12 in out and "b" * 12 in out, "the refusal must print both fingerprints"
 
 
@@ -218,3 +229,95 @@ def test_vendors_fingerprint_notices_a_moved_symlink(tmp_path):
     link.unlink()
     link.symlink_to(tmp_path / "real2")
     assert FP.vendors_fingerprint(str(tmp_path))["sha256"] != first
+
+
+# -- the object the fingerprint must watch -------------------------------
+
+
+def test_the_loaded_package_is_the_one_that_decides():
+    """The operator package is loaded from whichever tree is imported, it is
+    gitignored, and neither git merge nor the distribution scripts touch it --
+    so the tree's own copy and the shared baseline drift apart (759 files here
+    against 786 in build_artifacts/vendor92 on 2026-09-21). Hashing the shared
+    one let a swap in OUR tree read as "same build": the guard watched the
+    wrong object."""
+    got = FP.capture(label="unit-test")
+    assert got["vendors_source"].endswith("vllm_ascend/_cann_ops_custom/vendors"), got["vendors_source"]
+    assert "build_artifacts/vendor92" not in got["vendors_source"]
+    # the shared baseline is still recorded, labelled, and out of the decision
+    assert got["vendors_shared_baseline"]["role"] == "shared_baseline"
+    assert "vendors_shared_baseline" not in FP.BLOCKING
+    assert got["vendors"]["role"] == "loaded"
+
+
+def test_two_trees_with_different_packages_are_different_builds():
+    """The case that used to pass: only the loaded package differs."""
+    a = fp()
+    b = fp()
+    b["vendors_sha256"] = "z" * 64
+    b["vendors_files"] = 700
+    ok, reasons = FP.same_build(a, b)
+    assert not ok
+    assert any("vendors_sha256 differs" in r for r in reasons)
+    assert any("vendors_files differs" in r for r in reasons)
+
+
+def test_a_difference_in_the_shared_baseline_alone_does_not_block():
+    """It is context, not the thing that ran."""
+    a = fp()
+    b = fp()
+    a["vendors_shared_baseline"] = {"sha256": "1" * 64, "files": 786, "role": "shared_baseline"}
+    b["vendors_shared_baseline"] = {"sha256": "2" * 64, "files": 700, "role": "shared_baseline"}
+    ok, _ = FP.same_build(a, b)
+    assert ok
+
+
+def test_an_empty_package_is_refused_not_hashed(tmp_path):
+    """sha256 of nothing is a constant, so two failed reads would compare
+    equal and print as "same build"."""
+    empty = FP.vendors_fingerprint(str(tmp_path), role="loaded")
+    assert empty["ok"] is False and empty["files"] == 0
+    assert "sha256" not in empty, "an empty directory must not get a hash at all"
+    assert "0 files" in empty["why"] and FP.EMPTY_SHA256[:16] in empty["why"]
+    assert FP.EMPTY_SHA256[:16] == "e3b0c44298fc1c14"  # the sentinel to look for in a report
+    missing = FP.vendors_fingerprint(str(tmp_path / "nope"), role="loaded")
+    assert missing["ok"] is False and "sha256" not in missing
+
+
+def test_an_unreadable_package_blocks_the_comparison():
+    a, b = fp(), fp()
+    for side in (a, b):
+        side["vendors_ok"] = False
+        side["vendors_files"] = 0
+        side["vendors"] = {"why": "0 files under /gone"}
+    ok, reasons = FP.same_build(a, b)
+    assert not ok
+    assert sum("not readable" in r for r in reasons) == 2, reasons
+    assert any(FP.EMPTY_SHA256[:16] in r for r in reasons)
+
+
+def test_the_override_is_honoured_and_recorded(tmp_path, monkeypatch):
+    """DSV41_VENDORS points the fingerprint somewhere else on purpose; the
+    artifact must say so, or a later reader cannot tell what was measured."""
+    (tmp_path / "libfake.so").write_bytes(b"x" * 16)
+    monkeypatch.setenv("DSV41_VENDORS", str(tmp_path))
+    reloaded = _load("build_fingerprint_override", TOOLS / "build_fingerprint.py")
+    got = reloaded.capture(label="override", vendors=reloaded.VENDORS)
+    assert got["vendors_source"] == str(tmp_path)
+    assert got["vendors_source_is_override"] is True
+    assert got["vendors_files"] == 1 and got["vendors_bytes"] == 16
+
+
+def test_the_old_schema_cannot_be_subtracted_from():
+    """v1 recorded the shared baseline (or nothing), so a v1 artifact's numbers
+    may be quoted but never differenced."""
+    old = fp()
+    old["schema"] = "kt_offload/build_fingerprint/1"
+    ok, reasons = FP.same_build(old, fp())
+    assert not ok
+    assert any(r.startswith("OLDSCHEMA") for r in reasons)
+    assert any("SHARED BASELINE" in r for r in reasons)
+
+
+def test_counts_are_part_of_the_decision():
+    assert "vendors_files" in FP.BLOCKING and "vendors_bytes" in FP.BLOCKING

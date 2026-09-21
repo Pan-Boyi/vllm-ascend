@@ -813,6 +813,38 @@ A/B 的 31/50 在报告第 4 节被**引用**并附出处核对结果；构建�
 
 
 
+## k.14 🔴 指纹工具自己盯错了对象（2026-09-21，在我们刚做的护栏里）
+
+`build_fingerprint.py` 第一版把 `vendors` 指向 **`build_artifacts/vendor92`（786 文件）**——那是**共享基准**。
+而真正被加载的是**被 import 的那棵树自己的** `vllm_ascend/_cann_ops_custom/vendors`（我们树 **759 文件 / 118 MB**）。
+flash_dev 查清的机制：算子包**按被 import 的那棵树加载**，且 **gitignored ⇒ git merge 带不来、分发脚本也不碰**。
+⇒ 我们树里的算子包被换掉时**指纹不会变**，判读照样说"同构建"——**要防的那件事，防在了错的对象上**。
+实测两者今天确实不同（759 vs 786 文件、118 vs 132 MB、哈希不同）。
+
+改法：
+1. 主指纹＝**运行时会被 import 的那一份**（按 `TREE` 解析，`DSV41_VENDORS` 可覆盖且**记录来源路径与是否被覆盖**）；
+   `vendor92` 作为 `vendors_shared_baseline` 保留，**显式标注 role=shared_baseline，不参与"同构建"判定**。
+2. **文件数与字节数并排记且参与判定**（`vendors_files` / `vendors_bytes` 进 `BLOCKING`）：
+   目录不存在或 `files==0` ⇒ **拒绝**，且**不给哈希**。空输入的 sha256 是常量
+   **`e3b0c44298fc1c14…`**，两次读空会"相等" ⇒ 看到这个值就说明**没读到**（自检里显式断言这个常量）。
+3. schema 升到 **`/2`**；旧产物补盖的那份保持 **`/1`** 并写清 `vendors_provenance: UNRECORDED`
+   （含"当时那版工具量的是共享基准，所以即便有 v1 哈希也不描述真正跑的东西"）。
+   判读遇到旧 schema **只提示、不减法**：`packed_ab_report.py` 现在把"拒绝"细化成
+   **拒绝减法但照常跑不涉及减法的判据**（答案逐位比较、host-func 计数、异常扫描仍然有效且仍会打印），
+   每一处会产生差值的数字都打印 `suppressed`，rc 仍非零。
+4. 判据锁在工具上：两个 fixture 生成器改为**从 `build_fingerprint.py` 读 `SCHEMA`**——它们原来写死 `/1`，
+   升级 schema 后会把所有下游检查静默变成"不可比"（这次就是这么被自检抓到的）。
+5. 单测 8 条 + 自检 3 条：空目录必须拒绝且报错里出现 `files=0` 与那个常量；两棵树内容不同 ⇒ 必须判不同构建
+   （**这条原来会误判为相同**）；只有共享基准不同 ⇒ 不阻断；`DSV41_VENDORS` 覆盖时以它为准并记下来源；
+   旧 schema 不得相减。
+
+⚠️ `git diff --cached` 在这些仓里对某些索引条目失明（索引里有 6 项却 0 行、rc=0、无 stderr，和真正干净一模一样）。
+我方 kt_offload 的脚本与测试**零命中**（已全扫）。命中的是**上游文件**：
+`tools/check_long_functions.py:50` 用 `git diff --cached` 取"新增行"⇒ 在这里会读成"没有新增行"，
+那个 pre-commit 钩子于是**跳过检查**（偏松的方向）；`tools/check_repo.sh:24` 用 `git diff --quiet`（工作区，不是索引，
+同族但未被 flash_dev 实测）。两处都不是我的文件，未改动，转 flash_dev。判索引请用
+`git diff-index --cached --name-only HEAD` 或 `git status --porcelain`。
+
 ## k.13 仪表的两个坑（flash_dev 2026-09-21 通报，我们都中了）
 
 **① `npu-smi` 的进程表要大写 `Process id`。** 我们 `run_packed_ab.sh` 的"等卡退干净"循环写的是

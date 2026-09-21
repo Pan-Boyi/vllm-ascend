@@ -42,13 +42,31 @@ def write_empty(path: str) -> None:
             f.write(json.dumps({"id": f"gsm8k-{i}", "generation": ""}) + "\n")
 
 
+
+def _schema() -> str:
+    """Read the current schema from build_fingerprint.py."""
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "build_fingerprint.py"), os.path.join(here, "..", "build_fingerprint.py")):
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location("build_fingerprint", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.SCHEMA
+    raise SystemExit("build_fingerprint.py not found: a fixture cannot guess the schema")
+
+
 def fingerprint(arm: str) -> None:
     fp = {
-        "schema": "kt_offload/build_fingerprint/1",
+        "schema": _schema(),
         "label": "aa-fixture",
         "so_primary_md5": "a" * 32,
         "so_primary_md5_short": "a" * 12,
         "vendors_sha256": "b" * 64,
+        "vendors_files": 759,
+        "vendors_bytes": 118_000_000,
+        "vendors_ok": True,
         "kt_wheel_sha256": "c" * 64,
         "trees": {"vllm_ascend": {"head": "d" * 40}, "vllm": {"head": "e" * 40}},
         "backfilled": False,

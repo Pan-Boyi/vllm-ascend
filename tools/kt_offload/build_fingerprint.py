@@ -17,9 +17,19 @@ different question.
 What goes in the fingerprint:
   * ``so``       md5 of every ``vllm_ascend_C*.so`` found, and which one the
                  run would import (the operators' actual object code);
-  * ``vendors``  one sha256 over (relative path, size, md5) of every file in
-                 the operator package -- content, not mtime, because a copy
-                 refreshes mtime without changing a byte;
+  * ``vendors``  the operator package **that this tree imports**
+                 (``<tree>/vllm_ascend/_cann_ops_custom/vendors``): one sha256
+                 over (relative path, size, md5) of every file -- content, not
+                 mtime, because a copy refreshes mtime without changing a byte
+                 -- plus the file count and total bytes, which are part of the
+                 decision. The shared baseline under
+                 ``build_artifacts/vendor92`` is recorded too, labelled, and
+                 takes NO part in the same-build decision: the package is
+                 loaded from whichever tree is imported, it is gitignored, and
+                 git merge and the distribution scripts do not touch it, so
+                 the two can differ (they do today: 759 files here against
+                 786 there) and hashing the shared one would let a swap in
+                 OUR tree pass unnoticed;
   * ``kt_wheel`` sha256 (the CPU MoE);
   * ``trees``    both worktrees' HEAD and dirty-file count.
 
@@ -48,16 +58,24 @@ import sys
 ROOT = os.environ.get("DSV41_ROOT", "/workspace/code/dsv4_single_card/vllm_project")
 TREE = os.environ.get("DSV41_VLLM_ASCEND_TREE", os.path.join(ROOT, "worktrees/moe-offload"))
 VLLM_TREE = os.environ.get("DSV41_VLLM_TREE", os.path.join(ROOT, "worktrees/moe-offload-vllm"))
-VENDORS = os.environ.get("DSV41_VENDORS", os.path.join(ROOT, "build_artifacts/vendor92"))
+# The package that actually gets loaded: the one inside the tree being
+# imported. DSV41_VENDORS overrides it (and the override is recorded).
+VENDORS = os.environ.get("DSV41_VENDORS", os.path.join(TREE, "vllm_ascend/_cann_ops_custom/vendors"))
+VENDORS_SHARED_BASELINE = os.path.join(ROOT, "build_artifacts/vendor92")
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()  # the hash of no input: a constant, and constants always "match"
 KT_WHEEL_GLOB = os.path.join(ROOT, "build_artifacts/moe_offload_ref/kt_wheel/*.whl")
 SO_GLOBS = (
     os.path.join(TREE, "vllm_ascend/vllm_ascend_C*.so"),
     os.path.join(ROOT, "build_artifacts/vllm_ascend_C*.so"),
     os.path.join(ROOT, "vllm-ascend/vllm_ascend/vllm_ascend_C*.so"),
 )
+SCHEMA = "kt_offload/build_fingerprint/2"
 FILENAME = "build_fingerprint.json"
 BACKFILL_NAME = "build_fingerprint.backfilled.json"
-BLOCKING = ("so_primary_md5", "vendors_sha256", "kt_wheel_sha256")
+# Every key here decides. The counts are in on purpose: the hash of an empty
+# directory is a constant, so a hash alone cannot tell "identical packages"
+# from "read nothing twice".
+BLOCKING = ("so_primary_md5", "vendors_sha256", "vendors_files", "vendors_bytes", "kt_wheel_sha256")
 
 
 class CrossBuildError(RuntimeError):
@@ -80,17 +98,27 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def vendors_fingerprint(root: str = VENDORS) -> dict:
-    """One hash over the operator package's *content*.
+def vendors_fingerprint(root: str = VENDORS, role: str = "loaded") -> dict:
+    """Content fingerprint of one operator package, with its size.
 
-    Symlinks are followed and recorded as such: a shared build tree links
-    products between lines, and "the link moved" is a real change here (CANN
-    also refuses to load an operator package reached through a symlink, which
-    is how a whole afternoon once went).
+    ``role`` says what this directory IS: "loaded" (the tree's own package,
+    which decides) or "shared_baseline" (build_artifacts/vendor92, recorded
+    for context only). A fingerprint that does not say which one it measured
+    is how a guard ends up watching the wrong object.
+
+    Symlinks are followed only as names: a shared build tree links products
+    between lines, "the link moved" is a real change here, and CANN refuses an
+    operator package reached through a symlink anyway.
+
+    An absent or empty directory returns ``ok: False`` and no sha256. It must
+    not return the empty-input hash: that value is a constant, so two failed
+    reads would compare equal and print as "same build".
     """
-    if not os.path.isdir(root):
-        return {"path": root, "present": False}
-    entries, links, unreadable = [], 0, 0
+    out = {"path": root, "role": role, "present": os.path.isdir(root)}
+    if not out["present"]:
+        out.update(ok=False, why=f"not a directory: {root}", files=0, bytes=0)
+        return out
+    entries, links, unreadable, total = [], 0, 0, 0
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
@@ -100,7 +128,9 @@ def vendors_fingerprint(root: str = VENDORS) -> dict:
                 entries.append((rel, -1, "link:" + os.readlink(full)))
                 continue
             try:
-                entries.append((rel, os.path.getsize(full), _md5(full)))
+                size = os.path.getsize(full)
+                total += size
+                entries.append((rel, size, _md5(full)))
             except OSError:
                 unreadable += 1
                 entries.append((rel, -2, "unreadable"))
@@ -108,14 +138,13 @@ def vendors_fingerprint(root: str = VENDORS) -> dict:
     h = hashlib.sha256()
     for rel, size, digest in entries:
         h.update(f"{rel}\0{size}\0{digest}\n".encode())
-    return {
-        "path": root,
-        "present": True,
-        "sha256": h.hexdigest(),
-        "files": len(entries),
-        "symlinks": links,
-        "unreadable": unreadable,
-    }
+    out.update(files=len(entries), bytes=total, symlinks=links, unreadable=unreadable)
+    if not entries:
+        out.update(ok=False, why=f"0 files under {root}: an empty package hashes to the constant "
+                                 f"{EMPTY_SHA256[:16]}, which would compare equal to any other empty read")
+        return out
+    out.update(ok=True, sha256=h.hexdigest())
+    return out
 
 
 def host_facts() -> dict:
@@ -172,7 +201,8 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
     primary = next((md5 for path, md5 in so.items() if path.startswith(TREE)), None)
     if primary is None and so:
         primary = next(iter(so.values()))
-    vend = vendors_fingerprint(vendors)  # once: it hashes ~130 MB
+    vend = vendors_fingerprint(vendors, role="loaded")  # once: it hashes ~120 MB
+    shared = vendors_fingerprint(VENDORS_SHARED_BASELINE, role="shared_baseline")
     wheels = sorted(glob.glob(KT_WHEEL_GLOB))
     kt_sha = _sha256(wheels[-1]) if wheels else None
     trees = {}
@@ -184,13 +214,20 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
             "dirty_files": len([ln for ln in _git(tree, "status", "--porcelain").splitlines() if ln]),
         }
     return {
-        "schema": "kt_offload/build_fingerprint/1",
+        "schema": SCHEMA,
         "label": label,
         "so": so,
         "so_primary_md5": primary,
         "so_primary_md5_short": (primary or "")[:12] or None,
         "vendors": vend,
         "vendors_sha256": vend.get("sha256"),
+        "vendors_files": vend.get("files"),
+        "vendors_bytes": vend.get("bytes"),
+        "vendors_ok": vend.get("ok", False),
+        "vendors_source": vend.get("path"),
+        "vendors_source_is_override": bool(os.environ.get("DSV41_VENDORS")),
+        # context only: NOT part of the same-build decision (see the docstring)
+        "vendors_shared_baseline": {k: shared.get(k) for k in ("path", "role", "files", "bytes", "sha256", "ok")},
         "kt_wheel": {"path": wheels[-1] if wheels else None, "sha256": kt_sha},
         "kt_wheel_sha256": kt_sha,
         "trees": trees,
@@ -233,6 +270,8 @@ def short(fp: dict | None) -> str:
     if not fp:
         return "build: UNKNOWN (no fingerprint)"
     v = (fp.get("vendors_sha256") or "")[:12] or "?"
+    files = fp.get("vendors_files")
+    v = f"{v}/{files}f" if files is not None else f"{v}(shared-baseline?)"
     kt = (fp.get("kt_wheel_sha256") or "")[:12] or "?"
     heads = "/".join((fp.get("trees", {}).get(n, {}).get("head") or "?")[:9] for n in ("vllm_ascend", "vllm"))
     tag = " (backfilled)" if fp.get("backfilled") else ""
@@ -240,33 +279,51 @@ def short(fp: dict | None) -> str:
 
 
 def same_build(a: dict | None, b: dict | None, strict_trees: bool = False) -> tuple[bool, list[str]]:
-    """(comparable, reasons). A missing fingerprint is never 'the same build'."""
+    """(may these be subtracted, reasons). A missing fingerprint is never 'same'.
+
+    Reasons prefixed ``ADVISORY`` do not block. Everything else does, including
+    an operator package that could not be read: a failed read must not look
+    like a match (its hash would be the constant ``sha256("")``).
+    """
     reasons = []
     for name, fp in (("first", a), ("second", b)):
         if fp is None:
             reasons.append(f"the {name} artifact has no build fingerprint, so it cannot be shown to match")
     if reasons:
         return False, reasons
+
+    for name, fp in (("first", a), ("second", b)):
+        schema = fp.get("schema", "?")
+        if schema != SCHEMA:
+            reasons.append(
+                f"OLDSCHEMA the {name} artifact is {schema}, not {SCHEMA}: back then the vendors field held the "
+                "SHARED BASELINE (build_artifacts/vendor92), not the operator package the run actually loaded "
+                "from its own tree -- the two differ, so no difference may be computed across this boundary"
+            )
+        if fp.get("vendors_ok") is False or (fp.get("vendors_files") == 0 and "vendors_files" in fp):
+            reasons.append(
+                f"the {name} artifact's operator package was not readable "
+                f"(files={fp.get('vendors_files')}, why={fp.get('vendors', {}).get('why', '?')}): an unread "
+                f"package hashes to the constant {EMPTY_SHA256[:16]} and would compare equal to any other "
+                "unread package"
+            )
+
     for key in BLOCKING:
         va, vb = a.get(key), b.get(key)
         if va is None and vb is None:
-            # Symmetrically unknown: usually two backfilled fingerprints, where
-            # the .so is known and the rest was never recorded. Not a match and
-            # not a mismatch -- say so, and let the known keys decide.
             reasons.append(f"ADVISORY {key} unknown on both sides (never recorded; not verified equal)")
         elif va is None or vb is None:
             reasons.append(f"{key} recorded on one side only ({va} vs {vb}): cannot be shown to match")
         elif va != vb:
             reasons.append(f"{key} differs: {va} vs {vb}")
+
     for name in ("vllm_ascend", "vllm"):
         ha = a.get("trees", {}).get(name, {}).get("head")
         hb = b.get("trees", {}).get(name, {}).get("head")
         if ha and hb and ha != hb:
             note = f"{name} HEAD differs: {ha[:9]} vs {hb[:9]}"
-            if strict_trees:
-                reasons.append(note)
-            else:
-                reasons.append("ADVISORY " + note)
+            reasons.append(note if strict_trees else "ADVISORY " + note)
+
     blocking = [r for r in reasons if not r.startswith("ADVISORY ")]
     return (not blocking), reasons
 
@@ -333,6 +390,9 @@ def main() -> int:
         return 0 if ok else 1
 
     fp = {
+        # deliberately the OLD schema: these numbers were taken before the
+        # fingerprint existed, and the judge must treat them as not comparable
+        # rather than pretend they carry a v2 vendors reading.
         "schema": "kt_offload/build_fingerprint/1",
         "label": os.path.basename(os.path.normpath(args.dir)),
         "so": {},
@@ -342,6 +402,12 @@ def main() -> int:
         "kt_wheel_sha256": args.kt_wheel_sha256,
         "trees": {},
         "backfilled": True,
+        "vendors_provenance": "UNRECORDED. Nothing was written about the operator package at the time. "
+        "Note that the first fingerprint tool hashed the SHARED BASELINE (build_artifacts/vendor92, 786 "
+        "files) while a run loads the package from its own tree "
+        "(worktrees/<tree>/vllm_ascend/_cann_ops_custom/vendors, 759 here) -- so even a v1 vendors hash "
+        "would not have described what ran. Left empty on purpose; guessing from today's tree would read "
+        "as verified.",
         "backfill_note": args.note
         or "written after the run; the md5 is the build these numbers were measured on, recorded from "
            "outside the run, not captured by it",
