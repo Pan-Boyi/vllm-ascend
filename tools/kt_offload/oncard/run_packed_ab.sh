@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  run_packed_ab.sh <card>        —— packed_transfer A/B, one command, one card
+#  MODE=aa run_packed_ab.sh <card> —— A/A control: the SAME script, both arms
+#                                    packed_transfer=false. Same harness by
+#                                    construction, not by copy: the eval call
+#                                    is one function used by both modes, so a
+#                                    parameter cannot drift between them (if it
+#                                    could, the control would not control the
+#                                    variable it claims to).
 #
 #  Two arms on one card, differing in ONE switch (kt_offload_config.packed_transfer):
 #    A  packed_transfer=false   the path in service today (5 host-device ops/layer)
@@ -21,6 +28,16 @@
 #   * The profile capture prints "captured" even on a 404, so the ascend_pt
 #     directories are counted here and a zero count fails the arm.
 #   * Nothing here enables overlap_side_stream or form C: one variable.
+#
+#  MODE=aa detail: each arm runs the eval set AA_EVALS (default "c8,c8b,c1"):
+#    c8  num-threads 8  -> positionally identical to the A/B's only eval
+#    c8b num-threads 8  -> a SECOND eval inside the same service start, so
+#                          "batch composition" and "a different process" stop
+#                          being one explanation
+#    c1  num-threads 1  -> no concurrency at all. Without this档 "batch
+#                          composition caused it" is a story, not a measurement.
+#  perf/profile are skipped in aa mode (nothing compares them); the c8 eval
+#  still runs first, in the same position as in ab mode.
 #
 #  rc: 0 both arms done and judged | 2 usage | 3 preflight (no card touched)
 #      4 lease refused | 5 an arm failed | 6 the card was not returned
@@ -45,6 +62,12 @@ N_RESIDENT="${N_RESIDENT:-100}"
 THREADS="${THREADS:-96}"
 NUMA="${NUMA:-0,1}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-1800}"
+MODE="${MODE:-ab}"
+case "$MODE" in
+  ab) AA_EVALS="${AA_EVALS:-c8}";;
+  aa) AA_EVALS="${AA_EVALS:-c8,c8b,c1}";;
+  *) echo "usage: MODE=ab|aa $0 <card>"; exit 2;;
+esac
 
 # ---- snapshot first: bash reads a script by byte offset, so editing this file
 #      while it runs corrupts that run. exec keeps the PID, so LEASE_PID=$$ is
@@ -56,7 +79,7 @@ if [ -z "${PACKED_AB_SNAPSHOT:-}" ]; then
   mkdir -p "$RUN/code" || { echo "❌ cannot create $RUN"; exit 3; }
   cp -p "$SRC_DIR"/*.sh "$SRC_DIR"/*.py "$RUN/code/" || { echo "❌ snapshot failed"; exit 3; }
   cp -p "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../build_fingerprint.py" "$RUN/code/" 2>/dev/null || true
-  export PACKED_AB_SNAPSHOT=1 PACKED_AB_RUN="$RUN" PACKED_AB_ARGV="$0 $CARD"
+  export PACKED_AB_SNAPSHOT=1 PACKED_AB_RUN="$RUN" PACKED_AB_ARGV="MODE=$MODE $0 $CARD"
   exec bash "$RUN/code/run_packed_ab.sh" "$CARD"
 fi
 RUN="$PACKED_AB_RUN"; HERE="$RUN/code"; ONCARD_DIR="$HERE"
@@ -66,9 +89,14 @@ source "$HERE/oncard_lib.sh"
 source "$HERE/packed_ab_lib.sh"
 SUM="$RUN/summary.txt"
 say() { echo "$*" | tee -a "$SUM"; }
-say "▶ packed A/B card=$CARD port=$PORT run=$RUN pid=$$ argv=[$PACKED_AB_ARGV]"
+say "▶ packed ${MODE^^} card=$CARD port=$PORT run=$RUN pid=$$ argv=[$PACKED_AB_ARGV]"
+if [ "$MODE" = "aa" ]; then
+  say "  A/A control: both arms packed_transfer=false, evals=$AA_EVALS (c8 first, in the A/B's position)"
+  say "  it answers ONE question: does this service-level bit-identity criterion have any discriminating power"
+fi
 say "  VLLM_USE_BREAKABLE_CUDAGRAPH=1 (explicit; the platform defaults it to 0 and O15 refuses graph mode without it)"
 say "  host-func sampling: VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=${HFLOG}s in BOTH arms (A is the baseline shape)"
+say "  eval parameters (identical in both modes, one function): 50 questions, greedy (temperature 0, top-p 1.0), max-tokens 4096, thinking off"
 
 # ---- preflight: host only, before any lease -------------------------------
 pf() { say "❌ preflight: $1"; exit 3; }
@@ -141,7 +169,24 @@ teardown() {  # $1 = arm dir, $2 = serve pgid
   return $((1 - ok))
 }
 
-run_arm() {  # $1 = A|B, $2 = packed true|false
+run_evals() {  # $1 = arm dir. The ONLY place a GSM8K eval is launched.
+  local arm="$1" ev out th
+  for ev in ${AA_EVALS//,/ }; do
+    case "$ev" in
+      c8)  out="$arm/gsm8k50";     th=8;;
+      c8b) out="$arm/gsm8k50_c8b"; th=8;;
+      c1)  out="$arm/gsm8k50_c1";  th=1;;
+      *) say "  ❌ unknown eval '$ev' in AA_EVALS"; return 5;;
+    esac
+    ( cd "$ROOT" && EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py \
+        --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 --out-dir "$out" \
+        --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads "$th" --limit "$LIMIT" ) \
+        >"$out.log" 2>&1
+    say "  gsm8k[$ev threads=$th] rc=$? $(command grep -m1 'acc=' "$out.log" || true)"
+  done
+}
+
+run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false
   local name="$1" packed="$2"
   local arm="$RUN/arm$name"; mkdir -p "$arm/cap"
   cp -p "$RUN/build_fingerprint.json" "$arm/" 2>/dev/null || true
@@ -180,12 +225,17 @@ run_arm() {  # $1 = A|B, $2 = packed true|false
   say "  service ready after ${waited}s"
   command grep -m1 "BREAKABLE_CUDAGRAPH" "$arm/serve.log" | sed 's/^/     /' | tee -a "$SUM" >/dev/null
 
-  # ---- GSM8K 50, greedy, thinking off
-  ( cd "$ROOT" && EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py \
-      --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 --out-dir "$arm/gsm8k50" \
-      --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --limit "$LIMIT" ) \
-      >"$arm/gsm8k.log" 2>&1
-  say "  gsm8k rc=$? $(command grep -m1 'acc=' "$arm/gsm8k.log" || true)"
+  # ---- GSM8K 50, greedy, thinking off (same function in both modes)
+  run_evals "$arm" || { teardown "$arm" "${pgid:-}"; return 5; }
+  cp -p "$arm/gsm8k50.log" "$arm/gsm8k.log" 2>/dev/null || true
+
+  if [ "$MODE" = "aa" ]; then
+    # nothing in an A/A compares timing or kernels: skip perf and the profile
+    # rather than pay 6 minutes of window for numbers nobody will read
+    say "  (aa mode: perf and profile skipped)"
+    teardown "$arm" "${pgid:-}" || return 6
+    return 0
+  fi
 
   # ---- TPOT: same script, same cases, n=REPEAT
   ( cd "$ROOT" && PORT="$PORT" LABEL="packed_arm$name" NOTE="packed_transfer=$packed" \
@@ -231,13 +281,22 @@ run_arm() {  # $1 = A|B, $2 = packed true|false
 }
 
 rc=0
-for spec in "A false" "B true"; do
+if [ "$MODE" = "aa" ]; then
+  ARM_SPECS=("A1 false" "A2 false")   # one variable changed: none
+else
+  ARM_SPECS=("A false" "B true")
+fi
+for spec in "${ARM_SPECS[@]}"; do
   set -- $spec
   run_arm "$1" "$2" || { rc=$?; say "❌ arm $1 failed (rc=$rc); stopping before the next arm"; break; }
 done
 
 say "── report"
-python3 "$HERE/packed_ab_report.py" "$RUN" 2>&1 | tee -a "$SUM"
+if [ "$MODE" = "aa" ]; then
+  python3 "$HERE/aa_report.py" "$RUN" ${AB_RUN:+--ab-run "$AB_RUN"} 2>&1 | tee -a "$SUM"
+else
+  python3 "$HERE/packed_ab_report.py" "$RUN" 2>&1 | tee -a "$SUM"
+fi
 report_rc=${PIPESTATUS[0]}
 say "■ arms rc=$rc report rc=$report_rc  run=$RUN"
 [ "$rc" -ne 0 ] && exit "$rc"

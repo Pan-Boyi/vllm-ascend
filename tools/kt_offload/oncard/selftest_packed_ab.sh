@@ -43,6 +43,39 @@ chk "$rc" 1 "card NOT returned when the lease is still held"
 echo "$why" | command grep -q "lease still held" && ok "it names why" || bad "it does not name why"
 pa_card_returned "$free" 3 dsv41_vllm_singlecard 65000 "" >/dev/null; chk $? 0 "card returned when nothing holds it"
 
+echo "── A/A control: MODE=aa and every branch of its decision table"
+out=$(MODE=aa ONCARD_DRY=1 PACKED_AB_RUNS_DIR="$TMP/aaruns" bash "$HERE/run_packed_ab.sh" 3 2>&1); rc=$?
+chk "$rc" 0 "MODE=aa dry run stops before acquire"
+echo "$out" | command grep -q "packed AA" && ok "it says which mode it is" || bad "mode not announced"
+echo "$out" | command grep -q "evals=c8,c8b,c1" && ok "all three evals are planned by default" || bad "eval set not announced"
+echo "$out" | command grep -q "one function" && ok "it states the harness cannot drift between modes" || bad "harness note missing"
+command grep -q 'AA_EVALS' "$HERE/run_packed_ab.sh" && ok "the eval list is one variable" || bad "eval list not centralised"
+n_eval_calls=$(command grep -c "gsm8k_eval_effort.py" "$HERE/run_packed_ab.sh")
+[ "$n_eval_calls" -eq 1 ]; ok "exactly one GSM8K launch site in the runner (found $n_eval_calls) -- parameters cannot drift"
+for m in batchcomp bothdiffer bothsame; do
+  python3 "$HERE/make_aa_fixture.py" "$TMP/aa_$m" "$m" >/dev/null || bad "aa fixture $m failed"
+  python3 "$HERE/aa_report.py" "$TMP/aa_$m" > "$TMP/aa_$m.out" 2>&1; r=$?
+  [ $r -eq 0 ]; ok "aa verdict for $m decides (rc $r)"
+done
+command grep -q "BATCH COMPOSITION" "$TMP/aa_batchcomp.out"; ok "c8 differs + c1 identical -> batch composition"
+command grep -q "NO discriminating power" "$TMP/aa_batchcomp.out"; ok "and it says the service criterion is blunt"
+command grep -q "NOT batch composition" "$TMP/aa_bothdiffer.out"; ok "both differ -> another source"
+command grep -q "may NOT be attributed to packed" "$TMP/aa_bothdiffer.out"; ok "and it refuses to blame packed"
+command grep -q "packed changing the numbers" "$TMP/aa_bothsame.out"; ok "both identical -> packed changed the numbers"
+for m in inverted missing_c1 emptyfield otherquestions; do
+  python3 "$HERE/make_aa_fixture.py" "$TMP/aa_$m" "$m" >/dev/null || bad "aa fixture $m failed"
+  python3 "$HERE/aa_report.py" "$TMP/aa_$m" > "$TMP/aa_$m.out" 2>&1; r=$?
+  [ $r -eq 1 ]; ok "aa refuses to conclude on '$m' (rc $r)"
+done
+command grep -q "opposite of every hypothesis" "$TMP/aa_inverted.out"; ok "the inverted reading is named, not averaged away"
+command grep -q "cannot decide" "$TMP/aa_missing_c1.out"; ok "a missing concurrency-1 arm blocks the verdict"
+python3 "$HERE/make_aa_fixture.py" "$TMP/aa_gate" bothsame >/dev/null
+python3 "$HERE/../build_fingerprint.py" backfill "$TMP/aa_gate/armA2" --so-md5 ffffffffffffffffffffffffffffffff >/dev/null
+rm -f "$TMP/aa_gate/armA2/build_fingerprint.json"
+python3 "$HERE/aa_report.py" "$TMP/aa_gate" > "$TMP/aa_gate.out" 2>&1; r=$?
+{ [ $r -eq 1 ] && command grep -q "REFUSING" "$TMP/aa_gate.out"; }
+ok "an A/A across two builds is refused too (rc $r)"
+
 echo "── build fingerprint gate (cross-build comparison must be refused)"
 python3 "$HERE/make_packed_ab_fixture.py" "$TMP/fpsame" identical >/dev/null || bad "fixture builder failed"
 python3 "$HERE/packed_ab_report.py" "$TMP/fpsame" > "$TMP/fpsame.out" 2>&1; r=$?

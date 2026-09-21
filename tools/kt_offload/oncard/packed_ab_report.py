@@ -83,7 +83,14 @@ def build_gate(arm_dirs: dict) -> dict:
                 "fingerprints": {}}
     fps = {name: fp_mod.load(path) for name, path in arm_dirs.items()}
     lines = {name: fp_mod.short(fp) for name, fp in fps.items()}
-    ok, reasons = fp_mod.same_build(fps.get("A"), fps.get("B"))
+    # by position, not by the names "A"/"B": the same gate judges the A/A
+    # control, whose arms are A1/A2 (a gate that only knows two literal names
+    # passes silently on every other pair)
+    names = list(arm_dirs)
+    if len(names) != 2:
+        return {"ok": False, "why": f"expected exactly two arms, got {names}", "lines": lines,
+                "fingerprints": fps, "reasons": [f"arms: {names}"]}
+    ok, reasons = fp_mod.same_build(fps[names[0]], fps[names[1]])
     return {"ok": ok, "why": "; ".join(reasons) if reasons else "same build", "lines": lines,
             "fingerprints": fps, "reasons": reasons}
 
