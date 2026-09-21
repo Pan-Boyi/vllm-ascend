@@ -303,7 +303,9 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 
 ## 4.6 整网 bring-up 实测（2026-09-20，卡 3，N=100 prefix）
 
-**产物**：`build_artifacts/moe_offload_ref/bringup_0920_034907`（eager）、`bringup_graph_0920_040749`（图）、`prof_0920_045212`（算子 profile）、`build_artifacts/m1_run/perf_singlecard_offload_N100_graph_0920_041940`（perf）。
+**产物**：`build_artifacts/moe_offload_ref/bringup_0920_034907`（eager）、`bringup_graph_0920_040749`（图）**仍在**；
+`prof_0920_045212`（算子 profile）**【已记录、不可再验】原始产物已于 2026-09-21 项目清理中删除（未被 git 跟踪，不可恢复）**；`build_artifacts/m1_run/perf_singlecard_offload_N100_graph_0920_041940`（perf）。
+⇒ 下表与算子级一节的数字都是当时内联的，**仍可引用，但不能再回到产物复算**。
 
 | 项 | 实测 | 多卡基线 |
 |---|---|---|
@@ -314,7 +316,7 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 | HBM | 权重 82.14（⇒ **KT_DEVICE_FACTOR=1.024**）/ KV 27.34（42,733 token，5.22×）/ 激活 1.21 / 非 torch 0.15 / 图 0.24 | — |
 | 异常 | 无 10701x、无 AICore、无 507018、无 EngineCore fatal | — |
 
-**算子级 profile（bs=1 稳态 decode，8 s 窗口 182 token，`prof_0920_045212/op_breakdown_bs1.txt`）**
+**算子级 profile（bs=1 稳态 decode，8 s 窗口 182 token；出处曾是 `prof_0920_045212/op_breakdown_bs1.txt`，【已记录、不可再验】原始产物已于 2026-09-21 项目清理中删除（未被 git 跟踪，不可恢复））**
 - 区间并集：**device 真实忙 57.1%**，每 token 忙 24.96 ms、**空隙 18.73 ms**（相加法 57.0%，说明流间重叠可忽略）。
 - **>100 µs 的空隙每 token 43 个（= 40 层 + 少数）合计 17.91 ms/token** ⇒ 这就是**完全暴露的 host offload 等待**；其中 kt 纯计算约 10.4 ms，**剩余约 7.5 ms 是 D2H/H2D + 回调开销**。
 - Top 算子（每 token）：QuantBatchMatmulV3 4.16 ms / GroupedMatmul 1.79 ms（驻留专家）/ MhcPre+MhcSinkhorn 1.72 ms / SparseFlashMla 0.82 ms / MoeInitRoutingV3 0.51 ms。
@@ -347,6 +349,9 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 - 🔧 **两条护栏教训**（比 M3 本身重要）：① 护栏读**代理**（"有捕获在进行"≠"这条流的工作会进图"）⇒ 在该拦的那一刻放行；② 改成"对被判断对象做实验"后，**实验用了太弱的替身**（只搬 int32 标量 + `add_`，没有真实 GMM/dispatch/kt 缓冲）⇒ 同形只同了模式，没同规模与内容，仍是假绿灯。
 - **修法（已审阅，暂停实现）**：形态 C = engram 形态——**同一条捕获流**上两个 host-func 节点（①只提交 `forward_task`+`cpu_infer.submit` 立即返回 → GMM → ②`sync_cpu_only()` 只等 CPU → H2D）。绕开 107025，不需票号（本层提交→GMM→本层等待之间无别的提交 ⇒ allowance=0 即"只等本层"）。⚠️ kt 硬事实：**CPU 队列单 worker 串行** ⇒ 跨层流水不可能，可重叠窗口只有本层 GMM；**每层必须 sync**（kt 只在下次 sync 重抛任务异常）。
 - 🔁 **为什么暂停**：形态 C 净收益 = GMM 窗口 0.62 ms（实测）− 多一次回调 ≈62.5 µs（**推断**）。下一发 packed A/B 反解 **C = Δ(>100µs ms/token)/80**：C≈62 µs ⇒ 做；C≥300 µs ⇒ 作废；**Δ 与 80×C 对不上 ⇒ 模型本身错、7.5 ms 归因重做**。
+  > 🔴 **2026-09-21 更新（这条待办已不可按原样完成）**：第三分支实际发生了——单价模型被 profile 否掉（§4.10 / design k.5d），
+  > 且那份 A/B 产物已删（design k.16）⇒ **"反解 C"这件事没有产物可依**。形态 C 现在由 **t4 实测**的
+  > node_us / window_us / ceiling 决定（design k.7），`0.62 ms/层` 与 `62.5 µs` 两个数均已作废，不要再引。
 
 ## 4.8 减操作数（packed_transfer，默认关，待上卡）
 
@@ -375,7 +380,12 @@ L3 一条就把 8192-token 请求的并发从 5.22 抬到 20.07，或者在并�
 - **真正的大头是等待**（等 CPU 算完），不是搬运。
 - ⛔ **作废**：形态 C 窗口「0.62 ms/层」——那是整层**全部** device 忙时间；窗口只有驻留专家 GMM，实测 **44.7 µs/层**（旁证：sglang 同结构 80–94 µs/层、只藏住约 10%）。
 
-## 4.11 packed_transfer A/B 实测（2026-09-20，卡 3，`packed_ab_0920_094053`）
+## 4.11 packed_transfer A/B 实测（2026-09-20，卡 3；出处曾是 `packed_ab_0920_094053`，【已记录、不可再验】原始产物已于 2026-09-21 项目清理中删除（未被 git 跟踪，不可恢复））
+
+> 🔴 本节数字均为当时内联，**可引用、不可再验**。**依赖这份产物的待办已回扫**（design k.8 出处状态块）：
+> 长尾离线定位、从 armA `task_time` 反解每操作成本、算子级前 20 两臂对照 ⇒ **都需重跑才能回答**；
+> 其中"算子级前 20"**原始产物已删、本报告未内联**。另：两臂各 50/50 是**答对题数**，
+> 逐位只有 **19/50 相同**（贪心），见 design k.8 的更正。
 
 两臂 GSM8K **各 50/50**。性能**不是干净的胜利**：
 

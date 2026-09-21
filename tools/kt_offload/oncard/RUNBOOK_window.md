@@ -17,9 +17,11 @@ WT=worktrees/moe-offload/tools/kt_offload/oncard
 ## 1. A/A 对照（先校仪器，再量任何东西）
 
 ```bash
-ONCARD_EXPECT_SO_MD5=$SO MODE=aa \
-  AB_RUN=build_artifacts/moe_offload_ref/packed_ab_0920_094053 \
-  bash $WT/run_packed_ab.sh $CARD
+ONCARD_EXPECT_SO_MD5=$SO MODE=aa bash $WT/run_packed_ab.sh $CARD
+# 注：原来这里还传 AB_RUN=…/packed_ab_0920_094053 用来现场重算 A/B 的 31/50；
+# 那份产物已在 2026-09-21 的清理中删除（未被 git 跟踪、不可恢复）⇒ 不要再传它。
+# 31/50 已内联在 design k.8，作为「已记录、不可再验」的读数引用；
+# 有了新的 A/B 产物再 --ab-run 指向新的那份。
 ```
 - 两臂都是 `packed_transfer=false`（**改动项＝零**），harness 参数与 A/B **同一个函数**产生
   （runner 里只有一处 GSM8K 启动点，自检里有一条数它的个数），并发 8 的那一档在 A/B 的同一位置先跑。
