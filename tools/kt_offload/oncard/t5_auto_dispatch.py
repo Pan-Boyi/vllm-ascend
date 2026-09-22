@@ -17,10 +17,13 @@ t3 uses -- never a miniature graph: a scalar-plus-trivial-host-func capture
 passed on 2026-09-20 while every real-layer capture failed, and it is that
 false green this file exists to avoid.
 
-  arm "off"  auto_dispatch_capture=False  -> expected to RAISE at capture_end.
-             This is the positive control: if it does not raise, the machine
-             is not in the state the earlier flights measured, and arm "on"
-             proves nothing.
+  arm "off"  auto_dispatch_capture=False. Until 2026-09-22 this was "expected
+             to RAISE" (the positive control). Re-read on 09-22: the earlier
+             107025s were tripped by an empty capture buffer; the real trigger
+             is an unjoined tail record on the side stream. Now "off" (the
+             production record+join) and "off_evtw" must CAPTURE and pass the
+             replay checks; only "off_evt" (extra unjoined tail record) is the
+             must-be-red positive control.
   arm "on"   auto_dispatch_capture=True   -> if it raises, the side-stream
              route stays dead and form C is decided by t4's ceiling. If it
              captures, that is NOT the answer yet: capture success and replay
@@ -62,7 +65,8 @@ sys.path.insert(0, HERE)
 import oncard_common as C  # noqa: E402
 
 PLAN = """T5 plan (real-layer capture, one parameter changed):
-  arm off : torch.npu.graph(g)                          -> expected RAISE (positive control)
+  arm off : torch.npu.graph(g)                          -> clean arm: must capture + replay checks
+  arm off_evt : off + unjoined tail record on the side stream -> must RAISE 107025 (positive control)
   arm on  : torch.npu.graph(g, auto_dispatch_capture=True)
             if it captures: replay >= 3 inputs, each == the serial arm bit for bit,
             replays pairwise different,每 layer host-func +1 per replay, 0 during capture
@@ -413,18 +417,24 @@ def main() -> int:
             v.note("the mutant went red as required; this is what makes the clean arm's bit-identity mean "
                    "'the side-stream work really happened and was joined'")
 
-    # the positive control: the status-quo arm must reproduce the known failure
-    for ctl in ("off", "off_evt", "off_evtw"):
-        keys = [k for k in results if k.startswith(ctl + "@")]
-        for key in keys:
-            off_failed = results[key]["captured"] is False
-            v.must_be_red(off_failed, f"status quo (auto_dispatch_capture=False) capture of the forked shape "
-                                      f"[{key}]")
-            if not off_failed:
-                v.note("🔴 the positive control captured: this machine is NOT in the state the three earlier "
-                       "flights measured, so nothing here can be attributed to auto_dispatch_capture")
-    if not [k for k in results if k.split("@")[0] in ("off", "off_evt", "off_evtw")]:
-        v.note("no positive control in this run (--arm on): run --arm off before concluding")
+    # the positive control (2026-09-22 re-read, RUNBOOK_sidestream.md §0/§2): 107025's real trigger is
+    # "the side stream's last event record is not joined by the main stream". Only off_evt builds that
+    # shape (an extra unjoined record after the layer's own record+join), so only off_evt must go red.
+    # "off" (production record+join) and "off_evtw" (extra record, joined) are clean arms and must
+    # capture -- the pre-09-22 rule "every off* arm must raise" came from the retired
+    # "platform cannot capture a side stream" hypothesis and made the clean arm unpassable.
+    for key in [k for k in results if k.startswith("off_evt@")]:
+        off_failed = results[key]["captured"] is False
+        v.must_be_red(off_failed, f"unjoined tail record on the side stream [{key}] (expect 107025)")
+        if not off_failed:
+            v.note("🔴 the positive control captured: an unjoined side-stream tail record no longer "
+                   "triggers 107025 here, so the probe has no discriminating power -- stop and re-judge")
+    if mutant == "none":
+        for key in [k for k in results if k.split("@")[0] in ("off", "off_evtw")]:
+            v.check(results[key]["captured"] is True,
+                    f"clean arm [{key}] captured (error: {results[key]['error']})")
+    if not [k for k in results if k.split("@")[0] == "off_evt"]:
+        v.note("no 107025 positive control in this run: run --arm off_evt (separate process) before concluding")
 
     if ids_buffers_added:
         v.note(f"the test prepared kt's int64 id buffers itself for layers {sorted(set(ids_buffers_added))} "
