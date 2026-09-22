@@ -307,31 +307,50 @@ I1 必须有这一行；**没有 = wheel 没换或 env 没传进 worker** ⇒ �
 两份站点各 104 个文件（不含 `__pycache__`），**逐文件比只有 2 个不同**：`kt_kernel/experts_base.py`
 与 `kt_kernel/kt_kernel_ext.…so`（另加 dist-info 的 `RECORD`/`direct_url.json`，记的是 wheel 自己的哈希）。
 
-### 8.1 切换要改的五处（都在本线自己的树里）
+### 8.1 切换要改的一处（2026-09-22 起；原来是五处，其中一处必漏）
 
 ```
-tools/kt_offload/serve_v41_singlecard.sh:614     PYTHONPATH 末尾追加的 kt_site
-tools/kt_offload/oncard/run_oncard.sh:121-122    KT_SITE= 与 KT_WHEEL=（两行都要，wheel 路径进指纹）
-tools/kt_offload/oncard/run_packed_ab.sh:115,119 预检的 kt_site 路径 + 打印的 experts.py 指纹
-tools/kt_offload/bench/run_cpu_bench.sh:15       KT_SITE=
-tools/kt_offload/build_fingerprint.py:94         KT_WHEEL_GLOB = …/kt_wheel/*.whl
+tools/kt_offload/kt_build.env:KT_SITE_DEFAULT=…/kt_site   ← 改这一行，别处都不用动
 ```
 
-🔴 **`build_fingerprint.py` 那一行是最容易漏的**：它写死了 `kt_wheel/*.whl`，**和站点目录无关**。
-只改起服务脚本的 `kt_site` 而不改这一行，指纹会继续报告**旧 wheel 的 sha256**，于是
-「新构建的发次」和「旧构建的发次」在指纹上看起来是同一个构建 —— `same_build()` 放行，两份读数
-直接相减，**而且不会报错**。这正是这个文件开头那段话要挡的那种失败。切换时把 glob 指向
-`kt_wheel_v2`（或改成可被 env 覆盖），并在切换后的第一发里用肉眼核对
-`build_fingerprint.txt` 里的 `kt 46a2f22ad99b`。
+四个 shell 驱动（`serve_v41_singlecard.sh`、`run_oncard.sh`、`run_packed_ab.sh`、
+`bench/run_cpu_bench.sh`）都 `source` 这个文件拿 `$KT_SITE`；`build_fingerprint.py` 解析**同一个文件**的
+`KT_SITE_DEFAULT`（env `KT_SITE` 优先，且会被记成 override）。wheel 目录由站点名**推导**
+（`kt_site`→`kt_wheel`，`kt_site_v2`→`kt_wheel_v2`），不再单独写一个路径 —— 那个「不跟着站点走」的
+独立性就是坑本身。
 
-`oncard` 侧另有一处冗余：`run_oncard.sh:236` 在指纹工具失败时自己写一份兜底 JSON，
-里面的 `kt_wheel.sha256` 取自同文件的 `KT_WHEEL` 变量 —— 改了 121-122 行它就跟着对，**不用单独改**。
+🔴 **原来的坑（已修，记在这里是因为它是这类失效的标本）**：`build_fingerprint.py:94` 的
+`KT_WHEEL_GLOB` 写死 `…/kt_wheel/*.whl`，**和站点目录毫无关系**。只改前四处而漏掉它，指纹会继续报
+**旧 wheel 的 sha256**，新旧构建在 `same_build()` 眼里相同 —— 放行、相减、**不报错**。
+变异臂（临时拷贝，2026-09-22 实测，两臂唯一差别是站点 `kt_site` vs `kt_site_v2`、wheel glob 照旧）：
+
+| | 修改前（HEAD `8e0c16fcb` 的工具） | 修改后 |
+|---|---|---|
+| 两份指纹 | 逐字段相同（`kt 1b8e9b211476` 两边一样） | `ktsite kt_site:36af5f989340` vs `ktsite kt_site_v2:0ae01329e217` |
+| `compare` | `SAME BUILD: comparable`，rc 0 | `kt_site_sha256 / kt_site_bytes / kt_wheel_sha256 differs` → `DIFFERENT BUILD`，rc 1 |
+| 同站点两次（对照） | rc 0 | rc 0（没有过度拦截） |
+
+现在指纹的 kt 部分**读被判对象**：直接哈希 `$KT_SITE/kt_kernel/` 整棵（排除 `__pycache__`；
+`kt_site_files` 因此是 **70**，而上面那句「两份站点各 104 个文件」数的是**整个站点**，两个数不是一回事，
+别拿来互相校对），其中
+`kt_kernel_ext*.so` 与 `experts_base.py` 必须在、且单独记一份 sha256；站点解析不出或缺这两件 ⇒
+**拒绝出指纹**（stderr 说原因，rc 2，不写 `build_fingerprint.json`），不会悄悄退回别的路径。
+schema 随之 `/3`→`/4`：`/3` 的产物说不出自己跑在哪个站点上，**一律不许和 `/4` 的相减**。
+切换后第一发仍然肉眼核对 `build_fingerprint.txt` 里的 `ktsite kt_site_v2:0ae01329e217`
+与 `ktwheel 46a2f22ad99b`（两个都在一行里，站点在前）。
+
+`oncard` 侧另有一处冗余：`run_oncard.sh` 在指纹工具失败时自己写一份兜底 JSON，里面的
+`kt_wheel.sha256` 取自同文件的 `KT_WHEEL` 变量，而 `KT_WHEEL` 现在来自 `$KT_WHEEL_DIR`（= 推导出来的），
+**跟着站点自动对**，不用单独改。`run_packed_ab.sh` 预检原来打印 `experts.py` 的哈希 —— 那个文件在两个
+构建里**逐字节相同**，分不开新旧；已改成打印站点目录名 + `experts_base.py`。
 
 ### 8.2 换构建之后必须重跑什么
 
-- **t0 / t1 / t2 全部重跑**（`run_oncard.sh <card> t0|t1|t2`）。不是保险起见：`kt_wheel_sha256`
-  在 `build_fingerprint.py` 的 `BLOCKING` 里，换 wheel 之后**旧的 t0/t1/t2 产物与新发次不可比**，
-  判读脚本会直接拒绝，而不是给个警告。
+- **t0 / t1 / t2 全部重跑**（`run_oncard.sh <card> t0|t1|t2`）。不是保险起见：`kt_site_sha256` /
+  `kt_site_bytes` / `kt_wheel_sha256` 都在 `build_fingerprint.py` 的 `BLOCKING` 里，换站点之后
+  **旧的 t0/t1/t2 产物与新发次不可比**，判读脚本会直接拒绝，而不是给个警告。
+  （另外：schema 已 `/3`→`/4`，所以 09-22 之前盖的**所有**产物本来就都被判为不可相减 —— 这条重跑要求
+  不是换构建才出现的，只是换构建让它变得显眼。）
 - **第 1 节的 D0/D1（以及任何已经采过的臂）若要和新构建上的臂相减，也必须在新构建上重跑一遍。**
   D0 是「两行 env 都留空」的对照臂 —— 它的值取决于构建，不是取决于 env，老构建上的 D0
   不能当新构建的对照。同理 §4.20 那批 A/F、submit/E 读数只在老构建上成立，引用时要写明构建。
