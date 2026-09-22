@@ -182,6 +182,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # bit-exactly (card A4). On by default since the 2026-09-19 4-card A/B
     # (together with the mHC pre operator).
     "VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_INVERSE_ROPE_OPERATOR", "1"),
+    # Forward RoPE (q and kv) through the same inplace_partial_rotary_mul the
+    # inverse already uses. "1" (default) = operator, "0" = the torch
+    # decomposition. ⚠ The two are not bit-identical: the operator rotates in
+    # the tensor dtype, the torch form in float32 with one rounding at the
+    # end. Kept switchable so an accuracy question can be answered by flipping
+    # it rather than by reverting. Measured saving: ~1.5 ms of a 28.8 ms
+    # bs=1 decode step (适配方案 §6.9.15).
+    "VLLM_ASCEND_DSV41_FORWARD_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_FORWARD_ROPE_OPERATOR", "1"),
     # DeepSeek-V4.1 indexer K write: quantise and store through CANN's
     # indexer_quant_cache instead of indexer_compress_epilog_v2.
     # k_norm/RoPE/slot gating are unchanged either way.
