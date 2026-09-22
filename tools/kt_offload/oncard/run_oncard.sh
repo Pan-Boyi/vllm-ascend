@@ -167,9 +167,24 @@ set -u
 # Out of tree we rewrite what it put on PYTHONPATH afterwards -- REPLACING, not
 # appending: two vllm_ascend trees on the path would make "which one wins" a
 # side effect of ordering.
+# 按【路径分量】精确替换（不是子串替换）：`${PYTHONPATH//$ROOT/worktrees/moe-offload/…}`
+# 会把 worktrees/moe-offload-vllm 也改掉（前者是后者的前缀）⇒ vllm 树从路径上消失，
+# import 到 $ROOT/vllm 的命名空间包。2026-09-22 首次整网树外起服务时实测踩中。
+_pp_swap() {  # <旧分量> <新分量> ；读写 PYTHONPATH，只动完全相等的分量
+  local old="$1" new="$2" out="" c
+  local IFS=:
+  for c in $PYTHONPATH; do
+    [ "$c" = "$old" ] && c="$new"
+    out="${out:+$out:}$c"
+  done
+  PYTHONPATH="$out"
+}
 if [ -n "${ONCARD_OUT_OF_TREE:-}" ]; then
-  export PYTHONPATH="${PYTHONPATH//$ROOT\/worktrees\/moe-offload:/$VA_TREE:}"
-  export PYTHONPATH="${PYTHONPATH//$ROOT\/vllm-ascend/$VA_TREE}"
+  _pp_swap "$ROOT/worktrees/moe-offload" "$VA_TREE"
+  _pp_swap "$ROOT/vllm-ascend" "$VA_TREE"
+  export PYTHONPATH
+  case ":$PYTHONPATH:" in *":$DSV41_VLLM_TREE:"*) ;; *)
+    say "❌ the rewrite lost the vllm tree $DSV41_VLLM_TREE from PYTHONPATH -- refusing"; exit 3;; esac
   export ASSERT_TREES_ALLOW_OUT_OF_TREE="$VA_TREE"
   say "🔴 OUT-OF-TREE run: vllm_ascend = $VA_TREE @ $(git -C "$VA_TREE" rev-parse --short HEAD)"
   say "   only that tree is swapped; the .so expectation, the fingerprint and the provenance all judge IT."

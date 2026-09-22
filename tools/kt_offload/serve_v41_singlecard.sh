@@ -344,6 +344,18 @@ set +u
 #  ⚠ env_dsv41.sh / _resolve_tree.sh 是共享的、只认 worktrees/<名>，不改它们 ——
 #    照共享 bringup 的做法，在它们【之后】改写 PYTHONPATH。
 # ============================================================================
+# 按【路径分量】精确替换（不是子串替换）：`${PYTHONPATH//$ROOT/worktrees/moe-offload/…}`
+# 会把 worktrees/moe-offload-vllm 也改掉（前者是后者的前缀）⇒ vllm 树从路径上消失，
+# import 到 $ROOT/vllm 的命名空间包。2026-09-22 首次整网树外起服务时实测踩中。
+_pp_swap() {  # <旧分量> <新分量> ；读写 PYTHONPATH，只动完全相等的分量
+  local old="$1" new="$2" out="" c
+  local IFS=:
+  for c in $PYTHONPATH; do
+    [ "$c" = "$old" ] && c="$new"
+    out="${out:+$out:}$c"
+  done
+  PYTHONPATH="$out"
+}
 if [ -n "${SERVE_OUT_OF_TREE:-}" ]; then
   case "$SERVE_OUT_OF_TREE" in
     1|yes|true) echo "❌ SERVE_OUT_OF_TREE 必须给【绝对路径】，不是开关。"; exit 1;;
@@ -356,8 +368,19 @@ if [ -n "${SERVE_OUT_OF_TREE:-}" ]; then
     echo "❌ $SERVE_OUT_OF_TREE 不是 git 树 —— 那样这一发对应不到任何 commit，拒绝"; exit 1; }
   [ -z "$(git -C "$SERVE_OUT_OF_TREE" status --porcelain)" ] || {
     echo "❌ 树外那棵树有未提交改动 —— 这一发的 revision 不可复述，拒绝"; exit 1; }
-  export PYTHONPATH="${PYTHONPATH//$ROOT\/vllm-ascend/$SERVE_OUT_OF_TREE}"
-  export PYTHONPATH="${PYTHONPATH//$ROOT\/worktrees\/$WT/$SERVE_OUT_OF_TREE}"
+  _PP_BEFORE="$PYTHONPATH"
+  _pp_swap "$ROOT/vllm-ascend" "$SERVE_OUT_OF_TREE"
+  _pp_swap "$ROOT/worktrees/$WT" "$SERVE_OUT_OF_TREE"
+  export PYTHONPATH
+  # 正反两条都断言：换进去的在、换出去的不在、vllm 树原样还在
+  case ":$PYTHONPATH:" in *":$SERVE_OUT_OF_TREE:"*) ;; *)
+    echo "❌ 改写后 PYTHONPATH 里没有 $SERVE_OUT_OF_TREE —— 原值: $_PP_BEFORE"; exit 1;; esac
+  case ":$PYTHONPATH:" in *":$ROOT/worktrees/$WT:"*|*":$ROOT/vllm-ascend:"*)
+    echo "❌ 改写后 PYTHONPATH 仍含原 vllm_ascend 树 —— 两棵树同在路径上，拒绝"; exit 1;; esac
+  if [ -n "${VLLM_TREE:-}" ]; then
+    case ":$PYTHONPATH:" in *":$VLLM_TREE:"*) ;; *)
+      echo "❌ 改写把 vllm 树 $VLLM_TREE 弄丢了 —— 原值: $_PP_BEFORE"; exit 1;; esac
+  fi
   export ASSERT_TREES_ALLOW_OUT_OF_TREE="$SERVE_OUT_OF_TREE"
   echo "=============================================================================="
   echo "  🔴 本发为【树外运行】：$SERVE_OUT_OF_TREE @ ${_OOT_COMMIT:0:9}"
