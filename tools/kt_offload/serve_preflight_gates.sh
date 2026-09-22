@@ -128,15 +128,54 @@ PYCHK
   return 0
 }
 
+# ── gate_shared：共享闸的【窄放行】（用户 2026-09-22 授权）───────────────────
+#   现状：build_artifacts 仓 2e21d32（09-21 清理）删了 shared_so_manifest.txt ⇒
+#   verify_shared_artifacts.sh 对所有人 rc=1，而它报的只有两条 ❌，判的都是
+#   build_artifacts/ 那份【共享】.so 的出处。本线这一发加载的是 $_TREE 自己的 .so，
+#   由其后必跑的 gate_so（md5 期望值）判；共享 .so 本发根本不 import。
+#   用户决定：不恢复 manifest、不改共享脚本，只在本线 launcher 放行【这两条且仅这两条】。
+#   🔴 fail-closed：rc 不是 1、没有 ❌、或出现白名单之外任何一条 ❌ ⇒ 照旧拒绝。
+#   🔴 放行的前提是 gate_so 在起服务前一定会跑（launcher 里它无条件 `|| exit 1`）；
+#      放行后设 SHARED_GATE_WAIVED=1，launcher 据此再断言一次 gate_so 已通过。
+#   白名单是逐字子串（取自 verify_shared_artifacts.sh 的原文输出）：
+GATE_SHARED_WAIVABLE=(
+  "取不到 base 的 csrc 最新提交或 manifest 的 built_from"
+  "build_artifacts/shared_so_manifest.txt —— .so 没有出处"
+)
+gate_shared() {  # <共享闸完整输出文件> <它的 rc>
+  local out="$1" rc="$2" line w hit n=0
+  SHARED_GATE_WAIVED=0
+  [ "$rc" = 0 ] && { echo "  ✅ gate_shared: 共享闸 rc=0"; return 0; }
+  [ -r "$out" ] || { echo "🔴 gate_shared: 读不到共享闸输出 —— 拒绝"; return 1; }
+  [ "$rc" = 1 ] || { echo "🔴 gate_shared: 共享闸 rc=$rc（不是 1）—— 不在放行范围，拒绝"; return 1; }
+  while IFS= read -r line; do
+    n=$((n + 1)); hit=0
+    for w in "${GATE_SHARED_WAIVABLE[@]}"; do
+      [[ "$line" == *"$w"* ]] && { hit=1; break; }
+    done
+    [ "$hit" = 1 ] || { echo "🔴 gate_shared: 白名单之外的 ❌ —— 拒绝："; echo "     $line"; return 1; }
+  done < <(grep '❌' "$out")
+  [ "$n" -ge 1 ] || { echo "🔴 gate_shared: rc=1 却没有任何 ❌ 行 —— 解析不了就不放行"; return 1; }
+  SHARED_GATE_WAIVED=1
+  echo "=============================================================================="
+  echo "  🟠 共享闸【窄放行】：$n 条 ❌ 全部属于「共享 .so 出处未验」"
+  echo "     （shared_so_manifest.txt 缺失，build_artifacts 2e21d32 删除；用户 2026-09-22 授权）"
+  echo "     本发【不加载】共享 .so；本发实际加载的 .so 由其后的 gate_so 按 md5 判定。"
+  echo "     其余共享判据（各树钉值、覆盖数）已在同一份输出里通过。产物里请连这一行一起引。"
+  echo "=============================================================================="
+  return 0
+}
+
 # 直接跑本文件时当独立小脚本用（不起服务，可在 CPU 上验）
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   _rc=0
   case "${1:-all}" in
     so)   gate_so "${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}" || _rc=$? ;;
     ds41) gate_ds41 || _rc=$? ;;
+    shared) gate_shared "${2:?共享闸输出文件}" "${3:?共享闸 rc}" || _rc=$? ;;
     all)  gate_so "${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}" || _rc=$?
           gate_ds41 || _rc=$? ;;
-    *)    echo "用法: $0 [so|ds41|all] [tree]"; _rc=2 ;;
+    *)    echo "用法: $0 [so|ds41|all] [tree] | shared <输出文件> <rc>"; _rc=2 ;;
   esac
   exit $_rc
 fi

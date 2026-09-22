@@ -370,9 +370,18 @@ if [ -n "${SERVE_OUT_OF_TREE:-}" ]; then
 fi
 
 # ---- 产物新鲜度 + 树来源：两条都必须过，否则起来的也是错的 -------------------
-"$ROOT/build_artifacts/verify_shared_artifacts.sh" >/dev/null || {
+#   共享闸的输出整份留下来（放行与否都要可复述）；判定交给 gate_shared（窄放行，见其注释）。
+_SHARED_OUT="$(mktemp "${TMPDIR:-/tmp}/verify_shared.XXXXXX")"
+"$ROOT/build_artifacts/verify_shared_artifacts.sh" > "$_SHARED_OUT" 2>&1; _SHARED_RC=$?
+if ! gate_shared "$_SHARED_OUT" "$_SHARED_RC"; then
   echo "❌ 共享产物检查未过 —— 多半是源码合了但 .so 没重编。跑一次看详情："
-  echo "   $ROOT/build_artifacts/verify_shared_artifacts.sh"; exit 1; }
+  echo "   $ROOT/build_artifacts/verify_shared_artifacts.sh"; exit 1
+fi
+if [ "$SHARED_GATE_WAIVED" = 1 ] && [ -n "${SERVE_LOG:-}" ]; then
+  mkdir -p "$(dirname "$SERVE_LOG")"
+  { echo "shared_gate=WAIVED rc=$_SHARED_RC tree=$_TREE at=$(date -Is) (manifest missing; user 2026-09-22)"
+    cat "$_SHARED_OUT"; } > "$(dirname "$SERVE_LOG")/shared_gate_waiver.txt"
+fi
 python3 "$ROOT/build_artifacts/assert_trees.py" || { echo "❌ 树来源断言失败，拒绝启动"; exit 1; }
 
 # ---- 要跑的那棵树不能落后于 dsv41-base ---------------------------------------
@@ -419,6 +428,8 @@ echo "  ✅ 要跑的树 $WT ($(git -C "$_TREE" rev-parse --short HEAD)) 包含 
 #       改写也已经做过 ⇒ gate_ds41 查的 find_spec 就是服务进程会解析的那一份。
 gate_so "$_TREE" || exit 1
 gate_ds41 || exit 1
+# 共享闸若是窄放行过的，它的前提（本发 .so 已按 md5 判过）到这里才成立 —— 显式记一笔。
+[ "$SHARED_GATE_WAIVED" = 1 ] && echo "  ✅ 共享闸窄放行的前提成立：gate_so 已判过本发实际加载的 .so（$_TREE）"
 
 # ---- engram：必须是【全量】，不是切片 ---------------------------------------
 #   切片和全量在日志里长得一样，而下游 mmap 到截断张量【不报错，只算错】。
