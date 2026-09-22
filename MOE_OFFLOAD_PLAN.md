@@ -754,6 +754,55 @@ Pearson 只有 0.361，被层 2 的 1071 µs 离群点压住 ⇒ 判据用**秩*
 上卡时必须同时读 A+F 与 E（自旋变短会把成本挪到唤醒）。执行单 `tools/kt_offload/oncard/RUNBOOK_dispatch.md`，
 三臂同时段交错 D0/D1/D2，主判据是 `seam.json` 的每层 A+F_dev，旁证 `/proc/<pid>/task/*/stat` 的 R 态线程数（192 → 更低）。
 
+## 4.22 🔴 接缝方案表（2026-09-22 夜，未占卡）：新靶子 30.75 µs 空转 + 拆掉 host-func 节点
+
+> 依据的 profile 是 §4.20 那发（`/dev/shm/dsv41_prof_seam`，**未跟踪、随时消失**，读数按「已记录」引用；
+> 那发带埋点，TPOT 35.49 ms，可能含 0.4–0.8 ms 埋点开销 ⇒ **绝对值不作基线，相对结构是稳的**）。
+> 两个 CPU 微基准已入库可复跑：`tools/kt_offload/prof/bench/{tq_bench,merge_bench}.cpp`。
+
+**F1 🔴 每个 host-func 节点前有 30.75 µs 的设备纯空转（账本里原本没有这一项）**
+stream 244 上按「前一个 task 结束→本 task 开始」统计：`HOSTFUNC_CALLBACK` n=7984 **中位 30.75 µs**；
+而 `DAVID_EVENT_WAIT`(30406)、`MEM_WAIT_VALUE`(2286)、`NOTIFY_WAIT`、`MEMCPY_ASYNC`、`EVENT_RECORD` 的前置空隙**全是 0.000**。
+抽 2000 个空隙核对别的流：只有 8% 被其它流覆盖，92% 是真空转 ⇒ **30.75 × 40 ≈ 1.23 ms/token**，
+**挂在 host-func 机制上、且不在 §4.20 的 4.3 ms 里**（那张表只算 `NW − T_cb`）。
+⇒ **可攻击面修正为 ≈5.5 ms/token**（≈139 µs/层）。旁证：t4 实测**空**节点 52.6 µs/节点（§4.19）与「空隙 30.75 + 派发的一部分」同量级
+⇒ **host-func 节点本身就是 ≈2.1 ms/token 的固定开销**。
+
+**F2 事件等待在本平台几乎不要钱**：`DAVID_EVENT_WAIT` 中位 **0.027 µs**、`MEM_WAIT_VALUE` **0.144 µs**，前置空隙 0。
+
+**F3 `ExternalEvent` = `aclrtValueWait`/`aclrtValueWrite`，而且这套在本树、本图里已经在跑**
+（`acl_rt.h:3802/3814`、`ACL_EVENT_EXTERNAL acl_rt.h:32`；捕获侧 `attention_v1.py:1036-1038`、`mla_v1.py:1744-1747`
+把 `event.wait(stream)+event.reset(stream)` 进图，回放侧 `mla_v1.py:947-970` 由 host `event.record(update_stream)` 放行；
+profile 里 `MEM_WAIT_VALUE` 实打实 2286 次）⇒ **「device 等 ExternalEvent、由别的线程 record」不是猜想**。
+唯一无先例的是 **record 由「非主线程、在 replay 进行中」发出**。
+
+**F4 kt 的提交路径有一次完整线程握手，空任务往返实测 10.44 µs（p90 11.0）**
+（`CPUInfer::submit` → `TaskQueue`（`new Node`+mutex+notify）→ 另一线程执行 → notify 唤醒 `sync` 的 `cv.wait`；
+`cpuinfer.h:82-87`、`task_queue.cpp:41-96`；内联参照 0.04 µs）⇒ **0.42 ms/token 是纯线程跳**，落在 `submit`(2.4 µs) 与 E(18.2 µs) 两段里。
+⚠ 连带更正：**E 的大头不是跨 NUMA 归并** —— `merge_results`（`moe_base.hpp:766-808`）在 qlen=1 走单线程直算，
+本机实测 **1.18–1.78 µs**（≈0.07 ms/token）。「让两个 NUMA 池直接写最终 pinned 输出」**没戏**。
+
+### 方案排序（用户定：主指标 bs1 延迟；本 session 只做前三）
+
+| # | 方案 | 预计省 | 状态 |
+|---|---|---|---|
+| **P0** | **把 A 与 F 分开**（仪器，不改行为）：回调 entry/exit 再取一次 `CLOCK_REALTIME`，与 profile 的 `HOSTFUNC_CALLBACK.ts` / `NOTIFY_WAIT.ts+dur` 直接相减（profile 的 `ts` 就是 CLOCK_REALTIME µs，已核）。顺带补 §4.20.1 挂起的 `resid_us.max`/`n_unsplit` | 0（但 P1a/P1b 的取舍全靠它） | ⬜ 0 独占卡时，搭车 |
+| **P1** | **拆掉 host-func 节点，device 改等 ExternalEvent**。1a：回调只 submit 立即返回，kt 算完由完成线程 record 放行（省 F 段）；1b：连启动信号也不走回调——图里多挂一次 8 字节 D2H（每步自增的 device 计数器），常驻自旋线程（放 kt 里、C++、避 GIL）轮询到就跑 kt 并 record | 1a ≈1.9 ms（若 A/F 各半，推断）；**1b 净 2.5–3.5 ms**（30.75 空转 + A + F ≈109 µs/层，减新机制 6–15 µs，推断） | ⬜ 1a ~2.5 h 卡时；1b 再 +2 h（含 kt 重建与 t0/t1/t2） |
+| **P2** | **kt 内联执行**：加 `CPUInfer::run_inline`，图路径下 `submit`+`sync(0)` 不入 TaskQueue | **0.3–0.4 ms**（F4 实测基础上的推断） | ⬜ CPU 可先验，整网 A/B ~1 h |
+| P3 | 回调内 Python 前奏（kt_pre 0.62 ms/token）在捕获期固化成 C++ prepared task | 0.4–0.6 ms | 📒 排第四：有「缓存指针失效＝静默算错」的尖角，等 P1 落地后再动 |
+| P4 | 我方 Python 0.31 ms/token 的削减 | ≈0.2 ms | 📒 搭车做；🔴 **不得为省 2 µs 把 A3/A4 守卫改弱** |
+| P5 | packed 在新尺子下重测 | 上界 ≈0.16 ms（三次 MEMCPY 合计仅 6.6 µs/层） | 📒 只作 P1b 的前置（自有缓冲配计数器最干净），不单独排 |
+
+**P1 的判据（写进将来的 t6 用例，缺一不可）**：捕获期 record/回调计数 0、每次 replay 恰 +1、与串行臂**逐位相同**、三次 replay 互不相同；
+🔴 **两条变异臂**：①「不 record」⇒ 必须挂住/超时（证明 device 真在等）；②「提前 record（数据 D2H 之前）」⇒ 输出必须与串行臂不同
+（**放行早 = 更快且算错，且不报错**，这是本方案的主失效形态）。另加 profile 侧硬证据：**`HOSTFUNC_CALLBACK` 节点数变 0、30.75 µs 空隙消失**。
+
+### 看着诱人、实际没戏（附理由，别重走）
+1. 让两个 NUMA 池直接写最终 pinned 输出 —— 归并只值 0.07 ms（实测 1.2–1.8 µs/次），E 的大头是线程跳（F4）。
+2. 把提交点前移到 top-k 之后最早处 —— gating→三次 D2H→host-func 之间**没有空隙**（中位 0.000），三次 copy 合计 6.6 µs；30.75 µs 的空转在 copy **之后**。
+3. 降 `cpuinfer_threads` 给回调线程让核 —— 微基准已无拐点（§4.20.1）；F1 给了更可能的解释（空隙是 **host-func 节点类型独有**，其它节点全 0，像是 ACL 对 host 任务的调度方式）。要做也排在 P1 之后；P1b 成了它自动没意义。
+4. 靠 `graph_task_group` 省接缝 —— 它解决的是「replay 时换算子入参」，能借的只有它顺带证明的 ExternalEvent 用法（已计入 P1）。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -836,3 +885,4 @@ Pearson 只有 0.361，被层 2 的 1071 µs 离群点压住 ⇒ 判据用**秩*
 - 2026-09-22（phase2）：t4 修表后 node 52.6 µs / window 83.2 µs（形态 C 判负）；🔴「副流捕不了」作废——真因是我们自己的 int64 缓冲守卫 bug，现状参数下真实 3 层 fork/join 可捕获且 replay 逐位正确；107025 的真条件是「副流尾 record 必须被主流 join」。见 §4.19。
 - 2026-09-22（phase2）：接缝拆解首发——A+F（ACL 派发+回通知）78 µs/层 = 3.83 ms/token 占接缝 67%，我方 Python 仅 0.31 ms；埋点开销"没测出来但可能 0.4–0.8 ms"；seam.py 两条仪器问题待修。见 §4.20。
 - 2026-09-22（phase2）：查清 ACL 回调派发链路——单条报告线程、不绑核、`aclrtProcessReport(100ms)` 是阻塞上限非轮询间隔且不可调；🔴 kt worker 忙等 50 ms 才睡 ⇒ 稳态 192 个 PU 全程自旋、挤占不绑核的报告线程（解释了微基准 56.8 vs 整网 78 µs 的缺口）；GIL 只解释离群不解释中位。见 §4.21。
+- 2026-09-22（phase2）：接缝方案表——🔴 新靶子 F1「每个 host-func 节点前 30.75 µs 设备空转（其它节点类型全 0）＝1.23 ms/token」，可攻击面修正为 ≈5.5 ms；ExternalEvent 机制在本树本图已有先例（F3）；kt TaskQueue 线程握手实测 10.4 µs＝0.42 ms/token（F4）；归并只值 0.07 ms（"直接写最终缓冲"没戏）。三件事：P0 分开 A/F → P1 拆掉 host-func 节点改等事件 → P2 kt 内联。见 §4.22。
