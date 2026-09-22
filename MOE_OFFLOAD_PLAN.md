@@ -534,7 +534,34 @@ perf＝`perf_baseline.sh` bs1（并发 1、16 条、random IN 128 / OUT 256、ig
   数值判据留在 t0/t1/t2 层级。⚠ 没跑两发 c1 互比（用户为省时取消），"并发 1 是否自身确定"未测。
   旁证：旧 packed A/B 的"19/50 相同"在这把尺子下**不构成** packed 改数值的证据。
 
-**待办**：launcher 起服务不自动盖构建指纹（本次事后补盖）；decode profile 进行中。
+**decode profile（bs1 稳态，卡 2，同基线配置 + `KT_MOE_PHASE_TIMING=1`；`p2_prof_0922_131258/SUMMARY.md`【可复验，2.2 GB 未跟踪】）**
+分析脚本入库 `tools/kt_offload/prof/{kd,nw,ktphase}.py`（区间并集 / NOTIFY_WAIT 步切分 / kt 相位解析）。
+`prof_decode_breakdown.py` 在本版**结构性不可用**（`kernel_details.csv` 已无 `Model ID`/`Step Id` 列）。
+
+| TPOT 分解（196 步） | 中位 ms | p90 | 占比 |
+|---|---|---|---|
+| device step 周期（profiling 下） | **38.51** | 43.47 | 100% |
+| NPU 计算（区间并集） | **19.49** | 19.59 | 50.6% |
+| 等 CPU（NOTIFY_WAIT） | **15.88** | 19.00 | 41.2% |
+| 其余 host/launch/小空隙 | **2.81** | 6.58 | 7.3% |
+
+- 对账缺口 0.33 ms（0.9%）；profiling 膨胀 **+10.9%**（同服务不开 profiler bs1 中位 34.50–35.04，n=3）。
+- device 忙 **48.7%**；<100 µs 碎空隙合计仅 0.69 ms/token ⇒ 碎下发不是问题。
+- 算子 top（ms/token）：QuantBatchMatmulV3 4.30 · GroupedMatmul 1.86 · MatMulV3 1.66 · TransposeQuantBatchMatMul 1.33 ·
+  MhcSinkhorn 1.03 · MhcPre 0.88 · SparseFlashMla 0.85 · DynamicMxQuant 0.80 · Cast 0.78 · MoeInitRoutingV3 0.54。
+- **NOTIFY_WAIT 每层中位 353.6 µs**（40 层求和 14.39 ms/token）；host-func 计数每层每步恰一次、无丢层。
+- **驻留 GMM 窗口 42.7 µs/层**（全网 1.81 ms/token）⇒ 形态 C / 侧流在本层窗口内**最多藏住等待的约 12%**（≈1.7 ms/token 量级，推断上限）；§4.9 结论不变。
+- **kt CPU 分段（首次卡上实测，`KT_MOE_PHASE_TIMING=1`，不改代码、不改数值）**：每层每 NUMA 中位 236.7 µs =
+  up_gate 140.4（59%）+ down 78.2（33%）+ 其余 <20；每层取慢的 NUMA **246.1 µs**，40 层 **9.59 ms/token**（profiler 关时 8.88）。
+  对 §4.3 曲线（k=4.54 预测 266.4 µs）**快 7.6%** ⇒ **CPU 地板 ≈9–10 ms 被卡上证实**。
+- 🔴 **新靶子：接缝开销**。NOTIFY_WAIT 353.6 − kt 计算 246.1 = **107.5 µs/层 ≈ 4.3 ms/token（等 CPU 的约 27%）不是 kt 计算**
+  （D2H 等待 + host-func 派发 + Python + kt 提交/唤醒 + 跨 NUMA 归并 + H2D）。这部分不受「不许跨层」约束的上限限制。
+- ⚠ 两条：① `/stop_profile` 后 EngineCore **静默退出**（`Stop profiler while current state is RECORD`，无 traceback；产物完好）
+  ⇒ 采 profile 的服务当一次性用；`stop_by_port` 需带 `STOP_PGID` 才停干净（k.13 复现）。
+  ② 采集期间（13:12–13:47 之间）有**别的容器**上了卡 0–3（各 84,852 MB），不能排除与 13:28 窗口重叠；NPU 计算项极稳
+  （四分位无趋势）⇒ 按"未受明显影响"用，但本发绝对值不作最终基线。
+
+**待办**：launcher 起服务不自动盖构建指纹（本次事后补盖）。
 
 ## 5. 边界（不碰）
 
