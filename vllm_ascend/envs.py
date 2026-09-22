@@ -195,6 +195,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 合计约 2.1 ms / 28.8 ms 一步（适配方案 §6.9.15）。
     "VLLM_ASCEND_DSV41_MHC_FUSED_OPS": lambda: os.getenv("VLLM_ASCEND_DSV41_MHC_FUSED_OPS", "1"),
     "VLLM_ASCEND_DSV41_FORWARD_ROPE_OPERATOR": lambda: os.getenv("VLLM_ASCEND_DSV41_FORWARD_ROPE_OPERATOR", "1"),
+    # 融合 [T] -> [T, 2] 的 slot mapping：8 个算子 + 1 次 copy_ 压成 1 次下发，
+    # 每步 42 组。设 0 退回 torch 分解（两条路逐位相同），用于二分回归。
+    "VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING": lambda: os.getenv("VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING", "1"),
     # DeepSeek-V4.1 indexer K write: quantise and store through CANN's
     # indexer_quant_cache instead of indexer_compress_epilog_v2.
     # k_norm/RoPE/slot gating are unchanged either way.

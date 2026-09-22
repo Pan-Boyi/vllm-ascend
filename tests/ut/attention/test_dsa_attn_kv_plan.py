@@ -152,3 +152,113 @@ def test_a5_mode_survives_the_spec_path_rewrite():
 
         pinned = resolve_dsv4_cache_dtype("bfloat16", "bfloat16")
         assert is_a5_bf16_kv_enabled(_cache_config(pinned))
+
+# ---------------------------------------------------------------------------
+# format_dsa_slot_mapping: the fused [T] -> [T, 2] path
+#
+# 🔴 What these can and cannot prove. The fused spelling is a triton kernel
+# with no CPU implementation, so everything below exercises the **torch
+# fallback** and the ``out=`` contract. That the kernel agrees with torch
+# bit-for-bit is a card-only claim and is verified separately -- see the
+# perf report's 3.3. Writing a CPU test that "passes" for the fused path
+# would only prove the dispatch skipped it.
+# ---------------------------------------------------------------------------
+
+
+def _bf16_plan():
+    return get_dsa_attn_kv_plan(_config(True))
+
+
+def test_a_negative_slot_becomes_a_negative_pair_on_both_columns():
+    # Not (-1, offset): the scatter operators skip a row only when the block
+    # index is negative, and the compressor path reads the second column too.
+    with _on(AscendDeviceType.A5):
+        out = _bf16_plan().format_dsa_slot_mapping(
+            torch.tensor([-1, 0, 129], dtype=torch.int64), 128
+        )
+        torch.testing.assert_close(
+            out, torch.tensor([[-1, -1], [0, 0], [1, 1]], dtype=torch.int32)
+        )
+
+
+def test_out_is_written_in_place_and_returned():
+    # The builder passes a view of its resident buffer, whose address the FULL
+    # graph has baked in. Returning a fresh tensor instead of filling that
+    # view is the failure mode this pins (48d3202a6).
+    with _on(AscendDeviceType.A5):
+        dest = torch.full((3, 2), 7, dtype=torch.int32)
+        got = _bf16_plan().format_dsa_slot_mapping(
+            torch.tensor([5, -1, 256], dtype=torch.int64), 128, out=dest
+        )
+        assert got is dest
+        torch.testing.assert_close(
+            dest, torch.tensor([[0, 5], [-1, -1], [2, 0]], dtype=torch.int32)
+        )
+
+
+def test_out_and_no_out_agree():
+    with _on(AscendDeviceType.A5):
+        plan = _bf16_plan()
+        slots = torch.tensor([0, 127, 128, -1, 4095], dtype=torch.int64)
+        dest = torch.empty((5, 2), dtype=torch.int32)
+        plan.format_dsa_slot_mapping(slots, 128, out=dest)
+        torch.testing.assert_close(dest, plan.format_dsa_slot_mapping(slots, 128))
+
+
+@pytest.mark.parametrize(
+    "dest, why",
+    [
+        (torch.empty((2, 2), dtype=torch.int32), "too few rows"),
+        (torch.empty((3, 3), dtype=torch.int32), "not a (block, offset) pair"),
+        (torch.empty((3, 2), dtype=torch.int64), "wrong dtype"),
+    ],
+)
+def test_a_mismatched_out_is_refused_rather_than_reinterpreted(dest, why):
+    # The fused kernel stores at ``offsets * 2`` and ``offsets * 2 + 1``, so a
+    # mis-shaped destination would be filled with plausible-looking wrong
+    # slots. Both paths must refuse it, or the CPU tests stop describing the
+    # card. ``why`` is only here to name the case in the report.
+    with _on(AscendDeviceType.A5):
+        with pytest.raises((ValueError, RuntimeError)):
+            _bf16_plan().format_dsa_slot_mapping(
+                torch.tensor([5, -1, 0], dtype=torch.int64), 128, out=dest
+            )
+
+
+def test_the_flat_plan_still_honours_out():
+    # requires_block_offset_slots=False keeps flat slots, and that builder's
+    # resident buffer is 1-D (dsa_v1.py:1009). Refusing ``out`` here would
+    # only break the plan we do not run in production -- the worst place for
+    # a defect to sit, because nothing in our own runs would surface it.
+    with _on(AscendDeviceType.A5):
+        plan = get_dsa_attn_kv_plan(_config(False))
+        assert not plan.requires_block_offset_slots
+        dest = torch.zeros(3, dtype=torch.int32)
+        got = plan.format_dsa_slot_mapping(
+            torch.tensor([5, -1, 9], dtype=torch.int64), 128, out=dest
+        )
+        assert got is dest
+        torch.testing.assert_close(dest, torch.tensor([5, -1, 9], dtype=torch.int32))
+
+
+def test_an_empty_mapping_is_not_an_error():
+    # Dummy runs reach the builder with zero tokens.
+    with _on(AscendDeviceType.A5):
+        out = _bf16_plan().format_dsa_slot_mapping(
+            torch.empty(0, dtype=torch.int64), 128
+        )
+        assert tuple(out.shape) == (0, 2) and out.dtype == torch.int32
+
+
+def test_the_fused_switch_does_not_change_the_cpu_result(monkeypatch):
+    # The env switch exists to bisect a regression without a rebuild. On CPU
+    # both settings must take the torch path, so the switch is a no-op here;
+    # if this ever diverges, the dispatch is keying off something other than
+    # is_npu and the CPU suite has stopped describing the card.
+    with _on(AscendDeviceType.A5):
+        plan = _bf16_plan()
+        slots = torch.tensor([0, 130, -1], dtype=torch.int64)
+        expected = plan.format_dsa_slot_mapping(slots, 128)
+        for setting in ("0", "1"):
+            monkeypatch.setenv("VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING", setting)
+            torch.testing.assert_close(plan.format_dsa_slot_mapping(slots, 128), expected)

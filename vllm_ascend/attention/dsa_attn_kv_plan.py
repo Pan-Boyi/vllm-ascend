@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch_npu
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -187,14 +188,73 @@ class DsaAttnKvPlan:
     def get_dsa_compressor_slot_mapping_format(self) -> int:
         return self.compressor_slot_mapping_format
 
-    def format_dsa_slot_mapping(self, slot_mapping: torch.Tensor, block_size: int) -> torch.Tensor:
+    def format_dsa_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        block_size: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``[T]`` flat slots -> ``[T, 2]`` int32 (block, offset).
+
+        Called once per KV-cache group, 42 times per decode step. The torch
+        spelling below is eight dispatches and the caller then copies into its
+        resident buffer, so the fused kernel replaces nine launches with one.
+        Measured 2026-09-22: this path is launch-overhead bound (~1.07 us per
+        kernel for elementwise work on a T <= 8 vector), so the win is in the
+        dispatch count, not the arithmetic.
+
+        ``out``, when given, is written in place -- that is what removes the
+        caller's copy. It must be a contiguous ``[T, 2]`` int32 tensor.
+
+        The two paths are bit-identical by construction: for ``slot >= 0``
+        floor- and trunc-division agree, and both spellings map every negative
+        slot to ``(-1, -1)``. Verified on card; the fallback stays behind
+        ``VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING=0`` so a regression can be
+        bisected without a rebuild.
+        """
         if not self.requires_block_offset_slots:
+            # This plan keeps flat slots. ``out`` still has to be honoured:
+            # the caller passes its resident buffer either way, and that
+            # buffer is 1-D here (dsa_v1.py:1009). Refusing ``out`` on this
+            # branch would only break the plan we do not run in production,
+            # which is the worst place for a defect to sit.
+            if out is not None:
+                out.copy_(slot_mapping)
+                return out
             return slot_mapping
+        # 🔴 Validate ``out`` **before** dispatching, so both spellings refuse
+        # the same inputs. Caught by test_a_mismatched_out_is_refused_...:
+        # the torch path's ``copy_`` silently casts an int64 destination,
+        # while the fused kernel refuses it. A CPU suite that exercises only
+        # the lenient path stops describing the card -- the same shape as the
+        # round-1 lesson where the equivalence harness fed row-count-matched
+        # inputs and walked straight past a silent-truncation contract.
+        if out is not None:
+            expected = (slot_mapping.shape[0], 2)
+            if tuple(out.shape) != expected:
+                raise ValueError(f"out must be {list(expected)}, got {list(out.shape)}")
+            if out.dtype != torch.int32:
+                raise ValueError(f"out must be int32, got {out.dtype}")
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous")
+        # ``is_npu`` (not a try/except) keeps the CPU unit tests on the torch
+        # path without letting a real operator failure fall back silently --
+        # dsnext's try/except around its fused ops turns a genuine fault into
+        # "slow but no error", which we explicitly do not copy.
+        if getattr(slot_mapping, "is_npu", False) and envs_ascend.VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING == "1":
+            from vllm_ascend.ops.triton.dsa_block_offset_slots import \
+                dsa_block_offset_slots
+
+            return dsa_block_offset_slots(slot_mapping, block_size, out=out)
         valid = slot_mapping >= 0
         invalid = torch.full_like(slot_mapping, -1)
         block_idx = torch.where(valid, torch.div(slot_mapping, block_size, rounding_mode="floor"), invalid)
         offset = torch.where(valid, slot_mapping % block_size, invalid)
-        return torch.stack([block_idx, offset], dim=-1).to(torch.int32)
+        formatted = torch.stack([block_idx, offset], dim=-1).to(torch.int32)
+        if out is not None:
+            out.copy_(formatted)
+            return out
+        return formatted
 
     def dsa_kv_compress_scatter(self, cache: torch.Tensor, x: torch.Tensor | None, slot_mapping: torch.Tensor) -> None:
         if x is None:

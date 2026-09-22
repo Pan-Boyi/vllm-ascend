@@ -1278,8 +1278,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # are generated later from the logical block table by compressor_metadata.
         if self.compressor_ratio <= 1:
             slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-            self.slot_mapping[:num_input_tokens] = get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
-                slot_mapping, self.storage_block_size
+            # out= 写进常驻 buffer：省掉这里原本那次 copy_，也是 FULL 图要求的
+            # —— 图里烘死的是这块 buffer 的地址，必须原地重填（见 48d3202a6）。
+            get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
+                slot_mapping,
+                self.storage_block_size,
+                out=self.slot_mapping[:num_input_tokens],
             )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
