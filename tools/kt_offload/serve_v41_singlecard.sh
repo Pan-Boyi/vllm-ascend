@@ -127,6 +127,31 @@ OURS="${OURS:-0 1 2 3}"            # 归属：用户 2026-09-14 口径「优先�
 MIN_EP="${MIN_EP:-3}"              # V4.1 每卡权重 275.7/EP + 10.4，EP=2 是 148.2 GiB，装不下
 # ---- KT_OFFLOAD=1(单卡 MoE offload,09-18 加):必须显式给【一张】卡 ----------------
 #   这样 MIN_EP / 下面的自动选卡段对 KT 分支不生效,也就不用改它们 —— 默认路径一个字节不动。
+# ── 起飞前两道闸（本线自有，2026-09-22 rebase 到 f85267ab8 时加）─────────────
+#   实现与理由都在 tools/kt_offload/serve_preflight_gates.sh（可单独跑、不起服务）。
+#   ① .so 期望值：旧 .so + 新代码 = 静默算错 ⇒ 换 .so 之前必然拒绝起飞。
+#   ② ds41 算子包（O6 / >16k）：缺了不报错、只是静默退回 v2 —— 所以判据读
+#      解释器真会解析到的那个文件，不读 env。
+#   gate_ds41 会把 $DS41 前置进 PYTHONPATH（必须在 env_dsv41.sh 之后，
+#   因为 CANN 的 set_env.sh 会把自带的同名包插到最前）。
+. "$(dirname "${BASH_SOURCE[0]}")/serve_preflight_gates.sh"
+gate_so "$_TREE" || exit 1
+gate_ds41 || exit 1
+
+# ── 图模式必须显式带 VLLM_USE_BREAKABLE_CUDAGRAPH=1（新 O15 闸）───────────────
+#   clean 的 platform.py:_require_validated_dsv41_graph_mode() 在真捕图而没设
+#   它时 raise；以前本脚本"由调用方传"，于是忘了传就直接起不来（而在加这条
+#   硬拦截之前是【静默】走 piecewise torch.compile + 普通 ACLGraph，那条路没有
+#   任何 DSV4.1 精度/浸泡数覆盖）。--enforce-eager 豁免。
+#   ⚪ 要故意跑未验证那条路：VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE=1。
+#   两条路的 EAGER 默认值相反：KT 路默认 eager（EAGER:-1），默认路默认图模式。
+if [ "${KT_OFFLOAD:-0}" = "1" ]; then _WILL_CAPTURE=$([ "${EAGER:-1}" = "1" ] && echo 0 || echo 1)
+else _WILL_CAPTURE=$([ "${EAGER:-0}" = "1" ] && echo 0 || echo 1); fi
+if [ "$_WILL_CAPTURE" = "1" ]; then
+  export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}"
+  echo "  ⚪ 非 --enforce-eager ⇒ VLLM_USE_BREAKABLE_CUDAGRAPH=$VLLM_USE_BREAKABLE_CUDAGRAPH"
+fi
+
 if [ "${KT_OFFLOAD:-0}" = "1" ]; then
   [ -n "${NPUS:-}" ] || { echo "❌ KT_OFFLOAD=1 要显式传 NPUS=<一张卡>,不走自动选卡"; exit 1; }
   [ "${SMOKE:-0}" = "1" ] && { echo "❌ KT_OFFLOAD=1 与 SMOKE=1(dummy 权重)不兼容"; exit 1; }
@@ -472,8 +497,11 @@ if [ "${KT_OFFLOAD:-0}" = "1" ]; then
   # kt_site 追加在 PYTHONPATH 末尾(不前置,免得它遮住 vllm/vllm_ascend)。
   # 图模式开关(09-18):本分支 EAGER 默认 1(= 原来写死的 --enforce-eager,不设 EAGER 时行为不变);
   #   EAGER=0 去掉 --enforce-eager,其余照抄默认(四卡)路径 —— 默认路径不传 --compilation-config
-  #   (vLLM 默认 FULL_AND_PIECEWISE),也不在脚本里设 VLLM_USE_BREAKABLE_CUDAGRAPH:
-  #   已验证的图模式发次都由调用方(runner)传 VLLM_USE_BREAKABLE_CUDAGRAPH=1(指南 §199/§277),这里同样由调用方传。
+  #   (vLLM 默认 FULL_AND_PIECEWISE)。
+  #   🔴 2026-09-22 起 VLLM_USE_BREAKABLE_CUDAGRAPH 不再"由调用方传":上面已按
+  #      "本发会不会真捕图"显式设成 1(调用方仍可覆盖)。clean 的
+  #      _require_validated_dsv41_graph_mode() 现在会 raise,忘传就起不来;
+  #      在那条硬拦截之前忘传是【静默】走没有任何精度/浸泡数覆盖的那条路。
   # ⚠️ 注意默认值和默认路径相反:默认路径不设 EAGER = 图模式;本分支不设 EAGER = eager。
   export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ROOT/build_artifacts/moe_offload_ref/kt_site"
   KT_EAGER="${EAGER:-1}"
