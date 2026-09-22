@@ -98,15 +98,19 @@ pa_advice() {  # <state> -> what to do about it (the two busy states differ)
   esac
 }
 
-# Sample a real card and classify it. Prints the state; the samples land in
-# PA_LAST_SAMPLES for the caller to log.
-pa_card_state() {  # <card> [samples] [sleep_s]
+# Sample a real card and classify it. Sets PA_LAST_STATE and PA_LAST_SAMPLES in
+# the CALLING shell and prints nothing.
+# 🔴 Call it directly, never as $(pa_sample_card ...): a command substitution is a
+#    subshell, the two globals die with it, and under `set -u` the caller's first
+#    read of PA_LAST_SAMPLES aborts the run (2026-09-22, first on-card t0 after
+#    the aicore dimension landed: "PA_LAST_SAMPLES: unbound variable", nothing ran).
+pa_sample_card() {  # <card> [samples] [sleep_s]
   local card="$1" n="${2:-${PA_AICORE_SAMPLES:-3}}" nap="${3:-2}" i out hbm ai proc_busy=0
   local hbm_list="" ai_list=""
   out=$(timeout 20 npu-smi info -t proc-mem -i "$card" 2>/dev/null) || out=""
   if [ -z "$out" ]; then
     PA_LAST_SAMPLES="proc-mem unreadable"
-    echo running-unknown; return 0
+    PA_LAST_STATE=running-unknown; return 0
   fi
   pa_proc_table_busy "$out" && proc_busy=1
   for ((i = 0; i < n; i++)); do
@@ -117,14 +121,19 @@ pa_card_state() {  # <card> [samples] [sleep_s]
     [ $((i + 1)) -lt "$n" ] && sleep "$nap"
   done
   PA_LAST_SAMPLES="proc_busy=$proc_busy hbm=[$hbm_list] aicore=[$ai_list]"
-  pa_classify "$proc_busy" "$hbm_list" "$ai_list"
+  PA_LAST_STATE=$(pa_classify "$proc_busy" "$hbm_list" "$ai_list")
+}
+
+# Prints the state only. Fine inside $(...) because it promises nothing about
+# the globals; callers that log the samples must use pa_sample_card instead.
+pa_card_state() {  # <card> [samples] [sleep_s]
+  pa_sample_card "$@"
+  echo "$PA_LAST_STATE"
 }
 
 pa_card_busy() {  # <card> -> rc 0 = busy (keep waiting), 1 = looks free
-  local state
-  state=$(pa_card_state "$1" "${PA_BUSY_SAMPLES:-3}" "${PA_BUSY_SLEEP:-2}")
-  PA_LAST_STATE="$state"
-  [ "$state" = free ] && return 1
+  pa_sample_card "$1" "${PA_BUSY_SAMPLES:-3}" "${PA_BUSY_SLEEP:-2}"
+  [ "$PA_LAST_STATE" = free ] && return 1
   return 0
 }
 

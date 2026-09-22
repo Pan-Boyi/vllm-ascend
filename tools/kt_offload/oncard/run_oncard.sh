@@ -296,7 +296,8 @@ PCT=$(awk -F: '/HBM Usage Rate/{gsub(/ /,"",$2); print $2; exit}' "$RUN/card_bef
 # HBM for 12 minutes while aicore moved 7..77% -- a live deployment in ANOTHER
 # CONTAINER, whose pids do not exist in ours. The two states call for opposite
 # actions, so the gate names which one it saw.
-CARD_STATE=$(pa_card_state "$CARD" "${ONCARD_BUSY_SAMPLES:-3}" "${ONCARD_BUSY_SLEEP:-2}")
+pa_sample_card "$CARD" "${ONCARD_BUSY_SAMPLES:-3}" "${ONCARD_BUSY_SLEEP:-2}"   # direct call: see packed_ab_lib.sh
+CARD_STATE=$PA_LAST_STATE
 say "⚪ card $CARD state=$CARD_STATE  ($PA_LAST_SAMPLES)"
 echo "state=$CARD_STATE $PA_LAST_SAMPLES" >> "$RUN/card_before.txt"
 if [ "$CARD_STATE" != free ]; then

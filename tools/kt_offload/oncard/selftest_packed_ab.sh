@@ -98,7 +98,36 @@ ok "with aicore they are different verdicts"
 pa_advice running | command grep -q "never kill, never reset"; ok "the 'running' advice forbids kill/reset"
 pa_advice residue | command grep -q "drain"; ok "the 'residue' advice is to let it drain"
 [ "$(pa_advice running)" != "$(pa_advice residue)" ]; ok "the two busy states advise different actions"
-command grep -q "pa_card_state" "$HERE/run_oncard.sh"; ok "run_oncard's pre-flight uses the three-dimension state"
+# The pre-flight must be EXERCISED, not grepped for: a name check stayed green while
+# `CARD_STATE=$(pa_card_state ...)` lost PA_LAST_SAMPLES in the subshell and the
+# first real t0 (2026-09-22) died under set -u before anything ran.
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/npu-smi" <<'FAKE'
+#!/usr/bin/env bash
+case "$*" in
+  *proc-mem*) printf '\tNPU ID : 0\n\tNo process in device.\n';;
+  *usages*)   printf '\tHBM Usage Rate(%%)              : 4\n\tAicore Usage Rate(%%)           : 0\n';;
+esac
+FAKE
+chmod +x "$TMP/bin/npu-smi"
+pre=$(command grep -E '^pa_sample_card "\$CARD"' "$HERE/run_oncard.sh")
+[ -n "$pre" ] && ok "run_oncard's pre-flight calls pa_sample_card directly (not in \$(...))" \
+  || bad "run_oncard's pre-flight does not call pa_sample_card directly"
+out=$(PATH="$TMP/bin:$PATH" bash -uc 'source "$1"; CARD=0; ONCARD_BUSY_SLEEP=0
+  '"$pre"'
+  CARD_STATE=$PA_LAST_STATE; echo "state=$CARD_STATE ($PA_LAST_SAMPLES)"' _ "$HERE/packed_ab_lib.sh" 2>&1); rc=$?
+chk "$rc" 0 "the pre-flight line runs under set -u against a fake idle card"
+echo "$out" | command grep -q "state=free (proc_busy=0 hbm=\[4,4,4\] aicore=\[0,0,0\])" \
+  && ok "it reads free and the samples reach the caller ($out)" || bad "unexpected pre-flight reading: $out"
+# mutant: the old subshell form must die exactly the way the card run did
+out=$(PATH="$TMP/bin:$PATH" bash -uc 'source "$1"; CARD_STATE=$(pa_card_state 0 3 0)
+  echo "state=$CARD_STATE ($PA_LAST_SAMPLES)"' _ "$HERE/packed_ab_lib.sh" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && echo "$out" | command grep -q "PA_LAST_SAMPLES: unbound variable" \
+  && ok "mutant: the old \$(pa_card_state) form reproduces the on-card failure" \
+  || bad "mutant did not reproduce 'PA_LAST_SAMPLES: unbound variable' (rc=$rc: $out)"
+PATH="$TMP/bin:$PATH" pa_card_busy 0 && bad "pa_card_busy reads the fake idle card as busy" \
+  || { [ -n "${PA_LAST_SAMPLES:-}" ] && ok "pa_card_busy: free, and PA_LAST_SAMPLES survives for its caller" \
+       || bad "pa_card_busy left PA_LAST_SAMPLES empty"; }
 command grep -q "pa_advice" "$HERE/run_packed_ab.sh"; ok "run_packed_ab reports which kind of busy it waited on"
 command grep -q "lease table is a convention INSIDE this container" "$HERE/run_oncard.sh"
 ok "the gate says a lease cannot answer 'is somebody else on this card'"
