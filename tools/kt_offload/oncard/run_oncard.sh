@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t5
-#                                                     | e2p | e5   (gate-clearing checks)
+#                                                     | e2p | e5 | e2w | h2d  (gate-clearing checks)
 #
 #  The only way the single-layer on-card checks touch a card. The shell enforces:
 #   1. lease first: build_artifacts/card_lease.sh acquire <card> dsv41_vllm_singlecard
@@ -34,7 +34,9 @@ set -u
 set -o pipefail
 
 ROOT=/workspace/code/dsv4_single_card/vllm_project
-OWNER=dsv41_vllm_singlecard
+# 2026-09-22: 本线（stream_prefill）也用这套脚手架 ⇒ owner 可覆盖。默认不变。
+# card_lease 允许同 owner 名续租/覆盖 ⇒ 覆盖成自己的名字才不会与本线已持有的租约撞车。
+OWNER="${ONCARD_OWNER:-dsv41_vllm_singlecard}"
 
 # ---- which vllm-ascend tree this run uses (2026-09-22) ----------------------
 #  Default is unchanged: $ROOT/worktrees/moe-offload.
@@ -70,7 +72,7 @@ fi
 export DSV41_VLLM_ASCEND_TREE="$VA_TREE"
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
-usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|e2p|e5|e2w> [test args...]"; exit 2; }
+usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|e2p|e5|e2w|h2d> [test args...]"; exit 2; }
 [[ "$CARD" =~ ^[0-9]+$ ]] || usage
 case "$TEST" in
   t0) PY=t0_offload_off.py; DEF_TIMEOUT=2400;;
@@ -85,6 +87,7 @@ case "$TEST" in
   e2p) PY=e2p_slice_cast.py;  DEF_TIMEOUT=2400;;
   e5)  PY=e5_chunked_accum.py; DEF_TIMEOUT=2400;;
   e2w) PY=e2w_write_channels.py; DEF_TIMEOUT=1800;;
+  h2d) PY=h2d_bandwidth.py;  DEF_TIMEOUT=1800;;
   *) usage;;
 esac
 
