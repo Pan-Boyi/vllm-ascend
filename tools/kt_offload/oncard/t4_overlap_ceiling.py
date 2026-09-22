@@ -189,10 +189,16 @@ def main() -> int:
     payload = ("t4", 0)
     KL._subscribe_stream(torch.npu.current_stream(dev))
 
+    # Every host-func node counts its own calls. Without this a node that never
+    # entered the graph is indistinguishable from a node that costs nothing --
+    # which is exactly the way the 2026-09-22 14:15 flight read "0 us".
+    calls = {"noop": 0, "fat": 0}
+
     def noop(_payload):
-        return None
+        calls["noop"] += 1
 
     def fat(_payload):
+        calls["fat"] += 1
         end = time.perf_counter() + args.fat_us / 1e6
         while time.perf_counter() < end:
             pass
@@ -206,8 +212,18 @@ def main() -> int:
 
     def build(nodes) -> tuple:
         g = torch.npu.NPUGraph()
-        stream = torch.npu.current_stream(dev)
         with torch.npu.graph(g):
+            # The capture runs on torch_npu's own capture stream (graphs.py:851,
+            # ``graph.default_capture_stream``), NOT on the stream that was
+            # current outside the ``with``. Reading the stream outside -- what
+            # this file did until 2026-09-22 -- launched every host func on the
+            # default stream instead, so the nodes never entered the graph:
+            # they ran once, eagerly, at capture time, and every replay measured
+            # a graph with no node in it (that is the "500 us fat node = -1.3 us"
+            # reading). Production takes the stream inside the capture
+            # (layer.py:347/_submit_captured) and subscribes it there; so do we.
+            stream = torch.npu.current_stream(dev)
+            KL._subscribe_stream(stream)
             for fn in nodes.get("before", []):
                 KL._launch_host_func(stream, fn, payload)
             out = npu_only()
@@ -230,6 +246,23 @@ def main() -> int:
             build_errors[name] = f"{type(exc).__name__}: {str(exc)[:400]}"
             v.note(f"{name}: capture failed -- {build_errors[name]}")
 
+    # Did the nodes enter the graph at all? A node recorded in the graph runs
+    # zero times during the capture and exactly once per replay.
+    calls_after_capture = dict(calls)
+    v.check(
+        calls_after_capture == {"noop": 0, "fat": 0},
+        f"no host func ran during capture (got {calls_after_capture}); a non-zero count means the node "
+        "was launched on a stream the capture does not own and ran eagerly instead",
+    )
+    for name, key, want in (("g_one", "noop", 1), ("g_fat", "fat", 1), ("g_two", "noop", 2)):
+        if name not in graphs:
+            continue
+        before = calls[key]
+        graphs[name][0].replay()
+        torch.npu.synchronize()
+        got = calls[key] - before
+        v.check(got == want, f"{name}: one replay runs its host func(s) {want}x (got {got})")
+
     def replay_of(name):
         g, _ = graphs[name]
 
@@ -242,15 +275,80 @@ def main() -> int:
     gr = timed({name: replay_of(name) for name in graphs}, args.reps)
     graph_stats = {k: M.stats(s) for k, s in gr.items()}
     for k, s in graph_stats.items():
-        print(f"  graph {k:9s} median {s['median']:9.1f} us  p10 {s['p10']:9.1f}  p90 {s['p90']:9.1f}  n={s['n']}",
-              flush=True)
+        print(f"  graph {k:9s} (wall) median {s['median']:9.1f} us  p10 {s['p10']:9.1f}  p90 {s['p90']:9.1f} "
+              f" n={s['n']}", flush=True)
 
-    ok, line = M.negative_control(gr["g_none"], eager["npu_only"], args.tol)
-    v.check(ok, f"negative control: {line}")
+    # ---- device time: the only comparison that means anything ------------
+    #
+    # Wall time around an EAGER arm is launch-bound at T=1 (the host issues ~a
+    # hundred small ops), while wall time around a replay is not: comparing the
+    # two reads "the graph is 2.5x cheaper" even when both run the same kernels.
+    # That is an instrument difference, not a finding, and it is what made the
+    # negative control fail on 2026-09-22 14:15. So both sides are measured on
+    # the device timeline instead: a blocker kernel is enqueued first, the arm
+    # is enqueued behind it while the device is still busy, and two events
+    # bracket the arm's own execution. ``e0.query()`` false right after the
+    # enqueue is the proof that the host really did run ahead; if it is not, the
+    # sample carries launch gaps and the check below says so.
+    blk = torch.randn((2048, 2048), device=dev, dtype=torch.bfloat16)
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(10):
+        torch.mm(blk, blk)
+    torch.npu.synchronize()
+    per_blk_us = (time.perf_counter() - t0) * 1e5
+    blk_reps = max(1, int(round(5000.0 / max(per_blk_us, 1.0))))
+    print(f"  blocker: {per_blk_us:.1f} us per 2048^3 mm, {blk_reps} of them (~{blk_reps * per_blk_us / 1000:.1f} ms) "
+          f"queued ahead of every device-timed sample", flush=True)
 
-    d_one = M.paired_delta(gr["g_one"], gr["g_none"])
-    d_two = M.paired_delta(gr["g_two"], gr["g_none"])
-    d_fat = M.paired_delta(gr["g_fat"], gr["g_none"])
+    def dev_timed(fns: dict, reps: int) -> tuple[dict, dict]:
+        out = {k: [] for k in fns}
+        ahead = {k: [] for k in fns}
+        names = list(fns)
+        for r in range(reps + 2):
+            k = r % len(names)
+            for name in names[k:] + names[:k]:
+                torch.npu.synchronize()
+                e0, e1 = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+                for _ in range(blk_reps):
+                    torch.mm(blk, blk)
+                e0.record()
+                fns[name]()
+                e1.record()
+                host_ran_ahead = not e0.query()  # device has not reached e0 yet
+                torch.npu.synchronize()
+                if r >= 2:
+                    out[name].append(e0.elapsed_time(e1) * 1000.0)
+                    ahead[name].append(host_ran_ahead)
+        return out, ahead
+
+    def replay_no_sync(name):
+        g, _ = graphs[name]
+        return g.replay
+
+    dev_arms = {name: replay_no_sync(name) for name in graphs}
+    dev_arms["eager_npu_only"] = npu_only
+    dv, ahead = dev_timed(dev_arms, args.reps)
+    dev_stats = {k: M.stats(s) for k, s in dv.items()}
+    for k, s in dev_stats.items():
+        frac = sum(ahead[k]) / len(ahead[k])
+        print(f"  DEV   {k:14s} median {s['median']:9.1f} us  p10 {s['p10']:9.1f}  p90 {s['p90']:9.1f} "
+              f" n={s['n']}  host-ahead {frac:.0%}", flush=True)
+    worst = min(sum(a) / len(a) for a in ahead.values())
+    v.check(
+        worst >= 0.9,
+        f"the host ran ahead of the device on >= 90% of device-timed samples (worst arm {worst:.0%}); "
+        "below that the events bracket launch gaps, not execution",
+    )
+
+    ok, line = M.negative_control(dv["g_none"], dv["eager_npu_only"], args.tol)
+    v.check(ok, f"negative control (device time): {line}")
+    wall_nc = M.negative_control(gr["g_none"], eager["npu_only"], args.tol)
+    v.note(f"the same control on wall time (NOT a criterion; eager is launch-bound at T=1): {wall_nc[1]}")
+
+    d_one = M.paired_delta(dv["g_one"], dv["g_none"])
+    d_two = M.paired_delta(dv["g_two"], dv["g_none"])
+    d_fat = M.paired_delta(dv["g_fat"], dv["g_none"])
     print(f"  node cost: 1 empty node {d_one['median']:.1f} us (p10 {d_one['p10']:.1f}, p90 {d_one['p90']:.1f}); "
           f"2 nodes {d_two['median']:.1f} us; fat node {d_fat['median']:.1f} us", flush=True)
     ok, line = M.instrument_control(d_fat["median"], args.fat_us)
@@ -289,7 +387,7 @@ def main() -> int:
 
     # ---- the three numbers and the verdict --------------------------------
     cpu_us = eager_stats["kt_only"]["median"]
-    window_us = graph_stats["g_none"]["median"]
+    window_us = dev_stats["g_none"]["median"]  # device time: the window is NPU execution, not host launch
     node_us = d_one["median"]
     ceil = M.ceiling(cpu_us, window_us, node_us, args.layers)
     print(f"\n  1) node_us   = {node_us:.1f} us/node   (form C adds {2 * node_us:.1f} us/layer for its two nodes)")
@@ -320,7 +418,12 @@ def main() -> int:
         "validates_correctness": False,
         "eager_us": eager_stats,
         "eager_saved_vs_serial": {"sglang": saved_sglang, "formC": saved_formc},
-        "graph_us": graph_stats,
+        "graph_us_wall": graph_stats,
+        "device_us": dev_stats,
+        "device_host_ahead_frac": {k: sum(a) / len(a) for k, a in ahead.items()},
+        "blocker": {"per_mm_us": per_blk_us, "reps": blk_reps},
+        "host_func_calls_after_capture": calls_after_capture,
+        "negative_control_wall_only": wall_nc[1],
         "graph_build_errors": build_errors,
         "node_cost_us": {"one_empty": d_one, "two_empty": d_two, "fat": d_fat},
         "numbers": {"node_us": node_us, "window_us": window_us, "cpu_us": cpu_us},
