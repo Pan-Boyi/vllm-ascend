@@ -760,3 +760,62 @@ def test_the_two_mode_refusal_names_the_runtime_values():
         saa._check_modes_are_not_both_requested(kwargs)
     assert "cmp_mask_mode=3" in str(exc.value)
     assert "cmp_ratio=2" in str(exc.value)
+
+
+# ------------------------------------------- capture launches no reduction
+
+def _capturing(monkeypatch, yes: bool):
+    from vllm_ascend.models.deepseek_v4_1 import engram_embedding
+    monkeypatch.setattr(engram_embedding, "_stream_is_capturing",
+                        lambda: yes)
+
+
+@pytest.mark.parametrize("fn,extra", [("_device_scalar", (-1, )),
+                                      ("_device_predicate", ())])
+def test_capture_does_not_evaluate_the_reduction(monkeypatch, fn, extra):
+    """🔴 The whole point of passing a callable rather than a tensor.
+
+    ``table.max()`` at the call site is evaluated **before** the capture
+    check can skip it, so the kernel is launched, recorded into the graph and
+    then re-run on every replay for the life of the process -- computing a
+    value that the host, at replay, never reads. Measured: 512 kernels and
+    0.98 ms of a 28.8 ms decode step (3.4%), see 适配方案 §6.9.15.
+
+    A test that only checked "the guard still raises on bad input" would pass
+    against the old, wasteful form; this is the one that would not.
+    """
+    from vllm_ascend.models.deepseek_v4_1 import sparse_attn_args as mod
+
+    calls = []
+
+    def reduction():
+        calls.append(1)
+        return torch.tensor(0)
+
+    _capturing(monkeypatch, True)
+    getattr(mod, fn)(reduction, *extra)
+    assert calls == [], (
+        f"{fn} evaluated its reduction while capturing: the kernel is in the "
+        "graph and will re-run on every replay")
+
+    _capturing(monkeypatch, False)
+    getattr(mod, fn)(reduction, *extra)
+    assert calls == [1], f"{fn} skipped the reduction outside capture"
+
+
+def test_the_call_sites_pass_callables_not_tensors():
+    """Derived from the source: a future edit that drops the lambda restores
+    the waste silently -- the guard still works, it is just costly again."""
+    import inspect
+
+    source = inspect.getsource(
+        __import__("vllm_ascend.models.deepseek_v4_1.sparse_attn_args",
+                   fromlist=["x"]))
+    for call in ("_device_scalar(", "_device_predicate("):
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(call) and f"= {call}" not in stripped \
+                    and f"_check({call}" not in stripped:
+                continue
+            assert "lambda" in stripped or stripped.endswith("("), (
+                f"call site passes an evaluated tensor: {stripped}")

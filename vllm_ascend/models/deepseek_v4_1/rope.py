@@ -234,19 +234,22 @@ def _inverse_rope_operator(o: torch.Tensor, positions: torch.Tensor,
     Rotates a copy, so the caller's ``o`` is left as it was, as in the torch
     form.
     """
-    from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
+    from vllm_ascend.models.deepseek_v4_1.rope_widen import neg_sin_for_slice
 
     if o.dim() != 3:
         raise ValueError(
             f"o has shape {tuple(o.shape)}; expected [num_tokens, heads, "
             "head_dim]. The operator takes x 4-D and one axis is added here.")
     head_dim = o.shape[-1]
-    cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
+    # ``neg_sin_for_slice``, not ``cos_sin_for_slice`` + a negation here: the
+    # forward RoPE in ``qkv_prolog`` already built this exact pair for this
+    # step, and the negation is the same every layer. Both are cached there.
+    cos, neg_sin = neg_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
     out = o.clone(memory_format=torch.contiguous_format)
     _partial_rotary_op()(
         out.unsqueeze(1),                       # [T, 1, H, D]
         cos[:, None, None, :],                  # [T, 1, 1, rope_head_dim]
-        (-sin)[:, None, None, :],
+        neg_sin[:, None, None, :],
         rotary_mode="interleave",
         partial_slice=[head_dim - rope_head_dim, head_dim],
     )
