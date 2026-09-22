@@ -3,9 +3,14 @@ positions 1.. = decode steps (FULL graph, bs1 -> captured path, where the side s
 A position is compared only while all earlier chosen tokens agree (same input)."""
 import json, sys, math
 def load(p): return {r["i"]: r for r in map(json.loads, open(p))}
-A, B = load(sys.argv[1]), load(sys.argv[2])
-label = sys.argv[3] if len(sys.argv) > 3 else ""
-keys = sorted(set(A) & set(B))
+argv = [a for a in sys.argv[1:] if not a.startswith("--skip-first=")]
+skip = next((int(a.split("=")[1]) for a in sys.argv[1:] if a.startswith("--skip-first=")), 0)
+A, B = load(argv[0]), load(argv[1])
+label = argv[2] if len(argv) > 2 else ""
+# --skip-first=N: drop the first N requests of each run. The first few requests after a
+# service starts are not comparable to later ones (JIT / warmup); 2026-09-22 measured:
+# in-process A1 pass1 vs pass2 differed on exactly 4 prompts, all at request index 2-5.
+keys = sorted(k for k in set(A) & set(B) if k >= skip)
 stat = {"prefill": [0, 0, []], "decode": [0, 0, []]}  # compared, bit-identical, |d| list (over all top-k entries)
 tok_div = []; key_set_diff = 0; prefill_pt = []
 for i in keys:
