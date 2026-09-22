@@ -245,67 +245,121 @@ def test_the_constructor_calls_the_resolver():
 # -- the real planner, not a model of it ------------------------------------
 
 
-def _dsv41_specs(swa_block_size):
-    """The V4.1 spec dict as the flight builds it: 4 kv-source layers
-    (ratios 2,2,2,1) with their indexer K caches, 3 compressor rings, and 40
-    sliding-window layers. Values match the 2026-09-20 single-card flight
-    (block_size 128, kv_cache_dtype bfloat16, A5 bf16 KV path).
+# The V4.1 geometry that decides which cache objects exist. These are model
+# constants (hf_config of /workspace/models/DeepSeek-V4.1-Flash), not facts
+# about the code under test, so writing them here copies nothing the test
+# is meant to check: 40 layers, a 128-token window, and the four kv-source
+# layers with their compress ratios.
+N_LAYERS, SLIDING_WINDOW, INDEX_HEAD_DIM = 40, 128, 128
+KV_SOURCE_RATIOS = {2: 2, 8: 2, 14: 2, 20: 1}
+
+
+def _flight_config(cache_block_size=128, cache_dtype="bfloat16"):
+    """The slice of VllmConfig the cache constructors and the planner read,
+    as the 2026-09-20 single-card flight set it (block_size 128,
+    kv_cache_dtype bfloat16 -> the A5 bf16 KV path, no speculative decode).
+    The forward context starts empty and is filled by the constructors
+    themselves, which is also what lets the planner run its ring-backend check
+    against real layers below."""
+    cache_config = SimpleNamespace(block_size=cache_block_size,
+                                   cache_dtype=cache_dtype,
+                                   num_gpu_blocks_override=None)
+    return SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        max_in_flight_tokens=8192,
+        num_speculative_tokens=0,
+        compilation_config=SimpleNamespace(static_forward_context={}))
+
+
+def _dsv41_specs(swa_block_size, cfg=None):
+    """The V4.1 spec dict, read off the real cache objects.
+
+    Every spec comes from the class that produces it in the worker, through
+    its own ``get_kv_cache_spec``:
+
+    * index K  -- ``AscendDeepseekV41IndexerCache``, built by its real
+      ``__init__`` with upstream's own head_dim (``_indexer_k_cache_head_dim``);
+    * ring     -- ``AscendDeepseekV41CompressorStateCache``, real ``__init__``;
+    * SWA      -- ``AscendDeepseekV41SWACache``, real ``__init__`` (switch off,
+      so ``block_size`` is the constructor argument -- upstream passes 32;
+      128 stands for what the switch resolves to, which the resolver tests
+      above cover);
+    * main MLA -- ``AscendDeepseekV41Attention.get_kv_cache_spec``. The layer
+      itself is far too heavy to construct on a CPU, so the four fields that
+      method reads (``is_kv_source``, ``head_dim``, ``compress_ratio``,
+      ``kv_cache_torch_dtype``) are set on a bare instance; the arithmetic is
+      the method's own.
+
+    This used to build the specs by hand (``head_size=128,
+    dtype=float8_e4m3fn, scale_dim=1`` for index K). When the index-K row
+    moved to MXFP4 (68 B per state) that copy stayed at the fp8 132 B, and
+    every test below kept passing against a pool block the worker no longer
+    allocates (542,208 B hand-built vs 517,632 B real). A spec written into
+    the test cannot notice the code it describes changing.
     """
-    from vllm.v1.kv_cache_interface import CircularBufferSpec
+    from vllm.config import set_current_vllm_config
+    from vllm.models.deepseek_v4_1.attention import _indexer_k_cache_head_dim
 
-    from vllm_ascend.core.kv_cache_interface import (
-        AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)
+    from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
+    from vllm_ascend.models.deepseek_v4_1.attention import \
+        AscendDeepseekV41Attention
 
-    ratios = {2: 2, 8: 2, 14: 2, 20: 1}
+    cfg = cfg or _flight_config()
+    cc = cfg.cache_config
     specs = {}
-    for layer, ratio in ratios.items():
-        common = dict(num_kv_heads=1, model_version="deepseek_v4",
-                      cache_dtype_str="bfloat16", scale_dtype=torch.float,
-                      tokens_per_state=ratio, block_size=128 * ratio)
-        specs[f"L{layer}.attn"] = AscendMLAAttentionSpec(
-            head_size=HEAD_DIM, dtype=torch.bfloat16, scale_dim=0, **common)
-        specs[f"L{layer}.idx"] = AscendMLAAttentionSpec(
-            head_size=128, dtype=torch.float8_e4m3fn, scale_dim=1, **common)
-        if ratio > 1:
-            specs[f"L{layer}.ring"] = CircularBufferSpec(
-                block_size=8, num_kv_heads=1, head_size=1024, head_size_v=0,
-                dtype=torch.float32)
-    for layer in range(40):
-        specs[f"L{layer}.swa"] = AscendSlidingWindowMLASpec(
-            block_size=swa_block_size, num_kv_heads=1, head_size=HEAD_DIM,
-            dtype=torch.bfloat16, sliding_window=128,
-            cache_dtype_str="bfloat16", model_version="deepseek_v4",
-            alignment=None)
+    with set_current_vllm_config(cfg):
+        for layer, ratio in KV_SOURCE_RATIOS.items():
+            attn = object.__new__(AscendDeepseekV41Attention)
+            torch.nn.Module.__init__(attn)
+            attn.is_kv_source = True
+            attn.head_dim = HEAD_DIM
+            attn.compress_ratio = ratio
+            attn.kv_cache_torch_dtype = torch.bfloat16
+            specs[f"L{layer}.attn"] = attn.get_kv_cache_spec(cfg)
+            idx = caches.AscendDeepseekV41IndexerCache(
+                head_dim=_indexer_k_cache_head_dim(INDEX_HEAD_DIM, False),
+                dtype=torch.uint8, prefix=f"L{layer}.idx", cache_config=cc,
+                compress_ratio=ratio)
+            specs[f"L{layer}.idx"] = idx.get_kv_cache_spec(cfg)
+            if ratio > 1:
+                ring = caches.AscendDeepseekV41CompressorStateCache(
+                    state_dim=2 * HEAD_DIM, dtype=torch.float32,
+                    prefix=f"L{layer}.ring")
+                specs[f"L{layer}.ring"] = ring.get_kv_cache_spec(cfg)
+        for layer in range(N_LAYERS):
+            swa = caches.AscendDeepseekV41SWACache(
+                head_dim=HEAD_DIM, window_size=SLIDING_WINDOW,
+                dtype=torch.bfloat16, prefix=f"L{layer}.swa", cache_config=cc,
+                backend_cls=AscendDSASWABackend, block_size=swa_block_size)
+            specs[f"L{layer}.swa"] = swa.get_kv_cache_spec(cfg)
     return specs
 
 
 def _plan(swa_block_size, available_bytes=29350261248):
-    """Run the patched planner that actually runs in the worker."""
-    import math
-    from types import SimpleNamespace
+    """Run the patched planner that actually runs in the worker, on the
+    specs the real cache objects report.
 
-    from vllm.v1.kv_cache_interface import CircularBufferSpec
+    ``available_bytes`` is only an input (the 2026-09-20 flight's backing
+    size); what it maps to under the current page sizes is the output.
+    """
+    import math
 
     import vllm_ascend.patch.platform.patch_kv_cache_utils as P
 
-    cfg = SimpleNamespace(
-        cache_config=SimpleNamespace(num_gpu_blocks_override=None,
-                                     block_size=128),
-        model_config=SimpleNamespace(max_model_len=8192),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        max_in_flight_tokens=8192,
-        compilation_config=SimpleNamespace(static_forward_context={}))
-    specs = _dsv41_specs(swa_block_size)
-    groups = P._get_kv_cache_groups_uniform_groups(
-        P.group_and_unify_kv_cache_specs(specs))
-    rings = {n: s for n, s in specs.items()
-             if isinstance(s, CircularBufferSpec)}
-    groups = groups + P._ring_groups(rings, cfg)
+    cfg = _flight_config()
+    specs = _dsv41_specs(swa_block_size, cfg)
+    # The routing entry the worker calls, not its pieces: it splits the ring
+    # caches off, groups the rest, and checks each ring block size against
+    # the backend of the layer registered under that name.
+    groups = P._ascend_get_kv_cache_groups(cfg, specs)
     num_blocks, tensors = P._get_kv_cache_config_deepseek_v4_main(
         cfg, groups, available_bytes)
     swa_groups = [g for g in groups if g.layer_names[0].endswith(".swa")]
     return SimpleNamespace(
         groups=groups,
+        specs=specs,
         block_sizes=[g.kv_cache_spec.block_size for g in groups],
         lcm=math.lcm(*[g.kv_cache_spec.block_size for g in groups]),
         pool_bytes_per_block=P._ascend_pool_bytes_per_block(groups),
@@ -321,18 +375,43 @@ def _plan(swa_block_size, available_bytes=29350261248):
     )
 
 
-def test_the_shipped_plan_reproduces_our_flight():
-    """Positive control for the two tests below: at the shipped 32 the real
-    planner lands exactly on what our 2026-09-20 flights printed -- 43 groups,
-    [128, 256, 32x40, 8], lcm 256, 27.3346 GiB backing.
+def test_the_shipped_plan_on_the_real_specs():
+    """Positive control for the two tests below: the real planner, fed the
+    specs the real cache objects report at the shipped SWA block size 32.
+
+    Expected values and where they come from (computed from the real objects
+    on the rebased tree, f85267ab8 + ours, 2026-09-22 -- not copied from a
+    log):
+
+    * index-K page 8,704 B = storage block 128 x (64 packed E2M1 + 4 E8M0)
+      -- ``AscendDeepseekV41IndexerCache.get_kv_cache_spec`` (MXFP4 row);
+    * main MLA page 131,072 B = 128 x 512 x bf16 (A5 bf16 KV path);
+    * ring page 32,768 B = 8 x 1024 x fp32, three ratio-2 sources;
+    * pool block = 3 x (8,704 + 131,072) + 3 x 32,768 = 517,632 B;
+    * num_blocks = 29,350,261,248 // 517,632 = 56,701; backing
+      56,701 x 517,632 = 29,350,252,032 B.
+
+    ⚠️ Before the MXFP4 index-K cache the page was 16,896 B (fp8 + fp32
+    scale) and the pool block 542,208 B -- the number our 2026-09-20 flights
+    printed. That build is gone from this tree; those logs no longer describe
+    it, so this test no longer claims to reproduce them.
     """
     p = _plan(32)
     assert len(p.groups) == 43
     assert p.block_sizes[:3] == [128, 256, 32]
     assert p.lcm == 256
-    assert p.pool_bytes_per_block == 542208
-    assert p.num_blocks == 54131
-    assert p.backing_size == 29350261248
+    # the pool block, first as the planner's own arithmetic over the pages the
+    # real objects report, then as the number that arithmetic gives today
+    pages = {k.split(".")[1]: v.page_size_bytes
+             for k, v in p.specs.items() if k.startswith("L2.")}
+    assert pages["idx"] == 128 * (64 + 4) == 8704
+    assert pages["attn"] == 128 * HEAD_DIM * 2 == 131072
+    assert pages["ring"] == 8 * 2 * HEAD_DIM * 4 == 32768
+    assert p.pool_bytes_per_block == (3 * (pages["idx"] + pages["attn"])
+                                      + 3 * pages["ring"])
+    assert p.pool_bytes_per_block == 517632
+    assert p.num_blocks == 56701
+    assert p.backing_size == 29350252032
     assert p.swa_group_count == 40          # 40 single-layer SWA groups
     assert p.swa_page == 131072             # 32*512*2 = 32 KiB, padded 4.00x
     assert p.swa_blocks_per_req == 40 * 257
