@@ -271,10 +271,20 @@ class KTLayerOffload:
             return  # every expert resident: nothing for kt to do
         self.wrapper = self._build_wrapper()
         # Seam timing, if the env var asks for it. The CPUInfer probe is what
-        # splits kt's submit from its sync without touching kt's C++; on the
-        # packed path we make those two calls ourselves, so no probe is needed
-        # (and wrapping there would only add a frame to the thing measured).
-        seam_timing.maybe_enable(self.num_layers, None if self.packed else self.wrapper, split=self.packed)
+        # splits kt's submit from its sync without touching kt's C++; where WE
+        # make those two calls, no probe is needed (and wrapping there would
+        # only add a frame to the thing measured).
+        # 🔴 That is now true of the side stream too: since 2026-09-22 the
+        # forked path runs ``_kt_packed_forward`` on this layer's own buffers,
+        # so it stamps submit/sync itself. Asking for the probe as well put two
+        # instruments on one call -- the probe's ``T_SUBMIT_IN`` (taken inside
+        # its own frame) overwrote ours, moving time out of ``submit`` and into
+        # ``kt_pre``, and it lengthened the very host-func node the side stream
+        # exists to hide. Diagnostic-only (this whole block is off unless
+        # VLLM_ASCEND_DSV41_KT_SEAM_TIMING is set), but a seam report reads as
+        # if one instrument were installed.
+        own_node = self.packed or self.overlap
+        seam_timing.maybe_enable(self.num_layers, None if own_node else self.wrapper, split=own_node)
         if self.overlap:
             # Created here, never inside a capture, and subscribed for host-func
             # reports before any capture can reach it.

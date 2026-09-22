@@ -1139,3 +1139,41 @@ def test_the_counter_moving_between_replays_is_fine(monkeypatch, sim):
     sim.capturing = False  # replay, not capture
     kl.HOST_FUNC_CALLS[rt.layer_idx] = kl.HOST_FUNC_CALLS.get(rt.layer_idx, 0) + 1
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# 6. the diagnostic instrument must not be installed twice on one call
+# ---------------------------------------------------------------------------
+
+
+def test_seam_timing_does_not_also_probe_cpu_infer_on_the_forked_path(monkeypatch, sim):
+    """🔴 Two instruments on one call read like one.
+
+    ``seam_timing``'s CPUInfer probe exists to split submit from sync on the
+    path where *kt* makes those calls. Since the forked path runs
+    ``_kt_packed_forward`` on this layer's own buffers, it stamps submit/sync
+    itself -- and the probe's ``T_SUBMIT_IN``, taken inside its own frame, then
+    overwrote ours, moving time out of ``submit`` and into ``kt_pre``, while the
+    extra frame lengthened the host-func node the side stream exists to hide.
+    So: split is on (the node does it), and ``cpu_infer`` is left alone.
+    """
+    from vllm_ascend.kt_offload import seam_timing as sm
+
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", "60")
+    sm._reset_for_tests()
+    try:
+        boxes = _boxes()
+        rt, fake = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+        assert sm.RECORDER is not None and sm.RECORDER.split is True
+        assert not isinstance(fake.cpu_infer, sm._TimedCpuInfer), (
+            "the CPUInfer probe was installed on top of a node that already times itself"
+        )
+        # ...and the serial captured path, where kt makes the calls, still gets it
+        sm._reset_for_tests()
+        boxes2 = _boxes()
+        _rt2, fake2 = _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes2)
+        assert isinstance(fake2.cpu_infer, sm._TimedCpuInfer), (
+            "the serial path lost the probe that splits kt's submit from its sync"
+        )
+    finally:
+        sm._reset_for_tests()
