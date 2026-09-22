@@ -567,12 +567,19 @@ perf＝`perf_baseline.sh` bs1（并发 1、16 条、random IN 128 / OUT 256、ig
 
 | # | 项 | 预计收益 | 状态 |
 |---|---|---|---|
-| ① | **接缝拆解**：NOTIFY_WAIT 353.6 − kt 计算 246.1 = 107.5 µs/层（≈4.3 ms/token，实测差值）逐段打时间戳，再对最大段下手 | 上限 4.3 ms | 🟡 进行中 |
+| ① | **接缝拆解**：NOTIFY_WAIT 353.6 − kt 计算 246.1 = 107.5 µs/层（≈4.3 ms/token，实测差值）逐段打时间戳，再对最大段下手 | 上限 4.3 ms | 🟡 埋点已入库，**未上卡** |
 | ② | t4：节点成本 + 窗口（含 shared expert / dispatch 能否挪进窗口） | 决定 ③ 值不值 | ⬜ |
 | ③ | t5 → 侧流 或 形态 C 二选一实现 | 上限 ≈1.7 ms（窗口 42.7 µs/层 × 40；加宽窗口可能更多，推断） | ⬜ |
 | ④ | L3 容量（SWA block 32→128） | 32k 下 3.58×；TPOT ≤1 ms | 📒 记账，本 session 不做 |
 | ⑤ | 频率放置（M0c） | 0.9–3.1 ms（推断） | 📒 记账，本 session 不做（需多卡采频率表） |
 | ⑥ | 吞吐轴 MAXSEQS 8→32 | ×1.3–1.8 吞吐（推断：均匀路由下 8 条 ≈75 tok/s → 32 条 ≈128 tok/s，单请求 TPOT ≈106→≈250 ms） | 📒 记账，本 session 不做；硬前提 ④；若主指标改成单卡吞吐应提到最前 |
+
+① 的仪器（2026-09-22，只写代码、**没碰卡**）：`VLLM_ASCEND_DSV41_KT_SEAM_TIMING=<采样秒>` 开
+（默认关；开时只读时钟，不改设备操作、不改输出字节），回调内分段见
+`vllm_ascend/kt_offload/seam_timing.py`；kt 的 submit/sync 靠**替换 `wrapper.cpu_infer` 的 Python 探针**拆开
+（`run_pinned_forward_sync` 本身是 Python，experts_base.py:717-772）⇒ **不改 kt C++、不重建 wheel**。
+离线 `tools/kt_offload/prof/seam.py`（对账 `B+C+D+E+F ≈ T_cb`，差值 `A+F_dev = NOTIFY_WAIT − T_cb`）；
+上卡执行单 `tools/kt_offload/oncard/RUNBOOK_seam.md`。**注意 device 侧的 A/F 分不开，只能作为一项**。
 
 另记账：M4（GSM8K 1319 全量精度）待最终形态再跑；O15 等算子方。
 

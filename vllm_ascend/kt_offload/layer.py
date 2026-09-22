@@ -34,6 +34,7 @@ import inspect
 import os
 import re
 import weakref
+from time import perf_counter_ns
 from typing import Any
 
 import torch
@@ -48,6 +49,7 @@ import torch
 # (vllm/logger.py:204-214). 132 files in this tree use the import below.
 from vllm.logger import logger
 
+from vllm_ascend.kt_offload import seam_timing
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
     NpuRouting,
@@ -253,6 +255,11 @@ class KTLayerOffload:
         if not p.cpu_ids:
             return  # every expert resident: nothing for kt to do
         self.wrapper = self._build_wrapper()
+        # Seam timing, if the env var asks for it. The CPUInfer probe is what
+        # splits kt's submit from its sync without touching kt's C++; on the
+        # packed path we make those two calls ourselves, so no probe is needed
+        # (and wrapping there would only add a frame to the thing measured).
+        seam_timing.maybe_enable(self.num_layers, None if self.packed else self.wrapper, split=self.packed)
         if self.overlap:
             # Created here, never inside a capture, and subscribed for host-func
             # reports before any capture can reach it.
@@ -716,11 +723,21 @@ def _kt_packed_forward(payload) -> None:
         its own errors for ever.
     """
     wrapper, buf, layer_idx = payload
+    # Seam timing, same segments as _kt_host_forward. Here the submit and the
+    # sync are ours, so the split needs no CPUInfer probe: ``kt_pre`` is the
+    # forward_task build, ``kt_tail`` is empty by construction.
+    rec = seam_timing.RECORDER
+    ts = seam_timing.TS
+    if rec is not None:
+        ts[seam_timing.T_SUBMIT_IN] = 0
+        ts[seam_timing.T_ENTER] = perf_counter_ns()
     try:
         # A3/A4 per replay: in graph mode route()/merge() run once, at capture,
         # so this node is the only place a per-step check exists. Raising here
         # is caught below and logged -- the graph has nowhere to return to.
         _assert_no_pending(wrapper, layer_idx, layer_idx - 1, "before this node's submit")
+        if rec is not None:
+            ts[seam_timing.T_PRE] = perf_counter_ns()
         task = wrapper.moe.forward_task(
             buf["bsz"].data_ptr(),
             buf["pin_ids"].shape[-1],
@@ -730,10 +747,19 @@ def _kt_packed_forward(payload) -> None:
             buf["pin_out"].data_ptr(),
             False,  # incremental: no deferred experts
         )
-        wrapper.cpu_infer.submit(task)
-        wrapper.cpu_infer.sync(0)
+        if rec is None:
+            wrapper.cpu_infer.submit(task)
+            wrapper.cpu_infer.sync(0)
+        else:
+            ts[seam_timing.T_SUBMIT_IN] = perf_counter_ns()
+            wrapper.cpu_infer.submit(task)
+            ts[seam_timing.T_SUBMIT_OUT] = ts[seam_timing.T_SYNC_IN] = perf_counter_ns()
+            wrapper.cpu_infer.sync(0)
+            ts[seam_timing.T_SYNC_OUT] = ts[seam_timing.T_KT_OUT] = perf_counter_ns()
         _assert_no_pending(wrapper, layer_idx, layer_idx, "after this node drained")
         HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+        if rec is not None:
+            rec.record(layer_idx, ts, perf_counter_ns())
     except BaseException as exc:  # noqa: BLE001
         logger.error(
             "kt_offload packed host-func for layer %d raised: %r. The CPU-expert output of this step is "
@@ -750,11 +776,28 @@ def _kt_host_forward(payload) -> None:
     device would then read the previous step's CPU output. Log loudly.
     """
     wrapper, shape_ref, stream_handle, layer_idx = payload
+    # Seam timing (VLLM_ASCEND_DSV41_KT_SEAM_TIMING): off -> RECORDER is None
+    # and this costs one global read and one branch per segment boundary. On,
+    # it reads clocks and stores integers; it changes no argument, no order
+    # and no device operation. See seam_timing.py for what each segment is.
+    rec = seam_timing.RECORDER
+    ts = seam_timing.TS
+    if rec is not None:
+        ts[seam_timing.T_SUBMIT_IN] = 0
+        ts[seam_timing.T_ENTER] = perf_counter_ns()
     try:
         _assert_no_pending(wrapper, layer_idx, layer_idx - 1, "before this node's submit")
+        if rec is not None:
+            ts[seam_timing.T_PRE] = perf_counter_ns()
         wrapper.run_pinned_forward_sync(shape_ref, stream_handle)
+        if rec is not None:
+            ts[seam_timing.T_KT_OUT] = perf_counter_ns()
         _assert_no_pending(wrapper, layer_idx, layer_idx, "after this node drained")
         HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+        if rec is not None:
+            # Taken before the store, so the bookkeeping this module costs is
+            # not counted inside the callback it measures.
+            rec.record(layer_idx, ts, perf_counter_ns())
     except BaseException as exc:  # noqa: BLE001
         logger.error(
             "kt_offload host-func for layer %d raised inside a graph node: %r. The CPU-expert output "
@@ -892,9 +935,12 @@ def _register_wrapper(wrapper, layer_idx: int) -> None:
             "would read each other's flags."
         )
     _WRAPPER_REGISTRY[layer_idx] = wrapper
-    infer = getattr(wrapper, "cpu_infer", None)
+    # Unwrap the seam-timing probe: every wrapper gets its own pass-through
+    # over the *same* CPUInfer, so comparing the probes would read "two
+    # queues" where there is one. The invariant is about the queue.
+    infer = seam_timing.unwrap_infer(getattr(wrapper, "cpu_infer", None))
     for other_idx, other in _WRAPPER_REGISTRY.items():
-        other_infer = getattr(other, "cpu_infer", None)
+        other_infer = seam_timing.unwrap_infer(getattr(other, "cpu_infer", None))
         if other is wrapper or other_infer is None or infer is None:
             continue
         if other_infer is not infer:

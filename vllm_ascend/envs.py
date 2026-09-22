@@ -261,6 +261,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # does not grow while decoding has no CPU-expert work in the graph. "" or
     # "0" (default) = off. Diagnostic; read once at import. Not sensitive.
     "VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG", ""),
+    # DeepSeek-V4.1 MoE offload: sampling interval in seconds for the host-func
+    # seam timing (vllm_ascend/kt_offload/seam_timing.py), which splits the
+    # 107.5 us/layer that NOTIFY_WAIT pays on top of kt's own compute into
+    # pre / submit / sync / post. "" or "0" (default) = off. When on it only
+    # reads clocks: no device operation and no output byte changes. Diagnostic;
+    # read once per layer at weight-load time. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_SEAM_TIMING": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", ""),
 }
 
 # end-env-vars-definition
