@@ -7,6 +7,13 @@ V4.1's writers index it *per token*. Read per token, the dense mapping writes
 the second compressed entry, never the first, and sends a later token to a
 slot belonging to whoever holds block 0.
 
+Staleness fixed here (these tests were red on HEAD, not broken by anyone):
+the rebuild started reading ``req_metadata.seq_lens`` with 069c7d3e9 -- it is
+how a padded request row under graph replay (block_table row filled with 0,
+seq_len 0) is told apart from a real block 0 -- and the fake ``_Req`` below
+did not carry it. It is now a *required* argument, and the padding drop has
+its own tests (the ``padding`` section), following
+``test_deepseek_v4_1_indexer_k_store.py``.
 """
 
 import pytest
@@ -18,17 +25,21 @@ from vllm_ascend.models.deepseek_v4_1 import compressed_slots
 class _Req:
     """Copied from AscendDSAReqMetadata (vllm_ascend/attention/dsa_v1.py:1793).
 
-    Not simplified: the rebuild reads block_table, query_start_loc and
-    storage_block_size, and a double missing any of them would pass a rebuild
-    that never ran.
+    Not simplified: the rebuild reads block_table, query_start_loc,
+    storage_block_size and seq_lens, and a double missing any of them would
+    pass a rebuild that never ran. ``seq_lens`` arrived with 069c7d3e9 and is
+    required, not defaulted: a default large enough to keep every token live
+    would make the padding drop untestable, and one computed from the row
+    count is wrong whenever positions do not start at 0.
     """
 
-    def __init__(self, mapping, page, blocks, starts):
+    def __init__(self, mapping, page, blocks, starts, seq_lens):
         self.slot_mapping = mapping
         self.token_slot_mapping = mapping
         self.storage_block_size = page
         self.block_table = torch.tensor(blocks, dtype=torch.int32)
         self.query_start_loc = torch.tensor(starts, dtype=torch.int32)
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
 
 
 class _Meta:
@@ -57,9 +68,11 @@ def ctx(monkeypatch):
     return _install
 
 
-def _owned(ctx, mapping, page=128, blocks=((84, 85), ), starts=None, name="c2"):
+def _owned(ctx, mapping, *, seq_lens, page=128, blocks=((84, 85), ),
+           starts=None, name="c2"):
+    """``seq_lens`` keyword-only and required, for the reason on ``_Req``."""
     starts = [0, mapping.shape[0]] if starts is None else starts
-    ctx({name: _Meta(_Req(mapping, page, blocks, starts))})
+    ctx({name: _Meta(_Req(mapping, page, blocks, starts, seq_lens))})
     return mapping
 
 
@@ -89,7 +102,7 @@ def test_the_rebuild_reproduces_upstreams_mapping(ctx):
     position 1 closes state 0 (84 * 128 + 0) and position 3 closes state 1.
     What the builder published instead was [10752, 10753, -1, 0, 0].
     """
-    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32))
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), seq_lens=[5])
     slots, layer = compressed_slots.per_token_compressed_slots(
         handed, torch.arange(5), 2)
     assert slots.tolist() == [-1, 10752, -1, 10753, -1]
@@ -101,7 +114,7 @@ def test_a_second_page_of_states_walks_the_block_table(ctx):
     ratio, and using the token index would change blocks twice as fast."""
     page = 2
     handed = _owned(ctx, torch.zeros(8, dtype=torch.int32), page=page,
-                    blocks=((7, 9), ))
+                    blocks=((7, 9), ), seq_lens=[8])
     slots, _ = compressed_slots.per_token_compressed_slots(
         handed, torch.arange(8), 2)
     # states 0,1 -> block 7 offsets 0,1; states 2,3 -> block 9 offsets 0,1
@@ -112,20 +125,93 @@ def test_each_request_uses_its_own_row_of_the_block_table(ctx):
     """Two requests packed into one forward. Taking request 0's blocks for
     every token is in-range arithmetic that lands on another request's rows."""
     handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), page=128,
-                    blocks=((84, ), (40, )), starts=[0, 3, 5])
+                    blocks=((84, ), (40, )), starts=[0, 3, 5], seq_lens=[3, 2])
     positions = torch.tensor([0, 1, 2, 0, 1])
     slots, _ = compressed_slots.per_token_compressed_slots(handed, positions, 2)
     assert slots.tolist() == [-1, 84 * 128, -1, -1, 40 * 128]
 
 
+# ------------------------------------------- padding: seq_lens, not blocks >= 0
+
+@pytest.mark.parametrize("seq_len,expect", [
+    (5, [-1, 10752, -1, 10753, -1]),
+    # Position 3 is the last live token and a boundary: it must still publish.
+    # Pins the edge from below (a `pos < seq_len - 1` rebuild drops it).
+    (4, [-1, 10752, -1, 10753, -1]),
+    # Position 3 is at seq_len, i.e. a padding token. Its block-table entry is
+    # real (84), so the arithmetic alone gives 10753 -- only seq_lens drops it,
+    # and it has to arrive as -1. Pins the edge from above (`pos <= seq_len`).
+    (3, [-1, 10752, -1, -1, -1]),
+    (1, [-1, -1, -1, -1, -1]),
+    # A whole padded request: nothing publishes.
+    (0, [-1, -1, -1, -1, -1]),
+])
+def test_tokens_at_or_past_seq_len_publish_nothing(ctx, seq_len, expect):
+    """069c7d3e9: every live token has position < seq_len, so a token at or
+    past it is padding and gets -1, whatever its block-table entry says."""
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), seq_lens=[seq_len])
+    slots, _ = compressed_slots.per_token_compressed_slots(
+        handed, torch.arange(5), 2)
+    assert slots.tolist() == expect
+
+
+def test_a_padded_request_row_is_not_a_real_block_0(ctx):
+    """The case 069c7d3e9 was written for.
+
+    Under graph replay the runner pads the batch with request rows whose
+    block_table row is 0 (not -1; FIA relies on that) and whose seq_len it
+    zeroes. Position 1 of such a row computes block 0 * 128 + 0 = slot 0 --
+    in range, belonging to whoever holds block 0 -- and ``blocks >= 0`` keeps
+    it. Only seq_lens can drop it.
+    """
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), page=128,
+                    blocks=((84, ), (0, )), starts=[0, 3, 5], seq_lens=[3, 0])
+    positions = torch.tensor([0, 1, 2, 0, 1])
+    slots, _ = compressed_slots.per_token_compressed_slots(handed, positions, 2)
+    assert slots.tolist() == [-1, 84 * 128, -1, -1, -1]
+
+
+def test_a_live_request_on_block_0_still_publishes(ctx):
+    """The control for the test above: the same batch with request 1 live.
+
+    Without it, a rebuild that dropped every block-0 slot -- rather than
+    every padded token -- would pass the padding test. Block 0 is a real
+    block, and slot 0 is a real destination when its request is live.
+    """
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), page=128,
+                    blocks=((84, ), (0, )), starts=[0, 3, 5], seq_lens=[3, 2])
+    positions = torch.tensor([0, 1, 2, 0, 1])
+    slots, _ = compressed_slots.per_token_compressed_slots(handed, positions, 2)
+    assert slots.tolist() == [-1, 84 * 128, -1, -1, 0]
+
+
+@pytest.mark.parametrize("seq_lens,expect", [
+    # Request 1 is 2 long: its position 3 is padding. Reading request 0's
+    # length (4) for every token would keep it as 40 * 128 + 1.
+    ([4, 2], [-1, 84 * 128, -1, 40 * 128, -1, -1]),
+    # And the other way round: request 1 is 4 long, so position 3 is live.
+    # Reading request 0's length (2) would drop it.
+    ([2, 4], [-1, 84 * 128, -1, 40 * 128, -1, 40 * 128 + 1]),
+])
+def test_each_token_is_judged_by_its_own_requests_length(ctx, seq_lens,
+                                                         expect):
+    handed = _owned(ctx, torch.zeros(6, dtype=torch.int32), page=128,
+                    blocks=((84, ), (40, )), starts=[0, 2, 6],
+                    seq_lens=seq_lens)
+    positions = torch.tensor([0, 1, 0, 1, 2, 3])
+    slots, _ = compressed_slots.per_token_compressed_slots(handed, positions, 2)
+    assert slots.tolist() == expect
+
+
 def test_ratio_zero_is_refused_rather_than_dividing_by_it(ctx):
-    handed = _owned(ctx, torch.zeros(2, dtype=torch.int32))
+    handed = _owned(ctx, torch.zeros(2, dtype=torch.int32), seq_lens=[2])
     with pytest.raises(ValueError, match="no group boundary"):
         compressed_slots.per_token_compressed_slots(handed, torch.arange(2), 0)
 
 
 def test_the_page_needs_two_sources_to_agree(ctx):
-    handed = _owned(ctx, torch.zeros(2, dtype=torch.int32), page=128)
+    handed = _owned(ctx, torch.zeros(2, dtype=torch.int32), page=128,
+                    seq_lens=[2])
     cache = torch.zeros(4, 32, 512, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="real but wrong place"):
         compressed_slots.per_token_compressed_slots(handed, torch.arange(2), 2,
@@ -151,7 +237,7 @@ def test_the_dense_mapping_is_refused_and_named(ctx):
 
 
 def test_the_rebuilt_mapping_passes(ctx):
-    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32))
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), seq_lens=[5])
     slots, layer = compressed_slots.per_token_compressed_slots(
         handed, torch.arange(5), 2)
     compressed_slots.check_per_token(slots, torch.arange(5), 2,
@@ -178,9 +264,14 @@ def test_length_cannot_tell_the_two_apart_but_the_valid_rows_can(
     positions = torch.cat([
         torch.arange(starts[i + 1] - starts[i]) for i in range(num_reqs)
     ])
+    # Positions restart at 0 per request, so each request's length is its
+    # token count and every token is live -- this test is about the dense
+    # mapping, not padding.
     handed = _owned(ctx, torch.zeros(num_tokens, dtype=torch.int32),
                     page=128, blocks=tuple((80 + r, ) for r in range(num_reqs)),
-                    starts=starts)
+                    starts=starts,
+                    seq_lens=[starts[i + 1] - starts[i]
+                              for i in range(num_reqs)])
     rebuilt, layer = compressed_slots.per_token_compressed_slots(
         handed, positions, 2)
     dense = _dense(num_tokens, 2, num_reqs, [84], 128)
@@ -239,7 +330,7 @@ def test_a_sibling_groups_block_table_is_not_borrowed(ctx):
     match would accept the wrong one with in-range arithmetic."""
     mine = torch.zeros(4, dtype=torch.int32)
     ctx({"swa": _Meta(_Req(torch.zeros(4, dtype=torch.int32), 32, ((1, ), ),
-                           [0, 4]))})
+                           [0, 4], [4]))})
     with pytest.raises(ValueError, match="not the slot mapping of"):
         compressed_slots.per_token_compressed_slots(mine, torch.arange(4), 2)
 
@@ -285,8 +376,8 @@ def test_the_check_stands_down_under_capture_without_spending_its_budget(
 def test_every_layer_sharing_one_mapping_is_named(ctx):
     """Layers whose caches share a group share one mapping; all are named."""
     shared = torch.zeros(5, dtype=torch.int32)
-    req = _Req(shared, 128, ((84, ), ), [0, 5])
-    other = _Req(torch.zeros(5, dtype=torch.int32), 32, ((1, ), ), [0, 5])
+    req = _Req(shared, 128, ((84, ), ), [0, 5], [5])
+    other = _Req(torch.zeros(5, dtype=torch.int32), 32, ((1, ), ), [0, 5], [5])
     ctx({"layers.2.attn": _Meta(req),
          "layers.8.attn": _Meta(req),
          "elsewhere": _Meta(other),
@@ -378,7 +469,7 @@ def test_the_rebuild_reproduces_the_measured_mapping(ctx):
     position 1 closes state 0 (84 * 128 + 0) and position 3 closes state 1.
     What the builder published instead was [10752, 10753, -1, 0, 0].
     """
-    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32))
+    handed = _owned(ctx, torch.zeros(5, dtype=torch.int32), seq_lens=[5])
     slots, layer = compressed_slots.per_token_compressed_slots(
         handed, torch.arange(5), 2)
     assert slots.tolist() == [-1, 10752, -1, 10753, -1]

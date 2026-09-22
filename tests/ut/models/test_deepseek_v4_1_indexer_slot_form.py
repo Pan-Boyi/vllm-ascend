@@ -12,6 +12,18 @@ wrong one produces in-range slots belonging to other tokens.
 
 So the page size is matched by object identity against the metadata carrying
 the tensor, and a failure to match is a refusal rather than a default.
+
+Staleness fixed here (red on HEAD, not broken by anyone): the entry-point test
+built a 132-byte fp8 row from ``indexer_k_store.SCALE_GROUP`` / ``SCALE_BYTES``
+-- constants that describe the *epilog's* fp8 rollback row -- while since
+batch 1 (ada1cc48e) the cache is MXFP4, 68 bytes, split with
+``indexer_cache_view``'s constants. Its refusal of 132 is right (132 is not a
+whole number of 17-byte groups) and is pinned as behaviour in
+``test_deepseek_v4_1_indexer_k_store.py``
+(``test_the_row_is_the_mxfp4_row_and_the_fp8_row_is_refused``), not here. The
+test also stubbed ``indexer_compress_epilog_v2``, which the default path
+(``VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE=1``) no longer calls; it now captures
+the ``indexer_quant_cache`` call instead.
 """
 
 import pytest
@@ -55,17 +67,23 @@ def ctx(monkeypatch):
 
 
 def _bound_cache():
-    """Rank 3, and the width the operator's own rule asks for.
+    """Rank 3, and the width the writer's own rule asks for.
 
-    Not an arbitrary shape: the store now cross-checks the cache against x,
-    so a fixture with a made-up width stops exercising the path it is here to
+    Not an arbitrary shape: the store cross-checks the cache against x, so a
+    fixture with a made-up width stops exercising the path it is here to
     exercise and starts exercising the guard.
-    """
-    from vllm_ascend.models.deepseek_v4_1.indexer_k_store import (
-        INDEX_HEAD_DIM, SCALE_BYTES, SCALE_GROUP)
 
-    width = INDEX_HEAD_DIM + SCALE_BYTES * -(-INDEX_HEAD_DIM // SCALE_GROUP)
-    return torch.zeros(4, 32, width, dtype=torch.uint8)
+    The width comes from ``indexer_cache_view`` (the MXFP4 row: 64 value
+    bytes + 4 E8M0 scale bytes = 68), not from ``indexer_k_store``'s
+    ``SCALE_GROUP`` / ``SCALE_BYTES``: those describe the epilog's fp8 row
+    (128 + 4 = 132), which the MXFP4 writer refuses.
+    """
+    from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (
+        scale_bytes_per_token, value_bytes_per_token)
+
+    d = indexer_k_store.INDEX_HEAD_DIM
+    width = value_bytes_per_token(d) + scale_bytes_per_token(d)
+    return torch.zeros(4, PAGE, width, dtype=torch.uint8)
 
 
 def _split(flat, page=PAGE):
@@ -160,33 +178,61 @@ def test_a_wrong_page_size_would_have_stayed_in_range(ctx):
 # ------------------------------------------------------- the store entry point
 
 def test_the_store_accepts_the_block_offset_form_now(ctx, monkeypatch):
-    """End to end through the entry point upstream calls."""
-    flat = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    """End to end through the entry point upstream calls.
+
+    What is pinned is the slot operand the writer receives:
+    ``indexer_quant_cache`` has no CPU kernel, so the quantised bytes are out
+    of reach here (as in ``test_deepseek_v4_1_indexer_k_store.py``).
+
+    Was: ``[0, 1, 2, 3]``, all in block 0 -- under which *any* page size
+    inverts to the same answer, so the page lookup this file is about was not
+    exercised end to end. The slots now span four blocks of ``PAGE``.
+    """
+    flat = torch.tensor([5, PAGE + 8, 2 * PAGE + 6, 3 * PAGE + 31],
+                        dtype=torch.int32)
     pairs = _split(flat)
+    assert pairs[:, 0].tolist() == [0, 1, 2, 3], "meant to span blocks"
     ctx({"indexer": _Meta(_Req(pairs))})
 
-    seen = {}
+    seen = []
 
-    def _fake_epilog(*, indexer_compress_cache, x, slot_mapping, layout):
-        seen["slots"] = slot_mapping.clone()
+    def _fake_quant_cache(**kwargs):
+        seen.append({k: (v.clone() if k == "slot_mapping" else v)
+                     for k, v in kwargs.items()})
 
-    monkeypatch.setattr(
-        indexer_k_store.torch.ops._C_ascend, "indexer_compress_epilog_v2",
-        _fake_epilog, raising=False)
+    class _TrippedEpilog:
+        @staticmethod
+        def indexer_compress_epilog_v2(**_):
+            raise AssertionError(
+                "the fp8 epilog writer was called on the MXFP4 path")
 
+    # Set explicitly rather than left to the default, so an ambient =0 cannot
+    # turn this into a test of the rollback writer.
+    monkeypatch.setenv("VLLM_ASCEND_DSV41_INDEXER_QUANT_CACHE", "1")
+    monkeypatch.setattr(indexer_k_store, "_indexer_quant_cache_op",
+                        lambda: _fake_quant_cache)
+    monkeypatch.setattr(torch.ops, "_C_ascend", _TrippedEpilog, raising=False)
+
+    cache = _bound_cache()
     indexer_k_store.indexer_k_norm_rope_store_ascend(
         k_pre=torch.zeros(4, indexer_k_store.INDEX_HEAD_DIM),
         positions=torch.tensor([0, 1, 2, 3]),
         cos_sin_cache=torch.zeros(8, indexer_k_store.INDEX_ROPE_HEAD_DIM),
         rms_norm_weight=torch.ones(indexer_k_store.INDEX_HEAD_DIM),
         rms_norm_eps=1e-6,
-        k_cache=_bound_cache(),
+        k_cache=cache,
         kv_slot_mapping=pairs,
         compress_ratio=1,
         use_fp4_cache=False,
     )
-    assert seen["slots"].ndim == 1
-    assert seen["slots"].tolist() == [0, 1, 2, 3]
+    (call, ) = seen
+    assert call["slot_mapping"].ndim == 1
+    assert call["slot_mapping"].dtype is torch.int32
+    assert call["slot_mapping"].tolist() == flat.tolist()
+    # Into *this* cache: a plane that is a copy would be written, never read.
+    for plane in (call["cache"], call["cache_scale"]):
+        assert (plane.untyped_storage().data_ptr()
+                == cache.untyped_storage().data_ptr())
 
 
 def test_a_three_column_mapping_is_still_refused(ctx):
