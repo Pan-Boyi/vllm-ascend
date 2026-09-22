@@ -192,3 +192,98 @@ awk -F, 'NR==1{for(i=1;i<=NF;i++)h[$i]=i} NR>1 && $h["Name"]~/HOSTFUNC_CALLBACK|
 - `--enforce-eager`：eager 路径的 host func 跑在**主线程**上，绑核开关会**跳过并 warn**
   （绑主线程是另一个实验）⇒ eager 发次读不到本单的东西。
 - SCHED_FIFO（`..._KT_REPORT_FIFO`）：见 §1 末尾，要单独一发。
+
+---
+
+# 附：P0（把 A 与 F 分开）与 P2（kt 内联执行）的执行单
+
+下面两节是 §4.22 方案表里 **P0 / P2** 的上卡部分，写在这里是因为它们判的是同一个
+`A+F = 78.0 µs/层`，而且 P0 **不需要独占卡时**——它搭任何一发已经带埋点 + profiler 的服务。
+**同样不执行**，只是给排到卡的人贴的命令。
+
+## 6. P0 搭车：一发里同时取到 A 与 F（0 独占卡时）
+
+**不需要任何新开关**：`VLLM_ASCEND_DSV41_KT_SEAM_TIMING=5` 一开，回调就在 entry/exit 各取一次
+`CLOCK_REALTIME`，采样线程除了原来的 `[kt-seam]` 还会每层写一行 `[kt-seam-rt]`（逐次回调的
+绝对时刻，单位 ns）。所以**上面第 2 步那条起服务命令原样用**（D0/D1/D2 哪一臂都行），
+只要那一发**同时**带 `KT_MOE_PHASE_TIMING=1`、`VLLM_ASCEND_DSV41_KT_SEAM_TIMING=5` 和 profiler。
+代价：两次时钟读数 ≈0.15 µs/回调（CPU 实测，见 `tests/ut/kt_offload/test_seam_timing.py`
+里那条会打印 ns/call 的用例），对 78 µs 可忽略；日志每 5 s 多 40 行、每行约 1–2 KB。
+
+⚠ **P0 是纯 vllm 侧 Python 改动，不动 kt** ⇒ 不需要重建 wheel、不需要重跑 t0/t1/t2，
+但**仍然要盖构建指纹**（同一发里读出来的 A/F 与 D/E 必须同构建）。
+
+离线（与第 3 步同一条命令，多喂的只有同一份 `task_time.csv`）：
+
+```bash
+python3 $WT/seam.py $RUN/serve.log --ktphase $RUN/ktphase.json \
+        --nw-csv ./task_time.csv --layers 40 --since <cap start> --until <cap end> \
+        --json-out $RUN/seam.json
+# 表末多出一段 "A / F split"：每层 A_med/A_p90/F_med/F_p90 与 A+F、NW-cb、diff
+```
+
+怎么读：
+- `A` = 回调 entry 的 CLOCK_REALTIME − `HOSTFUNC_CALLBACK.ts`（ACL 把回调送到这条线程、
+  抢 GIL、建参数元组）；`F` = `NOTIFY_WAIT.ts+dur` − 回调 exit（回调返回 → device 收到通知）。
+  两者由**逐次回调**按时间对位得到（HOSTFUNC 与紧随其后的 NOTIFY_WAIT 为一对，回调中点落在
+  `[HF.ts, NW 末]`），**不用位移切片**，所以它比 §4.20 的 `A+F_dev` 那一列更不依赖对位假设。
+- 🔴 **拒绝即作废**：只要有一条判据不过，工具**不出 A/F 两列**并 `rc=1`（`seam.json` 里
+  `a_f.ok=false`，`a_f.why` 写明哪条）。判据：回调落在 profile 时间跨度内（落不进 = 不是同一发，
+  或者时钟不是 CLOCK_REALTIME）、几乎没有落在任何一对之外的回调、没有一对吃两个回调、
+  每层 med(A)>0 且 med(F)>0、每层 `|med((A+F) − (NW.dur − cb))| < 5 µs`（新拆法必须加回旧口径）。
+  被拒绝时**退回读 `A+F_dev` 这一列**，不要手算 A/F。
+- 这一发还顺带给出每层 `n_unsplit` 与 `resid_us.max`（记录侧精确统计）：只要非 0，
+  `seam.py` 直接判红 —— 中位/p90 看不见的「40 次里坏 1 次」现在看得见了。
+
+**P0 出数之后的取舍**（这才是它存在的理由）：
+- A ≫ F ⇒ P1a（回调只 submit 就返回、由完成线程 record 放行）**只省 F**，不值当，直接上 P1b；
+- A ≈ F 或 F 占大头 ⇒ P1a 先做（约 2.5 h 卡时），P1b 再排。
+
+## 7. P2 内联执行：两臂交错（I0 / I1）
+
+kt 侧 `CPUInfer::run_inline`（`KT_CPUINFER_INLINE`，**默认关**）：submit 的任务改在调用线程
+（= ACL 报告线程）上直接跑，不入 `TaskQueue`。纯 CPU 微基准（`prof/bench/tq_bench.cpp`）：
+队列往返中位 **11.3–12.9 µs**，内联 + sync **0.101–0.110 µs** ⇒ 账面 **0.45–0.52 ms/token**。
+
+🔴 **前提：要重建 kt wheel**（C++ 改动）。换构建 ⇒ **先重跑 t0/t1/t2**，并且本单第 1 节的
+D0/D1 若要与 P2 的发次相减，也必须在新构建上重跑一遍。**跨构建读数不可比**。
+
+| 臂 | 改什么 | 预计 |
+|---|---|---|
+| **I0 对照** | 不设 `KT_CPUINFER_INLINE`（逐字节等于今天的路径） | submit 2.4 µs、E 18.2 µs（§4.20） |
+| **I1 内联** | `KT_CPUINFER_INLINE=1` | submit → ≈0；E → ≈7 µs（18.2 减去一次线程往返 ~10.4） |
+
+起服务命令同第 2 步，`ARM_ENV` 换成上表这一列（**其余逐项同基线，含 `cpuinfer_threads:96`**）；
+两臂**同时段交错**至少 2 轮，理由同第 1 节。
+
+**自证开关生效（判据读被判对象）**：
+
+```bash
+grep -n "\[kt\] CPUInfer: inline execution ON" $RUN/serve.log
+```
+
+I1 必须有这一行；**没有 = wheel 没换或 env 没传进 worker** ⇒ 这一臂标**未覆盖**，
+不许写成「内联没用」。I0 里这一行**不应该**出现（默认关的自证）。
+
+**主判据 = 埋点的 `submit` 段与 `E` 段**（`seam.json`，逐层配对比 I0/I1）：
+- `submit`：队列臂 2.4 µs（enqueue 的 new Node + mutex + notify），内联臂应≈0.2 µs 以下；
+- `E = sync − D`：18.2 → 预期 ~7 µs。**这是本方案真正的靶子**；
+- **同时读 `D`（kt 计算）**：内联把「等两个 NUMA 池」的自旋挪到了报告线程上
+  （`NumaJobDistributor::do_numa_job` 里调用方是忙等，不是睡），所以 D 不应变；
+  **D 变大 = 报告线程和 kt 抢核了**，这时要么给报告线程绑核（第 1 节 D1）再试，要么判 P2 不成立。
+- 顺带看 `A+F_dev`（或 P0 的 A/F）：内联不碰 ACL 派发，A 不应变；F 只应受回调总时长影响。
+
+**次判据 bs1 TPOT**：地板 ≈1 ms，预期收益 0.42–0.52 ms ⇒ **落在地板以下，判不可分辨**，
+不得用 TPOT 判 P2 成不成立（只用来兜底「没有变慢很多」）。
+
+**正确性闸（必须过，且比性能优先）**：
+1. I1 与 I0 **同输入逐位相同**：t1（offload on）/ t2（graph）两个 oncard 用例各跑一遍，
+   输出张量按位比；
+2. I1 上跑一遍 §4.1 的 GSM8K 验收；
+3. 异常路径不许被吞：内联任务的异常按 kt 老规矩在**下一次 `sync()`** 抛
+   （`test/cpp/test_cpuinfer_inline.cpp` 已在 CPU 上钉死），上卡时若 serve.log 出现
+   `host-func for layer ... raised` 之类，按老路子当作该步输出作废处理。
+
+**本单不覆盖**：`packed_transfer=true` 的回调（`_kt_packed_forward` 里的 submit/sync 是我们自己调的，
+**没有**接内联，要接是另一处改动）；以及 I1 与 D1（报告线程绑核）同时开 —— 那是第三变量，
+要看就单独起一发（I1+D1），不要混在一发里读。
