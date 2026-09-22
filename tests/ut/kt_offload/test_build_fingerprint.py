@@ -40,8 +40,16 @@ REPORT = _load("packed_ab_report", TOOLS / "oncard" / "packed_ab_report.py")
 
 def fp(so="a" * 32, vendors="v" * 64, kt="k" * 64, head="1" * 40, vllm_head="2" * 40, backfilled=False,
        files=759, nbytes=118_000_000, custom_ops="o" * 64, ds41="d" * 64, ds41_files=973,
-       ds41_bytes=47_757_444):
+       ds41_bytes=47_757_444, kt_site="s" * 64, kt_site_files=70, kt_site_bytes=9_518_073):
     return {
+        # the kt site (schema /4): the package the run imports. Separate from
+        # the wheel on purpose -- the wheel used to be the only kt input and it
+        # was found by a glob that did not move when the site did.
+        "kt_site_sha256": kt_site,
+        "kt_site_files": kt_site_files,
+        "kt_site_bytes": kt_site_bytes,
+        "kt_site_ok": True,
+        "kt_site_source": "/x/build_artifacts/moe_offload_ref/kt_site",
         # the ds41 operator package (schema /3): the distribution unit and
         # the installed site, both blocking
         "custom_ops_sha256": custom_ops,
@@ -81,7 +89,8 @@ def test_a_different_so_blocks_the_comparison():
 
 @pytest.mark.parametrize(
     "key,kwargs",
-    [("vendors_sha256", {"vendors": "x" * 64}), ("kt_wheel_sha256", {"kt": "y" * 64})],
+    [("vendors_sha256", {"vendors": "x" * 64}), ("kt_wheel_sha256", {"kt": "y" * 64}),
+     ("kt_site_sha256", {"kt_site": "z" * 64})],
 )
 def test_the_other_binary_inputs_block_too(key, kwargs):
     ok, reasons = FP.same_build(fp(), fp(**kwargs))
@@ -332,6 +341,156 @@ def test_the_old_schema_cannot_be_subtracted_from():
 
 def test_counts_are_part_of_the_decision():
     assert "vendors_files" in FP.BLOCKING and "vendors_bytes" in FP.BLOCKING
+
+
+# -- the kt site: the second time the guard watched the wrong object -----
+
+
+def _fake_site(root: Path, name: str, ext: bytes, experts_base: bytes, wheel: bytes | None = b"WHEEL") -> Path:
+    """A minimal kt site next to its wheel directory, laid out like the real
+    ones: <root>/<name>/kt_kernel/{kt_kernel_ext*.so,experts_base.py,...} and
+    the sibling <root>/kt_wheel<suffix>/*.whl."""
+    pkg = root / name / "kt_kernel"
+    pkg.mkdir(parents=True)
+    (pkg / "kt_kernel_ext.cpython-312-x86_64-linux-gnu.so").write_bytes(ext)
+    (pkg / "experts_base.py").write_bytes(experts_base)
+    (pkg / "experts.py").write_bytes(b"# identical in both builds in circulation\n")
+    (pkg / "__pycache__").mkdir()
+    (pkg / "__pycache__" / "experts.cpython-312.pyc").write_bytes(b"noise that must not decide")
+    if wheel is not None:
+        wheel_dir = root / ("kt_wheel" + name[len("kt_site"):])
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+        (wheel_dir / "kt_kernel-0.7.0.post4-cp312-cp312-linux_x86_64.whl").write_bytes(wheel)
+    return root / name
+
+
+def test_the_kt_site_hashes_the_two_files_the_service_imports(tmp_path):
+    site = _fake_site(tmp_path, "kt_site", ext=b"OLDSO", experts_base=b"old")
+    got = FP.kt_site_fingerprint(str(site))
+    assert got["ok"] and got["sha256"]
+    decisive = got["decisive"]
+    assert any(k.endswith("kt_kernel_ext.cpython-312-x86_64-linux-gnu.so") for k in decisive)
+    assert "kt_kernel/experts_base.py" in decisive
+    # __pycache__ is not part of the build: it is regenerated per interpreter
+    # run and would make the same site hash differently from one day to the next
+    assert got["files"] == 3, got
+
+
+def test_a_site_swap_is_a_different_build_even_when_the_old_wheel_is_still_globbed(tmp_path):
+    """The bug this schema bump fixes, in one test.
+
+    Both builds ship as a *site* on PYTHONPATH; the wheel directory the old
+    fingerprint globbed (kt_wheel/*.whl) had no link to the site at all. So
+    switching serve/run_oncard to kt_site_v2 and missing that one glob left
+    both runs reporting the same kt sha256, same_build() said "comparable",
+    and two TPOT tables from two different .so builds subtracted in silence.
+
+    Here: the site changes (new ext .so, new experts_base.py) while the wheel
+    stays exactly the byte string the old glob would have found.
+    """
+    old = _fake_site(tmp_path, "kt_site", ext=b"OLDSO", experts_base=b"old", wheel=b"THE-OLD-WHEEL")
+    new = _fake_site(tmp_path, "kt_site_v2", ext=b"NEWSO", experts_base=b"new", wheel=b"THE-OLD-WHEEL")
+    a = FP.kt_site_fingerprint(str(old))
+    b = FP.kt_site_fingerprint(str(new))
+    assert a["sha256"] != b["sha256"], "the two sites hash the same: the site is not being read"
+    # the wheel alone cannot tell them apart -- that is the whole point
+    wa = FP.kt_wheel_fingerprint(str(old))
+    wb = FP.kt_wheel_fingerprint(str(new))
+    assert wa["sha256"] == wb["sha256"]
+    # and the judge refuses on the site, not on the wheel
+    ok, reasons = FP.same_build(fp(kt_site=a["sha256"]), fp(kt_site=b["sha256"]))
+    assert not ok
+    assert any("kt_site_sha256 differs" in r for r in reasons), reasons
+
+
+def test_the_wheel_is_derived_from_the_site_not_named_separately(tmp_path):
+    """kt_site -> kt_wheel, kt_site_v2 -> kt_wheel_v2. A wheel path of its own
+    does not move when the site moves; that independence was the bug."""
+    old = _fake_site(tmp_path, "kt_site", ext=b"OLDSO", experts_base=b"old", wheel=b"W1")
+    new = _fake_site(tmp_path, "kt_site_v2", ext=b"NEWSO", experts_base=b"new", wheel=b"W2")
+    assert FP.kt_wheel_fingerprint(str(old))["dir"].endswith("/kt_wheel")
+    assert FP.kt_wheel_fingerprint(str(new))["dir"].endswith("/kt_wheel_v2")
+    assert FP.kt_wheel_fingerprint(str(old))["sha256"] != FP.kt_wheel_fingerprint(str(new))["sha256"]
+    # a site with no wheel beside it is still a usable fingerprint: the site
+    # decides, the wheel is provenance
+    lone = _fake_site(tmp_path, "kt_site_v3", ext=b"X", experts_base=b"y", wheel=None)
+    assert FP.kt_site_fingerprint(str(lone))["ok"]
+    assert FP.kt_wheel_fingerprint(str(lone))["sha256"] is None
+
+
+@pytest.mark.parametrize("what", ["missing", "no-kt_kernel", "no-so", "no-experts_base", "unnamed"])
+def test_a_site_that_cannot_be_read_is_refused_never_hashed(tmp_path, what):
+    """As with the operator package: an unread input must not get a hash. The
+    empty-input sha256 is a constant, so two failed reads would compare equal
+    and print as "same build"."""
+    if what == "missing":
+        site = str(tmp_path / "not-here")
+    elif what == "no-kt_kernel":
+        (tmp_path / "bare").mkdir()
+        site = str(tmp_path / "bare")
+    elif what == "unnamed":
+        site = None
+    else:
+        s = _fake_site(tmp_path, "kt_site", ext=b"e", experts_base=b"p")
+        drop = ("kt_kernel_ext.cpython-312-x86_64-linux-gnu.so" if what == "no-so" else "experts_base.py")
+        (s / "kt_kernel" / drop).unlink()
+        site = str(s)
+    got = FP.kt_site_fingerprint(site)
+    assert got["ok"] is False and "sha256" not in got, got
+    assert got["why"]
+
+
+def test_the_site_is_named_in_exactly_one_place_and_the_env_overrides_it(tmp_path, monkeypatch):
+    """kt_build.env is the single source: the shell drivers source it, this
+    tool parses it. A second copy of the path is how the site and the
+    fingerprint came apart."""
+    assert FP.KT_BUILD_ENV.endswith("tools/kt_offload/kt_build.env")
+    text = Path(FP.KT_BUILD_ENV).read_text()
+    assert "KT_SITE_DEFAULT=" in text
+    assert FP._kt_site_from_build_env() == FP.KT_SITE or os.environ.get("KT_SITE")
+    site = _fake_site(tmp_path, "kt_site_v2", ext=b"NEWSO", experts_base=b"new")
+    monkeypatch.setenv("KT_SITE", str(site))
+    reloaded = _load("build_fingerprint_kt_override", TOOLS / "build_fingerprint.py")
+    assert reloaded.KT_SITE == str(site)
+    got = reloaded.kt_site_fingerprint(reloaded.KT_SITE)
+    assert got["ok"] and got["is_override"] is True and got["source"] == "env KT_SITE"
+
+
+def test_the_tool_refuses_to_write_a_fingerprint_without_a_site(tmp_path):
+    """No site, no fingerprint. Falling back to some other path would put a
+    build label on a reading nobody can attribute."""
+    env = dict(os.environ, KT_SITE=str(tmp_path / "not-a-site"))
+    out = tmp_path / "stamped"
+    out.mkdir()
+    proc = subprocess.run([sys.executable, str(TOOLS / "build_fingerprint.py"), "stamp", str(out)],
+                          env=env, capture_output=True, text=True)
+    assert proc.returncode != 0, proc.stdout
+    assert "refusing to write a build fingerprint" in proc.stderr
+    assert not (out / FP.FILENAME).exists(), "a fingerprint was written anyway"
+
+
+def test_the_kt_site_is_part_of_the_decision():
+    for key in ("kt_site_sha256", "kt_site_files", "kt_site_bytes"):
+        assert key in FP.BLOCKING, key
+
+
+def test_an_unreadable_kt_site_blocks_the_comparison():
+    a, b = fp(), fp()
+    for side in (a, b):
+        side["kt_site_ok"] = False
+        side["kt_site_files"] = 0
+    ok, reasons = FP.same_build(a, b)
+    assert not ok
+    assert sum("kt site" in r for r in reasons) == 2, reasons
+
+
+def test_the_previous_schema_cannot_be_subtracted_from():
+    """A /3 artifact cannot say which kt site it ran on -- its kt hash is a
+    wheel found by a glob that did not follow the site."""
+    old = fp()
+    old["schema"] = "kt_offload/build_fingerprint/3"
+    ok, reasons = FP.same_build(old, fp())
+    assert not ok and any(r.startswith("OLDSCHEMA") for r in reasons)
 
 
 # -- the two principles this round produced ------------------------------

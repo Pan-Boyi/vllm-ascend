@@ -47,12 +47,25 @@ def main() -> int:
     assert fp["custom_ops_ok"] and fp["custom_ops_files"] == 4, fp.get("custom_ops")
     assert fp["ds41_ok"] and fp["ds41_files"] > 0, fp.get("ds41_site")
     assert fp["ds41_sha256"] and fp["custom_ops_sha256"]
+    # the kt site (schema /4): the fingerprint must watch the directory that
+    # goes on PYTHONPATH, not a wheel in some unrelated directory. The wheel
+    # glob was fixed at kt_wheel/*.whl and independent of the site, so a run on
+    # kt_site_v2 carried the OLD wheel's sha256 and same_build() called the two
+    # builds one.
+    assert fp["kt_site_ok"] and fp["kt_site_files"] > 0, fp.get("kt_site")
+    assert fp["kt_site_sha256"], "no kt site hash: the imported package is not being watched"
+    decisive = fp["kt_site"]["decisive"]
+    assert any(k.endswith(".so") for k in decisive) and any(k.endswith("experts_base.py") for k in decisive), decisive
+    assert fp["kt_site_sha256"] != fp["kt_wheel_sha256"], "the site hash is just the wheel's again"
+    assert fp["kt_wheel"]["is_override"] or fp["kt_wheel"]["derived_from"] == fp["kt_site_source"], (
+        "the wheel is not derived from the site -- that independence is the bug")
     shared = fp["vendors_shared_baseline"]
     assert fp["vendors_sha256"] != shared.get("sha256"), (
         "the loaded package and the shared baseline hash the same today, so this check cannot tell "
         "them apart -- re-check by file count before trusting it"
     )
-    print(f"loaded={fp['vendors_files']}f/{fp['vendors_bytes']}B  shared={shared['files']}f  distinct=True")
+    print(f"loaded={fp['vendors_files']}f/{fp['vendors_bytes']}B  shared={shared['files']}f  distinct=True  "
+          f"ktsite={os.path.basename(fp['kt_site_source'])}:{fp['kt_site_sha256'][:12]}")
     return 0
 
 

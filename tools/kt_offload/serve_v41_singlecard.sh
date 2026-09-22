@@ -611,10 +611,16 @@ if [ "${KT_OFFLOAD:-0}" = "1" ]; then
   #      _require_validated_dsv41_graph_mode() 现在会 raise,忘传就起不来;
   #      在那条硬拦截之前忘传是【静默】走没有任何精度/浸泡数覆盖的那条路。
   # ⚠️ 注意默认值和默认路径相反:默认路径不设 EAGER = 图模式;本分支不设 EAGER = eager。
-  export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ROOT/build_artifacts/moe_offload_ref/kt_site"
+  # 站点路径只写在 tools/kt_offload/kt_build.env 一处；build_fingerprint.py 也读同一处。
+  # 🔴 以前这里和指纹各写各的(而且指纹写的是 kt_wheel/*.whl,跟站点毫无关系):
+  #    只改这一行换到 kt_site_v2,指纹会继续报旧 wheel 的 sha256,两个构建在
+  #    same_build() 眼里相同,读数直接相减且不报错。见 oncard/RUNBOOK_dispatch.md §8。
+  # shellcheck source=kt_build.env
+  source "$(dirname "${BASH_SOURCE[0]}")/kt_build.env" || { echo "❌ kt_build.env 缺失:这发用的是哪个 kt 构建?"; exit 1; }
+  export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$KT_SITE"
   KT_EAGER="${EAGER:-1}"
   if [ "$KT_EAGER" = "1" ]; then KT_MODE_DESC="--enforce-eager"; else KT_MODE_DESC="图模式,VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-未设}"; fi
-  echo "  ⚪ KT_OFFLOAD=1:单卡 offload 起法(DP=1、无 EP、EAGER=$KT_EAGER → $KT_MODE_DESC);kt_site 已追加到 PYTHONPATH"
+  echo "  ⚪ KT_OFFLOAD=1:单卡 offload 起法(DP=1、无 EP、EAGER=$KT_EAGER → $KT_MODE_DESC);kt_site=$KT_SITE 已追加到 PYTHONPATH"
   exec vllm serve "$MODEL" \
     --served-model-name dsv41 \
     --tensor-parallel-size 1 \

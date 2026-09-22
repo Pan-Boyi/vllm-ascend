@@ -80,7 +80,8 @@ if [ -z "${PACKED_AB_SNAPSHOT:-}" ]; then
   RUN="${PACKED_AB_RUNS_DIR:-$ROOT/build_artifacts/moe_offload_ref/packed_ab}/${STAMP}"
   mkdir -p "$RUN/code" || { echo "❌ cannot create $RUN"; exit 3; }
   cp -p "$SRC_DIR"/*.sh "$SRC_DIR"/*.py "$RUN/code/" || { echo "❌ snapshot failed"; exit 3; }
-  cp -p "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../build_fingerprint.py" "$RUN/code/" 2>/dev/null || true
+  cp -p "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../build_fingerprint.py" \
+        "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../kt_build.env" "$RUN/code/" 2>/dev/null || true
   export PACKED_AB_SNAPSHOT=1 PACKED_AB_RUN="$RUN" PACKED_AB_ARGV="MODE=$MODE $0 $CARD"
   exec bash "$RUN/code/run_packed_ab.sh" "$CARD"
 fi
@@ -112,11 +113,17 @@ command -v npu-smi >/dev/null 2>&1 || pf "no npu-smi here -> no card environment
 [ -f "$ROOT/build_artifacts/eval_runners/prof_collect.sh" ] || pf "prof_collect.sh missing"
 [ -f "$WT/tools/kt_offload/serve_v41_singlecard.sh" ] || pf "serve_v41_singlecard.sh missing"
 [ -f "$HERE/packed_ab_report.py" ] || pf "packed_ab_report.py missing (it judges the run)"
-[ -d "$ROOT/build_artifacts/moe_offload_ref/kt_site/kt_kernel" ] || pf "kt_site missing"
+# which kt build -- one file, shared with build_fingerprint.py (RUNBOOK §8)
+# shellcheck source=../kt_build.env
+source "$HERE/kt_build.env" || pf "kt_build.env missing -- which kt build is this?"
+[ -d "$KT_SITE/kt_kernel" ] || pf "kt_site missing ($KT_SITE)"
 python3 -m py_compile "$HERE/packed_ab_report.py" || pf "packed_ab_report.py does not compile"
 AVAIL_KB=$(oc_meminfo_avail_kb)
 [ "${AVAIL_KB:-0}" -ge $(( ${MIN_AVAIL_GB:-150} * 1024 * 1024 )) ] || pf "MemAvailable $((AVAIL_KB/1048576)) GiB < ${MIN_AVAIL_GB:-150} GiB"
-say "  preflight ok (MemAvailable $((AVAIL_KB/1048576)) GiB, kt_site $(sha256sum "$ROOT/build_artifacts/moe_offload_ref/kt_site/kt_kernel/experts.py" 2>/dev/null | cut -c1-12))"
+# 🔴 this line used to print experts.py, which is byte-identical in both kt
+#    builds in circulation -- it could not tell them apart. experts_base.py is
+#    one of the two files that actually differ, so it can.
+say "  preflight ok (MemAvailable $((AVAIL_KB/1048576)) GiB, kt_site $(basename "$KT_SITE") experts_base $(sha256sum "$KT_SITE/kt_kernel/experts_base.py" 2>/dev/null | cut -c1-12))"
 # ---- build fingerprint: the two arms are only comparable inside one build,
 # and so is any later comparison against this run
 FPTOOL="$HERE/build_fingerprint.py"; [ -f "$FPTOOL" ] || FPTOOL="$ROOT/worktrees/moe-offload/tools/kt_offload/build_fingerprint.py"

@@ -99,7 +99,8 @@ if [ -z "${ONCARD_SNAPSHOT:-}" ]; then
   RUN="${ONCARD_RUNS_DIR:-$ROOT/build_artifacts/moe_offload_ref/oncard_runs}/${STAMP}_${TEST}"
   mkdir -p "$RUN/code" || { echo "❌ cannot create $RUN"; exit 3; }
   cp -p "$SRC_DIR"/*.sh "$SRC_DIR"/*.py "$RUN/code/" || { echo "❌ snapshot failed"; exit 3; }
-  cp -p "$SRC_DIR/../build_fingerprint.py" "$RUN/code/" || { echo "❌ snapshot failed (fingerprint tool)"; exit 3; }
+  cp -p "$SRC_DIR/../build_fingerprint.py" "$SRC_DIR/../kt_build.env" "$RUN/code/" \
+    || { echo "❌ snapshot failed (fingerprint tool / kt_build.env)"; exit 3; }
   export ONCARD_SNAPSHOT=1 ONCARD_RUN_DIR="$RUN" ONCARD_SRC_DIR="$SRC_DIR" ONCARD_ARGV="$0 $CARD $TEST $*"
   exec bash "$RUN/code/run_oncard.sh" "$CARD" "$TEST" "$@"
 fi
@@ -118,9 +119,17 @@ command -v npu-smi >/dev/null 2>&1 || { say "❌ preflight: no npu-smi here -> n
 [ -x "$ROOT/build_artifacts/card_lease.sh" ] || { say "❌ preflight: card_lease.sh missing"; exit 3; }
 [ -f "$ROOT/build_artifacts/env_dsv41.sh" ] || { say "❌ preflight: env_dsv41.sh missing"; exit 3; }
 [ -d "$VA_TREE" ] && [ -d "$ROOT/worktrees/moe-offload-vllm" ] || { say "❌ preflight: trees missing ($VA_TREE)"; exit 3; }
-KT_SITE="$ROOT/build_artifacts/moe_offload_ref/kt_site"
-KT_WHEEL=$(ls "$ROOT"/build_artifacts/moe_offload_ref/kt_wheel/kt_kernel-*.whl 2>/dev/null | head -n 1)
-[ -d "$KT_SITE/kt_kernel" ] && [ -n "$KT_WHEEL" ] || { say "❌ preflight: kt_site / kt wheel missing"; exit 3; }
+# Which kt build: named once, in tools/kt_offload/kt_build.env, which
+# build_fingerprint.py parses too. The site that goes on PYTHONPATH and the
+# site the fingerprint hashes are therefore the same string by construction --
+# they used to be two independent copies, and the fingerprint's copy was not
+# even a site but a wheel directory (RUNBOOK_dispatch §8).
+# shellcheck source=../kt_build.env
+source "$HERE/kt_build.env" || { say "❌ preflight: kt_build.env missing -- which kt build is this?"; exit 3; }
+# KT_WHEEL is left unexported on purpose: the fingerprint derives the wheel
+# from the site itself, and this local copy only feeds the fallback JSON below.
+KT_WHEEL=$(ls "$KT_WHEEL_DIR"/kt_kernel-*.whl 2>/dev/null | head -n 1)
+[ -d "$KT_SITE/kt_kernel" ] && [ -n "$KT_WHEEL" ] || { say "❌ preflight: kt_site / kt wheel missing ($KT_SITE)"; exit 3; }
 AVAIL_KB=$(oc_meminfo_avail_kb)
 NEED_KB=$(( ${ONCARD_MIN_AVAIL_GB:-150} * 1024 * 1024 ))
 [ "${AVAIL_KB:-0}" -ge "$NEED_KB" ] || { say "❌ preflight: MemAvailable $((AVAIL_KB/1048576)) GiB < ${ONCARD_MIN_AVAIL_GB:-150} GiB (plan §2 rule)"; exit 3; }

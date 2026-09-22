@@ -36,7 +36,21 @@ What goes in the fingerprint:
   * ``ds41_site`` the installed ds41 package by content -- what a run actually
                  imports, and without which the five candidate layers fall
                  back to the v2 operators and >16k stays blocked, silently;
-  * ``kt_wheel`` sha256 (the CPU MoE);
+  * ``kt_site``  the kt package **that this run imports** -- the directory
+                 appended to PYTHONPATH, hashed by content over its
+                 ``kt_kernel/`` tree, with ``kt_kernel/kt_kernel_ext*.so`` and
+                 ``kt_kernel/experts_base.py`` required and recorded one by
+                 one. The site is named in exactly one place,
+                 ``tools/kt_offload/kt_build.env``, which the shell drivers
+                 source and this file parses;
+  * ``kt_wheel`` sha256 of the wheel that site was installed from, **derived
+                 from the site directory** (kt_site -> kt_wheel, kt_site_v2 ->
+                 kt_wheel_v2). Provenance, recorded, and no longer the only
+                 thing watched: it used to be globbed from a fixed
+                 ``kt_wheel/*.whl`` with no link to the site, so switching the
+                 site to kt_site_v2 and forgetting that glob left two builds
+                 reporting one sha256 -- same_build() said "comparable" and
+                 the numbers subtracted in silence;
   * ``trees``    both worktrees' HEAD and dirty-file count.
 
 Blocking vs advisory: the first three decide numerics, so they block a
@@ -54,6 +68,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import hashlib
 import json
@@ -91,7 +106,31 @@ CUSTOM_OPS_FILES = (
 CUSTOM_OPS_NOT_INSTALLED = ("cann-ops-transformer-custom_linux-x86_64.run",)
 DS41_SITE = os.environ.get("DSV41_DS41_SITE", "/workspace/code/dsv4_single_card/ds41_site")
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()  # the hash of no input: a constant, and constants always "match"
-KT_WHEEL_GLOB = os.path.join(ROOT, "build_artifacts/moe_offload_ref/kt_wheel/*.whl")
+
+# The kt site: the directory the drivers append to PYTHONPATH, i.e. the
+# package a run actually imports. It is named ONCE, in kt_build.env, which the
+# shell drivers source and this file parses -- see that file for why. There is
+# deliberately no hard-coded fallback here: a second copy of the path is how
+# the site and the fingerprint came apart in the first place.
+KT_BUILD_ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kt_build.env")
+KT_SITE_REQUIRED_FILE = "kt_kernel/experts_base.py"   # the python half of the two that differ between builds
+KT_SITE_REQUIRED_GLOB = "kt_kernel/kt_kernel_ext*.so"  # the compiled half
+
+
+def _kt_site_from_build_env() -> str | None:
+    """The default site, read from the file the shell drivers source."""
+    try:
+        with open(KT_BUILD_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("KT_SITE_DEFAULT="):
+                    return line.split("=", 1)[1].strip().strip("\"'") or None
+    except OSError:
+        return None
+    return None
+
+
+KT_SITE = os.environ.get("KT_SITE") or _kt_site_from_build_env()
 SO_GLOBS = (
     os.path.join(TREE, "vllm_ascend/vllm_ascend_C*.so"),
     os.path.join(ROOT, "build_artifacts/vllm_ascend_C*.so"),
@@ -101,7 +140,13 @@ SO_GLOBS = (
 # artifacts and the installed ds41_site -- to the same-build decision. A /2
 # fingerprint never recorded them, so it may not be subtracted against a /3
 # one; that is the point of the bump, not a side effect.
-SCHEMA = "kt_offload/build_fingerprint/3"
+# /4 (2026-09-22): adds the kt SITE -- the package the run imports -- and
+# derives the wheel from it. Up to /3 the kt half of the fingerprint was a
+# wheel found by a fixed glob that was independent of the site on PYTHONPATH,
+# so a run on kt_site_v2 and a run on kt_site carried the SAME kt hash. A /3
+# artifact cannot say which site it ran on, so it may not be subtracted
+# against a /4 one; again the point of the bump, not a side effect.
+SCHEMA = "kt_offload/build_fingerprint/4"
 # The identity of the counting convention. Counts may only be compared when
 # this matches; a different value means "counted differently", never "the
 # package changed". Anything that writes a fingerprint reads this from here.
@@ -111,7 +156,8 @@ BACKFILL_NAME = "build_fingerprint.backfilled.json"
 # Every key here decides. The counts are in on purpose: the hash of an empty
 # directory is a constant, so a hash alone cannot tell "identical packages"
 # from "read nothing twice".
-BLOCKING = ("so_primary_md5", "vendors_sha256", "vendors_files", "vendors_bytes", "kt_wheel_sha256",
+BLOCKING = ("so_primary_md5", "vendors_sha256", "vendors_files", "vendors_bytes",
+            "kt_site_sha256", "kt_site_files", "kt_site_bytes", "kt_wheel_sha256",
             "custom_ops_sha256", "custom_ops_files", "ds41_sha256", "ds41_files", "ds41_bytes")
 
 
@@ -259,6 +305,119 @@ def custom_ops_fingerprint(root: str = CUSTOM_OPS) -> dict:
     return out
 
 
+def kt_site_fingerprint(site: str | None = KT_SITE) -> dict:
+    """The kt package this run imports, by content.
+
+    Reads the judged object: ``<site>/kt_kernel`` is what ends up on
+    PYTHONPATH, so it -- not a wheel sitting in some other directory -- is
+    what decides the CPU MoE numerics. The two files that differ between the
+    builds in circulation (``kt_kernel_ext*.so`` and ``experts_base.py``) are
+    required and recorded individually, so a reader can eyeball which build a
+    reading came from; the hash covers the whole ``kt_kernel`` tree, minus
+    ``__pycache__``, because anything else in the package is imported too.
+
+    Refusals -- all of them ``ok: False`` with no sha256, never a fallback to
+    another path:
+      * the site is not named at all (no ``KT_SITE``, no ``KT_SITE_DEFAULT``
+        in kt_build.env);
+      * the site or its ``kt_kernel`` directory does not exist;
+      * either required file is missing.
+    A refusal must not produce a hash: the empty-input sha256 is a constant,
+    so two failed reads would compare equal and print as "same build" -- which
+    is the exact failure this whole file exists to stop.
+    """
+    out = {"role": "kt_site", "path": site,
+           "source": "env KT_SITE" if os.environ.get("KT_SITE") else f"KT_SITE_DEFAULT in {KT_BUILD_ENV}",
+           "is_override": bool(os.environ.get("KT_SITE")),
+           "rule": "sha256 over (relpath, size, sha256) of every file under <site>/kt_kernel, "
+                   "__pycache__ excluded; kt_kernel_ext*.so and experts_base.py required",
+           "files": 0, "bytes": 0}
+    if not site:
+        out.update(ok=False, why=f"no kt site named: KT_SITE is unset and {KT_BUILD_ENV} has no "
+                                 "KT_SITE_DEFAULT. Refusing to guess -- a guessed site is how the "
+                                 "fingerprint stopped describing what ran.")
+        return out
+    pkg = os.path.join(site, "kt_kernel")
+    if not os.path.isdir(pkg):
+        out.update(ok=False, why=f"not a kt site: {pkg} is not a directory")
+        return out
+    entries, total = [], 0
+    for dirpath, dirnames, filenames in os.walk(pkg):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, site)
+            try:
+                size = os.path.getsize(full)
+                total += size
+                entries.append((rel, size, _sha256(full)))
+            except OSError:
+                entries.append((rel, -2, "unreadable"))
+    entries.sort()
+    by_rel = {rel: digest for rel, _size, digest in entries}
+    ext = sorted(rel for rel in by_rel if fnmatch.fnmatch(rel, KT_SITE_REQUIRED_GLOB))
+    out["files"] = len(entries)
+    out["bytes"] = total
+    out["ext_so"] = ext
+    missing = []
+    if not ext:
+        missing.append(KT_SITE_REQUIRED_GLOB)
+    if KT_SITE_REQUIRED_FILE not in by_rel:
+        missing.append(KT_SITE_REQUIRED_FILE)
+    if missing:
+        out.update(ok=False, missing=missing,
+                   why=f"{site} does not look like a kt site: missing {missing}. Not hashed -- the "
+                       f"service imports these two, so a fingerprint taken without them describes "
+                       f"nothing that ran.")
+        return out
+    h = hashlib.sha256()
+    for rel, size, digest in entries:
+        h.update(f"{rel}\0{size}\0{digest}\n".encode())
+    out.update(ok=True, sha256=h.hexdigest(),
+               decisive={rel: by_rel[rel] for rel in [*ext, KT_SITE_REQUIRED_FILE]},
+               ext_so_sha256=by_rel[ext[0]],
+               experts_base_sha256=by_rel[KT_SITE_REQUIRED_FILE])
+    return out
+
+
+def kt_wheel_fingerprint(site: str | None = KT_SITE) -> dict:
+    """The wheel the site was installed from -- found THROUGH the site.
+
+    kt_site -> kt_wheel, kt_site_v2 -> kt_wheel_v2: the wheel directory is the
+    site's sibling under the same name with ``kt_site`` swapped for
+    ``kt_wheel``. Never a path of its own, because a path of its own does not
+    move when the site does -- which is how the old fixed
+    ``kt_wheel/*.whl`` glob kept reporting the previous build's sha256 after
+    the site had been switched. ``KT_WHEEL`` overrides with an explicit file
+    and is recorded as an override.
+    """
+    explicit = os.environ.get("KT_WHEEL")
+    if explicit:
+        out = {"role": "kt_wheel", "path": explicit, "is_override": True, "derived_from": None}
+        try:
+            out["sha256"] = _sha256(explicit)
+        except OSError:
+            out.update(sha256=None, why=f"KT_WHEEL={explicit} is not readable")
+        return out
+    out = {"role": "kt_wheel", "is_override": False, "derived_from": site,
+           "rule": "sibling of the site with 'kt_site' replaced by 'kt_wheel' in the basename"}
+    if not site:
+        out.update(path=None, sha256=None, why="no kt site named, so no wheel to derive")
+        return out
+    base = os.path.basename(os.path.normpath(site))
+    sibling = "kt_wheel" + base[len("kt_site"):] if base.startswith("kt_site") else base
+    wheel_dir = os.path.join(os.path.dirname(os.path.normpath(site)), sibling)
+    out["dir"] = wheel_dir
+    wheels = sorted(glob.glob(os.path.join(wheel_dir, "*.whl")))
+    if not wheels:
+        out.update(path=None, sha256=None,
+                   why=f"no wheel under {wheel_dir}; the site is what decides, the wheel is provenance")
+        return out
+    out["path"] = wheels[-1]
+    out["sha256"] = _sha256(wheels[-1])
+    return out
+
+
 def host_facts() -> dict:
     """CPU counts and the thread env, because one of the readings lies.
 
@@ -318,8 +477,9 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
     custom_ops = custom_ops_fingerprint()
     # the installed result, by content: this is what a run imports
     ds41 = vendors_fingerprint(DS41_SITE, role="ds41_site")
-    wheels = sorted(glob.glob(KT_WHEEL_GLOB))
-    kt_sha = _sha256(wheels[-1]) if wheels else None
+    # the kt half: the site is the judged object, the wheel is derived from it
+    site = kt_site_fingerprint(KT_SITE)
+    wheel = kt_wheel_fingerprint(KT_SITE)
     trees = {}
     for name, tree in (("vllm_ascend", TREE), ("vllm", VLLM_TREE)):
         trees[name] = {
@@ -358,8 +518,15 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
         "ds41_ok": ds41.get("ok", False),
         "ds41_source": ds41.get("path"),
         "ds41_source_is_override": bool(os.environ.get("DSV41_DS41_SITE")),
-        "kt_wheel": {"path": wheels[-1] if wheels else None, "sha256": kt_sha},
-        "kt_wheel_sha256": kt_sha,
+        "kt_site": site,
+        "kt_site_sha256": site.get("sha256"),
+        "kt_site_files": site.get("files"),
+        "kt_site_bytes": site.get("bytes"),
+        "kt_site_ok": site.get("ok", False),
+        "kt_site_source": site.get("path"),
+        "kt_site_source_is_override": site.get("is_override", False),
+        "kt_wheel": wheel,
+        "kt_wheel_sha256": wheel.get("sha256"),
         "trees": trees,
         "host": host_facts(),
         "captured_at": subprocess.run(["date", "-Is"], capture_output=True, text=True).stdout.strip(),
@@ -403,11 +570,16 @@ def short(fp: dict | None) -> str:
     files = fp.get("vendors_files")
     v = f"{v}/{files}f" if files is not None else f"{v}(shared-baseline?)"
     kt = (fp.get("kt_wheel_sha256") or "")[:12] or "?"
+    # the site is what got imported; print it FIRST and next to its directory,
+    # because "kt <wheel sha>" alone is what used to read the same on two builds
+    ktsite = (fp.get("kt_site_sha256") or "")[:12] or "?"
+    ktdir = os.path.basename(os.path.normpath(fp.get("kt_site_source") or "")) or "?"
     ds41 = (fp.get("ds41_sha256") or "")[:12] or "?"
     ops = (fp.get("custom_ops_sha256") or "")[:12] or "?"
     heads = "/".join((fp.get("trees", {}).get(n, {}).get("head") or "?")[:9] for n in ("vllm_ascend", "vllm"))
     tag = " (backfilled)" if fp.get("backfilled") else ""
-    return (f"build: so {fp.get('so_primary_md5_short') or '?'} vendors {v} kt {kt} "
+    return (f"build: so {fp.get('so_primary_md5_short') or '?'} vendors {v} "
+            f"ktsite {ktdir}:{ktsite} ktwheel {kt} "
             f"ds41ops {ops} ds41site {ds41}/{fp.get('ds41_files')}f trees {heads}{tag}")
 
 
@@ -434,7 +606,8 @@ def same_build(a: dict | None, b: dict | None, strict_trees: bool = False) -> tu
                 "from its own tree -- the two differ, so no difference may be computed across this boundary"
             )
         for what, okkey, cnt in (("ds41 operator package (custom_ops_dsv41)", "custom_ops_ok", "custom_ops_files"),
-                                 ("installed ds41_site", "ds41_ok", "ds41_files")):
+                                 ("installed ds41_site", "ds41_ok", "ds41_files"),
+                                 ("kt site (the kt_kernel package the run imports)", "kt_site_ok", "kt_site_files")):
             if fp.get(okkey) is False or (cnt in fp and fp.get(cnt) == 0):
                 reasons.append(
                     f"the {name} artifact's {what} was not readable (files={fp.get(cnt)}): an unread input "
@@ -526,6 +699,19 @@ def main() -> int:
 
     if args.cmd in ("capture", "stamp"):
         fp = capture(label=args.label)
+        # A fingerprint that cannot say which kt site ran is not a weaker
+        # fingerprint, it is the failure mode this file exists to stop: two
+        # builds would carry the same kt hash and their numbers would subtract
+        # without a word. So: no site, no fingerprint -- and no silent
+        # fallback to some other path.
+        if not fp.get("kt_site_ok"):
+            site = fp.get("kt_site", {})
+            print(f"refusing to write a build fingerprint: {site.get('why', 'the kt site is unreadable')}\n"
+                  f"  site   : {site.get('path')}\n"
+                  f"  source : {site.get('source')}\n"
+                  f"  fix    : point KT_SITE at the site the run imports, or set KT_SITE_DEFAULT in "
+                  f"{KT_BUILD_ENV}", file=sys.stderr)
+            return 2
         out = args.out if args.cmd == "capture" and args.out else (
             os.path.join(args.dir, FILENAME) if args.cmd == "stamp" else ""
         )

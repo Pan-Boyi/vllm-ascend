@@ -12,7 +12,9 @@ OUT="${1:?usage: run_cpu_bench.sh <outdir> <phase>}"
 PHASE="${2:?usage: run_cpu_bench.sh <outdir> <phase>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT=/workspace/code/dsv4_single_card/vllm_project
-KT_SITE="$ROOT/build_artifacts/moe_offload_ref/kt_site"
+# which kt build -- one file, shared with build_fingerprint.py (RUNBOOK §8)
+# shellcheck source=../kt_build.env
+source "$HERE/../kt_build.env"
 mkdir -p "$OUT"
 
 run() {  # run <tag> <extra args...>   (env prefixed by caller via RUNENV)
