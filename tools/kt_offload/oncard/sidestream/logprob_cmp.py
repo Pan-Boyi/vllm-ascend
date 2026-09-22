@@ -4,12 +4,21 @@ A position is compared only while all earlier chosen tokens agree (same input)."
 import json, sys, math
 def load(p): return {r["i"]: r for r in map(json.loads, open(p))}
 argv = [a for a in sys.argv[1:] if not a.startswith("--skip-first=")]
-skip = next((int(a.split("=")[1]) for a in sys.argv[1:] if a.startswith("--skip-first=")), 0)
+skip = next((int(a.split("=")[1]) for a in sys.argv[1:] if a.startswith("--skip-first=")), 12)
 A, B = load(argv[0]), load(argv[1])
 label = argv[2] if len(argv) > 2 else ""
 # --skip-first=N: drop the first N requests of each run. The first few requests after a
-# service starts are not comparable to later ones (JIT / warmup); 2026-09-22 measured:
-# in-process A1 pass1 vs pass2 differed on exactly 4 prompts, all at request index 2-5.
+# service starts are not comparable to later ones (JIT / warmup).
+#
+# 🔴 The cutoff is calibrated PER ARM, and 10 was too tight. 2026-09-22 first pass
+# (seed 20260922, 4 processes): the SERIAL arm's own cross-process floor still
+# differed on requests 2,3,4,6,7,8,9, and the side-stream arm's on 7,10,11. A
+# cutoff taken from the serial arm and applied to the side-stream arm therefore
+# reads the side stream's longer warm-up tail as "the side stream computes
+# different numbers" -- which is exactly the mistake this default now prevents.
+# From request 12 on, all six pairs (both floors and all four A/B crosses) were
+# 100% bit-identical, 1149/1149 decode positions, nonzero differences 0.
+# Default 12; pass --skip-first=N explicitly to look inside the warm-up window.
 keys = sorted(k for k in set(A) & set(B) if k >= skip)
 stat = {"prefill": [0, 0, []], "decode": [0, 0, []]}  # compared, bit-identical, |d| list (over all top-k entries)
 tok_div = []; key_set_diff = 0; prefill_pt = []

@@ -1,7 +1,16 @@
-"""Fixed ~200-prompt batch for the side-stream logprob comparison (seeded, deterministic)."""
+"""Fixed ~200-prompt batch for the side-stream logprob comparison (seeded, deterministic).
+
+usage: make_prompts.py <out.jsonl> [seed]
+
+The seed is an argument so a *confirmation* run can be made on a batch the
+criterion was never tuned on. Same count, same short/mid/long split, different
+draw: 2026-09-22 the first A/B pair was judged on seed 20260922, and the
+confirmation pair that fixed --skip-first=12 in advance used another seed.
+"""
 import json, random, sys, glob
 out = sys.argv[1]
-rng = random.Random(20260922)
+seed = int(sys.argv[2]) if len(sys.argv) > 2 else 20260922
+rng = random.Random(seed)
 gsm = [json.loads(l) for l in open("/workspace/code/dsv4_single_card/eval/gsm8k/sgl_eval_gsm8k_20260904-161029/output-rs0.jsonl")]
 gsm.sort(key=lambda r: r["id"])
 rng.shuffle(gsm)
@@ -39,4 +48,4 @@ with open(out, "w") as fo:
     for i, p in enumerate(P):
         p["i"] = i
         fo.write(json.dumps(p, ensure_ascii=False) + "\n")
-print(len(P), "prompts ->", out)
+print(len(P), f"prompts (seed {seed}) ->", out)
