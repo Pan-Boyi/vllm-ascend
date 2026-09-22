@@ -63,9 +63,11 @@ per-callback identity, each of them valid without assuming additivity:
                p90s) <= 3 * 10% < 50%, so the median cannot exceed it. With
                ``split``, med(kt) <= sum of the five middle p90s (5 * 10%).
   non-zero     with ``split``, no middle segment may have a zero median.
-  n_unsplit    if the record side ever reports a per-layer count of rows whose
-               middle was not filled (or per-callback residual stats), that is
-               used directly and is exact; today's records do not carry it.
+  n_unsplit    the record side reports, per layer and sample, how many rows of
+               a split run had no middle (``n_unsplit``) and the per-callback
+               residual of largest magnitude (``resid_us.max``); both are exact
+               and are used when present (records from before 2026-09-23 do not
+               carry them -- then only the necessary conditions above apply).
 
 Resolution, stated because it is the point of an instrument: the union bound
 only rejects a hole bigger than the slack ``sum(p90) - med(cb)``, which is
@@ -84,6 +86,34 @@ per-layer NOTIFY_WAIT medians and the per-layer cb medians must be at least
 ``--nw-align-min`` at the chosen shift and beat every other feasible shift by
 ``--nw-align-margin``. If it does not, the NW / A+F_dev columns are refused --
 a misaligned number is worse than no number.
+
+Splitting A from F (--nw-csv + ``[kt-seam-rt]`` lines, §4.22 P0)
+---------------------------------------------------------------
+When the log carries ``[kt-seam-rt]`` lines (absolute CLOCK_REALTIME ns of each
+callback's entry and exit), the same task_time.csv gives A and F separately,
+per callback, with no position slicing at all -- the join is by time:
+
+  a HOSTFUNC_CALLBACK and the NOTIFY_WAIT that follows it on the same stream
+  form one pair (in this build they start at the same ts); a callback belongs
+  to the pair whose [HF.ts, NW.ts + NW.dur] holds its midpoint;
+  A = entry_realtime - HF.ts        F = (NW.ts + NW.dur) - exit_realtime
+
+The profile's ``task_start(us)`` is CLOCK_REALTIME microseconds (checked on
+the box), read here as exact decimal, not float: at 1.79e15 us a double only
+resolves 0.25 us.
+
+The two columns are printed only if all of these hold, otherwise they are
+refused and the tool returns 1:
+  * callbacks fall inside the profile's span at all (a clock mix-up -- e.g.
+    perf_counter written where CLOCK_REALTIME was meant -- lands nowhere);
+  * at most --af-max-unmatched of those are outside every pair, and no pair
+    takes two callbacks;
+  * per layer med(A) > 0 and med(F) > 0, and at most --af-max-nonpos of the
+    callbacks have A <= 0 or F <= 0;
+  * per layer |med((A + F) - (NW.dur - cb))| < --af-tol-us (default 5): the
+    new split must add back up to the existing NOTIFY_WAIT - T_cb column. A
+    realtime stamp taken in the wrong place (inside kt instead of at entry)
+    moves A by the part of cb it skipped, and this is where it shows.
 """
 from __future__ import annotations
 
@@ -98,6 +128,7 @@ import sys
 from collections import defaultdict
 
 REC = re.compile(r"\[kt-seam\] (\{.*\})")
+REC_RT = re.compile(r"\[kt-seam-rt\] (\{.*\})")
 # vllm's log prefix: "INFO 09-22 15:01:51 [seam_timing.py:377]".
 STAMP = re.compile(r"\b(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\b")
 
@@ -220,11 +251,23 @@ def merge(records: list[dict]) -> dict:
     per_layer: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     p90_layer: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     counts: dict[int, int] = defaultdict(int)
+    # Per-callback facts from the record side, when it carries them: summed /
+    # worst-of over the samples (they are counts and extremes, not medians).
+    extra: dict[int, dict] = {}
     split = any(bool(r.get("split")) for r in records)
     for rec in records:
         for layer_s, v in (rec.get("layers") or {}).items():
             layer = int(layer_s)
             counts[layer] += int(v.get("n", 0))
+            if "n_unsplit" in v:
+                e = extra.setdefault(layer, {})
+                e["n_unsplit"] = e.get("n_unsplit", 0) + int(v["n_unsplit"])
+            rmax = (v.get("resid_us") or {}).get("max")
+            if rmax is not None:
+                e = extra.setdefault(layer, {})
+                cur = (e.get("resid_us") or {}).get("max")
+                if cur is None or abs(float(rmax)) > abs(cur):
+                    e["resid_us"] = {"max": float(rmax)}
             for seg in SEGMENTS:
                 if seg in (v.get("med_us") or {}):
                     per_layer[layer][seg].append(float(v["med_us"][seg]))
@@ -238,7 +281,8 @@ def merge(records: list[dict]) -> dict:
         layer: {seg: max(xs) for seg, xs in segs.items() if xs}
         for layer, segs in p90_layer.items()
     }
-    return {"split": split, "median_us": med, "p90_us": p90, "n": dict(counts), "samples": len(records)}
+    return {"split": split, "median_us": med, "p90_us": p90, "n": dict(counts), "samples": len(records),
+            "extra": extra}
 
 
 # ------------------------------------------------------------- reconciliation
@@ -437,6 +481,156 @@ def check_alignment(shifted: dict[int, dict[int, float]], cb_by_layer: dict[int,
     }
 
 
+# ----------------------------------------------------------------- A and F split
+
+
+def parse_realtime(text: str) -> tuple[list[tuple[int, int, int, int]], int]:
+    """Every callback of the ``[kt-seam-rt]`` lines: (layer, entry_ns, exit_ns, cb_ns).
+
+    entry/exit are absolute CLOCK_REALTIME ns (seam_timing.realtime_rows); cb
+    is the perf_counter duration of the same callback. Returns the callbacks
+    and the number of markers that did not parse (a cut line is counted).
+    """
+    out, bad = [], 0
+    for line in text.splitlines():
+        if "[kt-seam-rt]" not in line:
+            continue
+        m = REC_RT.search(line)
+        try:
+            rec = json.loads(m.group(1)) if m else None
+            layer = int(rec["layer"])
+            ent, ext, cbs = rec["entry_realtime_ns"], rec["exit_realtime_ns"], rec["cb_ns"]
+            if not (len(ent) == len(ext) == len(cbs)):
+                raise ValueError("ragged")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            bad += 1
+            continue
+        out.extend((layer, int(a), int(b), int(c)) for a, b, c in zip(ent, ext, cbs))
+    return out, bad
+
+
+def _us_to_ns(field: str) -> int:
+    """``1790089308256624.2`` (us, maybe padded) -> exact integer ns."""
+    from decimal import Decimal
+
+    return int(Decimal(field.strip()) * 1000)
+
+
+def hostfunc_pairs(csv_path: str) -> list[tuple[int, int, int]]:
+    """(HF.ts, NW.ts, NW.ts + NW.dur) in ns, one per HOSTFUNC_CALLBACK that is
+    followed on its own stream by a NOTIFY_WAIT before the next HOSTFUNC."""
+    by_stream: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    with open(csv_path, newline="") as f:
+        for r in csv.DictReader(f):
+            k = (r.get("kernel_type") or "").strip()
+            if k not in ("NOTIFY_WAIT", "HOSTFUNC_CALLBACK"):
+                continue
+            ts = _us_to_ns(r["task_start(us)"])
+            dur = _us_to_ns(r["task_time(us)"])
+            # HF before NW when they share a ts (they do in this build).
+            by_stream[(r.get("stream_id") or "").strip()].append((ts, 0 if k == "HOSTFUNC_CALLBACK" else 1, dur))
+    pairs = []
+    for rows in by_stream.values():
+        rows.sort()
+        hf = None
+        for ts, kind, dur in rows:
+            if kind == 0:
+                hf = ts
+            elif hf is not None:
+                pairs.append((hf, ts, ts + dur))
+                hf = None
+    pairs.sort()
+    return pairs
+
+
+def _q(xs: list[float], q: float) -> float:
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * len(xs)))] if xs else float("nan")
+
+
+def split_a_f(callbacks, pairs, tol_us: float = 5.0, max_unmatched: float = 0.01,
+              max_nonpos: float = 0.01) -> dict:
+    """Join callbacks to (HOSTFUNC, NOTIFY_WAIT) pairs by time; A, F per layer.
+
+    Pure: ``callbacks`` as parse_realtime returns them, ``pairs`` as
+    hostfunc_pairs. Returns ``ok`` and, only when ok, the per-layer columns;
+    ``why`` lists every failed criterion (see the module docstring).
+    """
+    why: list[str] = []
+    res = {"ok": False, "why": why, "layers": {}, "n_callbacks": len(callbacks), "n_pairs": len(pairs)}
+    if not pairs:
+        why.append("the profile has no HOSTFUNC_CALLBACK + NOTIFY_WAIT pair")
+        return res
+    lo, hi = pairs[0][0], max(p[2] for p in pairs)
+    starts = [p[0] for p in pairs]
+    in_span = [c for c in callbacks if lo <= (c[1] + c[2]) // 2 <= hi]
+    res["n_in_span"] = len(in_span)
+    if not in_span:
+        why.append(f"none of the {len(callbacks)} callbacks falls inside the profile's span "
+                   f"[{lo / 1e9:.3f}, {hi / 1e9:.3f}] s -- not the same run, or not CLOCK_REALTIME")
+        return res
+    used: dict[int, int] = defaultdict(int)
+    per_layer: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    unmatched = 0
+    for layer, ent, ext, cb in in_span:
+        mid = (ent + ext) // 2
+        i = bisect.bisect_right(starts, mid) - 1
+        if i < 0 or mid > pairs[i][2]:
+            unmatched += 1
+            continue
+        hf, nw_ts, nw_end = pairs[i]
+        used[i] += 1
+        a = (ent - hf) / 1000.0
+        f = (nw_end - ext) / 1000.0
+        ref = ((nw_end - nw_ts) - cb) / 1000.0
+        d = per_layer[layer]
+        d["A"].append(a)
+        d["F"].append(f)
+        d["AF"].append(a + f)
+        d["ref"].append(ref)
+        d["diff"].append(a + f - ref)
+    res["unmatched"] = unmatched
+    doubles = sum(1 for v in used.values() if v > 1)
+    res["pairs_taken_twice"] = doubles
+    if unmatched > max_unmatched * len(in_span):
+        why.append(f"{unmatched}/{len(in_span)} callbacks inside the span sit in no HOSTFUNC..NOTIFY_WAIT "
+                   f"window (> {max_unmatched:.0%})")
+    if doubles:
+        why.append(f"{doubles} pair(s) took more than one callback")
+    for layer in sorted(per_layer):
+        d = per_layer[layer]
+        n = len(d["A"])
+        nonpos = sum(1 for a, f in zip(d["A"], d["F"]) if a <= 0 or f <= 0)
+        row = {
+            "n": n,
+            "A_med_us": round(st.median(d["A"]), 3), "A_p90_us": round(_q(d["A"], 0.9), 3),
+            "F_med_us": round(st.median(d["F"]), 3), "F_p90_us": round(_q(d["F"], 0.9), 3),
+            "AF_med_us": round(st.median(d["AF"]), 3),
+            "NW_minus_cb_med_us": round(st.median(d["ref"]), 3),
+            "diff_med_us": round(st.median(d["diff"]), 3),
+            "nonpos": nonpos,
+        }
+        res["layers"][layer] = row
+        if row["A_med_us"] <= 0 or row["F_med_us"] <= 0:
+            why.append(f"layer {layer}: med(A)={row['A_med_us']:+.2f} med(F)={row['F_med_us']:+.2f} us, both must be > 0")
+        if nonpos > max_nonpos * n:
+            why.append(f"layer {layer}: {nonpos}/{n} callbacks with A <= 0 or F <= 0")
+        if abs(row["diff_med_us"]) >= tol_us:
+            why.append(f"layer {layer}: med((A+F) - (NW - cb)) = {row['diff_med_us']:+.2f} us, "
+                       f"|.| must be < {tol_us:g}")
+    res["ok"] = not why
+    if res["ok"]:
+        L = res["layers"]
+        res["totals_ms"] = {
+            "A": round(sum(v["A_med_us"] for v in L.values()) / 1000.0, 4),
+            "F": round(sum(v["F_med_us"] for v in L.values()) / 1000.0, 4),
+            "A_plus_F": round(sum(v["AF_med_us"] for v in L.values()) / 1000.0, 4),
+        }
+    else:
+        res["layers"] = {}  # refused: no column survives a failed check
+    return res
+
+
 # --------------------------------------------------------------------- the CLI
 
 
@@ -461,6 +655,12 @@ def main(argv=None) -> int:
     ap.add_argument("--layers", type=int, default=0, help="expected layer count (0 = whatever reported)")
     ap.add_argument("--tol-us", type=float, default=2.0, help="informational residual tolerance (default 2 us)")
     ap.add_argument("--eps-us", type=float, default=0.5, help="slack on the containment/union checks")
+    ap.add_argument("--af-tol-us", type=float, default=5.0,
+                    help="max |med((A+F) - (NW - cb))| per layer before A/F are refused (default 5 us)")
+    ap.add_argument("--af-max-unmatched", type=float, default=0.01,
+                    help="fraction of in-span callbacks allowed outside every HF..NW pair (default 0.01)")
+    ap.add_argument("--af-max-nonpos", type=float, default=0.01,
+                    help="fraction of a layer's callbacks allowed with A <= 0 or F <= 0 (default 0.01)")
     ap.add_argument("--json-out", help="write the whole decomposition here")
     args = ap.parse_args(argv)
 
@@ -533,7 +733,7 @@ def main(argv=None) -> int:
         row = f"{layer:5d} {m['n'].get(layer, 0):5d}  " + "".join(f"{mm.get(c, 0.0):9.2f}" for c in cols)
         row += f" {mm.get('cb', 0.0):8.2f} {mm.get('gap', 0.0):8.1f}"
         rec = reconcile(mm, split, args.tol_us)
-        chk = check_layer(mm, pp, split, None, args.eps_us)
+        chk = check_layer(mm, pp, split, m["extra"].get(layer), args.eps_us)
         entry = {"med_us": mm, "p90_us": pp, "n": m["n"].get(layer, 0),
                  "resid_med": rec, "check": chk}
         if not chk["ok"]:
@@ -599,14 +799,40 @@ def main(argv=None) -> int:
     if align is not None and not align["ok"]:
         print("❌ NOTIFY_WAIT alignment refused -- A+F_dev was not computed.")
 
+    # ---- A and F separately (needs the [kt-seam-rt] lines and the csv)
+    af = None
+    rt_calls, rt_bad = parse_realtime(text)
+    if args.nw_csv and rt_calls:
+        af = split_a_f(rt_calls, hostfunc_pairs(args.nw_csv), args.af_tol_us,
+                       args.af_max_unmatched, args.af_max_nonpos)
+        print(f"\nA / F split: {af['n_callbacks']} callbacks with CLOCK_REALTIME stamps "
+              f"({rt_bad} unparsable line(s)), {af['n_pairs']} HOSTFUNC+NOTIFY_WAIT pairs, "
+              f"{af.get('n_in_span', 0)} callbacks inside the profile, {af.get('unmatched', '-')} unmatched")
+        if af["ok"]:
+            print("layer     n    A_med    A_p90    F_med    F_p90     A+F   NW-cb   diff")
+            for layer, v in sorted(af["layers"].items()):
+                print(f"{layer:5d} {v['n']:5d} {v['A_med_us']:8.2f} {v['A_p90_us']:8.2f} {v['F_med_us']:8.2f} "
+                      f"{v['F_p90_us']:8.2f} {v['AF_med_us']:7.1f} {v['NW_minus_cb_med_us']:7.1f} "
+                      f"{v['diff_med_us']:+6.2f}")
+            t = af["totals_ms"]
+            print(f"  whole net, ms/token: A {t['A']:.3f}  F {t['F']:.3f}  A+F {t['A_plus_F']:.3f}")
+            print(f"✅ A/F reconcile with NW - cb on every layer (|diff| < {args.af_tol_us:g} us), A, F > 0")
+        else:
+            print("❌ refusing the A / F columns:")
+            for w in af["why"][:10]:
+                print(f"   {w}")
+    elif rt_calls:
+        print("\nA / F split: [kt-seam-rt] lines present but no --nw-csv to join them with")
+
     if args.json_out:
         json.dump(
             {"split": split, "samples": m["samples"], "dropped": dropped,
-             "window": window_note, "alignment": align, "totals": totals,
+             "window": window_note, "alignment": align, "totals": totals, "a_f": af,
              "layers": {str(k): v for k, v in out_layers.items()}},
             open(args.json_out, "w"), indent=1, default=float)
         print(f"wrote {args.json_out}")
-    return 1 if (bad or (align is not None and not align["ok"])) else 0
+    return 1 if (bad or (align is not None and not align["ok"]) or (af is not None and not af["ok"])) else 0
+
 
 
 if __name__ == "__main__":

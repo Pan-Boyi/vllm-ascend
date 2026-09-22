@@ -297,3 +297,207 @@ def test_end_to_end_refuses_a_plus_f_when_the_alignment_is_wrong(tmp_path, capsy
     assert "refusing the NW / A+F_dev columns" in out
     tail = out.split("whole net")[1]
     assert "A+F_dev: refused" in tail and "  A+F_dev " not in tail, tail
+
+
+# ------------------------------------------------- ④ A and F, told apart (P0)
+#
+# §4.22 P0: the callback also stamps CLOCK_REALTIME at entry and at exit, so A
+# (device reaches the node -> the callback runs) and F (the callback returns ->
+# the device's NOTIFY_WAIT ends) stop being one 78 us number. The join is by
+# time, per callback, against the same profile -- which means a stamp taken in
+# the wrong place, or on the wrong clock, has to be caught here. Both arms are
+# below; a split that cannot fail its own audit would just be two new columns.
+
+AF_BASE_NS = 1_790_089_308_000_000_000  # a real profile's ts, so the span is realistic
+
+
+def _af_run(n_layers=8, n_steps=30, seed=11, a_us=30.0, f_us=20.0, entry_extra_ns=0, clock_shift_ns=0):
+    """One synthetic run: the csv rows, the callbacks, and the cb per layer.
+
+    Every layer gets its own cb (not monotone in the index: the NOTIFY_WAIT
+    alignment check must have something to decide), and every callback sits
+    inside its pair with a known A and F.  ``entry_extra_ns`` is the mutation
+    "the entry stamp was taken later than the entry"; ``clock_shift_ns`` is
+    "the stamps are not CLOCK_REALTIME at all".
+    """
+    rng = random.Random(seed)
+    cb_us = {i: round(rng.uniform(200.0, 340.0), 1) for i in range(n_layers)}
+    rows, calls = [], []
+    t = AF_BASE_NS
+    for _ in range(n_steps):
+        rows.append(("MODEL_EXECUTE", "65535", t, 3_000))
+        t += 10_000
+        for head in (40_000, 50_000):  # the two waits at the head of a step that are not ours
+            rows.append(("HOSTFUNC_CALLBACK", "244", t, 7))
+            rows.append(("NOTIFY_WAIT", "244", t, head))
+            t += head + 1_000
+        for i in range(n_layers):
+            cb_ns = int(cb_us[i] * 1000) + rng.randint(-2000, 2000)
+            a_ns, f_ns = int(a_us * 1000), int(f_us * 1000)
+            hf = t
+            entry = hf + a_ns
+            exit_ = entry + cb_ns
+            nw_end = exit_ + f_ns
+            rows.append(("HOSTFUNC_CALLBACK", "244", hf, 7))
+            rows.append(("NOTIFY_WAIT", "244", hf, nw_end - hf))
+            calls.append((i, entry + entry_extra_ns + clock_shift_ns, exit_ + clock_shift_ns, cb_ns))
+            t = nw_end + 1_000
+        t += 5_000_000
+    return rows, calls, cb_us
+
+
+def _write_af_csv(path, rows):
+    out = ["Device_id,kernel_name,kernel_type,stream_id,task_id,task_time(us),task_start(us),task_stop(us)"]
+    for kind, stream, ts_ns, dur_ns in rows:
+        out.append(f"2,N/A,{kind},{stream},1,{dur_ns / 1000.0:.3f},{ts_ns / 1000.0:.3f}\t,{(ts_ns + dur_ns) / 1000.0:.3f}\t")
+    path.write_text("\n".join(out) + "\n")
+
+
+def _rt_lines(calls, stamp="09-22 15:01:51"):
+    by_layer = {}
+    for layer, entry, exit_, cb in calls:
+        d = by_layer.setdefault(layer, {"layer": layer, "entry_realtime_ns": [], "exit_realtime_ns": [], "cb_ns": []})
+        d["entry_realtime_ns"].append(entry)
+        d["exit_realtime_ns"].append(exit_)
+        d["cb_ns"].append(cb)
+    return [f"(EngineCore pid=1) INFO {stamp} [seam_timing.py:401] [kt-seam-rt] "
+            + json.dumps(d, separators=(",", ":"), sort_keys=True) for d in by_layer.values()]
+
+
+def test_the_pairs_are_one_hostfunc_and_the_wait_that_follows_it(tmp_path):
+    rows, _calls, cb = _af_run(n_layers=4, n_steps=3)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    pairs = tool.hostfunc_pairs(str(csv_path))
+    assert len(pairs) == 3 * (len(cb) + 2), "every HOSTFUNC_CALLBACK must find its NOTIFY_WAIT"
+    for hf, nw_ts, nw_end in pairs:
+        assert hf == nw_ts < nw_end
+    # exact ns, not float us: at 1.79e15 us a double only resolves 0.25 us
+    assert pairs[0][0] % 1000 == 0 and isinstance(pairs[0][0], int)
+
+
+def test_a_and_f_come_back_as_they_were_put_in(tmp_path):
+    rows, calls, cb = _af_run(a_us=30.0, f_us=20.0)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    out = tool.split_a_f(calls, tool.hostfunc_pairs(str(csv_path)))
+    assert out["ok"], out["why"]
+    assert out["unmatched"] == 0 and out["pairs_taken_twice"] == 0
+    for layer, v in out["layers"].items():
+        assert v["A_med_us"] == pytest.approx(30.0, abs=0.2), (layer, v)
+        assert v["F_med_us"] == pytest.approx(20.0, abs=0.2), (layer, v)
+        # and the split adds back up to the column that existed before it
+        assert v["diff_med_us"] == pytest.approx(0.0, abs=0.05), (layer, v)
+    assert out["totals_ms"]["A_plus_F"] == pytest.approx(len(cb) * 50.0 / 1000.0, abs=0.01)
+
+
+def test_mutation_the_entry_stamp_taken_after_kt_is_red(tmp_path):
+    """The arm that matters: the realtime stamp moved from the callback's
+    entry to after kt ran. A looks ~250 us bigger and the reconciliation
+    against NOTIFY_WAIT - cb must go red rather than print the new number."""
+    rows, calls, _cb = _af_run(entry_extra_ns=250_000)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    pairs = tool.hostfunc_pairs(str(csv_path))
+    honest = tool.split_a_f([(l, e - 250_000, x, c) for l, e, x, c in calls], pairs)
+    assert honest["ok"], honest["why"]  # the control arm of the same fixture
+    out = tool.split_a_f(calls, pairs)
+    assert not out["ok"]
+    assert out["layers"] == {}, "a refused check must not leave the columns behind"
+    assert any("med((A+F) - (NW - cb))" in w for w in out["why"]), out["why"]
+
+
+def test_mutation_perf_counter_where_realtime_was_meant_is_caught(tmp_path):
+    """Two clock sources mixed: perf_counter_ns is ns since boot, so the
+    stamps land nowhere near the profile's span and nothing may be printed."""
+    rows, calls, _cb = _af_run(clock_shift_ns=-1_789_000_000_000_000_000)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    out = tool.split_a_f(calls, tool.hostfunc_pairs(str(csv_path)))
+    assert not out["ok"] and out["n_in_span"] == 0
+    assert any("not the same run, or not CLOCK_REALTIME" in w for w in out["why"]), out["why"]
+
+
+def test_a_callback_outside_every_window_is_not_silently_dropped(tmp_path):
+    """Between two pairs there is device time that belongs to no callback; a
+    stamp landing there means the join is wrong, and enough of them refuse."""
+    rows, calls, _cb = _af_run(n_layers=4, n_steps=10)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    pairs = tool.hostfunc_pairs(str(csv_path))
+    moved = [(l, e + 3_000_000, x + 3_000_000, c) if k % 3 == 0 else (l, e, x, c)
+             for k, (l, e, x, c) in enumerate(calls)]
+    out = tool.split_a_f(moved, pairs)
+    assert not out["ok"] and out["unmatched"] > 0
+    assert any("sit in no HOSTFUNC..NOTIFY_WAIT window" in w for w in out["why"]), out["why"]
+
+
+def _af_log(tmp_path, calls, cb_us, stamp="15:01:51"):
+    lines = []
+    rec = {"interval_s": 5.0, "split": True, "additive": list(tool.ADDITIVE), "layers": {}}
+    for i, c in cb_us.items():
+        med, p90 = _healthy(c / 286.5)
+        med["cb"] = c
+        p90["cb"] = c * 1.26
+        rec["layers"][str(i)] = {"n": 100, "med_us": med, "p90_us": p90,
+                                 "n_unsplit": 0, "resid_us": {"max": 0.0}}
+    lines.append(f"(EngineCore pid=1) INFO 09-22 {stamp} [seam_timing.py:377] [kt-seam] "
+                 + json.dumps(rec, separators=(",", ":")))
+    lines += _rt_lines(calls, f"09-22 {stamp}")
+    log = tmp_path / "serve.log"
+    log.write_text("\n".join(lines) + "\n")
+    return log
+
+
+def test_end_to_end_prints_a_and_f_and_the_json_carries_them(tmp_path, capsys):
+    rows, calls, cb_us = _af_run()
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    log = _af_log(tmp_path, calls, cb_us)
+    rc = tool.main([str(log), "--nw-csv", str(csv_path), "--layers", "8", "--year", "2026",
+                    "--json-out", str(tmp_path / "out.json")])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "A / F split" in out and "✅ A/F reconcile" in out
+    got = json.load(open(tmp_path / "out.json"))["a_f"]
+    assert got["ok"] and got["totals_ms"]["A"] == pytest.approx(8 * 30.0 / 1000.0, abs=0.01)
+    assert got["totals_ms"]["F"] == pytest.approx(8 * 20.0 / 1000.0, abs=0.01)
+
+
+def test_end_to_end_refuses_the_two_columns_and_returns_one(tmp_path, capsys):
+    rows, calls, cb_us = _af_run(entry_extra_ns=250_000)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    log = _af_log(tmp_path, calls, cb_us)
+    rc = tool.main([str(log), "--nw-csv", str(csv_path), "--layers", "8", "--year", "2026"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "refusing the A / F columns" in out
+    assert "A_med" not in out, "a refused split must not print its columns"
+
+
+def test_a_log_without_the_realtime_lines_still_works(tmp_path, capsys):
+    """Records from before P0: the A/F block stays silent, nothing goes red."""
+    log, csv_path = _fixture(tmp_path)
+    rc = tool.main([str(log), "--nw-csv", str(csv_path), "--layers", "8",
+                    "--since", "2026-09-22T15:01:48Z", "--until", "2026-09-22T15:01:56Z", "--year", "2026"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "A / F split" not in out, out
+
+
+# ------------------------------- ⑤ the exact per-callback fields (§4.20.1)
+
+
+def test_the_record_sides_own_counts_reach_the_verdict(tmp_path, capsys):
+    """n_unsplit / resid_us.max are exact; when the records carry them they
+    decide, instead of the median-only necessary conditions."""
+    _rows, calls, cb_us = _af_run(n_layers=2, n_steps=2)
+    log = _af_log(tmp_path, calls, cb_us)
+    text = log.read_text().replace('"n_unsplit":0', '"n_unsplit":7', 1)
+    log.write_text(text)
+    recs, _ = tool.parse_records(text)
+    merged = tool.merge(recs)
+    assert merged["extra"][0]["n_unsplit"] == 7
+    rc = tool.main([str(log), "--layers", "2", "--year", "2026"])
+    out = capsys.readouterr().out
+    assert rc == 1 and "n_unsplit=7" in out, out

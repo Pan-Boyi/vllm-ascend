@@ -35,6 +35,23 @@ can see those. They are obtained by subtraction against a same-run profile:
 which is why the runbook (tools/kt_offload/oncard/RUNBOOK_seam.md) insists the
 profile and these records come from the same service, same steps.
 
+Splitting A from F (§4.22 P0). The subtraction above gives A + F_device as one
+number. A profile's task timestamps are CLOCK_REALTIME microseconds (checked:
+a device task's ``ts`` and this host's ``time.time()*1e6`` share a base), so a
+CLOCK_REALTIME stamp at callback entry and exit can be subtracted from them
+directly, per callback:
+
+    A = entry_realtime - HOSTFUNC_CALLBACK.ts
+    F = (NOTIFY_WAIT.ts + NOTIFY_WAIT.dur) - exit_realtime
+
+The segments above stay on ``perf_counter_ns`` (monotonic, what they always
+were); the two realtime stamps are extra, taken first thing at entry and last
+thing in ``record()``, and are written out raw -- absolute CLOCK_REALTIME
+nanoseconds per callback, one ``[kt-seam-rt]`` line per layer per sample --
+because the join with the profile is per callback and a median cannot be
+joined. tools/kt_offload/prof/seam.py does the join and refuses the A/F
+columns when A + F does not reconcile with NOTIFY_WAIT - cb.
+
 Cost discipline. The callback is inside a graph node: the device is blocked on
 it. So on the hot path there is no I/O, no allocation, no dict insert, no
 locking -- only ``time.perf_counter_ns()`` calls and integer stores into a
@@ -52,6 +69,8 @@ from __future__ import annotations
 import atexit
 import json
 import threading
+from time import CLOCK_REALTIME as _CLOCK_REALTIME
+from time import clock_gettime_ns as _realtime_ns
 
 # The ``vllm`` logger, not ``logging.getLogger(__name__)``: see the note in
 # hostfunc_log.py -- a ``vllm_ascend.*`` logger loses INFO in the worker.
@@ -101,8 +120,18 @@ ADDITIVE_LUMPED = ("pre", "kt", "post")
 # that ever stops being true the records interleave; ``record()`` drops a
 # record whose timestamps are not monotonic, which is what that would look
 # like.
+#
+# ``T_ENTER_RT`` is the one CLOCK_REALTIME stamp in here (ns since the epoch,
+# ``time.clock_gettime_ns(time.CLOCK_REALTIME)``); every other slot is
+# ``perf_counter_ns``. The two clocks are never subtracted from each other.
 TS = [0] * 8
-T_ENTER, T_PRE, T_SUBMIT_IN, T_SUBMIT_OUT, T_SYNC_IN, T_SYNC_OUT, T_KT_OUT, _T_SPARE = range(8)
+T_ENTER, T_PRE, T_SUBMIT_IN, T_SUBMIT_OUT, T_SYNC_IN, T_SYNC_OUT, T_KT_OUT, T_ENTER_RT = range(8)
+
+# One ring slot: the NSEG segment durations (perf_counter ns), then the
+# callback's entry and exit in absolute CLOCK_REALTIME ns (0 = not stamped).
+R_ENTER_RT = NSEG
+R_EXIT_RT = NSEG + 1
+ROW = NSEG + 2
 
 # The one recorder of this process, or None (the feature is off). Read on the
 # hot path as a plain module global: no function call, no env lookup.
@@ -115,14 +144,15 @@ _STOP = threading.Event()
 class SeamRecorder:
     """Per-layer ring buffer of segment durations, in nanoseconds.
 
-    Sized once, at startup: ``num_layers * capacity * NSEG`` integers in one
-    flat list. A record is ten integer stores into slots that already exist.
+    Sized once, at startup: ``num_layers * capacity * ROW`` integers in one
+    flat list. A record is twelve integer stores into slots that already
+    exist (ten segments + the two CLOCK_REALTIME stamps).
     """
 
     def __init__(self, num_layers: int, capacity: int = 1024):
         self.num_layers = int(num_layers)
         self.capacity = int(capacity)
-        self.buf = [0] * (self.num_layers * self.capacity * NSEG)
+        self.buf = [0] * (self.num_layers * self.capacity * ROW)
         self.count = [0] * self.num_layers
         self.dropped = [0] * self.num_layers
         self._prev_enter = [0] * self.num_layers
@@ -141,8 +171,9 @@ class SeamRecorder:
             self.dropped[layer_idx] += 1
             return
         n = self.count[layer_idx]
-        base = (layer_idx * self.capacity + n % self.capacity) * NSEG
+        base = (layer_idx * self.capacity + n % self.capacity) * ROW
         buf = self.buf
+        buf[base + R_ENTER_RT] = ts[T_ENTER_RT]
         buf[base + S_PRE] = t1 - t0
         buf[base + S_KT] = t_kt - t1
         buf[base + S_POST] = t_exit - t_kt
@@ -167,6 +198,10 @@ class SeamRecorder:
             buf[base + S_BETWEEN] = 0
             buf[base + S_SYNC] = 0
             buf[base + S_KT_TAIL] = 0
+        # Last clock read of the callback, taken after this function's own
+        # stores so that F starts where our Python really ends. Stored before
+        # the count moves: the sampler reads only slots below ``count``.
+        buf[base + R_EXIT_RT] = _realtime_ns(_CLOCK_REALTIME)
         self.count[layer_idx] = n + 1
 
     def drain(self, since: list[int]) -> tuple[dict[int, list[list[int]]], list[int]]:
@@ -186,8 +221,8 @@ class SeamRecorder:
             take = min(new, self.capacity)
             rows = []
             for k in range(now[layer] - take, now[layer]):
-                base = (layer * self.capacity + k % self.capacity) * NSEG
-                rows.append(self.buf[base : base + NSEG])
+                base = (layer * self.capacity + k % self.capacity) * ROW
+                rows.append(self.buf[base : base + ROW])
             out[layer] = rows
             if lost:
                 self.dropped[layer] += lost
@@ -210,14 +245,45 @@ def _p90(xs: list[int]) -> float:
     return float(xs[min(len(xs) - 1, int(0.9 * len(xs)))])
 
 
+_MIDDLE_IDX = (S_KT_PRE, S_SUBMIT, S_BETWEEN, S_SYNC, S_KT_TAIL)
+
+
 def summarize(rows_by_layer: dict[int, list[list[int]]], split: bool, interval_s: float) -> dict:
-    """Median/p90 per segment per layer, in microseconds. Pure, hence testable."""
+    """Median/p90 per segment per layer, in microseconds. Pure, hence testable.
+
+    Two per-callback fields ride along (§4.20.1: medians alone cannot see one
+    bad callback, and tools/kt_offload/prof/seam.py:check_layer judges these
+    exactly when present):
+
+      n_unsplit      callbacks of a ``split`` run whose five middle segments
+                     were not filled (the probe did not run for them); always
+                     0 when the run is not split -- there is nothing to miss.
+      resid_us.max   per callback, cb - sum(additive parts) in us; the value
+                     of largest magnitude, sign kept. 0.0 on a healthy run by
+                     construction; an unsplit callback in a split run shows up
+                     here as its whole ``kt``.
+    """
     layers: dict[str, dict] = {}
+    add_idx = [SEGMENTS.index(k) for k in (ADDITIVE if split else ADDITIVE_LUMPED)]
     for layer, rows in sorted(rows_by_layer.items()):
         cols = list(zip(*rows))
         med = {name: round(_median(list(cols[i])) / 1000.0, 3) for i, name in enumerate(SEGMENTS)}
         p90 = {name: round(_p90(list(cols[i])) / 1000.0, 3) for i, name in enumerate(SEGMENTS)}
-        layers[str(layer)] = {"n": len(rows), "med_us": med, "p90_us": p90}
+        worst = 0
+        n_unsplit = 0
+        for r in rows:
+            resid = r[S_CB] - sum(r[i] for i in add_idx)
+            if abs(resid) > abs(worst):
+                worst = resid
+            if split and not any(r[i] for i in _MIDDLE_IDX):
+                n_unsplit += 1
+        layers[str(layer)] = {
+            "n": len(rows),
+            "med_us": med,
+            "p90_us": p90,
+            "n_unsplit": n_unsplit,
+            "resid_us": {"max": round(worst / 1000.0, 3)},
+        }
     keys = ADDITIVE if split else ADDITIVE_LUMPED
     return {
         "interval_s": round(interval_s, 3),
@@ -254,6 +320,37 @@ def reconcile(med_us: dict[str, float], split: bool, tol_us: float = 2.0) -> dic
 def format_record(summary: dict) -> str:
     """One structured line per sample, for offline aggregation (prof/seam.py)."""
     return "[kt-seam] " + json.dumps(summary, separators=(",", ":"), sort_keys=True)
+
+
+def realtime_rows(rows_by_layer: dict[int, list[list[int]]]) -> list[dict]:
+    """Per layer: every callback's absolute CLOCK_REALTIME entry/exit, and its cb.
+
+    Units are in the key names: ``*_realtime_ns`` are nanoseconds since the
+    epoch (``time.clock_gettime_ns(time.CLOCK_REALTIME)``), ``cb_ns`` is the
+    perf_counter duration the segments add up to -- the offline tool compares
+    the two spans, which is how a clock mix-up is caught. Callbacks with no
+    realtime stamp (0) are left out, never written as 0.
+    """
+    out = []
+    for layer, rows in sorted(rows_by_layer.items()):
+        keep = [r for r in rows if r[R_ENTER_RT] and r[R_EXIT_RT]]
+        if not keep:
+            continue
+        out.append(
+            {
+                "layer": int(layer),
+                "entry_realtime_ns": [r[R_ENTER_RT] for r in keep],
+                "exit_realtime_ns": [r[R_EXIT_RT] for r in keep],
+                "cb_ns": [r[S_CB] for r in keep],
+            }
+        )
+    return out
+
+
+def format_realtime(entry: dict) -> str:
+    """One ``[kt-seam-rt]`` line (one layer of one sample). Not a ``[kt-seam]``
+    line: the aggregate parser neither reads nor miscounts it."""
+    return "[kt-seam-rt] " + json.dumps(entry, separators=(",", ":"), sort_keys=True)
 
 
 def install_infer_probe(wrapper) -> bool:
@@ -375,6 +472,8 @@ def start(interval_s: float) -> threading.Thread | None:
             summary = summarize(rows, rec.split, interval_s)
             summary["dropped"] = sum(rec.dropped)
             logger.info("%s", format_record(summary))
+            for entry in realtime_rows(rows):
+                logger.info("%s", format_realtime(entry))
 
     _MONITOR = threading.Thread(target=run, name="kt-offload-seam", daemon=True)
     _STOP.clear()

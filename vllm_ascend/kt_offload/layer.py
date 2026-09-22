@@ -34,7 +34,7 @@ import inspect
 import os
 import re
 import weakref
-from time import perf_counter_ns
+from time import CLOCK_REALTIME, clock_gettime_ns, perf_counter_ns
 from typing import Any
 
 import torch
@@ -811,6 +811,9 @@ def _kt_packed_forward(payload) -> None:
     rec = seam_timing.RECORDER
     ts = seam_timing.TS
     if rec is not None:
+        # CLOCK_REALTIME first: it is what the profile's HOSTFUNC_CALLBACK.ts
+        # is joined against (A = this - that), so it is the earliest stamp.
+        ts[seam_timing.T_ENTER_RT] = clock_gettime_ns(CLOCK_REALTIME)
         ts[seam_timing.T_SUBMIT_IN] = 0
         ts[seam_timing.T_ENTER] = perf_counter_ns()
     try:
@@ -865,6 +868,9 @@ def _kt_host_forward(payload) -> None:
     rec = seam_timing.RECORDER
     ts = seam_timing.TS
     if rec is not None:
+        # CLOCK_REALTIME first: it is what the profile's HOSTFUNC_CALLBACK.ts
+        # is joined against (A = this - that), so it is the earliest stamp.
+        ts[seam_timing.T_ENTER_RT] = clock_gettime_ns(CLOCK_REALTIME)
         ts[seam_timing.T_SUBMIT_IN] = 0
         ts[seam_timing.T_ENTER] = perf_counter_ns()
     try:

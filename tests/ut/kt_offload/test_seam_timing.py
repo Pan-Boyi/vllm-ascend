@@ -400,3 +400,117 @@ def test_the_probe_costs_far_less_than_the_seam_it_measures(monkeypatch, capsys)
         print(f"\n  seam timing overhead: {delta_us:.3f} us/callback "
               f"(off {off_ns/1000:.3f} us, on {on_ns/1000:.3f} us, {reps} reps)")
     assert delta_us < 10.0, f"{delta_us:.2f} us/callback is too much next to a 107.5 us seam"
+
+
+# ----------------------------------------- the CLOCK_REALTIME stamps (§4.22 P0)
+
+
+def test_the_realtime_stamps_are_absolute_and_bracket_the_callback(monkeypatch):
+    """A and F are computed against a profile's ts, so these two stamps have to
+    be epoch-based CLOCK_REALTIME and have to straddle the whole callback --
+    entry before the first segment, exit after the last store."""
+    w = FakeWrapper(pre_us=50, sync_us=300)
+    rec = _enable(monkeypatch, 2, w)
+    before = time.clock_gettime_ns(time.CLOCK_REALTIME)
+    for _ in range(4):
+        kl._kt_host_forward((w, "s", 1, 1))
+    after = time.clock_gettime_ns(time.CLOCK_REALTIME)
+
+    rows, _ = rec.drain([0, 0])
+    assert len(rows[1]) == 4
+    for row in rows[1]:
+        entry, exit_ = row[sm.R_ENTER_RT], row[sm.R_EXIT_RT]
+        assert before <= entry < exit_ <= after, "not this process's CLOCK_REALTIME"
+        # the realtime span covers cb and the record() call that follows it,
+        # and nothing else: that difference is what the offline tool's
+        # |A+F - (NW - cb)| < 5 us check sees
+        assert 0 <= (exit_ - entry) - row[sm.S_CB] < 50_000, (exit_ - entry, row[sm.S_CB])
+    # and it is a *different* clock from the segments: perf_counter is ns since
+    # an arbitrary origin, so the two must not be confusable by magnitude
+    assert rows[1][0][sm.R_ENTER_RT] > 1_700_000_000_000_000_000
+
+
+def test_the_realtime_rows_are_what_the_offline_tool_parses(monkeypatch):
+    w = FakeWrapper(sync_us=100)
+    rec = _enable(monkeypatch, 2, w)
+    for _ in range(3):
+        kl._kt_host_forward((w, "s", 1, 1))
+    rows, _ = rec.drain([0, 0])
+    entries = sm.realtime_rows(rows)
+    assert [e["layer"] for e in entries] == [1]
+    line = sm.format_realtime(entries[0])
+    assert len(line.splitlines()) == 1
+    tool = _load_seam_tool()
+    calls, bad = tool.parse_realtime(line)
+    assert bad == 0 and len(calls) == 3
+    assert all(layer == 1 and 0 < entry < exit_ and cb > 0 for layer, entry, exit_, cb in calls)
+    # a [kt-seam-rt] line must not be counted as a missing [kt-seam] record
+    parsed, dropped = tool.parse_records(line)
+    assert parsed == [] and dropped == 0
+
+
+def test_a_callback_with_no_realtime_stamp_is_left_out_not_written_as_zero(monkeypatch):
+    rec = sm.SeamRecorder(1, capacity=4)
+    rec.record(0, [1000, 1100, 0, 0, 0, 0, 1900, 0], 2000)  # T_ENTER_RT = 0: no stamp
+    rows, _ = rec.drain([0])
+    assert rows[0][0][sm.R_ENTER_RT] == 0
+    assert sm.realtime_rows(rows) == [], "a 0 stamp is not a timestamp"
+
+
+def test_the_realtime_stamp_costs_a_tenth_of_a_microsecond(capsys):
+    """The number the report has to carry: two extra clock reads per callback,
+    inside a graph node the device is blocked on."""
+    reps = 20000
+    t0 = time.perf_counter_ns()
+    for _ in range(reps):
+        time.clock_gettime_ns(time.CLOCK_REALTIME)
+    rt_ns = (time.perf_counter_ns() - t0) / reps
+    t0 = time.perf_counter_ns()
+    for _ in range(reps):
+        time.perf_counter_ns()
+    pc_ns = (time.perf_counter_ns() - t0) / reps
+    with capsys.disabled():
+        print(f"\n  clock_gettime_ns(CLOCK_REALTIME) {rt_ns:.1f} ns/call, "
+              f"perf_counter_ns {pc_ns:.1f} ns/call, {reps} reps")
+    assert rt_ns < 1000.0, f"{rt_ns:.0f} ns/call next to a 78 us seam is no longer negligible"
+
+
+# --------------------------- n_unsplit / resid_us.max, the exact fields (§4.20.1)
+
+
+def test_a_healthy_split_run_reports_no_unsplit_callback_and_no_residual(monkeypatch):
+    w = FakeWrapper(pre_us=50, submit_us=20, between_us=20, sync_us=200, tail_us=20)
+    rec = _enable(monkeypatch, 2, w)
+    for _ in range(4):
+        kl._kt_host_forward((w, "s", 1, 1))
+    rows, _ = rec.drain([0, 0])
+    layer = sm.summarize(rows, True, 1.0)["layers"]["1"]
+    assert layer["n_unsplit"] == 0
+    assert layer["resid_us"]["max"] == 0.0, "the segments are one clock's differences: exactly 0"
+
+
+def test_one_unfilled_callback_among_many_is_counted_and_sized(monkeypatch):
+    """What the medians cannot see (§4.20.1): a single callback whose middle
+    never got filled. n_unsplit counts it and resid_us.max sizes it."""
+    w = FakeWrapper(pre_us=50, submit_us=20, between_us=20, sync_us=200, tail_us=20)
+    rec = _enable(monkeypatch, 2, w)
+    for _ in range(5):
+        kl._kt_host_forward((w, "s", 1, 1))
+    honest = sm.summarize(rec.drain([0, 0])[0], True, 1.0)["layers"]["1"]
+    assert honest["n_unsplit"] == 0
+
+    # the probe does not run for one callback (its stamps stay from the last
+    # one, so record() refuses to split it) -- exactly the mutation arm above
+    monkeypatch.setattr(sm._TimedCpuInfer, "submit", lambda self, task: self._kt_seam_inner.submit(task))
+    since = list(rec.count)
+    kl._kt_host_forward((w, "s", 1, 1))
+    for _ in range(4):
+        pass
+    rows, _ = rec.drain(since)
+    layer = sm.summarize(rows, True, 1.0)["layers"]["1"]
+    assert layer["n_unsplit"] == 1, rows
+    # and the size of what was lost is kt itself, in us
+    assert layer["resid_us"]["max"] == pytest.approx(rows[1][0][sm.S_KT] / 1000.0, abs=0.01)
+    tool = _load_seam_tool()
+    assert not tool.check_layer(layer["med_us"], layer["p90_us"], True, layer)["ok"], (
+        "the offline verdict must use the exact field when it is there")
