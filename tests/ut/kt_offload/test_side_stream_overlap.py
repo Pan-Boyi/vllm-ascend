@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from vllm_ascend.kt_offload import layer as kl
+from vllm_ascend.kt_offload import side_stream as ss
 from vllm_ascend.kt_offload.config import KTOffloadConfig
 from vllm_ascend.kt_offload.placement import build_plan
 
@@ -708,20 +709,24 @@ def test_multi_layer_overlap_under_changing_batch_size(monkeypatch, sim):
 
 
 # ---------------------------------------------------------------------------
-# 4. the switch is refused in production
+# 4. the switch: refused unless the operator asks for it explicitly
 #
 # 2026-09-20, in order: (a) the guard read torch.npu.is_current_stream_capturing()
 # as if it meant "this stream's work is in the graph" -- it does not; (b) the
 # replacement was a start-up probe that captured the same fork/join *pattern*
 # with a scalar copy and a trivial host function: it PASSED on the platform
 # where every real-layer capture failed with 107025. A stand-in weaker than its
-# subject passes where the subject fails. So there is no probe: the switch is
-# refused, and these tests keep the mechanism's contract for whatever replaces
-# it (the simulator arms above still cover join/event/propagation shapes).
+# subject passes where the subject fails. So there is still no probe.
+#
+# 2026-09-22: the 107025 verdict itself was withdrawn (it was our own empty
+# capture buffer, and the one arm that really reproduces 107025 is the one
+# whose side-stream record nobody joins -- t5 off_evt vs off_evtw). The switch
+# is therefore conditional, not dead: refused unless
+# VLLM_ASCEND_DSV41_KT_SIDE_STREAM=1, and then loud.
 # ---------------------------------------------------------------------------
 
 
-def test_production_refuses_the_switch():
+def _preconditions_cfg():
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=True)
     vcfg = SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -730,11 +735,53 @@ def test_production_refuses_the_switch():
         model_config=SimpleNamespace(enforce_eager=False),
         speculative_config=None,
     )
-    with pytest.raises(ValueError, match="107025"):
+    return cfg, vcfg
+
+
+def test_production_refuses_the_switch_without_the_env(monkeypatch):
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, ss.ENV_NAME, "0", raising=False)
+    cfg, vcfg = _preconditions_cfg()
+    with pytest.raises(ValueError, match=ss.ENV_NAME):
         cfg._validate_preconditions(vcfg)
     vcfg.model_config.enforce_eager = True
-    with pytest.raises(ValueError, match="SECOND stream"):
+    with pytest.raises(ValueError, match=ss.ENV_NAME):
         cfg._validate_preconditions(vcfg)  # eager too: it would be a no-op there anyway
+
+
+def test_the_env_opens_it(monkeypatch):
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
+    cfg, vcfg = _preconditions_cfg()
+    cfg._validate_preconditions(vcfg)
+
+
+def test_a_typo_in_the_env_does_not_open_it(monkeypatch):
+    from vllm_ascend import envs
+
+    for value in ("true", "yes", "", "0", "01"):
+        monkeypatch.setattr(envs, ss.ENV_NAME, value, raising=False)
+        cfg, vcfg = _preconditions_cfg()
+        with pytest.raises(ValueError, match=ss.ENV_NAME):
+            cfg._validate_preconditions(vcfg)
+
+
+def test_enabling_it_says_so_in_the_log(monkeypatch, sim):
+    """An operator reading serve.log must see which arm is running.
+
+    The vllm logger is captured by hand: it has its own handlers and does not
+    propagate to pytest's caplog (see the note at the top of layer.py).
+    """
+    said = []
+    monkeypatch.setattr(kl.logger, "warning", lambda msg, *a: said.append(msg % a if a else msg))
+    _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=_boxes())
+    assert any("SIDE STREAM ENABLED" in m and "侧流已启用" in m for m in said), said
+    # ...and the serial arm stays quiet, so the line means something
+    said.clear()
+    _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=_boxes())
+    assert not [m for m in said if "SIDE STREAM" in m], said
 
 
 def test_the_object_can_still_be_built_for_bisection(monkeypatch, sim):
@@ -742,3 +789,66 @@ def test_the_object_can_still_be_built_for_bisection(monkeypatch, sim):
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     assert rt.overlap is True  # no probe, no refusal at this level
+
+
+# ---------------------------------------------------------------------------
+# 5. the two runtime gates the side stream carries (each with its mutant)
+# ---------------------------------------------------------------------------
+
+
+def test_two_layers_sharing_a_kt_slot_cannot_be_in_flight_at_once(monkeypatch, sim):
+    """A6 as a check, not a comment: layer L and L+2 share kt's pinned slot.
+
+    In the real order this cannot happen -- L's join is consumed in L's merge,
+    which runs before L+2 is reached -- so the mutant has to be built by hand:
+    submit L, skip its merge, submit L+2.
+    """
+    monkeypatch.setattr(kl, "_SIDE_INFLIGHT", {})
+    buffers = KtBuffers()
+    ins = [Box(1.0) for _ in range(4)]
+    rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=True, graph=True) for i in range(4)]
+    sim.capturing = True
+    hs = torch.zeros(1, H, dtype=torch.bfloat16)
+    ids = torch.zeros(1, TOPK, dtype=torch.int32)
+    w = torch.ones(1, TOPK)
+    rts[0].route(hs, w, ids, in_profile_run=False)
+    rts[1].route(hs, w, ids, in_profile_run=False)  # slot 1: allowed alongside slot 0
+    with pytest.raises(AssertionError, match="pinned slot 0"):
+        rts[2].route(hs, w, ids, in_profile_run=False)  # slot 0 again, layer 0 not joined
+
+
+def test_the_normal_layer_order_never_trips_the_slot_guard(monkeypatch, sim):
+    """Positive control for the guard above: four layers, three steps, no raise."""
+    monkeypatch.setattr(kl, "_SIDE_INFLIGHT", {})
+    seen = _run_model(monkeypatch, sim, overlap=True, graph=True)
+    assert seen and all(got == want for got, want in seen)
+    assert kl._SIDE_INFLIGHT == {}, kl._SIDE_INFLIGHT  # every layer released its slot
+
+
+def test_a_host_func_that_runs_during_the_capture_is_refused(monkeypatch, sim):
+    """The silent non-replay shape: the node was executed, not recorded.
+
+    Nothing about the output can see this at capture time (it is the capture
+    run's own value), and it makes every replay faster -- so the counter is
+    the only witness.
+    """
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(11)
+    rt.route(hs, w, ids, in_profile_run=False)
+    kl.HOST_FUNC_CALLS[rt.layer_idx] = kl.HOST_FUNC_CALLS.get(rt.layer_idx, 0) + 1
+    with pytest.raises(RuntimeError, match="ran during the capture"):
+        rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+
+
+def test_the_counter_moving_between_replays_is_fine(monkeypatch, sim):
+    """Negative control: outside a capture the counter grows every step."""
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(12)
+    rt.route(hs, w, ids, in_profile_run=False)
+    sim.capturing = False  # replay, not capture
+    kl.HOST_FUNC_CALLS[rt.layer_idx] = kl.HOST_FUNC_CALLS.get(rt.layer_idx, 0) + 1
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))

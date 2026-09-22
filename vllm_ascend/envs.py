@@ -268,6 +268,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # reads clocks: no device operation and no output byte changes. Diagnostic;
     # read once per layer at weight-load time. Not sensitive.
     "VLLM_ASCEND_DSV41_KT_SEAM_TIMING": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", ""),
+    # DeepSeek-V4.1 MoE offload: allow kt_offload_config.overlap_side_stream
+    # (the CPU-expert D2H + host-func node captured onto a side stream, joined
+    # back in merge). "1" = allowed, anything else (default "0") = the config
+    # refuses to start. Experimental and unproven in a service: it is the B arm
+    # of tools/kt_offload/oncard/RUNBOOK_sidestream.md and every known way it
+    # fails is faster and wrong, so the A/B's criterion is bit-identity, not
+    # TPOT. Read at config validation. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_SIDE_STREAM": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SIDE_STREAM", "0"),
 }
 
 # end-env-vars-definition

@@ -125,15 +125,20 @@ class KTOffloadConfig:
         if not self.enabled:
             return
         if self.overlap_side_stream:
-            raise ValueError(
-                "kt_offload_config.overlap_side_stream is refused: forking the CPU-expert submit onto a "
-                "SECOND stream and joining it back inside a capture fails at capture_end with ACL 107025 "
-                "(2026-09-20, three independent on-card runs), and the one whole-model run that came up served "
-                "34/50 GSM8K with 38/50 answers different from the serial arm. This is not a limit on host work "
-                "in a graph -- a host-func node on the captured stream is a production path here. A start-up "
-                "probe is not an acceptable substitute either: the miniature graph it captured passed while "
-                "every real-layer capture failed. Leave it false."
-            )
+            from vllm_ascend.kt_offload import side_stream
+
+            if not side_stream.enabled_by_env():
+                raise ValueError(
+                    "kt_offload_config.overlap_side_stream is experimental and off by default. The 2026-09-20 "
+                    "refusal (ACL 107025 at capture_end) was withdrawn on 2026-09-22: the on-card case that "
+                    "produced it was failing on our own capture-buffer guard, and with that fixed a real "
+                    "three-layer capture on the side stream captures and replays correctly. The one arm that "
+                    "still fails with 107025 is the one whose side-stream event record nobody joins, which is "
+                    "not what this code does. It is still unproven in a service: no TPOT reading, and the ACL "
+                    f"capture itself has no CPU coverage. Set {side_stream.ENV_NAME}=1 to run the B arm "
+                    "(tools/kt_offload/oncard/RUNBOOK_sidestream.md), and compare bit-for-bit against the "
+                    "serial arm -- every known failure of this path is FASTER and wrong."
+                )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

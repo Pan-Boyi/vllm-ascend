@@ -1,0 +1,225 @@
+# 上卡执行单：侧流重叠 A/B（§4.18.1 ③；上限 ≈ 窗口 83.2 µs/层 ≈ 3.3 ms/token，推断）
+
+**本单只回答两个问题**：
+1. 侧流在**真服务**里能不能起来并且**算得对**（判据是 §3 的三层**逐位**判据，
+   不是 GSM8K 分数，更不是 TPOT）；
+2. 它到底省不省时间 —— 交错 A/B，差值必须大于噪声地板 **≈1 ms** 才算数。
+
+🔴 **每一种已知的侧流失效都是「更快而且错」**（捕获不进图 ⇒ 每次 replay 复用捕获那一次的 CPU 输出；
+join 丢了 ⇒ H2D 读到上一步的 pinned 输出）。所以**任何"TPOT 变好了"单独都不是证据**。
+
+## 0. 这一发之前发生了什么（读数的前提）
+
+- 侧流曾被"平台不支持（ACL 107025）"判死；2026-09-22 **作废**：那发 t5 是被我方**空的捕获缓冲**
+  （`no preallocated int64 id buffer`）绊倒，107025 是次生。真触发条件是**副流上最后一次 event record
+  没有被主流 join**（t5 `off_evt` 崩 / `off_evtw` 过）。生产 `_join_side_stream` 一直是 record+join。
+- 缓冲 bug 已修（本单对应的提交）：`_CAPTURE_BUFFERS_READY` 只再管 kt 那半边（进程级、类变量），
+  `self._ids_i64` **每个层实例都建**。CPU 单测 `tests/ut/kt_offload/test_capture_buffers.py`。
+- 开关**默认仍关**：`kt_offload_config.overlap_side_stream=true` **且**
+  `VLLM_ASCEND_DSV41_KT_SIDE_STREAM=1` 才放行；放行时每层打一条 `SIDE STREAM ENABLED` WARNING。
+
+### 只能在卡上验的三件事（代码里标了"零覆盖"）
+
+| # | 判据 | CPU 上为什么做不了 |
+|---|---|---|
+| Z1 | ACL 捕获真的跟着 `wait_event` 走到副流上 | 仿真器里是我们自己规定它会 |
+| Z2 | **107025 阳性对照**：副流尾 record 无人 join ⇒ capture_end 必崩 | 只有真 ACL 会报这个码 |
+| Z3 | 真 TPOT / NOTIFY_WAIT / A+F 的变化 | 时间不在 CPU 模型里 |
+
+CPU 上已有的（**不要在卡上重做**）：join/record 配对、捕获期 host-func 计数为 0、每 replay 每层 +1、
+A6 缓冲归属与「同槽两层不得同时在飞」、四个变异臂（丢 join / join 提前 / event 被回收 / 捕获没传播）
+全部更快且错。
+
+## 1. 起飞前
+
+```bash
+cd /workspace/code/dsv4_single_card/vllm_project
+export TMPDIR=/dev/shm/dsv41_tmp TMP=/dev/shm/dsv41_tmp
+export SO=85331298bdeffee02b7c42c5658030ac     # 本树（worktrees/moe-offload）期望的 .so
+export CARD=?          # 0–2 里起飞当时实测空闲的那张；🔴 别用卡 3
+export PORT=8041
+export OWNER=dsv41_vllm_singlecard
+export WT=$PWD/worktrees/moe-offload/tools/kt_offload/oncard
+```
+
+**卡空不空按三维读**（`RUNBOOK_window.md` §0 那张表，照抄不再重复）：HBM + aicore **连采 ≥3 次**；
+`HBM 高 + aicore 恒 0 = 拆解残留`（等，别 kill、别 reset）。租约表跨容器不可见 ⇒ acquire 成功 ≠ 卡上没人。
+
+## 2. 先做 Z2：107025 的阳性对照（不起服务，t5，约 2 分钟）
+
+**先证明仪器认得出真失效，再去读 A/B。** 顺序不能反：若 `off_evt` 这一臂没崩，
+说明这张卡/这个构建上"副流尾 record 无人 join"不再触发 107025 ⇒ **本单的探针失效，停下来重判**，
+不要接着往下跑 A/B。
+
+```bash
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 --arm off_evt   # 期望：capture_end 107025
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 --arm off_evtw  # 期望：捕获成功、replay 判据全过
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 --arm off       # 现状参数，期望全过
+```
+判读（照 §4.19 ② 那张表）：`off_evt` 崩 **且** `off_evtw`/`off` 过 ⇒ 探针有效，继续。
+三臂都过或都崩 ⇒ 探针无区分力，**本单到此为止**。
+
+## 3. 精度判据：三层，跑的顺序是 ③ → ② → ①（用户 2026-09-22 定）
+
+③ 与 ② 要有服务，**跑在第 4 步那几臂的服务里**（③ 用 A1 的服务，② 用交错的 A/B 两臂）；
+① 不占整网、可与之并行安排。本节先写判据，命令里的 `$D`/`$PORT` 就是第 4 步那套。
+
+侧流是**纯调度改动**（同样的 kt 计算，换了一条流和一对 event）⇒ 判据做成**逐位相同**，
+不是"分数差不多"。GSM8K 只当最后的冒烟（第 4 步里那一发），1319 全量留到最终形态（M4）。
+🔴 服务层**文本**逐位判据已证无区分力（§4.18：同进程只换批组成，c8 vs c8b 文本逐位相同仅 19/50）
+⇒ 整网这一层要比的是 **logprob 的浮点值**，不是文本。
+
+先跑基线逐位臂做背景（两发都必须 PASS；它们不走侧流，eager 永不 fork）：
+```bash
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t1   # eager offload，逐位
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t2   # 图模式，逐位
+```
+
+### ③ 先建仪器地板（不做这个，② 不可读）
+
+同一臂（先用 A＝侧流关）、**并发 1**、同一批 prompt **跑两次**，比 logprob 浮点值是否逐位相同。
+
+- 两次逐位相同 ⇒ 这把尺子有区分力，② 照常做。
+- 两次就不同 ⇒ 🔴 **② 改成分布比较**（逐位判据在这台机器上不成立），并在报告里写明
+  "只能排除大偏差，不能证明未改数值"，同时给出观察到的最大 |Δlogprob| 与分位数。
+- 背景：两发**并发 1** 互比从来没做过（§4.18 里用户为省时取消），所以这一步不是形式。
+
+### ② 整网强制单步 + logprob 逐位比（主判据）
+
+固定一批 prompt **≈200 条**（覆盖长短：短 ≈32 tok、中 ≈512、长 ≈4000，各约 1/3；从 GSM8K +
+LongBench 片段里取，**批固定存成 `$RUN/prompts.jsonl`，两臂读同一个文件**）。
+每条 **`max_tokens=1`**（只有一次前向 ⇒ 不被自回归放大），请求 `logprobs`，
+**top-k 取 5**（够分辨又不至于让响应体爆掉；k 要在报告里写清楚，两臂必须同 k）。
+**并发固定 1**，两臂（A=关 / B=开）**同时段交错**，比每条每个候选 token 的 logprob 浮点值逐位相同。
+
+⚠ **先确认这个配置支不支持返回 logprobs**（有的配置默认关）：起服务后先探一发
+```bash
+curl -s http://127.0.0.1:$PORT/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"dsv41","prompt":"1+1=","max_tokens":1,"temperature":0,"logprobs":5}' | head -c 600
+```
+- 返回里有 `logprobs.top_logprobs` ⇒ 照上面做。
+- 报 `logprobs is disabled` / `max_logprobs` 之类 ⇒ 起服务时加 `EXTRA_ARGS="--max-logprobs 5"`
+  （加了就**两臂都加**，且这发与第 4 步的 TPOT 读数不可混用）。
+- 仍不行 ⇒ 退路按优先级：(a) `prompt_logprobs`（chat/completions 皆可，评的是 prefill，
+  对侧流同样有效，因为 MoE offload 在 prefill 也走这条路）；(b) `echo=true` + `logprobs`；
+  (c) 都不行就**报告替代方案而不是降判据**，并把 ① 提为主判据。
+- 判读：逐位相同 ⇒ 侧流未改数值（在 ③ 证明尺子有区分力的前提下）；
+  任何一条不同 ⇒ 🔴 **侧流改了数值**，先查 host-func 计数与 join，不许拿 GSM8K 分数把它盖过去。
+
+### ① 单层逐位臂（最强、最便宜；扩 t5 现有的，**与整网可并行安排**）
+
+真实层、图捕获 + replay，侧流开的输出**逐位等于**串行臂。覆盖：
+- **层 0 / 20 / 39**（跨 `layer_idx % 2` 两种 kt 槽位 —— A6：L 与 L+2 共用 pinned 槽）；
+- 输入 **T = 1 / 4 / 32**；每臂 **≥3 个不同输入**。
+- 保留 t5 已有判据：捕获期 host-func **0**、每 replay 每层 **+1**、**replay 两两不同**。
+- 🔴 **必须加变异臂：故意去掉副流的 join，输出必须变得不同**。没有它，"逐位相同"可能只是因为
+  **根本没并行**（这正是 09-20 静默失败的形态：更快、而且每次 replay 复用同一份 CPU 输出）。
+  注意与第 2 步 Z2 的区别：Z2 去掉的是 **join 的 wait**（期望 capture_end 107025），
+  这里去掉的是 **merge 前的 join 语义**（期望捕获成功但输出错）；两条都要有。
+- ⚠ **t5 目前只跑单层、只有 `--arm` 那几个臂**：上面的层×T×输入矩阵和"去 join"变异臂
+  **尚未实现**（写本单的这一轮只改了 `vllm_ascend/kt_offload/`、`envs.py` 与单测，没有动 t5）。
+  执行本单的人要么先扩 t5（加 `--layers 0,20,39 --tokens 1,4,32 --inputs 3 --mutant drop-join`），
+  要么把 ① 记为"未覆盖"并在报告里说明——**不要**默认它做过了。
+- CPU 侧对应的同形判据已在 `tests/ut/kt_offload/test_side_stream_overlap.py`（四个变异臂全部
+  "更快且错"）⇒ 这一步在卡上加的是**真 ACL + 真 kt + 真权重**，不是重做逻辑。
+
+## 4. 交错 A/B（A=侧流关，B=侧流开，**同时段 A,B,A,B**）
+
+🔴 配置逐项同 §4.18 基线（出处 `packed_ab/20260922_122648/armA1/cfg.json`）。
+🔴 **跨发读数不得相减**；每臂自带重复轮次，A 与 B 交错以吃掉时段漂移。
+
+```bash
+RUN=$PWD/oncard_runs/$(date +%Y%m%d_%H%M%S)_sidestream; mkdir -p $RUN
+python3 worktrees/moe-offload/tools/kt_offload/build_fingerprint.py stamp $RUN --label sidestream | tee $RUN/fp.txt
+grep -q "$SO" $RUN/build_fingerprint.json || { echo "❌ .so 不是 $SO，停"; }
+
+cat > $RUN/cfg_A.json <<'JSON'
+{"kt_offload_config":{"enabled":true,"resident_strategy":"prefix","num_resident_experts":100,
+ "cpuinfer_threads":96,"threadpool_count":2,"numa_nodes":[0,1],"packed_transfer":false,
+ "overlap_side_stream":false}}
+JSON
+sed 's/"overlap_side_stream":false/"overlap_side_stream":true/' $RUN/cfg_A.json > $RUN/cfg_B.json
+```
+
+一轮 = 起 A → 测 → 收 → 起 B → 测 → 收，共 **两轮**（A1,B1,A2,B2）。每臂：
+
+```bash
+ARM=A1   # A1 / B1 / A2 / B2；A* 用 cfg_A.json 且不设 SIDE_STREAM，B* 用 cfg_B.json 且 =1
+CFG=$RUN/cfg_${ARM:0:1}.json; D=$RUN/$ARM; mkdir -p $D
+( cd /workspace/code/dsv4_single_card/vllm_project && setsid env \
+    WT=moe-offload DSV41_VLLM_TREE=$PWD/worktrees/moe-offload-vllm LEASE_OWNER=$OWNER \
+    KT_OFFLOAD=1 NPUS=$CARD PORT=$PORT EAGER=0 \
+    VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
+    KT_ADDITIONAL_CONFIG="$(cat $CFG)" \
+    MAXLEN=8192 MAXSEQS=8 MAXBATCH=4096 \
+    VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$([ "${ARM:0:1}" = B ] && echo 1 || echo 0) \
+    VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30 \
+    bash worktrees/moe-offload/tools/kt_offload/serve_v41_singlecard.sh ) > $D/serve.log 2>&1 &
+SERVE_PID=$!; PGID=$(ps -o pgid= -p $SERVE_PID | tr -d ' '); echo "pgid=$PGID" | tee $D/pgid.txt
+```
+
+**等就绪**：轮询 `curl -s http://127.0.0.1:$PORT/v1/models`，超时 900 s。
+失败判据**只认** `^Traceback|EngineCore failed|进程退出|超时` ——🔴 不要 grep 横幅里的 ❌ / 拒绝启动
+（脚本横幅自己就印这些词，已误判过两次）。
+
+**起来后三条必检**（B 臂多前两条；对不上 = 这一臂作废，不是"读数偏小"）：
+```bash
+grep -m1 'vllm_ascend = ' $D/serve.log            # 必须是 worktrees/moe-offload/vllm_ascend/__init__.py
+grep -c 'SIDE STREAM ENABLED' $D/serve.log        # B 臂 = 40（每层一条）；A 臂 = 0
+grep -c '10701[0-9]' $D/serve.log                 # 必须 0
+```
+🔴 **A 臂出现 `SIDE STREAM ENABLED`，或 B 臂一条都没有 ⇒ 两臂其实是同一臂，整发作废。**
+另：`VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30` 的周期报告在 B 臂必须是 **uniform、40 层每层都在长**；
+出现 `layers never ran` ⇒ 那些层的 CPU 专家根本不在图里（静默不重放），**这一臂的 TPOT 不许引用**。
+
+每臂两个 eval（GSM8K 50 在这里只是**冒烟**，数值判据在 §3）：
+```bash
+( cd /workspace/code/dsv4_single_card/vllm_project && PORT=$PORT LABEL=$ARM \
+    CASES="bs1 1 16" REPEAT=3 PERF_OUT=$D/perf bash build_artifacts/perf_baseline.sh ) > $D/perf.log 2>&1
+# 参数逐项抄 run_packed_ab.sh:211（A/B 与 A/A 的 GSM8K 只有那一处启动点）
+( cd /workspace/code/dsv4_single_card/vllm_project && EV_THINKING=0 python3 \
+    build_artifacts/eval_runners/gsm8k_eval_effort.py \
+    --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 --out-dir $D/gsm8k50 \
+    --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --limit 50 ) > $D/gsm8k.log 2>&1
+```
+收摊（每臂都收干净再起下一臂）：
+```bash
+OWNED_CARDS=$CARD STOP_PGID=$PGID bash build_artifacts/stop_by_port.sh $PORT | tee $D/stop.log
+```
+
+## 5. 判读表
+
+| 读数 | 结论 |
+|---|---|
+| B 臂起不来 / 有 10701x | 侧流在服务里不可用；把报错原文与 §4.19 ② 那张表对照，**不要**回到"平台不支持" |
+| B 臂 host-func 报告非 uniform | 静默不重放 ⇒ B 臂数值不可信，TPOT 不许引用 |
+| §3② logprob 有一条不逐位相同 | 🔴 侧流改了数值 ⇒ 整发判负，TPOT 不许引用 |
+| GSM8K B < A 明显 | 数值坏了（但**分数相同不代表没坏**：GSM8K 在这里只是冒烟，判数值靠 §3） |
+| \|median(B) − median(A)\| < **1 ms** | **判不可分辨**（不是"没有收益"，也不是"有收益"） |
+| B 比 A 快 >1 ms 且上面全绿 | 记为收益上限内的实测；与 t4 推断上限 3.3 ms/token 对表 |
+| B 比 A 快 >3.3 ms/token | 🔴 超过窗口上限 ⇒ 多半是少算了东西（查 host-func 计数），**先别高兴** |
+
+TPOT 取每臂 `perf/*.json` 的 **中位**；A1 vs A2 的差就是本时段的漂移，写进报告当地板
+（§4.18 初值 0.24 ms 中位差 / 1.0 ms 极差）。
+
+## 6. 第三发：埋点 + profiler（只在第 5 步判出"可分辨"之后做）
+
+看侧流把 §4.20 的 **A+F_dev 78 µs/层（3.83 ms/token）** 挪走了多少、NOTIFY_WAIT 怎么变。
+
+```bash
+# 在 B 臂的起服务命令上再加：
+#   KT_MOE_PHASE_TIMING=1  VLLM_ASCEND_DSV41_KT_SEAM_TIMING=5
+#   EXTRA_ARGS="--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFDIR\"}"
+```
+⚠ **采 profile 的服务一次性用**：`/stop_profile` 时 EngineCore 会 **SIGSEGV**（产物完好）。
+`stop_by_port.sh` 必须带 `STOP_PGID`。离线解析照 `RUNBOOK_seam.md` §6，
+并注意那里记的两条仪器问题（中位不可加 / `--nw-csv` 错位两格）。
+🔴 埋点本身可能有 **0.4–0.8 ms** 真实开销（§4.20，未证明）⇒ 这一发的绝对值**不得**与第 4 步的 A/B 相减。
+
+## 7. 收尾
+
+```bash
+bash build_artifacts/card_lease.sh release $CARD $OWNER
+```
+报告里每个数都标出处 run 目录与"可复验／已记录不可再验"；run 目录是未跟踪产物，随时会没（k.16）⇒
+结论落地时**当场内联读数**。
