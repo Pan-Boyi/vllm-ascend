@@ -59,6 +59,15 @@ ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 --arm off       # 现�
 判读（照 §4.19 ② 那张表）：`off_evt` 崩 **且** `off_evtw`/`off` 过 ⇒ 探针有效，继续。
 三臂都过或都崩 ⇒ 探针无区分力，**本单到此为止**。
 
+**2026-09-22 首发实测（卡 0，`.so` 85331298bdef）**：三臂都如期
+（`oncard_runs/20260922_160255_t5` off_evt → 107025「In the cross-stream capture scenario, the last
+task on the sub stream lacks the corresponding event wait task」；`_160358_t5` off_evtw 与
+`_160436_t5` off 各 12/12 replay 判据全过）。两条仪器修正一并落地：
+- t5 旧判据把**所有** `off*` 臂当"必须崩"的阳性对照（来自已作废的"平台不支持"假设）⇒ 干净臂
+  永远判不了 PASS。现在只有 `off_evt` 必须红，`off`/`off_evtw` 必须 captured（提交 b35a700ca）。
+- 🔴 **107025 不在 `10701[0-9]` 里**。run_oncard 的 "10701x lines" 计数和下面 §4 那条
+  `grep -c '10701[0-9]'` 都**漏掉 107025**；要查侧流的错码请用 `grep -cE '1070[12][0-9]'`。
+
 ## 3. 精度判据：三层，跑的顺序是 ③ → ② → ①（用户 2026-09-22 定）
 
 ③ 与 ② 要有服务，**跑在第 4 步那几臂的服务里**（③ 用 A1 的服务，② 用交错的 A/B 两臂）；
@@ -88,7 +97,16 @@ ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t2   # 图模式，逐位
 
 固定一批 prompt **≈200 条**（覆盖长短：短 ≈32 tok、中 ≈512、长 ≈4000，各约 1/3；从 GSM8K +
 LongBench 片段里取，**批固定存成 `$RUN/prompts.jsonl`，两臂读同一个文件**）。
-每条 **`max_tokens=1`**（只有一次前向 ⇒ 不被自回归放大），请求 `logprobs`，
+🔴 **`max_tokens=1` 在本配置下对侧流没有区分力（2026-09-22 发现）**：侧流只在**捕获路径**上
+fork（`eager never forks`），而本配置 `cudagraph_capture_sizes=[1,2,4,8]`（serve.log 自证）
+⇒ 任何超过 8 token 的 prefill 都走 eager，`max_tokens=1` 拿到的那个 logprob **只来自 prefill**，
+两臂必然相同，比了也说明不了问题。改成 **`max_tokens=8`**：位置 0（prefill、eager）当**内部对照**
+（它必须两臂相同，否则是别的东西变了），位置 1.. 是**并发 1 的 decode 步**（FULL 图 ⇒ 捕获路径
+⇒ 侧流真的在跑），逐位比就比这些位置；某条在位置 k 选出的 token 就不同 ⇒ 这条从 k 起不再可比
+（k 本身要报出来，它就是"侧流改了数值"的直接证据）。工具：`sidestream/logprob_run.py`
+（并发 1、贪心、top-5）与 `sidestream/logprob_cmp.py`（逐位 + 地板分位数），
+prompt 批由 `sidestream/make_prompts.py` 定死（200 条：67 短 / 67 中 / 66 长，长的 < 4096 token
+⇒ 不跨 chunk）。每条 **`max_tokens=8`**（decode 步够 7 个 ⇒ 不被自回归放大），请求 `logprobs`，
 **top-k 取 5**（够分辨又不至于让响应体爆掉；k 要在报告里写清楚，两臂必须同 k）。
 **并发固定 1**，两臂（A=关 / B=开）**同时段交错**，比每条每个候选 token 的 logprob 浮点值逐位相同。
 
@@ -129,8 +147,22 @@ ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 \
   t5 会拒绝把干净臂报成 PASS ——**这一条就是"逐位相同不等于真的并行"的挡板**。
   与第 2 步 Z2 的区别：Z2 在层的工作之外**额外**补一个 record（问的是 ACL 的规则），
   ① 的变异臂动的是**本层自己的 join**（问的是我们的正确性）。
-- 一发跑 9 个 scenario 会在同一进程里连做多次捕获；t5 会给第 2 次起的每个臂加一条 note
-  （失败的捕获可能留状态）。**要把某个 scenario 当最终结论，就用 `--layer X --tokens Y` 单独重跑一遍。**
+- 🔴 **一发跑 9 个 scenario 现在会在第 2 个 scenario 崩**（2026-09-22 首发实测，
+  `oncard_runs/20260922_161358_t5`）：上一个 scenario 捕过图的 forked 栈还活着（多半被图里的
+  host-func 回调持有），下一个 scenario 建同号层时撞上生产的"一个 layer_idx 只许一个活 wrapper"
+  硬拦截（`layer.py:_register_wrapper`）。**不要**用 `_reset_wrapper_registry()` 绕 —— 那正是
+  kt 按层号记的 deferred 标志会串台的地方。**按 scenario 一发一进程**（本来就是最终结论的口径）：
+  ```bash
+  for L in 0 20 39; do for T in 1 4 32; do
+    ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 --arm off --layer $L --tokens $T --inputs 3
+    ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 --arm off --layer $L --tokens $T --inputs 3 --mutant drop-join
+  done; done
+  ```
+  **2026-09-22 首发结果：9/9 干净臂 13/13 全绿（captured 且逐位等于串行臂），9/9 变异臂全红。**
+  变异臂**每一个**都是"捕获直接失败（107025）"那种红法，没有一个是"捕获成功但输出不同"
+  ⇒ 这证明的是 **ACL 不让缺 join 的图过**，**不**等于"逐位判据自己能抓住少 join 的竞态"。
+- 干净臂单发的 rc 仍是 1：Verdict 要求每发至少一个变异臂，而干净臂发里没有。判读要
+  **按配对发一起判**（干净发 required 13/13 failed 0 + 同参数的 drop-join 发 must_be_red 红）。
 - CPU 侧的同形判据已在 `tests/ut/kt_offload/test_side_stream_overlap.py`（四个变异臂全部"更快且错"）
   与 `test_t5_scenarios.py`（矩阵/下移/拒绝）⇒ 卡上这一步加的是**真 ACL + 真 kt + 真权重**。
 
@@ -154,7 +186,12 @@ sed 's/"overlap_side_stream":false/"overlap_side_stream":true/' $RUN/cfg_A.json 
 ⚠ 两臂都必须 `packed_transfer:false`：**packed 与侧流同开现在起服务就 raise**
 （packed 分支在 `route()` 里优先 ⇒ 侧流根本不会被用到，"开了却没生效"）。
 
-一轮 = 起 A → 测 → 收 → 起 B → 测 → 收，共 **两轮**（A1,B1,A2,B2）。每臂：
+一轮 = 起 A → 测 → 收 → 起 B → 测 → 收，共 **两轮**（A1,B1,A2,B2）。整套已脚本化：
+```bash
+bash $WT/sidestream/seq_ab.sh $RUN $CARD     # A1(probe,lp,lp2,perf,gsm) B1 A2 B2，任一臂非 0 就停
+```
+（A1 跑两发 logprob = §3③ 的**同进程**地板；A1 vs A2 是**跨进程**地板 —— A 与 B 本来就是两个进程，
+所以判 ② 用的地板必须是跨进程那个。）下面是它每臂做的事，手跑时照抄：
 
 ```bash
 ARM=A1   # A1 / B1 / A2 / B2；A* 用 cfg_A.json 且不设 SIDE_STREAM，B* 用 cfg_B.json 且 =1
@@ -179,7 +216,7 @@ SERVE_PID=$!; PGID=$(ps -o pgid= -p $SERVE_PID | tr -d ' '); echo "pgid=$PGID" |
 ```bash
 grep -m1 'vllm_ascend = ' $D/serve.log            # 必须是 worktrees/moe-offload/vllm_ascend/__init__.py
 grep -c 'SIDE STREAM ENABLED' $D/serve.log        # B 臂 = 40（每层一条）；A 臂 = 0
-grep -c '10701[0-9]' $D/serve.log                 # 必须 0
+grep -cE '1070[12][0-9]' $D/serve.log             # 必须 0（🔴 107025 不在 10701x 里，见 §2）
 ```
 🔴 **A 臂出现 `SIDE STREAM ENABLED`，或 B 臂一条都没有 ⇒ 两臂其实是同一臂，整发作废。**
 另：`VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30` 的周期报告在 B 臂必须是 **uniform、40 层每层都在长**；
