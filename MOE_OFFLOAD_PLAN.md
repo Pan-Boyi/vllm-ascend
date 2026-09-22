@@ -807,6 +807,28 @@ profile 里 `MEM_WAIT_VALUE` 实打实 2286 次）⇒ **「device 等 ExternalEv
 🔴 **两条变异臂**：①「不 record」⇒ 必须挂住/超时（证明 device 真在等）；②「提前 record（数据 D2H 之前）」⇒ 输出必须与串行臂不同
 （**放行早 = 更快且算错，且不报错**，这是本方案的主失效形态）。另加 profile 侧硬证据：**`HOSTFUNC_CALLBACK` 节点数变 0、30.75 µs 空隙消失**。
 
+### 4.22.1 P0/P2 落地与三条更正（2026-09-22 夜，未占卡）
+
+**已入库**：`e19e5465c`（P0 仪器：回调 entry/exit 各取一次 `CLOCK_REALTIME`，与 profile 的 `HOSTFUNC_CALLBACK.ts`/`NOTIFY_WAIT`
+直接相减出 A 与 F；判据不过就**不出这两列并 rc=1**；顺带补上 §4.20.1 挂起的 `n_unsplit` 与 `resid_us.max`）、
+kt 侧 `53eab3c`（`CPUInfer::run_inline` + `KT_CPUINFER_INLINE`，默认关）。埋点净增 **≈0.15 µs/回调**（实测 `clock_gettime` 76.5 ns/次）。
+变异臂实测会红：entry 戳挪到 kt 之后 ⇒ 拒绝出 A/F 列；把 `perf_counter` 当 realtime ⇒ 报「不是同一发或不是 CLOCK_REALTIME」。
+
+🔴 **三条更正**
+1. **A 不含那 30.75 µs 空转**：profile 里 `HOSTFUNC_CALLBACK.ts == NOTIFY_WAIT.ts`、HF 节点自身时长 0.007 µs
+   ⇒ `A+F ≡ NW.dur − T_cb` 是恒等式，**30.75 µs 的空转在 HF 节点之前，是账外的独立一项，只有 P1b 吃得到**。
+   好处：那条 `<5 µs` 判据实际在判「两个时钟一致 + record 开销」，不会被节点时长污染。
+2. 🔴 **kt 的 `submit`/`sync` pybind 绑定没有 `gil_scoped_release`** ⇒ 回调线程在整个提交+等待期间（含 kt ≈240 µs 计算）
+   **一直持有 GIL**，每 token 约 9.6 ms 主线程拿不到 GIL。这与 §4.21 第 4 点（GIL 只解释离群）相关且此前没记。
+   ⇒ **新候选 P6：在绑定里释放 GIL**——不让回调变快，但让主线程在 CPU 算的时候能继续干活（对 TPOT 的影响未知，**待测**）。
+3. `do_numa_job` 的调用方**不参与计算但忙等**（`USE_NUMA_JOB_DIRECT_WORK` 全树未定义）⇒ P2 内联不改 NUMA 局部性，
+   但**把这段自旋挪到报告线程上** ⇒ 上卡判 P2 时 **D（kt 计算）必须一起读**，D 变大＝抢核了。
+
+**P2 微基准（`prof/bench/tq_bench.cpp` 新增内联臂，本机两轮）**：队列 `enqueue+sync` **11.26 / 12.94 µs** 中位，
+`run_inline+sync` **0.101 / 0.110 µs** ⇒ **≈0.45–0.52 ms/token**（与 F4 的 10.44 µs 同量级，本轮机器更忙）。
+内联 vs 队列**输出逐位相同**（kt 侧 16 项 CPU 测试），变异臂「内联但故意不等某个 NUMA 池」判红。
+⚠ **未覆盖**：`packed_transfer` 路径没接内联；kt wheel **未重建** ⇒ 这条改动在服务里现在**完全不存在**。
+
 ### 看着诱人、实际没戏（附理由，别重走）
 1. 让两个 NUMA 池直接写最终 pinned 输出 —— 归并只值 0.07 ms（实测 1.2–1.8 µs/次），E 的大头是线程跳（F4）。
 2. 把提交点前移到 top-k 之后最早处 —— gating→三次 D2H→host-func 之间**没有空隙**（中位 0.000），三次 copy 合计 6.6 µs；30.75 µs 的空转在 copy **之后**。
