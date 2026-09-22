@@ -20,12 +20,109 @@ import torch
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
+import vllm_ascend.envs as envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
+
+
+
+
+def select_deepseek_v4_vision_experts_fused(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    bias_vl: torch.Tensor,
+    text_bias: torch.Tensor | None,
+    top_k: int,
+    routed_scaling_factor: float,
+    image_sentinel_lo: int,
+    k_group: int = 1,
+    group_count: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``select_deepseek_v4_vision_experts`` on the fused operator, twice.
+
+    🔴 **Why twice.** V4.1 needs a bias chosen **per row** -- ``bias_vl`` for
+    image rows, ``e_score_correction_bias`` for text rows -- and the operator
+    this tree ships with takes one global ``bias``. That is the whole reason
+    all 40 MoE layers fell back to a torch decomposition costing 702 kernels
+    and 1.292 ms a step, paid on **every** step including pure-text decode
+    (the branch keys off "does this layer have bias_vl", not "does this step
+    contain image tokens").
+
+    The operator is **per-row independent**: row i's output depends only on
+    row i of ``x`` and the global bias. So running it once per bias table and
+    selecting rows with ``where`` is not an approximation of per-row bias --
+    it **is** per-row bias:
+
+        A = op(x, bias=text_bias)      B = op(x, bias=bias_vl)
+        row i = image_mask[i] ? B[i] : A[i]
+
+    Measured on card 2026-09-22 against the torch form (e=384, k=6, T=1/7/64,
+    including **mixed** masks with both image and text rows in one batch):
+    identical ``topk_ids`` everywhere, weights within 6e-8 absolute and
+    2.3e-7 relative -- fp32 eps is 1.2e-7. The mixed-mask cases are the ones
+    that matter; they are what proves the row selection is right.
+
+    ⚪ A 6-input build of the same OpType exists in
+    ``custom_ops_dsv41/ops_vector_0920`` and does the choice inside the kernel
+    with ``additional_bias`` + ``additional_token_mask``, which would make
+    this one call instead of two. It is **not** used here: landing it means
+    putting another vendor directory on ``ASCEND_CUSTOM_OPP_PATH``, and the
+    kernel/binary-config layer does **not** fall through per operator -- the
+    first vendor wins wholesale. Measured 2026-09-22: a vendor holding only
+    that one operator masked the production vendor's other 27, and the service
+    failed to start with ``SwigluGroupQuant`` falling back to a built-in
+    hifloat8 variant. Two calls cost one extra operator launch per layer and
+    need no packaging change at all. See the perf report's 3.3.
+
+    Both calls are unconditional, so this adds no data-dependent branch and is
+    safe under FULL graph capture.
+    """
+    # dtype must match x: csrc/torch_binding.cpp enforces
+    # bias.scalar_type() == x.scalar_type() with a TORCH_CHECK.
+    zeros = None
+    if text_bias is None:
+        # The operator has no "no bias" mode on this path, and zeros are what
+        # "no correction" means.
+        zeros = torch.zeros(router_logits.shape[-1], dtype=router_logits.dtype,
+                            device=router_logits.device)
+
+    def _call(bias: torch.Tensor):
+        weights, ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+            x=router_logits,
+            k=top_k,
+            bias=bias.to(router_logits.dtype),
+            input_ids=None,
+            tid2eid=None,
+            k_group=k_group,
+            group_count=group_count,
+            routed_scaling_factor=routed_scaling_factor,
+            eps=1e-20,
+            group_select_mode=1,
+            # Same two literals as the text-only call site below, for the same
+            # reasons: no kernel variant reads `renorm`, and norm_type=2 is
+            # SOFTPLUS *and* selects the in-kernel normalisation. Read the long
+            # comment there before changing either.
+            renorm=0,
+            norm_type=2,
+            out_flag=False,
+        )
+        return weights, ids
+
+    w_text, i_text = _call(text_bias if text_bias is not None else zeros)
+    w_vl, i_vl = _call(bias_vl)
+
+    # The window is [lo, lo+5) -- the same width the upstream router uses.
+    # Reading it as 2 ids (that is upstream's engram/VL mask, a deliberately
+    # different rule) would route three reserved placeholder tokens through
+    # the text bias instead.
+    image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
+    row = ((input_ids >= image_sentinel_lo)
+           & (input_ids < image_hi)).reshape(-1, 1)
+    return torch.where(row, w_vl, w_text), torch.where(row, i_vl, i_text)
 
 
 def select_deepseek_v4_vision_experts(
@@ -328,6 +425,27 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 input_ids = None
                 tid2eid_ones = None
             if self.bias_vl is not None and input_ids is not None:
+                # tid2eid is None on every V4.1 layer (upstream hard-codes
+                # num_hash_layers=0), which is what makes the two-call form
+                # applicable: with a hash table the ids do not come from the
+                # topk at all and the substitution would not hold.
+                if (tid2eid_ones is None
+                        and envs.VLLM_ASCEND_DSV41_FUSED_VISION_ROUTER == "1"):
+                    topk_weights, topk_ids = \
+                        select_deepseek_v4_vision_experts_fused(
+                            router_logits=router_logits,
+                            input_ids=input_ids,
+                            bias_vl=self.bias_vl,
+                            text_bias=self.e_score_correction_bias,
+                            top_k=self.top_k,
+                            routed_scaling_factor=self.routed_scaling_factor,
+                            image_sentinel_lo=self.image_sentinel_lo,
+                            k_group=topk_group,
+                            group_count=num_expert_group,
+                        )
+                    return topk_weights.to(torch.float32), topk_ids.to(
+                        torch.int32 if indices_type is None else indices_type
+                    )
                 topk_weights, topk_ids = select_deepseek_v4_vision_experts(
                     router_logits=router_logits,
                     input_ids=input_ids,

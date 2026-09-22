@@ -205,6 +205,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     #    设 0 退回手写版，用于把精度问题变成一次翻转而不是一次回退。
     "VLLM_ASCEND_DSV41_INDEXER_FUSED_ROPE": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_FUSED_ROPE", "1"),
     "VLLM_ASCEND_DSV41_INDEXER_FUSED_NORM": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_FUSED_NORM", "1"),
+    # 视觉 MoE router 走融合算子（调两次 + where 实现按行选表），替掉
+    # 702 个 torch 小算子 / 1.292 ms 每步。设 0 退回 torch 分解。
+    # 两条路已在卡上对拍：topk_ids 逐位相同、权重差在 fp32 eps 量级。
+    "VLLM_ASCEND_DSV41_FUSED_VISION_ROUTER": lambda: os.getenv("VLLM_ASCEND_DSV41_FUSED_VISION_ROUTER", "1"),
     # DeepSeek-V4.1 indexer K write: quantise and store through CANN's
     # indexer_quant_cache instead of indexer_compress_epilog_v2.
     # k_norm/RoPE/slot gating are unchanged either way.
