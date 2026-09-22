@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t5
+#                                                     | e2p | e5   (gate-clearing checks)
 #
 #  The only way the single-layer on-card checks touch a card. The shell enforces:
 #   1. lease first: build_artifacts/card_lease.sh acquire <card> dsv41_vllm_singlecard
@@ -69,7 +70,7 @@ fi
 export DSV41_VLLM_ASCEND_TREE="$VA_TREE"
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
-usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5> [test args...]"; exit 2; }
+usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|e2p|e5> [test args...]"; exit 2; }
 [[ "$CARD" =~ ^[0-9]+$ ]] || usage
 case "$TEST" in
   t0) PY=t0_offload_off.py; DEF_TIMEOUT=2400;;
@@ -78,6 +79,11 @@ case "$TEST" in
   t3) PY=t3_side_stream.py; DEF_TIMEOUT=2400;;
   t4) PY=t4_overlap_ceiling.py; DEF_TIMEOUT=1800;;
   t5) PY=t5_auto_dispatch.py; DEF_TIMEOUT=1800;;
+  # gate-clearing checks for the streaming-prefill / dynamic-hot-expert design
+  # question (2026-09-22). Small on purpose: a co-tenant GSM8K run holds host
+  # memory, so both cap what this process may add and self-stop on the floor.
+  e2p) PY=e2p_slice_cast.py;  DEF_TIMEOUT=2400;;
+  e5)  PY=e5_chunked_accum.py; DEF_TIMEOUT=2400;;
   *) usage;;
 esac
 
