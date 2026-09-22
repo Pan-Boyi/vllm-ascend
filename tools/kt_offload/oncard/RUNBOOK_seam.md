@@ -57,9 +57,9 @@ bash build_artifacts/card_lease.sh acquire $CARD $OWNER $PORT
 PROFDIR=/dev/shm/dsv41_prof_seam; rm -rf $PROFDIR; mkdir -p $PROFDIR
 cat > $RUN/cfg.json <<'JSON'
 {"kt_offload_config":{"enabled":true,"resident_strategy":"prefix","num_resident_experts":100,
- "cpuinfer_threads":64,"threadpool_count":2,"numa_nodes":[0,1],"packed_transfer":false}}
+ "cpuinfer_threads":96,"threadpool_count":2,"numa_nodes":[0,1],"packed_transfer":false}}
 JSON
-# ⚠ cpuinfer_threads / numa_nodes 抄 §4.18 那发 run 目录里的 cfg.json，别照抄这里的占位值
+# cfg 与 §4.18 基线发次逐项相同（cpuinfer_threads 96 / threadpool 2 / numa [0,1] / N=100 prefix / packed 关）；出处 packed_ab/20260922_122648/armA1/cfg.json
 ( cd /workspace/code/dsv4_single_card/vllm_project && setsid env \
     WT=moe-offload DSV41_VLLM_TREE=$PWD/worktrees/moe-offload-vllm LEASE_OWNER=$OWNER \
     KT_OFFLOAD=1 NPUS=$CARD PORT=$PORT EAGER=0 \
