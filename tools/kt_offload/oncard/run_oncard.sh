@@ -24,6 +24,7 @@
 #      4 lease refused | 5 card not idle / dmesg gate | 20 anomaly | 124 timeout | other = test rc
 #  Env: ONCARD_TIMEOUT_S (default per test), ONCARD_SKIP_DMESG_GATE=1 (logged),
 #       ONCARD_DRY=1 (stop right before acquire: prints the plan; used by selftest).
+#       ONCARD_OUT_OF_TREE=<absolute path> (run a checkout outside worktrees/; see below).
 #       ONCARD_EXPECT_SO_MD5=<md5> (refuse to run unless THIS TREE's .so is that build; the
 #         value is per-tree -- another tree's pin moving is a different fact. The tree path
 #         and its operator package's counts are printed next to the md5).
@@ -33,6 +34,39 @@ set -o pipefail
 
 ROOT=/workspace/code/dsv4_single_card/vllm_project
 OWNER=dsv41_vllm_singlecard
+
+# ---- which vllm-ascend tree this run uses (2026-09-22) ----------------------
+#  Default is unchanged: $ROOT/worktrees/moe-offload.
+#  ONCARD_OUT_OF_TREE=<absolute path> runs a checkout OUTSIDE worktrees/ instead.
+#  Why that exists: the shared gate verify_shared_artifacts.sh scans every
+#  registered worktrees/* and fails the lot if any one differs from its pin, and
+#  both the shared bring-up and our launcher run it before serving. So a new .so
+#  dropped into worktrees/moe-offload before the pin moves blocks EVERY line.
+#  New artifacts therefore get accepted on a staging checkout outside worktrees/
+#  first, and only then get copied back together with the pin change.
+#  🔴 Absolute path only, never a "1": autodetection would make "out of tree" a
+#     state nobody chose, and such a state appears in nobody's memory.
+#  🔴 It only swaps vllm_ascend. The vllm tree, CANN, the kt wheel, the lease,
+#     the dmesg/idle gates and the .so expectation all still apply -- and the
+#     expectation, the fingerprint and the provenance are all evaluated against
+#     THIS tree, i.e. the one that will actually be imported.
+VA_TREE="$ROOT/worktrees/moe-offload"
+if [ -n "${ONCARD_OUT_OF_TREE:-}" ]; then
+  case "$ONCARD_OUT_OF_TREE" in
+    1|yes|true) echo "❌ ONCARD_OUT_OF_TREE must be an ABSOLUTE PATH, not a switch."; exit 2;;
+    /*) : ;;
+    *)  echo "❌ ONCARD_OUT_OF_TREE=$ONCARD_OUT_OF_TREE is not an absolute path -- refusing."; exit 2;;
+  esac
+  [ -d "$ONCARD_OUT_OF_TREE/vllm_ascend" ] || {
+    echo "❌ $ONCARD_OUT_OF_TREE has no vllm_ascend/ -- not a vllm-ascend tree, refusing."; exit 3; }
+  git -C "$ONCARD_OUT_OF_TREE" rev-parse HEAD >/dev/null 2>&1 || {
+    echo "❌ $ONCARD_OUT_OF_TREE is not a git tree -- this run would map to no commit, refusing."; exit 3; }
+  [ -z "$(git -C "$ONCARD_OUT_OF_TREE" status --porcelain)" ] || {
+    echo "❌ $ONCARD_OUT_OF_TREE has uncommitted changes -- this run's revision cannot be restated, refusing."; exit 3; }
+  VA_TREE="$ONCARD_OUT_OF_TREE"
+fi
+# The fingerprint tool (and with it the .so expectation below) reads this.
+export DSV41_VLLM_ASCEND_TREE="$VA_TREE"
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
 usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5> [test args...]"; exit 2; }
@@ -73,7 +107,7 @@ say "▶ run_oncard card=$CARD test=$TEST run=$RUN pid=$$ argv=[$ONCARD_ARGV]"
 command -v npu-smi >/dev/null 2>&1 || { say "❌ preflight: no npu-smi here -> no card environment; stopping before acquire"; exit 3; }
 [ -x "$ROOT/build_artifacts/card_lease.sh" ] || { say "❌ preflight: card_lease.sh missing"; exit 3; }
 [ -f "$ROOT/build_artifacts/env_dsv41.sh" ] || { say "❌ preflight: env_dsv41.sh missing"; exit 3; }
-[ -d "$ROOT/worktrees/moe-offload" ] && [ -d "$ROOT/worktrees/moe-offload-vllm" ] || { say "❌ preflight: trees missing"; exit 3; }
+[ -d "$VA_TREE" ] && [ -d "$ROOT/worktrees/moe-offload-vllm" ] || { say "❌ preflight: trees missing ($VA_TREE)"; exit 3; }
 KT_SITE="$ROOT/build_artifacts/moe_offload_ref/kt_site"
 KT_WHEEL=$(ls "$ROOT"/build_artifacts/moe_offload_ref/kt_wheel/kt_kernel-*.whl 2>/dev/null | head -n 1)
 [ -d "$KT_SITE/kt_kernel" ] && [ -n "$KT_WHEEL" ] || { say "❌ preflight: kt_site / kt wheel missing"; exit 3; }
@@ -129,6 +163,25 @@ set +u
 # shellcheck source=/dev/null
 source "$ROOT/build_artifacts/env_dsv41.sh" moe-offload "$CARD" >> "$SUM" 2>&1 || { say "❌ env_dsv41.sh failed"; exit 3; }
 set -u
+# env_dsv41.sh is shared and only knows worktrees/<name>; it is not changed.
+# Out of tree we rewrite what it put on PYTHONPATH afterwards -- REPLACING, not
+# appending: two vllm_ascend trees on the path would make "which one wins" a
+# side effect of ordering.
+if [ -n "${ONCARD_OUT_OF_TREE:-}" ]; then
+  export PYTHONPATH="${PYTHONPATH//$ROOT\/worktrees\/moe-offload:/$VA_TREE:}"
+  export PYTHONPATH="${PYTHONPATH//$ROOT\/vllm-ascend/$VA_TREE}"
+  export ASSERT_TREES_ALLOW_OUT_OF_TREE="$VA_TREE"
+  say "🔴 OUT-OF-TREE run: vllm_ascend = $VA_TREE @ $(git -C "$VA_TREE" rev-parse --short HEAD)"
+  say "   only that tree is swapped; the .so expectation, the fingerprint and the provenance all judge IT."
+  case ":$PYTHONPATH:" in
+    *":$ROOT/worktrees/moe-offload:"*)
+      say "❌ PYTHONPATH still contains $ROOT/worktrees/moe-offload after the rewrite -- refusing (two vllm_ascend trees)"; exit 3;;
+  esac
+  case ":$PYTHONPATH:" in
+    *":$VA_TREE:"*) : ;;
+    *) say "❌ PYTHONPATH does not contain $VA_TREE after the rewrite -- refusing"; exit 3;;
+  esac
+fi
 unset LD_PRELOAD
 export ASCEND_RT_VISIBLE_DEVICES="$CARD"
 PRIV=/dev/shm/dsv41_singlecard
@@ -146,7 +199,7 @@ def git(t, *a):
     return subprocess.run(["git", "-C", t, *a], capture_output=True, text=True).stdout.strip()
 def sha(p):
     h = hashlib.sha256(); h.update(open(p, "rb").read()); return h.hexdigest()
-va, vl = "$ROOT/worktrees/moe-offload", "$ROOT/worktrees/moe-offload-vllm"
+va, vl = "$VA_TREE", "$ROOT/worktrees/moe-offload-vllm"
 code = "$HERE"
 json.dump({
   "argv": os.environ.get("ONCARD_ARGV"), "card": "$CARD", "test": "$TEST", "script": "$PY",

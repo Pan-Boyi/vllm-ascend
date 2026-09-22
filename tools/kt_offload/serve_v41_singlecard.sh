@@ -132,11 +132,16 @@ MIN_EP="${MIN_EP:-3}"              # V4.1 每卡权重 275.7/EP + 10.4，EP=2 �
 #   ① .so 期望值：旧 .so + 新代码 = 静默算错 ⇒ 换 .so 之前必然拒绝起飞。
 #   ② ds41 算子包（O6 / >16k）：缺了不报错、只是静默退回 v2 —— 所以判据读
 #      解释器真会解析到的那个文件，不读 env。
-#   gate_ds41 会把 $DS41 前置进 PYTHONPATH（必须在 env_dsv41.sh 之后，
-#   因为 CANN 的 set_env.sh 会把自带的同名包插到最前）。
+#   🔴 2026-09-22 修：这里【只 source】，两个函数的【调用】挪到了下面
+#      「要跑的那棵树」解析完之后（约 :360）。原因是两条都读错了对象：
+#        · gate_so "$_TREE" 在这一行执行时 $_TREE 还【是空的】（它在 :333 才
+#          被 _resolve_tree.sh 赋值）⇒ 走的是 "没给树路径" 那条 fail-safe
+#          return 2，也就是说这道闸从来没有真的比过任何一个 md5；
+#        · gate_ds41 自己的注释写着「必须在 env_dsv41.sh 之后」，而 env_dsv41.sh
+#          在 :320 才 source —— CANN 的 set_env.sh 会把自带的同名
+#          cann_ops_transformer 插到 PYTHONPATH 最前，正是这道闸要抓的那件事，
+#          在它后面发生 ⇒ 闸绿而运行时被遮住。
 . "$(dirname "${BASH_SOURCE[0]}")/serve_preflight_gates.sh"
-gate_so "$_TREE" || exit 1
-gate_ds41 || exit 1
 
 # ── 图模式必须显式带 VLLM_USE_BREAKABLE_CUDAGRAPH=1（新 O15 闸）───────────────
 #   clean 的 platform.py:_require_validated_dsv41_graph_mode() 在真捕图而没设
@@ -320,6 +325,50 @@ set +u
 source "$ROOT/build_artifacts/env_dsv41.sh" "$WT" "$NPUS" || exit 1
 set +u
 
+# ============================================================================
+#  🔴 树外运行（2026-09-22 移植自共享 build_artifacts/serve_v41_bringup.sh:300-330，
+#     **默认行为逐字节不变**：不设 SERVE_OUT_OF_TREE 时下面整块不执行）。
+#
+#  为什么本线需要它：共享闸 verify_shared_artifacts.sh 扫【全部注册的
+#  worktrees/*】，任一棵与钉值不符就 rc=1，而共享 bringup 与本脚本起服务前都
+#  要跑它 ⇒ 把新 .so 直接拷进 worktrees/moe-offload 而钉值未改，会把**所有线**
+#  一起挡在起飞前。所以新产物先放在 worktrees/ 之【外】的一棵暂存检出里，
+#  在那里做卡上验收，验收过了再拷回来并同步改钉值。
+#
+#  🔴 必须给【绝对路径】，给 "1" 不算 —— 自动探测会让「树外」变成一个没人
+#     选择过的状态，而这种状态不会出现在任何人的记忆里。
+#  🔴 只换 vllm_ascend 这一棵：vllm 树 / CANN / LD_PRELOAD / 共享产物检查 /
+#     不落后于 base 这几条【全部照判】。
+#  🔴 是【换】不是【追加】：追加会让 PYTHONPATH 上同时有两棵 vllm_ascend，
+#     「谁赢」就成了顺序的副作用。
+#  ⚠ env_dsv41.sh / _resolve_tree.sh 是共享的、只认 worktrees/<名>，不改它们 ——
+#    照共享 bringup 的做法，在它们【之后】改写 PYTHONPATH。
+# ============================================================================
+if [ -n "${SERVE_OUT_OF_TREE:-}" ]; then
+  case "$SERVE_OUT_OF_TREE" in
+    1|yes|true) echo "❌ SERVE_OUT_OF_TREE 必须给【绝对路径】，不是开关。"; exit 1;;
+    /*) : ;;
+    *)  echo "❌ SERVE_OUT_OF_TREE=$SERVE_OUT_OF_TREE 不是绝对路径 —— 拒绝。"; exit 1;;
+  esac
+  [ -d "$SERVE_OUT_OF_TREE/vllm_ascend" ] || {
+    echo "❌ $SERVE_OUT_OF_TREE 下没有 vllm_ascend/ —— 不像一棵 vllm-ascend 树，拒绝"; exit 1; }
+  _OOT_COMMIT=$(git -C "$SERVE_OUT_OF_TREE" rev-parse HEAD 2>/dev/null) || {
+    echo "❌ $SERVE_OUT_OF_TREE 不是 git 树 —— 那样这一发对应不到任何 commit，拒绝"; exit 1; }
+  [ -z "$(git -C "$SERVE_OUT_OF_TREE" status --porcelain)" ] || {
+    echo "❌ 树外那棵树有未提交改动 —— 这一发的 revision 不可复述，拒绝"; exit 1; }
+  export PYTHONPATH="${PYTHONPATH//$ROOT\/vllm-ascend/$SERVE_OUT_OF_TREE}"
+  export PYTHONPATH="${PYTHONPATH//$ROOT\/worktrees\/$WT/$SERVE_OUT_OF_TREE}"
+  export ASSERT_TREES_ALLOW_OUT_OF_TREE="$SERVE_OUT_OF_TREE"
+  echo "=============================================================================="
+  echo "  🔴 本发为【树外运行】：$SERVE_OUT_OF_TREE @ ${_OOT_COMMIT:0:9}"
+  echo "     只换了 vllm_ascend 这一棵；vllm 树 / CANN / LD_PRELOAD /"
+  echo "     共享产物检查 / 不落后于 base 全部照判。"
+  echo "     ⚠ 共享 .so 【没有】被替换 —— 本发用的是那棵树自己的 .so，"
+  echo "        .so 期望值闸与 ds41 闸判的也是那棵树。"
+  echo "     产物里请连这一行一起引：没有它，树外就是个隐形状态。"
+  echo "=============================================================================="
+fi
+
 # ---- 产物新鲜度 + 树来源：两条都必须过，否则起来的也是错的 -------------------
 "$ROOT/build_artifacts/verify_shared_artifacts.sh" >/dev/null || {
   echo "❌ 共享产物检查未过 —— 多半是源码合了但 .so 没重编。跑一次看详情："
@@ -330,13 +379,29 @@ python3 "$ROOT/build_artifacts/assert_trees.py" || { echo "❌ 树来源断言�
 #   assert_trees.py 只回答「是不是我们的树、CANN 对不对」，不回答「这棵树新不新」。
 #   而落后的树【起得来】—— 它只是缺代码，症状是一个来自上游的、看起来很专业的 ValueError。
 #   判据用 commit 祖先关系，不用时间戳（时间戳会被 cp/checkout 刷新）。
-_TREE=$("$ROOT/build_artifacts/_resolve_tree.sh" "$WT") || { echo "❌ 解析不出树: $WT"; exit 1; }
+if [ -n "${SERVE_OUT_OF_TREE:-}" ]; then
+  # 🔴 树外时这条闸【照判，只是换一棵树去问】：跳过它等于放弃「要跑的树不落后
+  #    于 dsv41-base」这条保证，而落后的树【起得来】，症状是一个来自上游的、
+  #    看起来很专业、和我们的接线毫无关系的 ValueError。
+  #    ⚠ 祖先关系在【那棵树自己的仓】里求值：暂存检出若不是主仓的 worktree
+  #      （比如独立 clone），它的 commit 不在 $ROOT/vllm-ascend 里，拿主仓去问
+  #      会必然失败 —— 而那是「判据读错了对象」，不是「树落后了」。
+  _TREE="$SERVE_OUT_OF_TREE"
+  _ANCESTRY_REPO="$_TREE"
+else
+  _TREE=$("$ROOT/build_artifacts/_resolve_tree.sh" "$WT") || { echo "❌ 解析不出树: $WT"; exit 1; }
+  _ANCESTRY_REPO="$ROOT/vllm-ascend"
+fi
 _BASE=$(git -C "$ROOT/vllm-ascend" rev-parse dsv41-base 2>/dev/null)
 _HEAD=$(git -C "$_TREE" rev-parse HEAD 2>/dev/null)
 if [ -z "$_BASE" ] || [ -z "$_HEAD" ]; then
   echo "❌ 取不到 dsv41-base 或 $WT 的 HEAD —— 判据不成立，拒绝启动"; exit 1
 fi
-if ! git -C "$ROOT/vllm-ascend" merge-base --is-ancestor "$_BASE" "$_HEAD" 2>/dev/null; then
+if ! git -C "$_ANCESTRY_REPO" cat-file -e "$_BASE^{commit}" 2>/dev/null; then
+  echo "❌ $_ANCESTRY_REPO 里没有 dsv41-base ($_BASE) —— 祖先关系【判不了】。"
+  echo "   判据不成立一律拒绝：判不了和通过不是一回事。"; exit 1
+fi
+if ! git -C "$_ANCESTRY_REPO" merge-base --is-ancestor "$_BASE" "$_HEAD" 2>/dev/null; then
   echo "❌ 要跑的树 $WT ($(git -C "$_TREE" rev-parse --short HEAD)) 【落后于】 dsv41-base (${_BASE:0:9})"
   echo "   落后的树起得来，它只是缺代码 —— 2026-09-11 11:09 实证：缺 attn_selector 时"
   echo "   上游 flashmla 没被劫持，报的是 'fp8_ds_mla layout only supports fp8 kv-cache'，"
@@ -345,6 +410,15 @@ if ! git -C "$ROOT/vllm-ascend" merge-base --is-ancestor "$_BASE" "$_HEAD" 2>/de
   exit 1
 fi
 echo "  ✅ 要跑的树 $WT ($(git -C "$_TREE" rev-parse --short HEAD)) 包含 dsv41-base (${_BASE:0:9})"
+
+# ── 起飞前两道闸：在这里调用（函数在 :137 已 source）───────────────────────────
+#   位置是判据的一部分（k.14「判据要读它所判断的那个对象」）：
+#     · $_TREE 到这一行才有值，而树外运行时它【就是暂存树】 ⇒ 比的是这一发
+#       真正会被 import 的那份 .so，不是 worktrees/moe-offload 里的；
+#     · env_dsv41.sh（内含 CANN set_env.sh）已经 source 过、树外的 PYTHONPATH
+#       改写也已经做过 ⇒ gate_ds41 查的 find_spec 就是服务进程会解析的那一份。
+gate_so "$_TREE" || exit 1
+gate_ds41 || exit 1
 
 # ---- engram：必须是【全量】，不是切片 ---------------------------------------
 #   切片和全量在日志里长得一样，而下游 mmap 到截断张量【不报错，只算错】。
