@@ -49,7 +49,7 @@ import torch
 # (vllm/logger.py:204-214). 132 files in this tree use the import below.
 from vllm.logger import logger
 
-from vllm_ascend.kt_offload import seam_timing, side_stream
+from vllm_ascend.kt_offload import report_affinity, seam_timing, side_stream
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
     NpuRouting,
@@ -497,6 +497,11 @@ class KTLayerOffload:
         # (physical_to_logical_map_cpu).
         wrapper.load_weights(torch.arange(self.placement.num_experts, dtype=torch.int64, device="cpu"))
         _refuse_cross_layer(wrapper, self.layer_idx)  # A1: deferral cannot be produced
+        # Resolve the report-thread pinning here, on the main thread and after
+        # kt's pool exists: 'auto' reads kt's real threads to check its model,
+        # and a refusal must refuse the start-up rather than warn inside a
+        # graph node. Off unless VLLM_ASCEND_DSV41_KT_REPORT_CPU is set.
+        report_affinity.resolve_once(self.cfg)
         _register_wrapper(wrapper, self.layer_idx)  # A5/A9: one wrapper per index, one CPUInfer
         return wrapper
 
@@ -805,6 +810,7 @@ def _kt_packed_forward(payload) -> None:
         its own errors for ever.
     """
     wrapper, buf, layer_idx = payload
+    report_affinity.apply_in_callback()  # no-op unless the switch is on; once per process
     # Seam timing, same segments as _kt_host_forward. Here the submit and the
     # sync are ours, so the split needs no CPUInfer probe: ``kt_pre`` is the
     # forward_task build, ``kt_tail`` is empty by construction.
@@ -861,6 +867,7 @@ def _kt_host_forward(payload) -> None:
     device would then read the previous step's CPU output. Log loudly.
     """
     wrapper, shape_ref, stream_handle, layer_idx = payload
+    report_affinity.apply_in_callback()  # no-op unless the switch is on; once per process
     # Seam timing (VLLM_ASCEND_DSV41_KT_SEAM_TIMING): off -> RECORDER is None
     # and this costs one global read and one branch per segment boundary. On,
     # it reads clocks and stores integers; it changes no argument, no order

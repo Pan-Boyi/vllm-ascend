@@ -276,6 +276,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # fails is faster and wrong, so the A/B's criterion is bit-identity, not
     # TPOT. Read at config validation. Not sensitive.
     "VLLM_ASCEND_DSV41_KT_SIDE_STREAM": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SIDE_STREAM", "0"),
+    # DeepSeek-V4.1 MoE offload: pin the ONE ACL report thread (the thread
+    # torch_npu creates on the first _subscribe_report and that delivers every
+    # _launch_host_func callback) to a PU kt's spinning workers do not own.
+    # "" (default) = never call sched_setaffinity, byte-for-byte the current
+    # behaviour. A number = that PU. "auto" = model kt's own binding rule
+    # (vllm_ascend/kt_offload/report_affinity.py) and take the last fully idle
+    # core, preferring the device's NUMA node; auto refuses start-up when it
+    # cannot prove which PUs kt holds. Resolved once at weight-load time,
+    # applied inside the first host-func callback (the only code of ours that
+    # runs on that thread), and read back with sched_getaffinity. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_REPORT_CPU": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_REPORT_CPU", ""),
+    # DeepSeek-V4.1 MoE offload: additionally put that report thread on
+    # SCHED_FIFO at this priority (1-99). "" or "0" (default) = off. Requires
+    # CAP_SYS_NICE; without it the call fails and the service continues on
+    # SCHED_OTHER with a warning, and the log/artifact records whether it took
+    # effect (the policy is read back). Only read when
+    # VLLM_ASCEND_DSV41_KT_REPORT_CPU is set. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_REPORT_FIFO": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_REPORT_FIFO", ""),
 }
 
 # end-env-vars-definition
