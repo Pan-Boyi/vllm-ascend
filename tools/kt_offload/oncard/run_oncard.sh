@@ -381,9 +381,11 @@ T_END=$(oc_ms)
 if [ -z "$ANOMALY" ] && hit=$(oc_scan_anomaly "$ANOM" "$LOG" "$ASCEND_PROCESS_LOG_PATH"); then
   ANOMALY="$hit"; say "🛑 anomaly marker (final scan): $hit"
 fi
-N1070=$(oc_count "10701[0-9]" "$LOG" "$ASCEND_PROCESS_LOG_PATH")
+# 🔴 107025（跨流捕获失败）不在 10701[0-9] 里 —— 旧口径把它漏成 "0 条"，而它正是
+#    侧流那条路最常见的失败码（2026-09-22 t5 实测，见 PLAN §4.19②）。数 1070[12][0-9]。
+N1070=$(oc_count "1070[12][0-9]" "$LOG" "$ASCEND_PROCESS_LOG_PATH")
 VERD=$(command grep -E "^VERDICT:" "$LOG" | tail -n 1)
-say "  test rc=$TRC wall $(( (T_END - T_START) / 1000 ))s; $VERD; 10701x lines (log+plog) $N1070"
+say "  test rc=$TRC wall $(( (T_END - T_START) / 1000 ))s; $VERD; 1070[12]x lines (log+plog) $N1070"
 say "  MemAvailable min during run $((min_avail/1048576)) GiB; HBM usage max ${hbm_max}% (sampled); $(cat "$RUN/test_vmhwm.txt" 2>/dev/null)"
 if [ -n "$ANOMALY" ]; then RC=20
 elif [ -n "$RC" ]; then :
