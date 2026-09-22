@@ -36,7 +36,8 @@
 #                          being one explanation
 #    c1  num-threads 1  -> no concurrency at all. Without this档 "batch
 #                          composition caused it" is a story, not a measurement.
-#  perf/profile are skipped in aa mode (nothing compares them); the c8 eval
+#  profile is skipped in aa mode (nothing compares kernels); perf DOES run in
+#  every arm -- the A-vs-A' TPOT difference is the drift floor. The c8 eval
 #  still runs first, in the same position as in ab mode.
 #
 #  rc: 0 both arms done and judged | 2 usage | 3 preflight (no card touched)
@@ -231,7 +232,14 @@ run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false, $3 = round (1-based)
   LEASE_PID=$$ bash "$ROOT/build_artifacts/card_lease.sh" acquire "$CARD" "$OWNER" "$PORT" >>"$SUM" 2>&1 || {
     say "  ❌ lease refused for card $CARD"; return 4; }
 
+  # 🔴 WT / DSV41_VLLM_TREE / LEASE_OWNER 必须显式传（2026-09-22 首次上卡发现）：
+  #    本脚本的 $WT 是【路径】且不 export，launcher 的 WT 默认是 "base" ⇒ 不传就会起
+  #    主 checkout 那棵树（不是本线的树），vllm 树也退回 $ROOT/vllm。那次是 launcher
+  #    自己再申请租约（owner "dsv41-base" ≠ 本脚本的 $OWNER）撞上本脚本的租约才被拦下，
+  #    纯属运气。LEASE_OWNER 与本脚本一致 ⇒ launcher 那次申请是同一持有者续租。
+  #    起来之后还要读 serve.log 里 assert_trees 打印的 vllm_ascend 路径（读真对象）。
   ( cd "$ROOT" && setsid env \
+      WT=moe-offload DSV41_VLLM_TREE="$ROOT/worktrees/moe-offload-vllm" LEASE_OWNER="$OWNER" \
       KT_OFFLOAD=1 NPUS="$CARD" PORT="$PORT" EAGER=0 \
       VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
       KT_ADDITIONAL_CONFIG="$(cat "$arm/cfg.json")" \
@@ -243,7 +251,7 @@ run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false, $3 = round (1-based)
   pgid=$(ps -o pgid= -p "$serve_pid" 2>/dev/null | tr -d ' ')
   say "  serve pid=$serve_pid pgid=${pgid:-?} log=$arm/serve.log"
 
-  local ready=0 waited=0
+  local ready=0 waited=0 want_va="vllm_ascend = $WT/vllm_ascend/__init__.py"
   while [ "$waited" -lt "$READY_TIMEOUT_S" ]; do
     if curl -s -m 5 "http://127.0.0.1:$PORT/v1/models" -o "$arm/models.json" 2>/dev/null; then ready=1; break; fi
     kill -0 "$serve_pid" 2>/dev/null || { say "  ❌ serve exited before it was ready (see serve.log)"; break; }
@@ -254,6 +262,12 @@ run_arm() {  # $1 = A|B|A1|A2, $2 = packed true|false, $3 = round (1-based)
     teardown "$arm" "${pgid:-}" ; return 5
   fi
   say "  service ready after ${waited}s"
+  if ! command grep -qF "$want_va" "$arm/serve.log"; then
+    say "  ❌ arm $name: serve.log does not show '$want_va' -- the service is not running this tree"
+    command grep -m1 "vllm_ascend = " "$arm/serve.log" | sed 's/^/     got: /' | tee -a "$SUM" >/dev/null
+    teardown "$arm" "${pgid:-}" ; return 5
+  fi
+  say "  tree check: $want_va ✅"
   command grep -m1 "BREAKABLE_CUDAGRAPH" "$arm/serve.log" | sed 's/^/     /' | tee -a "$SUM" >/dev/null
 
   # ---- positive control for the busy reading: the service is up right now,
