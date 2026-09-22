@@ -40,6 +40,11 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
+import torch_npu
+
+import vllm_ascend.envs as envs
+from vllm_ascend.models.deepseek_v4_1.qkv_prolog import rope_tail_operator
+from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
 
 #: The rope width of the V4.1 indexer key, against a head width of 128.
 #: Upstream passes these to the kernel as separate constants
@@ -83,7 +88,29 @@ def _rms_norm(x: torch.Tensor, weight: torch.Tensor,
 
     The round trip is in the reference and in upstream's kernel: these values
     feed the absmax downstream, so fp32 precision would give a different scale.
+
+    🔴 **The operator route is not bit-identical and this is the one place in
+    the indexer change where that matters.** Both routes land on the bf16
+    grid -- ``npu_rms_norm`` of a bf16 input returns bf16, which *is* the
+    round trip -- so the contract above survives at the dtype level. What
+    differs is *how* the bf16 value is reached: the torch form accumulates in
+    fp32, takes ``rsqrt`` in fp32, multiplies by an fp32 gamma and rounds
+    once; the operator's internal order is not published. And the consumer is
+    an MXFP4 quantiser whose block scale is ``exp2(ceil(log2(absmax/max)))``,
+    so **a 1 ulp difference that crosses a power of two moves a whole block's
+    scale by a binade**. It is not "close enough" by inspection; it needs the
+    card, which is why this sits behind its own switch separate from the
+    rotation's.
     """
+    if (getattr(x, "is_npu", False)
+            and envs.VLLM_ASCEND_DSV41_INDEXER_FUSED_NORM == "1"):
+        # ``.to(float32)`` keeps this function's return contract: the caller
+        # and _rope_interleaved_tail below both expect fp32 values that happen
+        # to be bf16-representable. Returning bf16 here would silently change
+        # the rotation's arithmetic domain as well, which would make this one
+        # switch cover two independent changes.
+        return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0].to(
+            torch.float32)
     acc = x.to(torch.float32)
     variance = acc.pow(2).mean(dim=-1, keepdim=True)
     normed = acc * torch.rsqrt(variance + eps) * weight.to(torch.float32)
@@ -98,6 +125,20 @@ def _rope_interleaved_tail(k: torch.Tensor, cos_sin_cache: torch.Tensor,
     ``cos_sin_cache[p]`` is ``rope_head_dim`` wide and holds the half-width
     cosines followed by the half-width sines, one of each per interleaved pair.
     """
+    if (getattr(k, "is_npu", False)
+            and envs.VLLM_ASCEND_DSV41_INDEXER_FUSED_ROPE == "1"):
+        # 🔴 fp32 stays fp32: ``x=DT_FLOAT, cos=DT_FLOAT, sin=DT_FLOAT`` is
+        # combination 2 of the operator's five, and it is present in the
+        # ascend950 block too (inplace_partial_rotary_mul_def.cpp:38-56). So
+        # this route rotates in the **same arithmetic domain** as the torch
+        # form below -- the only thing that disappears is the second bf16
+        # round trip, which this function's own comment and
+        # test_the_post_rotation_round_trip_is_a_no_op_on_this_route already
+        # establish as a no-op on this route. Casting to bf16 to reach a
+        # different combination would have quietly changed the rotation's
+        # precision as well.
+        cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
+        return rope_tail_operator(k, cos, sin, rope_head_dim)
     half = rope_head_dim // 2
     row = cos_sin_cache[positions].to(torch.float32)  # [T, rope_head_dim]
     cos = row[..., :half]

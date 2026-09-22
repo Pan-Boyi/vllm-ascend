@@ -198,6 +198,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 融合 [T] -> [T, 2] 的 slot mapping：8 个算子 + 1 次 copy_ 压成 1 次下发，
     # 每步 42 组。设 0 退回 torch 分解（两条路逐位相同），用于二分回归。
     "VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING": lambda: os.getenv("VLLM_ASCEND_DSV41_FUSED_SLOT_MAPPING", "1"),
+    # indexer 的 q RoPE / k_norm / k 尾部旋转换成已在树里跑着的算子（第 2 轮序 4）。
+    # 🔴 k 侧的 rms_norm 是【非逐位】的：手写版中途那次 bf16 round trip 是喂给下游
+    #    absmax 的（indexer_k_store.py:82-86），而 MXFP4 的块 scale 是
+    #    exp2(ceil(log2(...)))，1 ulp 差跨过 2 的幂边界就整块跳一个 binade。
+    #    设 0 退回手写版，用于把精度问题变成一次翻转而不是一次回退。
+    "VLLM_ASCEND_DSV41_INDEXER_FUSED_ROPE": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_FUSED_ROPE", "1"),
+    "VLLM_ASCEND_DSV41_INDEXER_FUSED_NORM": lambda: os.getenv("VLLM_ASCEND_DSV41_INDEXER_FUSED_NORM", "1"),
     # DeepSeek-V4.1 indexer K write: quantise and store through CANN's
     # indexer_quant_cache instead of indexer_compress_epilog_v2.
     # k_norm/RoPE/slot gating are unchanged either way.

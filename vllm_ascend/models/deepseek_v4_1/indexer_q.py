@@ -41,10 +41,26 @@ from __future__ import annotations
 
 import torch
 
+import vllm_ascend.envs as envs
 from vllm_ascend.models.deepseek_v4_1.indexer_cache_view import (SCALE_GROUP,
                                                                  SCALE_PAIR,
                                                                  VALUES_PER_BYTE
                                                                  )
+from vllm_ascend.models.deepseek_v4_1.qkv_prolog import rope_tail_operator
+from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
+
+
+def _indexer_fused_rope_enabled(sample: torch.Tensor) -> bool:
+    """The operator route, when it can run here and is switched on.
+
+    ``is_npu`` rather than a try/except: the CPU unit tests must take the
+    torch route, but a genuine operator failure on card has to surface. A
+    try/except here would turn "the operator is broken" into "this is slow",
+    which is the failure mode dsnext has and we do not copy
+    (``dsa_v41.py:879-881``).
+    """
+    return (getattr(sample, "is_npu", False)
+            and envs.VLLM_ASCEND_DSV41_INDEXER_FUSED_ROPE == "1")
 
 
 def fused_indexer_q_rope_quant_ascend(
@@ -95,31 +111,75 @@ def fused_indexer_q_rope_quant_ascend(
             f"head_dim {head_dim} is smaller than the rotation width "
             f"{rot_dim} implied by the cos/sin cache")
 
-    cos_sin = index_q_cos_sin_cache.index_select(
-        0, positions.to(torch.long)).to(torch.float32)
-    cos = cos_sin[:, :half_rot].unsqueeze(1)      # (T, 1, half)
-    sin = cos_sin[:, half_rot:].unsqueeze(1)
+    # 🔴 Explicit, because the operator path below would not raise on it.
+    # The torch form happens to break: cos (P, 1, half) against pairs
+    # (T, H, half) fails to broadcast. The operator takes x as [T,1,H,D] and
+    # cos as [P,1,1,D], which broadcasts to a silently wrong rotation. The
+    # main-KV route raises here too (rope.py:289-292); this one only did so
+    # by accident, and the accident disappears with the operator.
+    if positions.shape[0] != num_tokens:
+        raise ValueError(
+            f"positions has {positions.shape[0]} rows and index_q has "
+            f"{num_tokens}. One angle per token is the whole contract; "
+            "broadcasting a shorter cos/sin would rotate every token by the "
+            "wrong amount and raise nothing.")
 
-    pairs = index_q[..., nope_dim:].to(torch.float32).reshape(
-        num_tokens, num_heads, half_rot, 2)
-    x_even, x_odd = pairs[..., 0], pairs[..., 1]
+    if _indexer_fused_rope_enabled(index_q):
+        # ``cos_sin_for_slice`` returns the **widened** (per-channel) form the
+        # operator requires, so the half-width cache never reaches it. Passing
+        # the half-width form would fail the operator's
+        # ``cos.size(-1) == end - start`` check, or worse, pass a reshaped one
+        # and rotate by the wrong angles.
+        cos, sin = cos_sin_for_slice(index_q_cos_sin_cache, positions, rot_dim)
+        # Same call the main KV path has used since e8dea3d36. It clones and
+        # rotates only ``[nope_dim, head_dim)``, which is exactly what the
+        # torch form below does -- including leaving the NoPE half untouched.
+        #
+        # ⚠️ **Not bit-identical by construction, and not yet measured on this
+        # shape.** The torch form rotates in float32 and rounds once; the
+        # operator rotates in the tensor dtype. For a bf16 ``index_q`` the
+        # explicit round trip above is provably a no-op
+        # (``bf16(fp32(bf16(r))) == bf16(r)``), so the absmax contract in the
+        # module docstring survives -- what may differ is the rounding of the
+        # rotation itself. The main KV route measured ``torch.equal`` on card
+        # (qkv_prolog.py:216-222), but that was [37,8,128]/[37,128]; one shape
+        # on one day is not a proof for this one. The switch is what turns a
+        # divergence into a flip.
+        q_roped = rope_tail_operator(index_q, cos, sin, rot_dim)
+    else:
+        cos_sin = index_q_cos_sin_cache.index_select(
+            0, positions.to(torch.long)).to(torch.float32)
+        cos = cos_sin[:, :half_rot].unsqueeze(1)      # (T, 1, half)
+        sin = cos_sin[:, half_rot:].unsqueeze(1)
 
-    r_even = x_even * cos - x_odd * sin
-    r_odd = x_odd * cos + x_even * sin
+        pairs = index_q[..., nope_dim:].to(torch.float32).reshape(
+            num_tokens, num_heads, half_rot, 2)
+        x_even, x_odd = pairs[..., 0], pairs[..., 1]
 
-    # Upstream's bf16 round trip, in the MXFP4 kernel as in the fp8 one. The
-    # NoPE half below is deliberately left alone: neither kernel round-trips
-    # it, and doing so here would change bytes that upstream does not.
-    r_even = r_even.to(torch.bfloat16).to(torch.float32)
-    r_odd = r_odd.to(torch.bfloat16).to(torch.float32)
+        r_even = x_even * cos - x_odd * sin
+        r_odd = x_odd * cos + x_even * sin
 
-    rotated = torch.stack((r_even, r_odd), dim=-1).reshape(
-        num_tokens, num_heads, rot_dim)
-    # clone, not empty_like: the NoPE half has to arrive at the quantiser as
-    # index_q had it, and a factory call here would also be a tensor built
-    # without an explicit device.
-    q_roped = index_q.clone()
-    q_roped[..., nope_dim:] = rotated.to(index_q.dtype)
+        # Upstream's bf16 round trip, in the MXFP4 kernel as in the fp8 one.
+        # The NoPE half below is deliberately left alone: neither kernel
+        # round-trips it, and doing so here would change bytes that upstream
+        # does not.
+        #
+        # ⚠️ For a bf16 ``index_q`` these two lines are a **no-op** -- storing
+        # back into a bf16 tensor rounds identically. They are load-bearing
+        # only if ``index_q`` is ever float32 or float16, and nothing here
+        # asserts that it is not. A test that feeds bf16 cannot tell whether
+        # they are present, so the unit test for this contract uses float32
+        # (test_deepseek_v4_1_indexer_q.py).
+        r_even = r_even.to(torch.bfloat16).to(torch.float32)
+        r_odd = r_odd.to(torch.bfloat16).to(torch.float32)
+
+        rotated = torch.stack((r_even, r_odd), dim=-1).reshape(
+            num_tokens, num_heads, rot_dim)
+        # clone, not empty_like: the NoPE half has to arrive at the quantiser
+        # as index_q had it, and a factory call here would also be a tensor
+        # built without an explicit device.
+        q_roped = index_q.clone()
+        q_roped[..., nope_dim:] = rotated.to(index_q.dtype)
 
     q_packed, q_scale = _mx_quantise(q_roped)
     q_packed = q_packed.view(torch.uint8).reshape(
