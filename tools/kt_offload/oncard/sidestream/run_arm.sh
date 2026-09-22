@@ -9,6 +9,19 @@ export TMPDIR=/dev/shm/dsv41_tmp TMP=/dev/shm/dsv41_tmp
 D=$RUN/$ARM; mkdir -p $D; SUM=$D/arm_summary.txt; : > $SUM
 say(){ echo "[$(date +%T)] $*" | tee -a $SUM; }
 X=${ARM:0:1}; CFG=$RUN/cfg_$X.json; SIDE=$([ "$X" = B ] && echo 1 || echo 0)
+# 🔴 Read the score from metrics.json, never by grepping the progress log: the
+# runner prints "[n/N] acc=..." every 50 items, so `grep -m1 acc` picks the
+# score after the FIRST 50 and calls it the result. With --limit 50 that is
+# accidentally the final line; with 1319 it reported acc=1.0000 for a run that
+# finished at 1275/1319. A reader cannot tell those two apart.
+score(){ python3 - "$1" <<'PYEOF' 2>/dev/null || echo "score unreadable"
+import json,sys
+m=json.load(open(sys.argv[1]+"/metrics.json"))
+print(f'{m["num_correct"]}/{m["num_examples"]} acc={m["aggregate"]["score"]:.4f} '
+      f'err_rate={m["aggregate"]["error_rate"]} trunc={m["aggregate"]["truncated_rate"]} '
+      f'{m["latency_seconds"]:.0f}s')
+PYEOF
+}
 say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE extra=[$*] steps=$STEPS"
 python3 worktrees/moe-offload/tools/kt_offload/build_fingerprint.py stamp $D --label sidestream_$ARM > $D/fp.txt 2>&1
 grep -q 85331298bdeffee02b7c42c5658030ac $D/build_fingerprint.json || { say "❌ .so mismatch"; exit 3; }
@@ -45,7 +58,7 @@ for s in ${STEPS//,/ }; do case $s in
       say "perf rc=$?"; grep -E 'bs1 +decode|bs1 +TPOT' $D/perf/summary.txt | tee -a $SUM;;
   gsm) EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 \
       --out-dir $D/gsm8k50 --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --limit 50 > $D/gsm8k.log 2>&1
-      say "gsm8k50 rc=$? $(grep -m1 -oE 'acc[^,]*' $D/gsm8k.log | head -1)";;
+      say "gsm8k50 rc=$? $(score $D/gsm8k50)";;
   # M4: the whole 1319. Same knobs as `gsm`, only --limit drops away (0 = all), plus
   # --resume so a retry continues from partial.jsonl instead of starting over.
   # 🔴 Read it against the band, not against a number: single-card offload has NO
@@ -54,7 +67,7 @@ for s in ${STEPS//,/ }; do case $s in
   # ⇒ inside the band = no detectable regression, <=11 apart = INDISTINGUISHABLE.
   gsm1319) EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 \
       --out-dir $D/gsm8k1319 --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --resume > $D/gsm1319.log 2>&1
-      say "gsm8k1319 rc=$? $(grep -m1 -oE 'acc[^,]*' $D/gsm1319.log | head -1)";;
+      say "gsm8k1319 rc=$? $(score $D/gsm8k1319)";;
   hold) say "hold: sleeping until $D/release exists"; while [ ! -e $D/release ]; do sleep 10; done;;
 esac; done
 grep 'host-func over' $D/serve.log | sed 's/.*kt_offload host-func/host-func/' > $D/hostfunc.txt
