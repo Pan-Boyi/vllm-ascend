@@ -39,8 +39,18 @@ REPORT = _load("packed_ab_report", TOOLS / "oncard" / "packed_ab_report.py")
 
 
 def fp(so="a" * 32, vendors="v" * 64, kt="k" * 64, head="1" * 40, vllm_head="2" * 40, backfilled=False,
-       files=759, nbytes=118_000_000):
+       files=759, nbytes=118_000_000, custom_ops="o" * 64, ds41="d" * 64, ds41_files=973,
+       ds41_bytes=47_757_444):
     return {
+        # the ds41 operator package (schema /3): the distribution unit and
+        # the installed site, both blocking
+        "custom_ops_sha256": custom_ops,
+        "custom_ops_files": 4,
+        "custom_ops_ok": True,
+        "ds41_sha256": ds41,
+        "ds41_files": ds41_files,
+        "ds41_bytes": ds41_bytes,
+        "ds41_ok": True,
         "schema": FP.SCHEMA,
         "vendors_files": files,
         "vendors_bytes": nbytes,
@@ -444,3 +454,126 @@ def test_counts_do_decide_within_one_convention():
     b["vendors"] = dict(rule)
     ok, reasons = FP.same_build(a, b)
     assert not ok and any("vendors_files differs" in r for r in reasons)
+
+
+# -- the ds41 operator package (schema /3, 2026-09-22) ----------------------
+
+
+@pytest.mark.parametrize("key,kwargs", [
+    ("custom_ops_sha256", {"custom_ops": "z" * 64}),
+    ("ds41_sha256", {"ds41": "z" * 64}),
+    ("ds41_files", {"ds41_files": 972}),
+    ("ds41_bytes", {"ds41_bytes": 47_757_443}),
+])
+def test_the_ds41_package_blocks_the_comparison(key, kwargs):
+    """Without these in the decision, swapping the ds41 wheels or the
+    installed site left the judge saying "same build" -- while the five
+    candidate layers and >16k depend on them."""
+    ok, reasons = FP.same_build(fp(), fp(**kwargs))
+    assert not ok and any(key in r for r in reasons)
+
+
+def test_one_flipped_byte_in_a_distributed_artifact_is_seen(tmp_path):
+    """Not a model of the rule -- the real capture(), over real copies.
+
+    The artifacts are copied to a temporary directory (the real ones are
+    never touched), one byte of one wheel is flipped, and the two captures
+    must not be comparable.
+    """
+    import shutil
+    src = Path(FP.CUSTOM_OPS)
+    if not src.is_dir():
+        pytest.skip(f"{src} 不在")
+    work = tmp_path / "custom_ops"
+    work.mkdir()
+    for name in FP.CUSTOM_OPS_FILES:
+        shutil.copy2(src / name, work / name)
+    # 传 root，不改默认值：默认参数在 def 时求值，monkeypatch 模块常量不生效
+    before = FP.custom_ops_fingerprint(str(work))
+    assert before["ok"] and before["files"] == 4
+
+    victim = work / FP.CUSTOM_OPS_FILES[0]
+    data = bytearray(victim.read_bytes())
+    data[len(data) // 2] ^= 0x01
+    victim.write_bytes(bytes(data))
+    after = FP.custom_ops_fingerprint(str(work))
+    assert after["sha256"] != before["sha256"]
+    ok, reasons = FP.same_build(fp(custom_ops=before["sha256"]),
+                                fp(custom_ops=after["sha256"]))
+    assert not ok and any("custom_ops_sha256 differs" in r for r in reasons)
+
+
+def test_the_run_is_recorded_as_shipped_but_not_installed(tmp_path):
+    """The .run is not installed (指南 §3.9: it overrides seven OpTypes of the
+    production vendor). It is still part of the unit, so it is hashed -- and
+    the fact that it is not installed is written down next to it, because a
+    hash with no statement of what it describes is how a guard ends up
+    watching the wrong object (k.14)."""
+    fpr = FP.custom_ops_fingerprint()
+    if not fpr["ok"]:
+        pytest.skip(fpr["why"])
+    run = "cann-ops-transformer-custom_linux-x86_64.run"
+    assert run in fpr["each"]
+    assert fpr["not_installed"] == [run]
+    assert len(fpr["each"]) == 4
+
+
+def test_a_missing_ds41_artifact_is_refused_not_hashed(tmp_path):
+    """A partial read must not produce a hash: two partial reads would
+    compare equal."""
+    fpr = FP.custom_ops_fingerprint(str(tmp_path))
+    assert fpr["ok"] is False and "sha256" not in fpr
+    assert len(fpr["missing"]) == 4
+    ok, reasons = FP.same_build(fp(custom_ops=None, **{}) | {"custom_ops_ok": False,
+                                                            "custom_ops_files": 0},
+                                fp())
+    assert not ok
+    assert any("ds41 operator package" in r for r in reasons)
+
+
+def test_an_unreadable_ds41_site_is_refused():
+    broken = fp() | {"ds41_ok": False, "ds41_files": 0}
+    ok, reasons = FP.same_build(broken, fp())
+    assert not ok and any("installed ds41_site" in r for r in reasons)
+
+
+def test_a_schema_2_artifact_cannot_be_subtracted_from_a_schema_3_one():
+    """The bump is the point: a /2 fingerprint never recorded the ds41
+    package, so "no difference seen" there means "never looked"."""
+    old = fp() | {"schema": "kt_offload/build_fingerprint/2"}
+    ok, reasons = FP.same_build(old, fp())
+    assert not ok and any(r.startswith("OLDSCHEMA") for r in reasons)
+
+
+def test_one_flipped_byte_in_the_installed_ds41_site_is_seen(tmp_path):
+    """The installed site is fingerprinted by content with the same walker
+    the operator package uses, so a swapped file inside it is visible even
+    when the wheels next door are untouched."""
+    site = tmp_path / "ds41_site"
+    (site / "cann_ops_transformer").mkdir(parents=True)
+    f = site / "cann_ops_transformer" / "__init__.py"
+    f.write_text("x = 1\n")
+    before = FP.vendors_fingerprint(str(site), role="ds41_site")
+    assert before["ok"] and before["role"] == "ds41_site"
+    f.write_text("x = 2\n")
+    after = FP.vendors_fingerprint(str(site), role="ds41_site")
+    assert after["sha256"] != before["sha256"]
+    ok, _ = FP.same_build(fp(ds41=before["sha256"]), fp(ds41=after["sha256"]))
+    assert not ok
+
+
+def test_the_ds41_sources_can_be_overridden_and_the_override_is_recorded(
+        tmp_path, monkeypatch):
+    """As with DSV41_VENDORS: an override is allowed, and the fact that one
+    was used is written into the artifact -- otherwise a fingerprint taken
+    against a copy reads like one taken against production."""
+    monkeypatch.setenv("DSV41_DS41_SITE", str(tmp_path))
+    monkeypatch.setenv("DSV41_CUSTOM_OPS", str(tmp_path))
+    mod = _load("build_fingerprint_override", TOOLS / "build_fingerprint.py")
+    assert mod.DS41_SITE == str(tmp_path) and mod.CUSTOM_OPS == str(tmp_path)
+    cap = mod.capture()
+    assert cap["ds41_source_is_override"] and cap["custom_ops_source_is_override"]
+    # ...and an empty override is a refusal, not a constant hash
+    assert cap["ds41_ok"] is False and cap["custom_ops_ok"] is False
+    ok, reasons = mod.same_build(cap, cap)
+    assert not ok and any("not readable" in r for r in reasons)

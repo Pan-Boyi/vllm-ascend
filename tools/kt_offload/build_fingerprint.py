@@ -30,6 +30,12 @@ What goes in the fingerprint:
                  the two can differ (they do today: 759 files here against
                  786 there) and hashing the shared one would let a swap in
                  OUR tree pass unnoticed;
+  * ``custom_ops`` the ds41 distribution unit under ``custom_ops_dsv41``:
+                 the three installed wheels and the shipped-but-not-installed
+                 ``.run``, each by (name, size, sha256);
+  * ``ds41_site`` the installed ds41 package by content -- what a run actually
+                 imports, and without which the five candidate layers fall
+                 back to the v2 operators and >16k stays blocked, silently;
   * ``kt_wheel`` sha256 (the CPU MoE);
   * ``trees``    both worktrees' HEAD and dirty-file count.
 
@@ -62,6 +68,28 @@ VLLM_TREE = os.environ.get("DSV41_VLLM_TREE", os.path.join(ROOT, "worktrees/moe-
 # imported. DSV41_VENDORS overrides it (and the override is recorded).
 VENDORS = os.environ.get("DSV41_VENDORS", os.path.join(TREE, "vllm_ascend/_cann_ops_custom/vendors"))
 VENDORS_SHARED_BASELINE = os.path.join(ROOT, "build_artifacts/vendor92")
+# The ds41 operator package: four artifacts distributed as one unit, and the
+# directory they are installed into. They decide numerics exactly like the
+# .so does -- the five candidate layers fall back to the v2 operators without
+# them and >16k stays blocked -- and until 2026-09-22 nothing here watched
+# them, so swapping them left the judge saying "same build".
+#   * the three wheels are the ones actually installed (指南 §3.9:
+#     pip install --no-deps --no-index --target $DS41 <the three>);
+#   * the .run is NOT installed (指南 §3.9 says do not: it overrides seven
+#     OpTypes of the production vendor). It is fingerprinted anyway because
+#     it ships in the same unit: if it changed, the unit changed, and a
+#     reading taken across that change is not comparable without someone
+#     having looked. Recorded next to the fact that it is not installed.
+#   * ds41_site is the installed result, by content -- what a run imports.
+CUSTOM_OPS = os.environ.get("DSV41_CUSTOM_OPS", os.path.join(ROOT, "custom_ops_dsv41"))
+CUSTOM_OPS_FILES = (
+    "cannbotdsl-0.5.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+    "cann_ops_transformer-1.0.0-py3-none-any.whl",
+    "cannbot_arena_net_ops-0.1.0-cp312-cp312-linux_x86_64.whl",
+    "cann-ops-transformer-custom_linux-x86_64.run",   # shipped, not installed
+)
+CUSTOM_OPS_NOT_INSTALLED = ("cann-ops-transformer-custom_linux-x86_64.run",)
+DS41_SITE = os.environ.get("DSV41_DS41_SITE", "/workspace/code/dsv4_single_card/ds41_site")
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()  # the hash of no input: a constant, and constants always "match"
 KT_WHEEL_GLOB = os.path.join(ROOT, "build_artifacts/moe_offload_ref/kt_wheel/*.whl")
 SO_GLOBS = (
@@ -69,7 +97,11 @@ SO_GLOBS = (
     os.path.join(ROOT, "build_artifacts/vllm_ascend_C*.so"),
     os.path.join(ROOT, "vllm-ascend/vllm_ascend/vllm_ascend_C*.so"),
 )
-SCHEMA = "kt_offload/build_fingerprint/2"
+# /3 (2026-09-22): adds the ds41 operator package -- the four custom_ops_dsv41
+# artifacts and the installed ds41_site -- to the same-build decision. A /2
+# fingerprint never recorded them, so it may not be subtracted against a /3
+# one; that is the point of the bump, not a side effect.
+SCHEMA = "kt_offload/build_fingerprint/3"
 # The identity of the counting convention. Counts may only be compared when
 # this matches; a different value means "counted differently", never "the
 # package changed". Anything that writes a fingerprint reads this from here.
@@ -79,7 +111,8 @@ BACKFILL_NAME = "build_fingerprint.backfilled.json"
 # Every key here decides. The counts are in on purpose: the hash of an empty
 # directory is a constant, so a hash alone cannot tell "identical packages"
 # from "read nothing twice".
-BLOCKING = ("so_primary_md5", "vendors_sha256", "vendors_files", "vendors_bytes", "kt_wheel_sha256")
+BLOCKING = ("so_primary_md5", "vendors_sha256", "vendors_files", "vendors_bytes", "kt_wheel_sha256",
+            "custom_ops_sha256", "custom_ops_files", "ds41_sha256", "ds41_files", "ds41_bytes")
 
 
 class CrossBuildError(RuntimeError):
@@ -189,6 +222,43 @@ def vendors_fingerprint(root: str = VENDORS, role: str = "loaded") -> dict:
     return out
 
 
+def custom_ops_fingerprint(root: str = CUSTOM_OPS) -> dict:
+    """The ds41 distribution unit: each named artifact by content.
+
+    Named explicitly rather than walking the directory: the four files are
+    what is distributed and what gets installed, while the directory also
+    holds unpacked experiments (``ops_vector_0920/``) whose churn must not
+    read as "the operator package changed". A missing file is a refusal, not
+    a skip -- as with the operator package, an unread input must never
+    compare equal.
+    """
+    out = {"path": root, "role": "ds41_distribution_unit",
+           "not_installed": list(CUSTOM_OPS_NOT_INSTALLED),
+           "rule": "the four named files, by (name, size, sha256); the rest of the directory is ignored"}
+    entries, missing, total = [], [], 0
+    for name in CUSTOM_OPS_FILES:
+        full = os.path.join(root, name)
+        try:
+            size = os.path.getsize(full)
+            entries.append((name, size, _sha256(full)))
+            total += size
+        except OSError:
+            missing.append(name)
+    out["files"] = len(entries)
+    out["bytes"] = total
+    out["missing"] = missing
+    if missing:
+        out.update(ok=False, why=f"{len(missing)} of {len(CUSTOM_OPS_FILES)} ds41 artifacts missing under "
+                                 f"{root}: {missing}. Not hashed: a partial read must not compare equal.")
+        return out
+    h = hashlib.sha256()
+    for name, size, digest in entries:
+        h.update(f"{name}\0{size}\0{digest}\n".encode())
+    out.update(ok=True, sha256=h.hexdigest(),
+               each={name: {"bytes": size, "sha256": digest} for name, size, digest in entries})
+    return out
+
+
 def host_facts() -> dict:
     """CPU counts and the thread env, because one of the readings lies.
 
@@ -245,6 +315,9 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
         primary = next(iter(so.values()))
     vend = vendors_fingerprint(vendors, role="loaded")  # once: it hashes ~120 MB
     shared = vendors_fingerprint(VENDORS_SHARED_BASELINE, role="shared_baseline")
+    custom_ops = custom_ops_fingerprint()
+    # the installed result, by content: this is what a run imports
+    ds41 = vendors_fingerprint(DS41_SITE, role="ds41_site")
     wheels = sorted(glob.glob(KT_WHEEL_GLOB))
     kt_sha = _sha256(wheels[-1]) if wheels else None
     trees = {}
@@ -273,6 +346,18 @@ def capture(label: str | None = None, vendors: str = VENDORS) -> dict:
             k: shared.get(k)
             for k in ("path", "role", "files", "files_regular", "symlinks", "bytes", "sha256", "ok", "count_rule")
         },
+        "custom_ops": custom_ops,
+        "custom_ops_sha256": custom_ops.get("sha256"),
+        "custom_ops_files": custom_ops.get("files"),
+        "custom_ops_ok": custom_ops.get("ok", False),
+        "custom_ops_source_is_override": bool(os.environ.get("DSV41_CUSTOM_OPS")),
+        "ds41_site": ds41,
+        "ds41_sha256": ds41.get("sha256"),
+        "ds41_files": ds41.get("files"),
+        "ds41_bytes": ds41.get("bytes"),
+        "ds41_ok": ds41.get("ok", False),
+        "ds41_source": ds41.get("path"),
+        "ds41_source_is_override": bool(os.environ.get("DSV41_DS41_SITE")),
         "kt_wheel": {"path": wheels[-1] if wheels else None, "sha256": kt_sha},
         "kt_wheel_sha256": kt_sha,
         "trees": trees,
@@ -318,9 +403,12 @@ def short(fp: dict | None) -> str:
     files = fp.get("vendors_files")
     v = f"{v}/{files}f" if files is not None else f"{v}(shared-baseline?)"
     kt = (fp.get("kt_wheel_sha256") or "")[:12] or "?"
+    ds41 = (fp.get("ds41_sha256") or "")[:12] or "?"
+    ops = (fp.get("custom_ops_sha256") or "")[:12] or "?"
     heads = "/".join((fp.get("trees", {}).get(n, {}).get("head") or "?")[:9] for n in ("vllm_ascend", "vllm"))
     tag = " (backfilled)" if fp.get("backfilled") else ""
-    return f"build: so {fp.get('so_primary_md5_short') or '?'} vendors {v} kt {kt} trees {heads}{tag}"
+    return (f"build: so {fp.get('so_primary_md5_short') or '?'} vendors {v} kt {kt} "
+            f"ds41ops {ops} ds41site {ds41}/{fp.get('ds41_files')}f trees {heads}{tag}")
 
 
 def same_build(a: dict | None, b: dict | None, strict_trees: bool = False) -> tuple[bool, list[str]]:
@@ -345,6 +433,13 @@ def same_build(a: dict | None, b: dict | None, strict_trees: bool = False) -> tu
                 "SHARED BASELINE (build_artifacts/vendor92), not the operator package the run actually loaded "
                 "from its own tree -- the two differ, so no difference may be computed across this boundary"
             )
+        for what, okkey, cnt in (("ds41 operator package (custom_ops_dsv41)", "custom_ops_ok", "custom_ops_files"),
+                                 ("installed ds41_site", "ds41_ok", "ds41_files")):
+            if fp.get(okkey) is False or (cnt in fp and fp.get(cnt) == 0):
+                reasons.append(
+                    f"the {name} artifact's {what} was not readable (files={fp.get(cnt)}): an unread input "
+                    f"hashes to the constant {EMPTY_SHA256[:16]} and would compare equal to any other unread one"
+                )
         if fp.get("vendors_ok") is False or (fp.get("vendors_files") == 0 and "vendors_files" in fp):
             reasons.append(
                 f"the {name} artifact's operator package was not readable "
