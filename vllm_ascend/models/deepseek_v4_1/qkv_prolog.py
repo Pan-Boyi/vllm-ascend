@@ -126,11 +126,19 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
             # 0.99 ms a step across the 40 layers, 适配方案 §6.9.15).
             import torch_npu
 
+            # 🔴 ``rows[:n]``: the torch form below truncates through
+            # ``_payload_that_leaves_invalid_rows_untouched`` (``rows =
+            # rows[:n]``), and that silent truncation is load-bearing -- a
+            # dummy/graph run hands more query rows than there are slots.
+            # Dropping it here raised "shape '[1, 512]' is invalid for input
+            # of size 4096" at the first real forward, **after** the operator
+            # equivalence test had passed: that test fed matching lengths,
+            # which is exactly the case the contract does not cover.
+            n = slot_mapping.shape[0]
             torch_npu.npu_scatter_nd_update_(
                 cache, slot_mapping.to(torch.int64).contiguous(),
-                rows.reshape((slot_mapping.shape[0], ) +
-                             tuple(cache.shape[2:])).to(cache.dtype)
-                .contiguous())
+                rows[:n].reshape((n, ) + tuple(cache.shape[2:]))
+                .to(cache.dtype).contiguous())
             return
         blocks, offsets = slot_mapping[:, 0], slot_mapping[:, 1]
         valid = blocks >= 0

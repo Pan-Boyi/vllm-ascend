@@ -57,11 +57,27 @@ def mhc_post_ascend(x: torch.Tensor, residual: torch.Tensor,
     return out.squeeze(0)
 
 
+def _fused_mhc_ops_enabled() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_MHC_FUSED_OPS == "1"
+
+
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm in fp32, cast back at the end.
 
     Accumulating in bf16 loses precision over a 5120-wide sum of squares.
+
+    The torch form below is 9 kernels a call and runs once per sublayer --
+    measured 702 kernels and **1.27 ms of a 28.8 ms decode step**
+    (适配方案 §6.9.15). ``npu_rms_norm`` does the same thing in one call and
+    is **already used in this model** for the q/kv norms; it accumulates in
+    fp32 internally, which is the property the comment above is about.
     """
+    if getattr(x, "is_npu", False) and _fused_mhc_ops_enabled():
+        import torch_npu
+
+        return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0]
     original = x.dtype
     x32 = x.float()
     normed = x32 * torch.rsqrt(x32.square().mean(-1, keepdim=True) + eps)
@@ -147,6 +163,16 @@ def _collapse_with(pre_mix: torch.Tensor | None,
     """
     if pre_mix is None:
         return residual[:, 0]
+    if getattr(residual, "is_npu", False) and _fused_mhc_ops_enabled():
+        # The same weighted sum over the stream axis as a single batched
+        # matmul: [T,1,S] @ [T,S,D] -> [T,1,D]. The torch form is
+        # Cast + Mul + ReduceSum + Cast, measured 309 kernels and 0.85 ms a
+        # step, and it is also where a bf16 residual gets widened to fp32 and
+        # immediately narrowed again -- the RMSNorm right after widens it
+        # back (mhc.py:122). The cube accumulates in fp32, so the widening
+        # this replaces was already what the hardware does.
+        return torch.bmm(pre_mix.unsqueeze(1).to(residual.dtype),
+                         residual).squeeze(1)
     return (pre_mix.unsqueeze(-1) * residual.float()).sum(dim=1).to(residual.dtype)
 
 
