@@ -70,7 +70,7 @@ fi
 export DSV41_VLLM_ASCEND_TREE="$VA_TREE"
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
-usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|e2p|e5> [test args...]"; exit 2; }
+usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|e2p|e5|e2w> [test args...]"; exit 2; }
 [[ "$CARD" =~ ^[0-9]+$ ]] || usage
 case "$TEST" in
   t0) PY=t0_offload_off.py; DEF_TIMEOUT=2400;;
@@ -84,6 +84,7 @@ case "$TEST" in
   # memory, so both cap what this process may add and self-stop on the floor.
   e2p) PY=e2p_slice_cast.py;  DEF_TIMEOUT=2400;;
   e5)  PY=e5_chunked_accum.py; DEF_TIMEOUT=2400;;
+  e2w) PY=e2w_write_channels.py; DEF_TIMEOUT=1800;;
   *) usage;;
 esac
 
