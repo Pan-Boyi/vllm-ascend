@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_arm.sh <RUN> <ARM: A1|B1|A2|B2|...> <CARD> <STEPS: comma list of probe,lp,lp2,perf,gsm> [extra env assignments...]
+# run_arm.sh <RUN> <ARM: A1|B1|A2|B2|...> <CARD> <STEPS: comma list of probe,lp,lp2,perf,gsm,gsm1319,hold> [extra env assignments...]
 set -u
 ROOT=/workspace/code/dsv4_single_card/vllm_project; cd $ROOT
 RUN=$1; ARM=$2; CARD=$3; STEPS=$4; shift 4
@@ -46,6 +46,15 @@ for s in ${STEPS//,/ }; do case $s in
   gsm) EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 \
       --out-dir $D/gsm8k50 --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --limit 50 > $D/gsm8k.log 2>&1
       say "gsm8k50 rc=$? $(grep -m1 -oE 'acc[^,]*' $D/gsm8k.log | head -1)";;
+  # M4: the whole 1319. Same knobs as `gsm`, only --limit drops away (0 = all), plus
+  # --resume so a retry continues from partial.jsonl instead of starting over.
+  # 🔴 Read it against the band, not against a number: single-card offload has NO
+  # 1319 history, the only comparable figure is multi-card 1276-1281/1319
+  # (96.74-97.12%), and same-code-same-package restart noise is 11 questions
+  # ⇒ inside the band = no detectable regression, <=11 apart = INDISTINGUISHABLE.
+  gsm1319) EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 \
+      --out-dir $D/gsm8k1319 --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --resume > $D/gsm1319.log 2>&1
+      say "gsm8k1319 rc=$? $(grep -m1 -oE 'acc[^,]*' $D/gsm1319.log | head -1)";;
   hold) say "hold: sleeping until $D/release exists"; while [ ! -e $D/release ]; do sleep 10; done;;
 esac; done
 grep 'host-func over' $D/serve.log | sed 's/.*kt_offload host-func/host-func/' > $D/hostfunc.txt
