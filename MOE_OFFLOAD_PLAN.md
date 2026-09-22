@@ -735,10 +735,14 @@ Pearson 只有 0.361，被层 2 的 1071 µs 离群点压住 ⇒ 判据用**秩*
    engram 走同一口径 `engram_embedding.py:484-497`）。⇒ **对侧流是新约束**：副流与主流的 host-func **不会并行执行**
    （bs1 下同一时刻只有一层在飞，影响有限，但收益模型要按此重算）。
 3. 🔴 **kt worker 干完活忙等 50 ms 才睡 condvar**（`kt-kernel/cpu_backend/worker_pool.cpp:326-345` 与 `:484-500`），
-   decode 每层几百 µs 就有新活 ⇒ **稳态下 96×2 个 kt 线程全程自旋**，且每条被 `kt_bind_worker`（`:114-143`，
-   `hwloc_bitmap_singlify` + `HWLOC_CPUBIND_STRICT`）**硬绑到单个 PU**；机器 256 PU、kt 占 192、**余 64 空闲**。
+   decode 每层几百 µs 就有新活 ⇒ **稳态下 kt 线程全程自旋**，且每条被 `kt_bind_worker`（`:114-143`，
+   `hwloc_bitmap_singlify` + `HWLOC_CPUBIND_STRICT`）**硬绑到单个 PU**。
+   🔴 **线程数更正（2026-09-22 夜，读 `experts_base.py:365-368` + `WorkerPool::init` 落实）**：`cpuinfer_threads:96` +
+   `threadpool_count:2` 是**总共 96 条**（每 NUMA 48 = 1 分发器 + 47 计算），占 **96 个 PU**；机器 256 PU ⇒ **空 160 个**，
+   每 NUMA 还有 **16 个整核**两条 SMT 都空。先前写的"96×2=192 条、余 64"是错的。
+   ⇒ 这让绑核方案更宽裕（**不必让核**），同时**进一步削弱"抢占"假设**（空闲核这么多）；21 µs 缺口仍待卡上判。
    ⇒ **这解释了 §4.20.1 微基准为何无拐点**：那里 kt 空闲 >50 ms 已睡，量到的 56.8 µs 是「无自旋」档，
-   整网 78 µs 是「192 PU 自旋」档，21 µs 的缺口与之同向（**推断，待上卡判**）。
+   整网 78 µs 是「96 PU 自旋」档，21 µs 的缺口与之同向（**推断，待上卡判**）。
 4. **GIL 不是中位的原因，但可能是离群的原因**（纯 CPU 实测，本次）：报告线程被唤醒后执行第一条字节码的延迟，
    无竞争中位 **7.0 µs**；只要有 1 条别的 Python 线程在跑，默认 `switchinterval=5 ms` 下中位 **8.1 ms**
    （0.5 ms→1.1 ms，0.05 ms→0.12 ms）。⇒ 78 µs 不是 GIL 争用；**§4.20 层 2 的 773 µs 离群点与此同形**。
@@ -748,6 +752,12 @@ Pearson 只有 0.361，被层 2 的 1071 µs 离群点压住 ⇒ 判据用**秩*
 7. **未知**（不拿推测填）：`aclrtProcessReport` 内部等在什么原语（库已 strip）；**A 与 F 分不开**；
    CANN 9.2 另有一套 `aclrtLaunchHostFunc/SubscribeHostFunc/ProcessHostFunc`（`acl_rt.h:3195-3233`，与 `aclrtLaunchCallback` 是
    **两套机制**），torch_npu **没有引入**（`nm -D` 无符号）⇒ 哪套更快、能否在捕获下用，**完全未验**；容器能否 `SCHED_FIFO` 未验。
+
+**两条实现已入库（默认关）**：`12f7aae17`（报告线程绑核，`report_affinity.py`；`auto` 的解算读 `kt_bind_worker` 落实 stripe/singlify 规则，
+挑**两条 SMT 都空**的整核、取 kt 顺序上最后一个，本机算出 PU 63/127；**绑前把模型算出的 PU 集合与 `/proc/self/task/*` 实际比对、
+绑后 `sched_getaffinity` 回读**，不符即拒绝启动或标未生效；单测 32 条 + 4 个变异臂实测会红）与 kt 侧 `1a8d1df`
+（`KT_WORKER_SPIN_MS`，默认仍 50 ⇒ 行为逐字节不变；已编过、env 解析测试通过）。
+⚠ **kt 的 wheel 未重建** ⇒ 服务里那条改动现在是惰性的，D2 臂标「未覆盖」；重建＝换构建 ⇒ t0/t1/t2 与 D0/D1 都要在新构建上重跑。
 
 **由此定的两条实现（默认关，代码已在做）**：① **把报告线程绑到 kt 不用的 PU**（回调里 `sched_setaffinity` + **回读断言**，
 可选 `SCHED_FIFO`）——不牺牲 kt 算力，性价比最高；② **kt 自旋时长可配**（默认仍 50 ms ⇒ 行为不变），
