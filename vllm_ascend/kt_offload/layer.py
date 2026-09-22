@@ -80,9 +80,12 @@ _SIDE_STREAM = None
 # every pair stays alive for the life of the process (sglang lost a capture to
 # collected events).
 _SIDE_EVENTS: list = []
-# A6 guard: kt pinned slot (layer_idx % KT_BUFFER_DEPTH) -> the layer whose
-# side-stream work is submitted and not yet joined. See side_stream.py.
-_SIDE_INFLIGHT: dict[int, int] = {}
+# A6 guard, and it is about buffers rather than slots since 2026-09-22: the
+# id() of every store the side stream reads or writes -> the layer that owns
+# it. kt's own pinned buffers are shared by ``layer_idx % KT_BUFFER_DEPTH``,
+# which is what this path stopped using; two layers turning up on one store
+# would be that sharing coming back. See side_stream.buffer_ownership_ok.
+_SIDE_BUFFER_OWNER: dict[int, int] = {}
 
 
 def _layer_index(layer_name: str) -> int:
@@ -192,7 +195,14 @@ class KTLayerOffload:
         self._keep_tables: dict[torch.dtype, torch.Tensor] = {}
         self._pending: torch.Tensor | None = None
         self._pending_captured = False
+        # Whether the captured submit filled OUR buffers (forked or packed) or
+        # kt's own; merge() reads it to pick where the H2D comes from.
+        self._pending_own_out = False
         self._pending_join: tuple | None = None
+        # A6 across steps: set by _claim_side_buffers, cleared ONLY by
+        # _join_side_stream. route()'s blanket _pending_join reset must not
+        # clear it -- see _claim_side_buffers.
+        self._side_inflight = False
         # Host-func count of this layer when its capture recorded the node.
         self._hostfunc_at_capture: int | None = None
         self.overlap = bool(getattr(cfg, "overlap_side_stream", False))
@@ -280,11 +290,11 @@ class KTLayerOffload:
                 side_stream.ENV_NAME,
                 side_stream.slot_of(self.layer_idx),
             )
-            if not self._overlap_supported():
+            if not self._packed_supported():
                 raise RuntimeError(
-                    "kt_offload: overlap_side_stream needs kt's copy_inputs_to_cpu_buffers / "
-                    "run_pinned_forward_sync / copy_forward_output_to_device; "
-                    f"this kt build ({type(self.wrapper).__name__}) does not have them."
+                    "kt_offload: overlap_side_stream runs the CPU experts on this layer's OWN pinned "
+                    "buffers, so it needs kt's moe.forward_task and cpu_infer.submit/sync; this kt build "
+                    f"({type(self.wrapper).__name__}) does not expose them."
                 )
         if self.packed:
             if not self._packed_supported():
@@ -292,8 +302,11 @@ class KTLayerOffload:
                     "kt_offload: packed_transfer needs kt's moe.forward_task and cpu_infer.submit/sync; "
                     f"this kt build ({type(self.wrapper).__name__}) does not expose them."
                 )
+        if self.packed or self.overlap:
             # Graph mode: every capture size up front (nothing may allocate
-            # inside a capture). Eager: lazily, on first use.
+            # inside a capture). Eager: lazily, on first use -- but the side
+            # stream only ever runs on the captured path, so for it these are
+            # the only sizes that matter.
             for bs in self.capture_sizes:
                 self._packed_buffers(bs, device)
         if self.graph_enabled:
@@ -396,14 +409,6 @@ class KTLayerOffload:
     def host_ops(self) -> dict[str, int]:
         """Host-device operations this layer costs per step (for the accounting)."""
         return host_ops_per_layer(self.packed)
-
-    def _overlap_supported(self) -> bool:
-        """The captured overlap path needs only the graph-mode kt entry points."""
-        w = self.wrapper
-        return all(
-            hasattr(w, name)
-            for name in ("copy_inputs_to_cpu_buffers", "run_pinned_forward_sync", "copy_forward_output_to_device")
-        )
 
     def _prepare_capture_buffers(self, device: torch.device) -> None:
         """Register every capture size with kt, and give THIS layer its buffers.
@@ -533,9 +538,15 @@ class KTLayerOffload:
                 )
         self._pending = None
         self._pending_captured = False
+        self._pending_own_out = False
         # Clear any join left by a previous capture on every route, not only in
         # the captured branch: a forward that captured and then runs eager would
         # otherwise carry that stale cross-stream dependency (sglang 18c8b21e3).
+        # 🔴 But clearing it *silently* was how the A6 guard lost its teeth: a
+        # layer whose side-stream work was never joined arrived at its next
+        # route looking exactly like one that had been. The flag below survives
+        # this reset and is cleared only by _join_side_stream, so that case
+        # reaches _claim_side_buffers instead of being erased here.
         self._pending_join = None
         if self.wrapper is not None and hidden_states.shape[0] > 0:
             if hidden_states.dtype != torch.bfloat16:
@@ -547,16 +558,23 @@ class KTLayerOffload:
                 # No runtime condition here (not even the profile flag): a
                 # branch the capture run skips is missing from every replay.
                 hs = hidden_states.contiguous()
-                if self.packed:
+                # overlap first, packed second: with both on, the side stream
+                # uses the packed per-layer buffers, so the two are the same
+                # buffers and only the stream differs. Testing packed first (as
+                # this did until 2026-09-22) made "side stream on" silently mean
+                # "packed serial", which is why the combination used to be
+                # refused at start-up.
+                if self.overlap:
+                    self._submit_captured_forked(hs, topk_ids, topk_weights)
+                    self._pending_own_out = True
+                elif self.packed:
                     self._packed_submit(hs, topk_ids, topk_weights)
                     stream = torch.npu.current_stream(hs.device)
                     _subscribe_stream(stream)
                     payload = self._packed_payload(hs.shape[0])
                     _CAPTURED_PAYLOADS.append(payload)
                     _launch_host_func(stream, _kt_packed_forward, payload)
-                    self._pending, self._pending_captured = hs, True
-                elif self.overlap:
-                    self._submit_captured_forked(hs, topk_ids, topk_weights)
+                    self._pending_own_out = True
                 else:
                     self._submit_captured(hs, topk_ids, topk_weights)
                 self._pending, self._pending_captured = hs, True
@@ -598,8 +616,11 @@ class KTLayerOffload:
             # H2D reads the pinned output: join first, at every replay.
             self._join_side_stream(hs.device)
             # H2D from the pinned output the host-func node filled; stream
-            # order puts it after that node at every replay.
-            cpu_out = self._packed_output(hs) if self.packed else self.wrapper.copy_forward_output_to_device(hs)
+            # order puts it after that node at every replay. ``_pending_own_out``
+            # (not ``self.packed``) says whose buffer that is: the forked path
+            # uses our per-layer buffers whether or not packed_transfer is on.
+            own_out, self._pending_own_out = self._pending_own_out, False
+            cpu_out = self._packed_output(hs) if own_out else self.wrapper.copy_forward_output_to_device(hs)
         elif self.packed:
             cpu_out = self._packed_output(hs)
         else:
@@ -651,37 +672,73 @@ class KTLayerOffload:
     # change outside the protection of that device sync. The reference
     # implementation forks only in the captured path; so do we.
 
+    def _side_buffers(self, bs: int, device) -> dict:
+        """This layer's OWN device + pinned buffers for the side-stream path.
+
+        The same per-layer buffers ``packed_transfer`` uses. Two independent
+        reasons, and the second one is why this changed on 2026-09-22:
+
+        * **A6.** kt hands layer L the pinned slot ``L % 2``, so L and L+2 share
+          one buffer. The serial path is ordered by being on one stream; the
+          forked one has to arrange it.
+        * 🔴 **Lifetime.** kt's ``copy_inputs_to_cpu_buffers`` reads
+          ``topk_weights`` *from the side stream*, and the caller drops its last
+          reference the moment ``route()`` returns (routed_experts.py:707-708).
+          Inside a capture the allocator may then hand that address to a later
+          allocation, whose writes are ordered against the compute stream only.
+          Nothing the side stream reads may come from the graph's pool: the
+          compute stream copies every input into these buffers *before* the
+          fork event, and the side stream reads nothing else.
+        """
+        buf = self._packed.get(bs)
+        if buf is not None:
+            return buf
+        if _capturing():
+            raise RuntimeError(
+                f"kt_offload side stream: capturing {bs} tokens but no side buffer was prepared for that "
+                f"size (prepared: {sorted(self._packed)}); allocating inside a capture is not possible."
+            )
+        return self._packed_buffers(bs, device)
+
     def _submit_captured_forked(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
-        """Capture the D2H + host-func on the side stream, to be joined in merge()."""
+        """Fill our own buffers on the compute stream, then fork the D2H + host-func.
+
+        Order matters and is the whole fix (2026-09-22, on card
+        ``oncard_runs/*_t5r``): the three ``_device_fill`` calls are enqueued on
+        the compute stream and ``fork.record(compute)`` comes **after** them, so
+        the side stream's wait on that event orders every one of them before
+        anything the side stream does. The previous version recorded the fork
+        first and filled afterwards -- with the delay stressor
+        (``t5_side_reuse.py --stress ids-delay``) the side stream then read the
+        *previous step's* routing ids in 1160 of 1200 layer-steps while the
+        serial arm stayed bit-identical, i.e. the side stream's read raced a
+        compute-stream write with no event between them.
+        """
         if not self.graph_enabled:
             raise RuntimeError("kt_offload: a capture reached a layer built for eager mode (enforce_eager on?)")
-        bs = hs.shape[0]
-        if bs not in _kt_buffer_class().capture_buffers:
-            raise RuntimeError(
-                f"kt_offload: capturing {bs} tokens but kt has no pre-allocated buffers for that size "
-                f"(prepared: {self.capture_sizes}). Allocating inside the capture is not possible."
-            )
         device = hs.device
+        bs = hs.shape[0]
+        buf = self._side_buffers(bs, device)
         compute, side = torch.npu.current_stream(device), _side_stream(device)
-        # A forward that captured and then runs eager would otherwise leave the
-        # previous capture's join here for this forward to wait on.
-        self._pending_join = None
-        self._release_side_slot()
-        self._claim_side_slot()
+        self._claim_side_buffers(buf)
         # Positive control for the silent non-replay failure, evaluated per
         # layer rather than once at start-up: if this layer's callback runs
         # between here and its merge while we are still capturing, it was
         # EXECUTED instead of recorded, and every replay would reuse that one
         # CPU output. merge() checks the delta (side_stream.capture_hostfunc_ok).
         self._hostfunc_at_capture = HOST_FUNC_CALLS.get(self.layer_idx, 0)
+        # Device-side fills, on the compute stream, from tensors whose storage
+        # is only guaranteed to be ours while this call runs. The ids cast to
+        # int64 happens here too, in a buffer that predates the capture.
+        _device_fill(buf["dev_hidden"], hs)
+        _device_fill(buf["dev_ids"], topk_ids)
+        _device_fill(buf["dev_weights"], topk_weights)
         fork, join = _new_event(device), _new_event(device)
         _SIDE_EVENTS.append((fork, join))  # the graph's nodes reference these
-        fork.record(compute)
+        fork.record(compute)  # AFTER the fills: that is what orders them
         side.wait_event(fork)
-        shape_ref = torch.empty(tuple(hs.shape), dtype=hs.dtype, device="meta")
-        payload = (self.wrapper, shape_ref, _handle_of(side), self.layer_idx)
+        payload = self._packed_payload(bs)
         _CAPTURED_PAYLOADS.append(payload)
-        ids_for_kt = self._ids_for_kt(topk_ids)
         with _stream_ctx(side, device):
             # The capture follows the event wait onto the side stream. If it did
             # not, everything below would run once, at capture time, and every
@@ -694,39 +751,52 @@ class KTLayerOffload:
                     "output). Run with overlap_side_stream=false, or with a torch_npu whose capture follows "
                     "an event wait onto another stream."
                 )
-            self.wrapper.copy_inputs_to_cpu_buffers(hs, ids_for_kt, topk_weights)
-            _launch_host_func(side, _kt_host_forward, payload)
+            _host_copy(buf["pin"], buf["dev"])  # the one D2H, our own buffer
+            _launch_host_func(side, _kt_packed_forward, payload)
         self._pending_join = (join, side, compute)
 
-    def _claim_side_slot(self) -> None:
-        """A6: kt's pinned slot ``layer_idx % depth`` may hold one layer at a time.
+    def _claim_side_buffers(self, buf: dict) -> None:
+        """A6, across steps: our own buffers, and the previous submit joined.
 
-        kt keeps ``buffer_depth`` (2) pinned in/out buffers per batch size and
-        hands layer L the slot ``L % 2``, so L and L+2 share one. The serial
-        path was ordered by kt's own device-wide ``torch.npu.synchronize()``;
-        the side stream does not have it. What orders it here is the fork
-        event: the side stream's first op waits on an event recorded on the
-        compute stream at this layer's route, which is after layer L's H2D was
-        enqueued -- and L's own join is consumed in L's merge, before L+2 is
-        reached at all. So at most one layer per slot is ever in flight. This
-        turns that reasoning into something that can go red, rather than a
-        comment saying it holds. (The packed path has per-layer buffers and
-        does not fork; it never reaches here.)
+        Two things can go wrong and both must be able to go red rather than be
+        argued in a comment:
+
+        * **Sharing.** Every store the side stream touches must belong to this
+          layer alone. kt's pinned pair is handed out as ``layer_idx % 2``, so
+          if this path ever went back to those, L and L+2 would turn up on one
+          store and this registry would say so.
+        * 🔴 **Across steps.** ``_claim_side_slot`` (the version this replaces)
+          only counted layers in flight *within one capture*, and ``route()``
+          cleared ``_pending_join`` on the way in, so a layer that submitted and
+          was never joined looked exactly like a layer that had been joined. The
+          flag below is cleared **only** by ``_join_side_stream``; a second
+          submit before that join -- in this step or any later one -- lands here.
+          That is what makes every replay's ordering follow: the compute stream
+          waits for this layer's join inside this layer's merge, so the next
+          step's fills for this layer are behind it.
         """
-        slot = side_stream.slot_of(self.layer_idx)
-        other = _SIDE_INFLIGHT.get(slot)
-        if other is not None and other != self.layer_idx:
+        if self._side_inflight:
             raise AssertionError(
-                f"kt_offload side stream: layer {self.layer_idx} would submit onto kt pinned slot {slot} "
-                f"while layer {other}'s side-stream work is still un-joined. They share that buffer "
-                f"(kt buffer_depth {side_stream.KT_BUFFER_DEPTH}) and nothing orders the two writes."
+                f"kt_offload side stream: layer {self.layer_idx} is submitting again while its previous "
+                "side-stream work has not been joined. Its own buffers would be overwritten while the "
+                "host-func node still has to read them, and nothing orders the two."
             )
-        _SIDE_INFLIGHT[slot] = self.layer_idx
+        for name in ("dev", "pin", "pin_out", "dev_out"):
+            store = buf.get(name)
+            if store is None:
+                raise AssertionError(f"kt_offload side stream: layer {self.layer_idx} has no {name!r} buffer")
+            owner = _SIDE_BUFFER_OWNER.setdefault(id(store), self.layer_idx)
+            if owner != self.layer_idx:
+                raise AssertionError(
+                    f"kt_offload side stream: layers {owner} and {self.layer_idx} share the {name!r} buffer. "
+                    f"Per-layer buffers are what replaced kt's pinned slot sharing "
+                    f"(layer_idx % {side_stream.KT_BUFFER_DEPTH}); with them shared again nothing orders "
+                    "one layer's write against the other's read."
+                )
+        self._side_inflight = True
 
-    def _release_side_slot(self) -> None:
-        slot = side_stream.slot_of(self.layer_idx)
-        if _SIDE_INFLIGHT.get(slot) == self.layer_idx:
-            del _SIDE_INFLIGHT[slot]
+    def _release_side_buffers(self) -> None:
+        self._side_inflight = False
 
     def _check_capture_hostfunc(self) -> None:
         """No callback of this layer may have RUN during its capture."""
@@ -748,6 +818,17 @@ class KTLayerOffload:
 
         The copy is enqueued on the caller's stream (the compute stream), not
         inside the side-stream context, so nothing allocates or writes there.
+
+        🔴 The forked path stopped calling this on 2026-09-22. Being on the
+        compute stream is not enough on its own: the version that called it did
+        so *after* ``fork.record(compute)``, so the side stream's D2H of the
+        same buffer was ordered against nothing and read the previous step's
+        ids whenever it got there first (measured: 1160 of 1200 layer-steps
+        under ``t5_side_reuse.py --stress ids-delay``). The forked path now
+        fills its own int64 buffer before the fork; this stays as the guard for
+        any captured path that hands kt its own ids -- ``_submit_captured``
+        does not, so kt's ``.to(torch.long)`` there allocates inside the
+        capture on the capture stream, which is allowed.
         """
         if topk_ids.dtype == torch.int64:
             return topk_ids
@@ -764,7 +845,7 @@ class KTLayerOffload:
         """Make the compute stream wait for this layer's side-stream work."""
         pending, self._pending_join = self._pending_join, None
         self._check_capture_hostfunc()
-        self._release_side_slot()
+        self._release_side_buffers()
         if pending is None:
             if self.overlap:
                 raise AssertionError(

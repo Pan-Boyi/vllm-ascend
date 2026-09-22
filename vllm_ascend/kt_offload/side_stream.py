@@ -37,12 +37,29 @@ runtime calls the ones it can evaluate in-process:
                             *positive control* for 107025: drop the wait and
                             the on-card capture fails with 107025 (t5 off_evt),
                             keep it and it captures (t5 off_evtw).
-  ``slot_ownership_ok``     A6. kt hands layer L the pinned slot ``L % 2``, so
-                            L and L+2 share one buffer, and the side stream
-                            removes the device-wide sync that used to order
-                            them. Each layer must own its own int64 id buffer,
-                            and no two layers sharing a slot may be in flight
-                            at the same time.
+  ``slot_ownership_ok``     A6, kt's slot model. kt hands layer L the pinned
+                            slot ``L % 2``, so L and L+2 share one buffer, and
+                            the side stream removes the device-wide sync that
+                            used to order them. Kept for the paths that still
+                            hand kt its own buffers; the forked path stopped
+                            doing so on 2026-09-22.
+  ``buffer_ownership_ok``   A6 as the forked path states it now, and **across
+                            steps**: every store the side stream touches is one
+                            layer's own, and no layer submits again while its
+                            previous submit is un-joined. The second half is
+                            what ``slot_ownership_ok`` could not say: its
+                            ``in_flight`` was read within one capture, so a
+                            layer that submitted in step N and was never joined
+                            looked identical to one that had been.
+  ``submit_order_ok``       🔴 the 2026-09-22 fix, as a criterion. Everything
+                            the side stream reads must be written by the
+                            compute stream BEFORE the fork event is recorded.
+                            Recording the fork first and filling afterwards
+                            leaves the side stream's read ordered against
+                            nothing; on card that read the previous step's
+                            routing ids in 1160 of 1200 layer-steps
+                            (``t5_side_reuse.py --stress ids-delay``) while the
+                            serial arm stayed bit-identical.
 
 Zero CPU coverage, on-card only (tools/kt_offload/oncard/RUNBOOK_sidestream.md):
 the ACL capture itself (107025 as a positive control), the actual TPOT, and
@@ -173,6 +190,97 @@ def slot_ownership_ok(layers, depth: int = KT_BUFFER_DEPTH) -> dict:
         "ok": not problems,
         "detail": problems,
         "why": "kt hands layer L the pinned slot L%%depth, so L and L+2 share one buffer",
+    }
+
+
+def buffer_ownership_ok(layers) -> dict:
+    """A6 for the per-layer side buffers, and it spans steps.
+
+    ``layers`` is a sequence of ``(layer_idx, buffer_keys, inflight)`` in submit
+    order, possibly across several steps:
+
+      ``buffer_keys``  ``id()`` of every store the side stream reads or writes
+                       for that layer (empty = the layer has none, which is the
+                       shape of "it is still using kt's shared pair").
+      ``inflight``     whether that layer's PREVIOUS side-stream submit has not
+                       been joined yet. This is the cross-step half: the flag
+                       is cleared by the join, not by the next route, so a
+                       submit that outlives its step arrives here.
+    """
+    problems = []
+    owner: dict = {}
+    for idx, keys, inflight in layers:
+        if not keys:
+            problems.append(f"layer {idx} has no side buffers of its own (it would be sharing kt's slot pair)")
+        if inflight:
+            problems.append(
+                f"layer {idx} submits again while its previous side-stream work is un-joined; its own "
+                "buffers would be overwritten while the host-func node still has to read them"
+            )
+        for key in keys:
+            other = owner.setdefault(key, idx)
+            if other != idx:
+                problems.append(f"layers {other} and {idx} share the side buffer {key}")
+    return {
+        "name": "buffer_ownership_a6_across_steps",
+        "ok": not problems,
+        "detail": problems,
+        "why": (
+            "the side stream may only touch stores this layer owns, and only while its previous submit "
+            "has been joined; anything else is a write racing a read with no event between them"
+        ),
+    }
+
+
+def submit_order_ok(ops) -> dict:
+    """Everything the side stream reads was written before the fork was recorded.
+
+    ``ops`` is one layer's submit as a sequence of ``(kind, what)``:
+
+      ``("fill", buf)``       a compute-stream write into ``buf``
+      ``("fork", None)``      ``fork.record(compute)``
+      ``("side_wait", None)`` ``side.wait_event(fork)``
+      ``("side_read", buf)``  the side stream reading ``buf``
+
+    The fork event is the only thing that orders the compute stream's writes
+    against the side stream's reads, so a fill after it buys nothing: the side
+    stream is already released and whichever gets there first wins. That is the
+    bug this ordering replaced, and it is what the ``early-fork`` mutant puts
+    back.
+    """
+    problems = []
+    forked = False
+    waited = False
+    written: set = set()
+    late: set = set()
+    for kind, what in ops:
+        if kind == "fill":
+            (late if forked else written).add(what)
+        elif kind == "fork":
+            if forked:
+                problems.append("the fork event is recorded twice in one submit")
+            forked = True
+        elif kind == "side_wait":
+            if not forked:
+                problems.append("the side stream waits on a fork event the compute stream has not recorded")
+            waited = True
+        elif kind == "side_read":
+            if not waited:
+                problems.append(f"the side stream reads {what} before waiting on the fork event")
+            if what in late:
+                problems.append(
+                    f"the side stream reads {what}, which the compute stream fills AFTER fork.record: "
+                    "nothing orders that write against this read"
+                )
+            elif what not in written:
+                problems.append(f"the side stream reads {what}, which the compute stream never filled")
+    if not forked:
+        problems.append("no fork event was recorded at all")
+    return {
+        "name": "fills_before_fork",
+        "ok": not problems,
+        "detail": problems,
+        "why": "the fork event is the only edge between the compute stream's writes and the side stream's reads",
     }
 
 

@@ -9,6 +9,16 @@ returned early with an empty dict, and the first captured forward on the side
 stream raised ``no preallocated int64 id buffer``. On card that surfaced as
 ACL 107025 and was written up as a platform limit (§4.19 ②/③).
 
+🔴 Later the same day the forked path stopped handing kt its own buffers
+altogether (it fills this layer's own packed buffers on the compute stream
+before the fork instead), so ``_ids_i64`` is no longer on that path. What is
+tested here is still live: ``_prepare_capture_buffers`` is what registers kt's
+capture sizes for the *serial* captured path, the per-instance/per-process
+split is what that bug was about, and ``slot_ownership_ok`` is still the
+criterion for anything that does use kt's ``layer_idx % 2`` pair. The forked
+path's own ownership criterion is ``side_stream.buffer_ownership_ok``
+(tests/ut/kt_offload/test_side_stream_overlap.py).
+
 Note what has zero coverage here and is on-card only: whether an ACL capture
 follows the event wait onto the side stream, and 107025 itself. Those are in
 tools/kt_offload/oncard/RUNBOOK_sidestream.md.
@@ -57,7 +67,7 @@ def _clean(monkeypatch):
     FakeKtBuffer.reset()
     monkeypatch.setattr(kl, "_kt_buffer_class", lambda: FakeKtBuffer)
     monkeypatch.setattr(kl, "_CAPTURE_BUFFERS_READY", None)
-    monkeypatch.setattr(kl, "_SIDE_INFLIGHT", {})
+    monkeypatch.setattr(kl, "_SIDE_BUFFER_OWNER", {})
     yield
 
 
@@ -230,35 +240,36 @@ def _preconditions(**kw):
     return cfg, vcfg
 
 
-def test_packed_and_side_stream_together_are_refused(monkeypatch):
-    """Both on = the packed branch wins in route() and nothing forks.
+def test_packed_and_side_stream_together_are_accepted(monkeypatch):
+    """The refusal is gone, and this records why it existed and what replaced it.
 
-    The service would then log "SIDE STREAM ENABLED", dump a config saying so,
-    and serve the serial packed path: a reading attributed to the side stream
-    that the side stream never produced. Mutant arm: delete the raise in
-    config._validate_preconditions and this test goes green with both switches
-    on, which is the failure being fenced.
+    It existed because ``route()`` tested ``packed`` first, so with both on the
+    packed branch ran and nothing forked: the service would log "SIDE STREAM
+    ENABLED", dump a config saying so, and serve the serial packed path -- a
+    reading attributed to the side stream that the side stream never produced.
+    The forked path now *is* the packed per-layer buffers (it was moved onto
+    them so it would stop reading kt's shared pinned slots and the caller's
+    short-lived routing tensors), and ``route()`` tests ``overlap`` first, so
+    "on" means on. The test below pins that branch order, and
+    test_side_stream_overlap.test_packed_and_overlap_together_fork_rather_than_
+    silently_serialise asserts that the side stream really carries the work.
     """
     from vllm_ascend import envs
 
-    monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)  # even with the env set
-    cfg, vcfg = _preconditions(overlap_side_stream=True, packed_transfer=True)
-    with pytest.raises(ValueError, match="cannot both be true"):
+    monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
+    for overlap, packed in ((True, True), (True, False), (False, True)):
+        cfg, vcfg = _preconditions(overlap_side_stream=overlap, packed_transfer=packed)
         cfg._validate_preconditions(vcfg)
-    # ...and each one alone still starts
-    cfg, vcfg = _preconditions(overlap_side_stream=True, packed_transfer=False)
-    cfg._validate_preconditions(vcfg)
-    cfg, vcfg = _preconditions(overlap_side_stream=False, packed_transfer=True)
-    cfg._validate_preconditions(vcfg)
 
 
-def test_the_route_branch_order_this_refusal_is_about_has_not_moved():
-    """If packed stops shadowing overlap in route(), revisit the refusal above."""
+def test_route_takes_the_overlap_branch_before_the_packed_one():
+    """🔴 The order the refusal above was traded for. Reverse it and "side
+    stream on" silently becomes "packed serial" again."""
     import inspect
 
     from vllm_ascend.kt_offload.layer import KTLayerOffload
 
     src = inspect.getsource(KTLayerOffload.route)
-    packed_at = src.index("if self.packed:")
-    overlap_at = src.index("elif self.overlap:")
-    assert packed_at < overlap_at, "route() no longer tests packed before overlap"
+    overlap_at = src.index("if self.overlap:")
+    packed_at = src.index("elif self.packed:")
+    assert overlap_at < packed_at, "route() no longer tests overlap before packed"

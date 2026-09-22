@@ -239,7 +239,7 @@ def main() -> int:
         """
         pending, self._pending_join = self._pending_join, None
         self._check_capture_hostfunc()
-        self._release_side_slot()
+        (getattr(self, "_release_side_buffers", None) or self._release_side_slot)()
         if pending is None:
             return
         join, side, _compute = pending

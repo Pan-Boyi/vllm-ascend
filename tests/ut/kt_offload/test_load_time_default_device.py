@@ -378,7 +378,11 @@ def test_no_tensor_in_this_package_takes_the_default_device():
         seen, bare = scan_factory_calls(Path(mod.__file__).read_text())
         assert not bare, f"{name}.py lets the default device decide:\n  " + "\n  ".join(bare)
         total += seen
-    assert total >= 15, f"the scan only saw {total} factory calls; it is looking in the wrong place"
+    # 15 until 2026-09-22, when the forked path dropped its ``torch.empty(...,
+    # device="meta")`` shape reference: it hands kt a buffer dict now, not a
+    # shape. The floor is a "the scan still finds the file" check, so it tracks
+    # the real count rather than being left above it.
+    assert total >= 14, f"the scan only saw {total} factory calls; it is looking in the wrong place"
 
 
 def test_the_scan_can_go_red():

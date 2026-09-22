@@ -3,19 +3,35 @@
 
 Two layers of checking, and the second one is the point:
 
-1. The call sequence the real ``KTLayerOffload`` emits (fork -> side wait ->
-   D2H/host-func on the side stream -> join -> H2D on the compute stream),
-   event lifetime, stale-join clearing, and the refusal when a capture does not
-   follow onto the side stream.
+1. The call sequence the real ``KTLayerOffload`` emits (fill this layer's own
+   buffers on the compute stream -> fork -> side wait -> D2H/host-func on the
+   side stream -> join -> H2D on the compute stream), event lifetime, stale-join
+   refusal, and the refusal when a capture does not follow onto the side stream.
 
 2. A tiny stream simulator *executes* that recorded schedule and compares the
    result with the serial (overlap off) one **bit for bit**. Every mutant below
    (join dropped, join recorded too early, events not kept alive, capture not
-   propagated) produces a schedule that is FASTER and WRONG -- each test asserts
-   both, so the record shows why the on-card criterion is bit-identity and not
-   TPOT. sglang's F1 failure was exactly this shape: the capture did not
-   propagate to the side stream, the graph got quicker and the CPU experts'
-   contribution froze at the capture run's value.
+   propagated, 🔴 fork recorded before the fills) produces a schedule that is
+   FASTER and WRONG -- each test asserts both, so the record shows why the
+   on-card criterion is bit-identity and not TPOT. sglang's F1 failure was
+   exactly this shape: the capture did not propagate to the side stream, the
+   graph got quicker and the CPU experts' contribution froze at the capture
+   run's value.
+
+🔴 2026-09-22: what the forked path reads changed, and so did this file.
+It used to hand ``hs``/``topk_ids``/``topk_weights`` straight to kt's
+``copy_inputs_to_cpu_buffers`` **from the side stream**, with the fork event
+recorded *before* the compute-stream work those reads depend on. Two holes:
+the caller drops its last reference to the routing tensors the moment
+``route()`` returns (routed_experts.py:707-708), so inside a capture the
+allocator may hand that storage to a later allocation; and the int64 id buffer
+was filled by the compute stream *after* the fork, so whichever stream got
+there first won. On card, with the compute stream made late on purpose
+(``t5_side_reuse.py --stress ids-delay``, 40 layers x 30 steps), the side
+stream read the previous step's ids in 1160 of 1200 layer-steps and every step
+diverged, while the serial arm stayed 30/30 bit-identical. The path now fills
+this layer's **own** buffers on the compute stream and records the fork after
+them; ``_early_fork`` below is that edge taken out again.
 """
 
 from __future__ import annotations
@@ -55,6 +71,11 @@ class Sim:
         self.capturing = False
         self.captured: dict[str, list[Op]] = {}
         self.current = None
+        # id(destination Box) -> the Box a _device_fill of it reads at the
+        # moment it executes. Without it a fill would copy the value the tensor
+        # had when the op was *enqueued*, which is the reordering these tests
+        # exist to see.
+        self.fill_src: dict[int, Box] = {}
 
     def enqueue(self, stream, op):
         self.programs.setdefault(stream.name, []).append(op)
@@ -173,7 +194,13 @@ class FStream:
 
 
 class FakeKT:
-    """kt wrapper on the simulator: CPU experts compute out = 3 * input."""
+    """kt wrapper on the simulator: CPU experts compute out = 3 * input.
+
+    Only the *serial* paths are exercised through it now (eager submit/sync and
+    the captured non-forked node). The forked path stopped calling kt's pinned
+    buffers on 2026-09-22; it runs ``_kt_packed_forward`` on this layer's own
+    buffers, which ``sim`` replaces with ``_fake_packed_forward``.
+    """
 
     _layer_has_pending_deferred: dict = {}
 
@@ -181,7 +208,10 @@ class FakeKT:
         self.ids_seen: list = []
         self.sim, self.device_in = sim, device_in
         self.pinned_in, self.pinned_out, self.out_gpu = pinned_in, pinned_out, out_gpu
-        self.cpu_infer = SimpleNamespace(sync=lambda allow: setattr(self, "host_synced", True))
+        self.cpu_infer = SimpleNamespace(
+            submit=lambda task: None, sync=lambda allow: setattr(self, "host_synced", True)
+        )
+        self.moe = SimpleNamespace(forward_task=lambda *a: None)
         self.calls: list[str] = []
 
     # eager (non-overlap) path, kept so the serial arm can run
@@ -195,7 +225,7 @@ class FakeKT:
         self._h2d()
         return self.out_gpu
 
-    # overlap / captured path
+    # captured, non-forked path
     def copy_inputs_to_cpu_buffers(self, hs, ids, w):
         self.calls.append("copy_inputs")
         self.ids_seen.append(ids)
@@ -220,6 +250,60 @@ class FakeKT:
         self.pinned_out.value = 3 * self.pinned_in.value
 
 
+# ---------------------------------------------------------------------------
+# the per-layer side buffers the forked path fills and reads
+# ---------------------------------------------------------------------------
+
+
+class Store:
+    """The combined device (or pinned) allocation; its regions are Boxes."""
+
+    def __init__(self):
+        self.hidden, self.ids, self.weights = Box(None), Box(None), Box(None)
+
+    def regions(self):
+        return (self.hidden, self.ids, self.weights)
+
+
+def make_side_buffers(sim: Sim, device_in: Box, out_gpu: torch.Tensor, ids_in: Box, w_in: Box) -> dict:
+    """``_packed_buffers``' shape, with Boxes where the device tensors would be.
+
+    ``dev_out`` has to be a real tensor: ``merge`` does arithmetic with what
+    ``_packed_output`` returns.
+    """
+    dev, pin = Store(), Store()
+    buf = {
+        "dev": dev,
+        "pin": pin,
+        "dev_hidden": dev.hidden,
+        "dev_ids": dev.ids,
+        "dev_weights": dev.weights,
+        "pin_hidden": pin.hidden,
+        "pin_ids": pin.ids,
+        "pin_weights": pin.weights,
+        "pin_out": Box(None),
+        "dev_out": out_gpu,
+        "bsz": Box(1),
+    }
+    sim.fill_src[id(dev.hidden)] = device_in
+    sim.fill_src[id(dev.ids)] = ids_in
+    sim.fill_src[id(dev.weights)] = w_in
+    return buf
+
+
+def _fake_packed_forward(payload) -> None:
+    """The host-func node: this layer's CPU experts on its own pinned buffers.
+
+    ``3 * hidden`` matches FakeKT so the serial and forked arms are comparable
+    bit for bit, and the ``+ ids`` term is what makes a stale id buffer visible
+    in the output rather than only in a probe.
+    """
+    _wrapper, buf, layer_idx = payload
+    hidden, ids = buf["pin_hidden"].value, buf["pin_ids"].value
+    kl.HOST_FUNC_CALLS[layer_idx] = kl.HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+    buf["pin_out"].value = None if hidden is None else 3 * hidden + (ids or 0)
+
+
 @pytest.fixture
 def sim(monkeypatch):
     s = Sim()
@@ -228,7 +312,7 @@ def sim(monkeypatch):
     s.compute, s.side = compute, side
     monkeypatch.setattr(kl, "_capturing", lambda: s.capturing and s.current is not None and _prop(s))
     monkeypatch.setattr(kl, "_subscribe_stream", lambda stream: None)
-    monkeypatch.setattr(kl, "_kt_buffer_class", lambda: SimpleNamespace(capture_buffers={1: object()}))
+    monkeypatch.setattr(kl, "_kt_buffer_class", lambda: SimpleNamespace(capture_buffers={1: object(), 2: object()}))
     monkeypatch.setattr(kl, "_stream_handle", lambda device: 0)
     monkeypatch.setattr(kl, "_handle_of", lambda stream: stream.npu_stream)
     monkeypatch.setattr(kl, "_new_stream", lambda device: side)
@@ -237,6 +321,42 @@ def sim(monkeypatch):
     monkeypatch.setattr(kl, "_SIDE_EVENTS", [])
     monkeypatch.setattr(kl, "_CAPTURED_PAYLOADS", [])
     monkeypatch.setattr(kl, "HOST_FUNC_CALLS", {})
+    monkeypatch.setattr(kl, "_SIDE_BUFFER_OWNER", {})
+    monkeypatch.setattr(kl, "_kt_packed_forward", _fake_packed_forward)
+
+    def device_fill(dst, src):
+        """A compute-stream write into one region of this layer's device buffer.
+
+        Cost 5 each against the 2-unit D2H of the combined buffer: with the
+        fork recorded after these (production) the D2H cannot start before they
+        finish, and with it recorded before them (the mutant) the D2H finishes
+        first and copies whatever the previous replay left. The numbers are a
+        fixture -- the ordering they expose is not.
+        """
+        src_box = s.fill_src.get(id(dst))
+
+        def do():
+            dst.value = src_box.value if src_box is not None else _scalar(src)
+
+        s.enqueue(s.current, Op("fill", do, 5.0))
+
+    def host_copy(dst, src):
+        if isinstance(dst, Store):  # the one D2H: whole combined buffer
+            def d2h():
+                for d, sr in zip(dst.regions(), src.regions()):
+                    d.value = sr.value
+
+            s.enqueue(s.current, Op("d2h", d2h, 2.0))
+        else:  # the H2D of the pinned output into this layer's device tensor
+            def h2d():
+                v = src.value
+                dst.fill_(float("nan") if v is None else v)
+
+            s.enqueue(s.current, Op("h2d", h2d, 5.0))
+
+    monkeypatch.setattr(kl, "_device_fill", device_fill)
+    monkeypatch.setattr(kl, "_host_copy", host_copy)
+    monkeypatch.setattr(kl, "_pinned_empty", lambda shape, dtype: torch.empty(shape, dtype=dtype))
 
     def stream_ctx(stream, device):
         class Ctx:
@@ -261,14 +381,24 @@ def sim(monkeypatch):
     return s
 
 
+def _scalar(t):
+    return float(t.reshape(-1)[0]) if isinstance(t, torch.Tensor) and t.numel() else 0.0
+
+
 def _prop(s):
     """Whether the capture is visible on the stream the code is enqueueing to."""
     return s.current is s.compute or s.capture_propagates
 
 
-def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes):
+def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes, *, packed: bool = False):
     plan = build_plan([[0, 3]], NEXP)
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=overlap)
+    cfg = KTOffloadConfig(
+        enabled=True,
+        cpuinfer_threads=4,
+        num_resident_experts=1,
+        overlap_side_stream=overlap,
+        packed_transfer=packed,
+    )
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(hidden_size=H, moe_intermediate_size=4, num_experts_per_tok=TOPK),
@@ -285,11 +415,22 @@ def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes):
     fake = FakeKT(sim, *boxes)
     monkeypatch.setattr(rt, "_build_wrapper", lambda: fake)
     monkeypatch.setattr(rt, "_prepare_capture_buffers", lambda device: None)
+    monkeypatch.setattr(rt, "_packed_buffers", lambda bs, device: _side_buffers_for(sim, rt, bs, boxes))
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(torch.ones(plan.num_slots, 3), requires_grad=False)
     rt.after_weights_loaded(layer)
     rt._ids_i64 = {bs: torch.zeros(bs, TOPK, dtype=torch.int64) for bs in (1, 2, 4, 8)}
     return rt, fake
+
+
+def _side_buffers_for(sim, rt, bs, boxes):
+    """Build (once per bs) the per-layer buffers, sharing the arm's value model."""
+    buf = rt._packed.get(bs)
+    if buf is None:
+        device_in, _pin_in, _pin_out, out_gpu = boxes
+        buf = make_side_buffers(sim, device_in, out_gpu, Box(0.0), Box(1.0))
+        rt._packed[bs] = buf
+    return buf
 
 
 def _boxes():
@@ -331,7 +472,12 @@ def test_eager_is_never_forked_even_with_overlap_on(monkeypatch, sim):
 def test_a_stale_join_is_cleared_by_an_eager_route(monkeypatch, sim):
     """Capture, then an eager forward: the previous capture's join must not
     survive into that forward's merge (sglang 18c8b21e3 clears it in
-    pre-dispatch for every path, not only the forked one)."""
+    pre-dispatch for every path, not only the forked one).
+
+    It is cleared, and the layer still remembers that its side-stream work was
+    never joined -- that is what ``_side_inflight`` is for, and the next
+    captured submit refuses (see ``test_a_second_submit_before_the_join_is_refused``).
+    """
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
@@ -341,9 +487,10 @@ def test_a_stale_join_is_cleared_by_an_eager_route(monkeypatch, sim):
     sim.capturing = False
     rt.route(hs, w, ids, in_profile_run=False)  # eager, no merge in between
     assert rt._pending_join is None
+    assert rt._side_inflight is True  # the un-joined submit is NOT forgotten
 
 
-def test_captured_overlap_records_fork_side_work_and_join(monkeypatch, sim):
+def test_captured_overlap_fills_first_then_forks_side_work_and_joins(monkeypatch, sim):
     boxes = _boxes()
     rt, fake = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
@@ -352,18 +499,38 @@ def test_captured_overlap_records_fork_side_work_and_join(monkeypatch, sim):
     assert rt._pending_join is not None
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
     assert rt._pending_join is None  # consumed
-    assert [o.kind for o in sim.programs["compute"]] == ["record", "wait", "h2d"]
+    # 🔴 the three fills come BEFORE the record: that is the edge that orders
+    # the compute stream's writes against the side stream's reads.
+    assert [o.kind for o in sim.programs["compute"]] == ["fill", "fill", "fill", "record", "wait", "h2d"]
     assert [o.kind for o in sim.programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
     # the event objects the graph's nodes point at are kept for the process
-    # (the startup probe's own pair is in there too)
     assert len(kl._SIDE_EVENTS) >= 1 and all(len(p) == 2 for p in kl._SIDE_EVENTS)
-    # the probe's payload is in the list too; the layer's is the last one
     assert len(kl._CAPTURED_PAYLOADS) >= 1 and kl._CAPTURED_PAYLOADS[-1][0] is fake
-    # kt got int64 ids from a buffer that predates the capture, so its
-    # .to(torch.long) is the identity: nothing allocates inside the side-stream
-    # context, where an allocation would not belong to the capture stream.
-    assert fake.ids_seen and all(t.dtype == torch.int64 for t in fake.ids_seen)
-    assert all(t is rt._ids_i64[t.shape[0]] for t in fake.ids_seen)
+    # kt's shared pinned slots are not touched by the forked path at all
+    assert fake.calls == []
+    assert fake.ids_seen == []
+
+
+def test_the_side_stream_reads_only_this_layers_own_buffers(monkeypatch, sim):
+    """The criterion for the lifetime half, as a check the code can fail.
+
+    Nothing the side stream reads may be storage the caller owns: the routing
+    tensors' last reference goes when ``route()`` returns.
+    """
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
+    sim.capturing = True
+    hs, ids, w = _inputs(21)
+    rt.route(hs, w, ids, in_profile_run=False)
+    buf = rt._packed[1]
+    ours = {id(buf[k]) for k in ("dev", "pin", "pin_out", "dev_out")}
+    theirs = {id(hs), id(ids), id(w)}
+    assert not (ours & theirs)
+    rep = ss.submit_order_ok(
+        [("fill", "hidden"), ("fill", "ids"), ("fill", "weights"), ("fork", None), ("side_wait", None),
+         ("side_read", "hidden"), ("side_read", "ids"), ("side_read", "weights")]
+    )
+    assert rep["ok"], rep
 
 
 def test_capture_that_does_not_reach_the_side_stream_is_refused(monkeypatch, sim):
@@ -376,17 +543,21 @@ def test_capture_that_does_not_reach_the_side_stream_is_refused(monkeypatch, sim
         rt.route(hs, w, ids, in_profile_run=False)
 
 
-def test_stale_join_from_a_previous_capture_is_cleared(monkeypatch, sim):
+def test_a_second_submit_before_the_join_is_refused(monkeypatch, sim):
+    """🔴 The guard that had to change: it must span steps, not one capture.
+
+    ``_claim_side_slot`` counted layers in flight inside one capture and
+    ``route()`` cleared ``_pending_join`` on the way in, so a layer that
+    submitted and was never joined arrived at its next route indistinguishable
+    from one that had been joined. Now the flag is cleared only by the join.
+    """
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
     hs, ids, w = _inputs(3)
     rt.route(hs, w, ids, in_profile_run=False)
-    stale = rt._pending_join
-    rt.route(hs, w, ids, in_profile_run=False)  # a second capture, no merge in between
-    assert rt._pending_join is not stale and rt._pending_join is not None
-    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
-    assert rt._pending_join is None
+    with pytest.raises(AssertionError, match="submitting again while its previous"):
+        rt.route(hs, w, ids, in_profile_run=False)  # a second capture, no merge in between
 
 
 def test_merge_without_a_join_is_an_error(monkeypatch, sim):
@@ -411,6 +582,23 @@ def test_overlap_off_keeps_the_m2_path(monkeypatch, sim):
     assert [o.kind for o in sim.programs["compute"]] == ["d2h", "hostfunc", "h2d"]
 
 
+def test_packed_and_overlap_together_fork_rather_than_silently_serialise(monkeypatch, sim):
+    """The combination the config used to refuse.
+
+    The refusal existed because ``route()`` tested ``packed`` first, so "side
+    stream on" quietly meant "packed serial". The branch order is the other way
+    round now and both switches use the same per-layer buffers, so the
+    combination is accepted -- and here is the assertion that it really forks.
+    """
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, packed=True)
+    sim.capturing = True
+    hs, ids, w = _inputs(6)
+    rt.route(hs, w, ids, in_profile_run=False)
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    assert [o.kind for o in sim.programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
+
+
 # ---------------------------------------------------------------------------
 # 2. execute the recorded schedule: bit-identity vs wall time
 # ---------------------------------------------------------------------------
@@ -429,7 +617,7 @@ def _capture_schedule(monkeypatch, sim, boxes, *, overlap: bool):
     sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
     sim.capturing = False
-    return {name: list(ops) for name, ops in sim.programs.items()}
+    return {name: list(ops) for name, ops in sim.programs.items()}, rt
 
 
 def _replay(sim, programs, device_in: Box, out_gpu: torch.Tensor, value: float, routed_out: float = 100.0):
@@ -447,12 +635,12 @@ def _replay(sim, programs, device_in: Box, out_gpu: torch.Tensor, value: float, 
 def _arms(monkeypatch, sim, mutate=None):
     """Serial (overlap off) vs overlap schedules, replayed on the same inputs."""
     serial_boxes = _boxes()
-    serial = _capture_schedule(monkeypatch, sim, serial_boxes, overlap=False)
+    serial, _ = _capture_schedule(monkeypatch, sim, serial_boxes, overlap=False)
     sim.reset_programs()
     ov_boxes = _boxes()
-    overlap = _capture_schedule(monkeypatch, sim, ov_boxes, overlap=True)
+    overlap, rt = _capture_schedule(monkeypatch, sim, ov_boxes, overlap=True)
     if mutate is not None:
-        overlap = mutate(overlap, ov_boxes)
+        overlap = mutate(overlap, ov_boxes, rt)
     out_s, out_o, t_s, t_o = [], [], [], []
     for v in (2.0, 5.0, 9.0):
         y, t = _replay(sim, serial, serial_boxes[0], serial_boxes[3], v)
@@ -471,15 +659,14 @@ def _bits_equal(a, b):
 def test_correct_overlap_is_bit_identical_and_not_slower(monkeypatch, sim):
     out_s, out_o, t_s, t_o = _arms(monkeypatch, sim)
     assert _bits_equal(out_s, out_o), (out_s, out_o)
-    # serial: d2h 5 + host 40 + npu 30 + h2d 5 = 80; overlapped: max(45, 30) + 5 = 50
     assert t_o < t_s, (t_o, t_s)  # the point of the change; never the criterion on its own
 
 
-def _drop_join(programs, boxes):
+def _drop_join(programs, boxes, rt):
     return {n: [o for o in ops if not (n == "compute" and o.kind == "wait")] for n, ops in programs.items()}
 
 
-def _join_before_host_func(programs, boxes):
+def _join_before_host_func(programs, boxes, rt):
     side = programs["side"]
     rec = [o for o in side if o.kind == "record"]
     rest = [o for o in side if o.kind != "record"]
@@ -487,7 +674,7 @@ def _join_before_host_func(programs, boxes):
     return {**programs, "side": rest[:2] + rec + rest[2:]}
 
 
-def _events_not_kept(programs, boxes):
+def _events_not_kept(programs, boxes, rt):
     """Events collected: their record/wait nodes degrade into no-ops."""
     out = {}
     for n, ops in programs.items():
@@ -495,16 +682,31 @@ def _events_not_kept(programs, boxes):
     return out
 
 
-def _capture_not_propagated(programs, boxes):
+def _capture_not_propagated(programs, boxes, rt):
     """The side stream's work never made it into the graph (sglang's F1).
 
     In that shape the D2H and the host func ran once, eagerly, while the graph
     was being captured: the pinned output keeps that run's value for ever.
     """
-    device_in, pinned_in, pinned_out, _ = boxes
-    pinned_in.value = device_in.value
-    pinned_out.value = 3 * pinned_in.value  # the capture run's CPU output, frozen
+    device_in = boxes[0]
+    buf = rt._packed[1]
+    buf["pin_hidden"].value = device_in.value
+    buf["pin_out"].value = 3 * device_in.value  # the capture run's CPU output, frozen
     return {n: ([] if n == "side" else [o for o in ops if o.kind != "wait"]) for n, ops in programs.items()}
+
+
+def _early_fork(programs, boxes, rt):
+    """🔴 The 2026-09-22 fix, taken out again: fork recorded before the fills.
+
+    The compute stream's writes into this layer's own buffers are then ordered
+    against nothing the side stream waits for, so the D2H (5 units) finishes
+    before the first fill (10) and copies whatever the previous replay left.
+    That is the shape measured on card at 1160/1200 layer-steps.
+    """
+    compute = programs["compute"]
+    fills = [o for o in compute if o.kind == "fill"]
+    rest = [o for o in compute if o.kind != "fill"]
+    return {**programs, "compute": rest[:1] + fills + rest[1:]}
 
 
 @pytest.mark.parametrize(
@@ -514,6 +716,7 @@ def _capture_not_propagated(programs, boxes):
         ("join recorded before the host func", _join_before_host_func),
         ("events not kept alive", _events_not_kept),
         ("capture not propagated to the side stream", _capture_not_propagated),
+        ("fork recorded before the compute-stream fills", _early_fork),
     ],
 )
 def test_mutants_are_faster_and_wrong(monkeypatch, sim, name, mutate):
@@ -533,25 +736,32 @@ def test_stale_output_fingerprint_of_the_unpropagated_capture(monkeypatch, sim):
     assert len(set(out_o)) == 1, f"expected one frozen value, got {out_o}"
 
 
+def test_the_early_fork_mutant_reads_the_previous_replays_input(monkeypatch, sim):
+    """Name the failure, not just "different": it is the PREVIOUS step's value.
+
+    That is what the on-card probe reported (kt's pinned id buffer holding the
+    previous step's routing ids in 1160 of 1200 layer-steps), so the CPU model
+    has to produce the same fingerprint or it is modelling something else.
+    """
+    out_s, out_o, _, _ = _arms(monkeypatch, sim, _early_fork)
+    # each overlap replay carries the value of the replay before it
+    assert out_o[1:] == out_s[:-1], (out_s, out_o)
+
+
 # ---------------------------------------------------------------------------
-# 3. several layers sharing kt's pinned slots, with the host running ahead
+# 3. several layers, with the host running ahead
 #
-# What the tests above could not see, and the 2026-09-20 A/B did (38/50 GSM8K
-# answers differed with overlap on): kt keeps ONE pair of pinned buffers per
-# batch size and hands layer L the slot ``L % 2``. The pinned output of layer L
-# is read by an ASYNC H2D on the compute stream, and the CPU task of layer L+2
-# writes that same buffer -- from the host, the moment it is submitted. Nothing
-# orders those two unless something waits for the device.
+# kt keeps ONE pair of pinned buffers per batch size and hands layer L the slot
+# ``L % 2``: the pinned output of layer L is read by an ASYNC H2D on the compute
+# stream while the CPU task of layer L+2 writes that same buffer. In the serial
+# path kt's own submit_forward calls torch.npu.synchronize() before submitting,
+# which is what supplies the ordering. The forked path used to inherit that
+# sharing without the sync; since 2026-09-22 it has per-layer buffers instead,
+# and these tests are what says the sharing is really gone.
 #
-# In the serial path kt's own submit_forward calls torch.npu.synchronize()
-# before submitting, which is what supplied that ordering (its comment only
-# claims to protect the input D2H; it protects the output slot too). The first
-# side-stream implementation replaced it with side.synchronize(), which waits
-# for the side stream only -- so the host ran ahead of the pending H2D.
-#
-# Everything above this line is single-layer or single-stream-order, i.e. zero
-# coverage for slot reuse: with fewer than three layers no two layers share a
-# slot, and with the device drained at every step the host can never run ahead.
+# Everything above this line is single-layer, i.e. zero coverage for reuse
+# across layers: with fewer than three layers no two layers share a slot, and
+# with the device drained at every step the host can never run ahead.
 # ---------------------------------------------------------------------------
 
 DEPTH = 2  # kt's KExpertsCPUBuffer.buffer_depth
@@ -576,7 +786,8 @@ class SlotKT:
 
     def __init__(self, sim, buffers: KtBuffers, layer_idx: int, device_in: Box):
         self.sim, self.buffers, self.layer_idx, self.device_in = sim, buffers, layer_idx, device_in
-        self.cpu_infer = SimpleNamespace(sync=lambda allow: None)
+        self.cpu_infer = SimpleNamespace(submit=lambda task: None, sync=lambda allow: None)
+        self.moe = SimpleNamespace(forward_task=lambda *a: None)
 
     def _slot(self, bs):
         return self.buffers.get(bs), self.layer_idx % DEPTH
@@ -592,7 +803,7 @@ class SlotKT:
         self.sim.drain()
         return self.copy_forward_output_to_device(hs)
 
-    # -- captured / overlap path
+    # -- captured, non-forked path
     def copy_inputs_to_cpu_buffers(self, hs, ids, w):
         buf, s = self._slot(hs.shape[0])
 
@@ -621,7 +832,7 @@ class SlotKT:
         return gpu
 
 
-def _layer_runtime(monkeypatch, sim, buffers, layer_idx, device_in, *, overlap, graph):
+def _layer_runtime(monkeypatch, sim, buffers, layer_idx, device_in, *, overlap, graph, outs=None):
     plan = build_plan([[0, 3]] * 8, NEXP)
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=overlap)
     vcfg = SimpleNamespace(
@@ -640,6 +851,18 @@ def _layer_runtime(monkeypatch, sim, buffers, layer_idx, device_in, *, overlap, 
     wrapper = SlotKT(sim, buffers, layer_idx, device_in)
     monkeypatch.setattr(rt, "_build_wrapper", lambda: wrapper)
     monkeypatch.setattr(rt, "_prepare_capture_buffers", lambda device: None)
+
+    def packed_buffers(bs, device, _rt=rt, _dev_in=device_in):
+        buf = _rt._packed.get(bs)
+        if buf is None:
+            out = torch.zeros(1)
+            buf = make_side_buffers(sim, _dev_in, out, Box(0.0), Box(1.0))
+            _rt._packed[bs] = buf
+            if outs is not None:
+                outs.setdefault(layer_idx, {})[bs] = out
+        return buf
+
+    monkeypatch.setattr(rt, "_packed_buffers", packed_buffers)
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(torch.ones(plan.num_slots, 3), requires_grad=False)
     rt.after_weights_loaded(layer)
@@ -654,8 +877,13 @@ def _run_model(monkeypatch, sim, *, overlap, graph, layers=4, steps=3, batch_siz
     # tensor; a single shared Box would be read at execution time and hide the
     # very reordering these tests look for)
     ins = [Box(0.0) for _ in range(layers)]
-    rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=overlap, graph=graph) for i in range(layers)]
-    seen: list[float] = []
+    outs: dict = {}
+    rts = [
+        _layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=overlap, graph=graph, outs=outs)
+        for i in range(layers)
+    ]
+    seen: list[tuple[float, float]] = []
+    forked = overlap and graph
     for step in range(steps):
         bs = batch_sizes[step % len(batch_sizes)]
         for i, rt in enumerate(rts):
@@ -672,7 +900,7 @@ def _run_model(monkeypatch, sim, *, overlap, graph, layers=4, steps=3, batch_siz
             expect = 3 * (100.0 * (step + 1) + i)
             # the merge's add is a compute-stream op after the H2D: it sees the
             # device-side CPU output as of that moment.
-            gpu = buffers.get(bs)["gpu"][i % DEPTH]
+            gpu = outs[i][bs] if forked else buffers.get(bs)["gpu"][i % DEPTH]
             sim.enqueue(sim.compute, Op("consume", lambda g=gpu, e=expect: seen.append((float(g[0]), e)), 1.0))
         sim.drain()
         sim.reset_programs()
@@ -701,11 +929,59 @@ def test_multi_layer_overlap_captured_path_is_safe(monkeypatch, sim):
 
 
 def test_multi_layer_overlap_under_changing_batch_size(monkeypatch, sim):
-    """Batch size alternates (concurrent requests): a new bs means new kt buffers,
+    """Batch size alternates (concurrent requests): a new bs means new buffers,
     and the old ones must not be written while an H2D still reads them."""
     seen = _run_model(monkeypatch, sim, overlap=True, graph=False, batch_sizes=(1, 2, 1))
     wrong = [(got, want) for got, want in seen if got != want]
     assert not wrong, f"{len(wrong)}/{len(seen)} wrong with a changing batch size: {wrong[:4]}"
+
+
+def test_no_two_layers_share_a_side_buffer(monkeypatch, sim):
+    """A6 after the change: the forked path's stores belong to one layer each."""
+    buffers = KtBuffers()
+    ins = [Box(1.0) for _ in range(4)]
+    rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=True, graph=True) for i in range(4)]
+    sim.capturing = True
+    hs = torch.zeros(1, H, dtype=torch.bfloat16)
+    ids = torch.zeros(1, TOPK, dtype=torch.int32)
+    w = torch.ones(1, TOPK)
+    keys = []
+    for rt in rts:
+        rt.route(hs, w, ids, in_profile_run=False)
+        buf = rt._packed[1]
+        keys.append({id(buf[k]) for k in ("dev", "pin", "pin_out", "dev_out")})
+        rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            assert not (keys[i] & keys[j]), f"layers {i} and {j} share a side buffer"
+    rep = ss.buffer_ownership_ok([(i, keys[i], False) for i in range(len(keys))])
+    assert rep["ok"], rep
+    # and the criterion goes red when they do share one
+    assert not ss.buffer_ownership_ok([(0, keys[0], False), (2, keys[0], False)])["ok"]
+
+
+def test_a_layer_reusing_another_layers_buffer_is_refused(monkeypatch, sim):
+    """The mutant for the ownership half: hand layer 2 layer 0's buffers."""
+    buffers = KtBuffers()
+    ins = [Box(1.0) for _ in range(4)]
+    rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=True, graph=True) for i in range(4)]
+    sim.capturing = True
+    hs = torch.zeros(1, H, dtype=torch.bfloat16)
+    ids = torch.zeros(1, TOPK, dtype=torch.int32)
+    w = torch.ones(1, TOPK)
+    rts[0].route(hs, w, ids, in_profile_run=False)
+    rts[0].merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    rts[2]._packed[1] = rts[0]._packed[1]  # kt's layer_idx % 2 sharing, by hand
+    with pytest.raises(AssertionError, match="share the"):
+        rts[2].route(hs, w, ids, in_profile_run=False)
+
+
+def test_the_normal_layer_order_never_trips_the_buffer_guard(monkeypatch, sim):
+    """Positive control for the guard above: four layers, three steps, no raise."""
+    seen = _run_model(monkeypatch, sim, overlap=True, graph=True)
+    assert seen and all(got == want for got, want in seen)
+    # every layer released: one owner per store, nothing left in flight
+    assert len(set(kl._SIDE_BUFFER_OWNER.values())) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -726,8 +1002,14 @@ def test_multi_layer_overlap_under_changing_batch_size(monkeypatch, sim):
 # ---------------------------------------------------------------------------
 
 
-def _preconditions_cfg():
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100, overlap_side_stream=True)
+def _preconditions_cfg(packed: bool = False):
+    cfg = KTOffloadConfig(
+        enabled=True,
+        cpuinfer_threads=8,
+        num_resident_experts=100,
+        overlap_side_stream=True,
+        packed_transfer=packed,
+    )
     vcfg = SimpleNamespace(
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, data_parallel_size=1, pipeline_parallel_size=1, enable_eplb=False
@@ -755,6 +1037,20 @@ def test_the_env_opens_it(monkeypatch):
 
     monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
     cfg, vcfg = _preconditions_cfg()
+    cfg._validate_preconditions(vcfg)
+
+
+def test_packed_and_the_side_stream_together_are_accepted(monkeypatch):
+    """Both on is a configuration now, not a refusal (see the test in §1).
+
+    It was refused while ``route()`` took the packed branch first, which made
+    "side stream on" mean "packed serial". The forked path *is* the packed
+    buffers now and is taken first.
+    """
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
+    cfg, vcfg = _preconditions_cfg(packed=True)
     cfg._validate_preconditions(vcfg)
 
 
@@ -792,37 +1088,28 @@ def test_the_object_can_still_be_built_for_bisection(monkeypatch, sim):
 
 
 # ---------------------------------------------------------------------------
-# 5. the two runtime gates the side stream carries (each with its mutant)
+# 5. the runtime gates the side stream carries (each with its mutant)
 # ---------------------------------------------------------------------------
 
 
-def test_two_layers_sharing_a_kt_slot_cannot_be_in_flight_at_once(monkeypatch, sim):
-    """A6 as a check, not a comment: layer L and L+2 share kt's pinned slot.
-
-    In the real order this cannot happen -- L's join is consumed in L's merge,
-    which runs before L+2 is reached -- so the mutant has to be built by hand:
-    submit L, skip its merge, submit L+2.
-    """
-    monkeypatch.setattr(kl, "_SIDE_INFLIGHT", {})
-    buffers = KtBuffers()
-    ins = [Box(1.0) for _ in range(4)]
-    rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=True, graph=True) for i in range(4)]
-    sim.capturing = True
-    hs = torch.zeros(1, H, dtype=torch.bfloat16)
-    ids = torch.zeros(1, TOPK, dtype=torch.int32)
-    w = torch.ones(1, TOPK)
-    rts[0].route(hs, w, ids, in_profile_run=False)
-    rts[1].route(hs, w, ids, in_profile_run=False)  # slot 1: allowed alongside slot 0
-    with pytest.raises(AssertionError, match="pinned slot 0"):
-        rts[2].route(hs, w, ids, in_profile_run=False)  # slot 0 again, layer 0 not joined
+def test_submit_order_criterion_goes_red_on_a_fill_after_the_fork(monkeypatch):
+    """The pure form of the fix, so it can be read without a simulator."""
+    good = [("fill", "ids"), ("fork", None), ("side_wait", None), ("side_read", "ids")]
+    assert ss.submit_order_ok(good)["ok"]
+    bad = [("fork", None), ("fill", "ids"), ("side_wait", None), ("side_read", "ids")]
+    rep = ss.submit_order_ok(bad)
+    assert not rep["ok"] and any("AFTER fork.record" in p for p in rep["detail"]), rep
+    never = [("fork", None), ("side_wait", None), ("side_read", "ids")]
+    assert not ss.submit_order_ok(never)["ok"]
 
 
-def test_the_normal_layer_order_never_trips_the_slot_guard(monkeypatch, sim):
-    """Positive control for the guard above: four layers, three steps, no raise."""
-    monkeypatch.setattr(kl, "_SIDE_INFLIGHT", {})
-    seen = _run_model(monkeypatch, sim, overlap=True, graph=True)
-    assert seen and all(got == want for got, want in seen)
-    assert kl._SIDE_INFLIGHT == {}, kl._SIDE_INFLIGHT  # every layer released its slot
+def test_buffer_ownership_criterion_spans_steps():
+    """``in flight`` is a property of the layer, not of one capture."""
+    steps = [(0, {1}, False), (1, {2}, False), (0, {1}, False), (1, {2}, False)]
+    assert ss.buffer_ownership_ok(steps)["ok"]
+    rep = ss.buffer_ownership_ok([(0, {1}, False), (0, {1}, True)])
+    assert not rep["ok"] and any("un-joined" in p for p in rep["detail"]), rep
+    assert not ss.buffer_ownership_ok([(0, set(), False)])["ok"]  # no buffers of its own
 
 
 def test_a_host_func_that_runs_during_the_capture_is_refused(monkeypatch, sim):

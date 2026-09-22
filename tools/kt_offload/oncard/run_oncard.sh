@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t5
+#  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t5 | t5r
 #                                                     | e2p | e5 | e2w | h2d  (gate-clearing checks)
 #
 #  The only way the single-layer on-card checks touch a card. The shell enforces:
@@ -72,7 +72,7 @@ fi
 export DSV41_VLLM_ASCEND_TREE="$VA_TREE"
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
-usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|e2p|e5|e2w|h2d> [test args...]"; exit 2; }
+usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|t5r|e2p|e5|e2w|h2d> [test args...]"; exit 2; }
 [[ "$CARD" =~ ^[0-9]+$ ]] || usage
 case "$TEST" in
   t0) PY=t0_offload_off.py; DEF_TIMEOUT=2400;;
@@ -81,6 +81,11 @@ case "$TEST" in
   t3) PY=t3_side_stream.py; DEF_TIMEOUT=2400;;
   t4) PY=t4_overlap_ceiling.py; DEF_TIMEOUT=1800;;
   t5) PY=t5_auto_dispatch.py; DEF_TIMEOUT=1800;;
+  # t5r: the same forked path under a service's shape (>=8 layers, K replays
+  # back to back with no synchronize, routing buffers written/freed right after
+  # route()). t5's single-layer arms are green on code that a service gets wrong
+  # (MOE_OFFLOAD_PLAN §4.23), so the two are separate tests, not one flag.
+  t5r) PY=t5_side_reuse.py; DEF_TIMEOUT=2400;;
   # gate-clearing checks for the streaming-prefill / dynamic-hot-expert design
   # question (2026-09-22). Small on purpose: a co-tenant GSM8K run holds host
   # memory, so both cap what this process may add and self-stop on the floor.
