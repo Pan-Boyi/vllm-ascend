@@ -121,29 +121,45 @@ cd $PROFDIR/*_ascend_pt/ASCEND_PROFILER_OUTPUT   # task_time.csv / kernel_detail
 WT=/workspace/code/dsv4_single_card/vllm_project/worktrees/moe-offload/tools/kt_offload/prof
 # ① kt 相位（D）：先用 kd/ktphase 的老口径拿到每层 D，写 JSON
 python3 $WT/ktphase.py $RUN/serve.log <start_byte> <end_byte> $RUN/ktphase.json
-# ② 接缝分解 + 对账（NOTIFY_WAIT 可给 csv，也可给 §4.18 的 353.6 当参照）
+# ② 接缝分解：窗口取 cap/capture.json 的 capture_start/capture_end（下面两行按它填）
 python3 $WT/seam.py $RUN/serve.log --ktphase $RUN/ktphase.json \
-        --nw-csv ./task_time.csv --layers 40 --json-out $RUN/seam.json
+        --nw-csv ./task_time.csv --layers 40 \
+        --since 2026-09-22T15:01:48Z --until 2026-09-22T15:01:56Z \
+        --json-out $RUN/seam.json
 ```
-`seam.py` 打印：每层各段中位/p90、全网 ms/token、`E = sync − D`、`A+F_dev = NW − T_cb`、
-以及 `NW − D` 这条与 §4.18 的 107.5 µs 直接对照的总量。
-**判红条件**（rc=1）：任一层 `|T_cb − Σ分段| > 2 µs` ⇒ 分段本身错了，表不要读。
-⚠ `--nw-csv` 里的"层序号"是**步内顺序**，不是层 id；只有每层都有节点时两者才对得上
-（`VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG` 那条日志正好证明这一点：每层每步恰一次、无丢层）。
-🔴 **原样喂 `task_time.csv` 会错位两格**（2026-09-22 首发实测）：本构建每步 **42** 个 NOTIFY_WAIT，
-前 2 个不是 kt 层（§4.18 基线同样如此，"后 40 个是我们的 40 层"），而 `seam.py` 按位置 j = 层 j 配对，
-只在 `len(nw)!=40` 时打一行警告、照样出表。对位验证：`corr(NW, cb)` 位移 0/1/2 = −0.19 / 0.06 / **0.75**。
-⇒ 先派生一份只含"每步恰 42 个的步、去掉步内前 2 个"的 csv 再喂（首发用的派生脚本在该 run 目录
-`make_nw_ours40.py`，未入库）。
-⚠ `[kt-seam]` 的窗口：`seam.py` 读整份日志的全部记录，**没有窗口参数** ⇒ 先把 profile 窗口内的记录行
-（按日志时间戳，每条覆盖其前 `interval_s` 秒）抽到单独文件再喂；ktphase 的字节区间取
-`POST /start_profile` 那行到 EngineCore 退出那行。`profile_window_end.txt` **不是**窗口终点
-（capture 脚本在 EngineCore 死后会挂满自己的超时，首发晚了 10 min）；窗口以 `cap/capture.json` 的
-`capture_start`/`capture_end` 为准。
-⚠ 对账判红的口径：`seam_timing.record()` 里各段是**首尾相接的同一串时间戳**，逐回调 Σ段 ≡ cb；
-而对账比的是"各段中位之和 vs cb 的中位"，二者本来就不相等（中位不可加）。首发两组读数残差都**有正有负**
-（窗口 −3.2…+10.2 µs/层，全程 −26…+24），不像一个放错位置的时间戳（那会是单侧常数）。
-这条是对判据的疑问，**不是放行**：rc=1 仍如实报告，改判据要另行决定。
+`seam.py` 打印：窗口里用了几条记录、每层各段中位/p90、全网 ms/token、`E = sync − D`、
+`A+F_dev = NW − T_cb`、以及 `NW − D` 这条与 §4.18 的 107.5 µs 直接对照的总量。
+
+**窗口**（09-22 入库）：`--since/--until` 收下 `2026-09-22T15:01:48Z` / `09-22 15:01:48` / `15:01:48`
+三种写法，**按日志自己的时钟**（本机 = UTC）；每条记录覆盖它前面 `interval_s` 秒，重叠 ≥ 50%
+（`--window-min-overlap`）才收。不给窗口就是全量，**用了几条一定印出来**。也可以 `--bytes A:B`
+按字节切（与 ktphase 同一口径）。`profile_window_end.txt` **不是**窗口终点（capture 脚本在
+EngineCore 死后会挂满自己的超时，首发晚了 10 min）；窗口以 `cap/capture.json` 为准。
+
+**NOTIFY_WAIT 的对位**（09-22 入库，首发是手工脚本 `make_nw_ours40.py`）：本构建每步 **42** 个
+NOTIFY_WAIT，**前 2 个不是我们的层**。现在这条规则在工具里：只用"恰好 `层数 + --nw-skip`（默认 2）个"
+的步、丢掉每步前 `--nw-skip` 个；并且**自带判据**——对位后 `Spearman(NW, cb)` 必须 ≥ `--nw-align-min`
+（0.5）且比其它任何位移高出 `--nw-align-margin`（0.3），否则**拒绝出 NW / A+F_dev 两列并 rc=1**。
+首发实测：位移 0/1/2 = −0.105 / 0.056 / **0.805**（Spearman；Pearson 0.361，被层 2 那个 1071 µs 的
+离群点压住了，所以判据用秩相关）。`--nw-median-us` 仍可给一个常数当参照（那条不做对位检查）。
+
+**判红条件**（rc=1，09-22 改口径）：
+- 分段自检失败（见下），或
+- NOTIFY_WAIT 对位判据没过。
+
+⚠ 分段自检判的是什么、不判什么（**首发 rc=1 的 24/40 层是旧判据的锅，不是机器的锅**）：
+`seam_timing.record()` 里各段是首尾相接的同一串时间戳 ⇒ **逐回调 Σ段 ≡ cb，没有可查的残差**；
+而记录侧只给中位/p90，"各段中位之和 vs cb 的中位"是两个不同的统计量（**中位不可加**），右偏的段会
+让它系统性为正。现在这个数只作为 `resid_med` 打印，**不是判据**。判据换成逐层的**必要条件**（都不假设可加）：
+- 包含关系：每段的中位与 p90 都必须 ≤ cb 的（split 时中间各段还要 ≤ `kt` 的）；
+- 联合界：`med(cb) ≤ p90(pre)+p90(kt)+p90(post)`（3×10% < 50%，故中位不可能超过它）；
+  split 时另有 `med(kt) ≤ Σ p90(中间 5 段)`。每层的余量 `slack` 逐行打印出来 = **这一层能查出多大的洞**；
+- split 跑里中间任何一段中位为 0 ⇒ 红（那是记录侧没填中段的回调混进来了）。
+
+**这套查不出**：小于 slack 的洞；占比不高的"未 split 回调"；以及**单次回调**残差被放大——
+中位/p90 的记录里根本没有这个信息。要判到单次回调，**记录侧**得多给一项（建议：每层
+`n_unsplit`，或 `resid_us` 的 max）；解析侧已经预留：记录里出现这两个字段就直接按它精确判。
+（本次没改 `vllm_ascend/` 下任何文件。）
 
 ## 读完之后
 
