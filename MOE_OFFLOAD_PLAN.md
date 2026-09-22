@@ -463,6 +463,60 @@ npu-smi 忙卡印 `Process id`（大写）、空卡印 `No process in device.` �
 ② **t4**：node_us / window_us / ceiling（全部相对本发实测，不再引用作废单价）。
 ③ **t5**：`auto_dispatch_capture` 能不能救回侧流；两臂**分进程**（失败的捕获会污染同进程的后一次）；`--arm off` 预期仍报 107025 作阳性对照——**没有它，「成功」可能只是参数没生效**。
 
+## 4.18 🟢 phase 2（2026-09-22）：rebase 到 clean `a0e673186` + 换包 + 首批卡上读数
+
+> 维护者：`dsv41_vllm_single_card_phase2`。本节读数全部**当场内联**；run 目录都是未跟踪产物（k.16），
+> 出处标「可复验」= 目录仍在且可重跑；丢了就按「已记录、不可再验」引用。
+
+**rebase**（用户拍定目标先 `f85267ab8`、途中 clean 前进后改 `a0e673186`）：74 个提交零冲突重放；
+`envs.py` 只剩我方三项；三个 clean 新提交都不碰 csrc。⚠ `69132e27c`（视觉 MoE router 融合，
+`VLLM_ASCEND_DSV41_FUSED_VISION_ROUTER` 默认 "1"）**走在纯文本 decode 的每一层**（V4.1 40 层都建 `bias_vl`），
+不改我方接口契约（仍返回 `(weights f32, ids i32)`，我方 route/merge 在其下游），但它调新 `.so` 的
+`moe_gating_top_k_hash` ⇒ 又一条"不换包不能跑"的理由。
+测试：kt_offload **297 passed / 0 skipped**；selftest_cpu 70、selftest_packed_ab 102；
+models+attention 失败集合与 clean `a0e673186` **逐条相同（34）**，我方多 17 通过。
+快照分支：`-pre-rebase-0922`（2dfbb3449）、`-rebased-f85267ab8`（393277913）、`-rebased-a0e673186`（ddbb42454）。
+
+**换包**（用户授权；验收在 worktrees/ 外做，免得共享闸在验收期间对全线变红）：
+- 依据：`ada1cc48e..a0e673186` csrc 零改动 ⇒ clean 的 `.so` `85331298…` 对应我方源码；旧 `.so` `2b58b578…`
+  里批次 1 新符号 **0 命中**、clean 那份命中（旧 `.so` + 新代码 = 静默算错，有读数）。
+- 四元组逐项与 clean 钉值相等：so `85331298bdeffee02b7c42c5658030ac` / vendor 786 文件 / 9.2.0-beta.2 /
+  指纹 `b7f2b59a…4a719b2`；不重编。
+- 验收（树外 `staging/moe-offload-a0e6`，卡 0）：**t0** 15/15 必检、6 变异臂全红、58 s；**t1** 57/57、21 臂、76 s；
+  **t2** 14/14、1 臂、17 s；整网图模式 GSM8K **50/50**（err 0 / trunc 0 / stop 1.0，T=0 thinking 关，口径自检一致）。
+  出处 `oncard_runs/20260922_115351_t0`、`_115534_t1`、`_115726_t2`、`p2_serve_0922_120351/gsm8k50`【可复验】。
+- 落地：拷进 `worktrees/moe-offload`，**同一步**改共享闸钉值（build_artifacts `5c87ee2`）；旧产物备份
+  `moe_offload_ref/pre_swap_artifacts_0922/`；正式树上复跑 t0（卡 1）PASS 59 s。
+- 🔴 **跨这次换包的读数一律不可比**（构建指纹会拒绝给差值）。
+
+**整网服务首读**（卡 0，图模式，KT_OFFLOAD=1 N=100 prefix，MAXLEN 32768，`p2_serve_0922_120351`【可复验】）：
+- 起到就绪约 4.5 min；`candidate filter: 8 indexers, 5 take part` ⇒ **ds41/O6 路径在**；无 10701x。
+- KV：available **27.40 GiB**，`GPU KV cache size 172,049 tokens / 5.25x`。⚠ 这个 token 数 = 满长并发 × MAXLEN
+  （旧 42,733 = 5.22 × 8192），**容量以并发数读，两次几乎相同**；不要拿 172k 与 42.7k 比。
+  `kv_budget_singlecard.py` 在新构建上对账通过：池块 **517,632 B**、167.0 KiB/token（L=32768）；
+  L3 在 L=32768 下 **3.58×**（8192 下 3.85×，倍数随 MAXLEN 变）。
+- **>16k 功能验通**（O15 前提：ds41 qli 在 `valid_s2%8==0` 时不钉最新块，本组读数都带着它，不是干净基线）：
+  - LongBench-v2 真题 4 道（完整 22.3k–26.5k tok，服务 usage 与本地计数逐一相同）：完整臂 **4/4 对**；
+    对照臂（只留尾部 12k）：**1 道判区分**（Nemotron-4 Table 2 题，截断臂原话 "I don't see any information…"），
+    3 道截断后仍对 ⇒ 无区分力、不计证据。单发单选 ⇒ 那道 PASS 仍有 ~25% 蒙对概率。
+  - 针扫描（真实语料填充）**9/9 命中**，实际 prompt **17,254–31,141 tok** 全部 >16384；最远一针在 31,141 tok 的深度 0。
+  - 单卡 offload 下 >16k 请求耗时 **37–45 s/条**（22–26.5k prompt，max_tokens 128；首个读数，未分解 prefill/decode）。
+  - 工具：`tools/kt_offload/longctx/`（`de7ee6cab` 入库）；读数 `p2_serve_0922_120351/longctx_check.json`、`niah.json`【可复验】。
+
+**这一路抓到的四个"只在卡上暴露"的缺陷**（都已修、都补了会红的检查）：
+1. `run_oncard` 起跑前的占卡采样在 `$(...)` 子 shell 里设全局量 ⇒ `set -u` 下第一发 t0 死于
+   `PA_LAST_SAMPLES: unbound variable`（`fb06ddedb`）。旧自检只 `grep` 函数名 = 判据读代理。
+2. launcher 的 .so 闸调用时 `$_TREE` 还是空 ⇒ **从没真比过 md5**（占位期望值让两种拒绝读起来一样）（`2b89f5699`）。
+3. 树外 PYTHONPATH 改写用子串替换，`worktrees/moe-offload` 是 `moe-offload-vllm` 的前缀 ⇒ vllm 树被改没
+   （`195f01808`，改按路径分量；共享 bringup:316 同病，已告知 flash_dev，未改共享件）。
+4. A/B runner 不传 `WT`/vllm 树给 launcher ⇒ 会起**主 checkout 那棵树**；被租约 owner 不一致意外拦下（`70d38c240`）。
+
+**共享闸现状**：`build_artifacts/shared_so_manifest.txt` 被 09-21 清理（`2e21d32`）删除 ⇒
+`verify_shared_artifacts.sh` 对所有人 rc=1。用户决定不恢复、不改共享脚本；本线 launcher 只对这两条 ❌
+**窄放行**（`dc3e7ec27`，fail-closed，放行记录落 `shared_gate_waiver.txt`）。
+
+**待办**：launcher 起服务不自动盖构建指纹（本次事后补盖）；A/A 基线与 decode profile 进行中。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -531,3 +585,4 @@ npu-smi 忙卡印 `Process id`（大写）、空卡印 `No process in device.` �
 - 2026-09-21：⛔ .so 不换了（撤回，见 §4.13 顶部）；旧读数无需脚注、不重测基线。产物盖指纹照做。新增通则：分发二进制前必须验证依赖的源码改动在被分发的树里——只搬一半的分发会产出「测了但什么都没测到」的漂亮报告。
 - 2026-09-21：仪表三条更正（§4.15）：等卡循环从没等过（小写 grep，且解释掉一批「环境毛病」旧观察）、nproc 恒为 1、机器自漂 2.5× ⇒ A/B 改交错轮次 + 噪声地板，没尺子就判 fail；packed 结论降级为「未测到收益」。.so 分发再次推后（改成树外验收），校验值保持旧值。
 - 2026-09-22：用户拍定 **rebase 到 clean `f85267ab8`**（不重新分叉；理由：保住 66 个提交里的「为什么」）并**交接给新 session**；实测代价：1 处相邻行冲突、283 条测试全过、依赖的接口在新 clean 上逐位未变。风险与队列见 `HANDOFF_next_session.md`。新事实：`INDEXER_QUANT_CACHE` 默认已为 1 且不能单独关 ⇒ 换算子包是硬前提；ds41 缺失**不报错只退回**；多卡对标 26.84→**≈22.7 ms**（四卡口径，单卡无读数）。
+- 2026-09-22（phase2）：rebase 到 clean `a0e673186`（74 提交零冲突）、换包（clean 同一份四元组，树外验收 t0/t1/t2 + GSM8K 50/50 后落地并改钉值）、整网图模式首读（KV 5.25× 并发 @32k、O6 路径在、>16k 验通：LongBench-v2 1 道区分 + 针 9/9）。四个卡上暴露的缺陷已修。见 §4.18。
