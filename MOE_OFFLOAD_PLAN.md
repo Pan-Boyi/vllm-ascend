@@ -718,6 +718,42 @@ Pearson 只有 0.361，被层 2 的 1071 µs 离群点压住 ⇒ 判据用**秩*
 2. **根治靠侧流**：侧流不消掉这 78 µs，但把它挪到副流、让主流同时算；t4 实测窗口 83.2 µs/层与之几乎相当。
    前提是先修 §4.19③ 的进程级缓冲守卫。
 
+## 4.21 🔴 ACL 回调派发链路（2026-09-22 夜，只读代码 + 纯 CPU 实验，未占卡）
+
+链路（带出处）：`_launch_host_func`（`layer.py:551/634/693`）→ `torch_npu._C._launch_host_func` →
+`c10_npu::launch_callback` → **`aclrtLaunchCallback`（ACL_CALLBACK_BLOCK）** ⇒ device 侧就是
+`NOTIFY_WAIT` + `HOSTFUNC_CALLBACK` 这一对任务。订阅走 `torch_npu.npu._subscribe_report`；
+执行回调的是 C trampoline：`PyGILState_Ensure → Py_BuildValue → PyObject_CallObject`（**seam 的 T_ENTER 打在 Python 里
+⇒ A 段含「报告送达 + 抢 GIL + 建参数元组」**）。
+
+1. **torch_npu 进程内只有一条报告线程**（首次 `_subscribe_report` 时 `pthread_create`，之后所有流复用同一 tid；
+   **无线程名、SCHED_OTHER、不绑核**），循环体 `while(!stop) aclrtProcessReport(100)`。
+   🔴 **100 ms 是阻塞等待上限、不是轮询间隔**（有回调立即返回；若是定时轮询则平均等 50 ms，与实测 78 µs 矛盾），
+   **且没有任何 env 可调** ⇒ **不要去试**。kt 自带 poller（`ascend_callback_worker.cpp:16`，同样 100 ms）与 torch_npu 逐行等价，
+   换回去也没用 ⇒ **不要浪费卡时**。
+2. **所有流共用这一条回调线程**（反汇编证据：全局 tid 传给每次 `aclrtSubscribeReport`；`seam_timing.py:96-101` 的注释已依赖此性质；
+   engram 走同一口径 `engram_embedding.py:484-497`）。⇒ **对侧流是新约束**：副流与主流的 host-func **不会并行执行**
+   （bs1 下同一时刻只有一层在飞，影响有限，但收益模型要按此重算）。
+3. 🔴 **kt worker 干完活忙等 50 ms 才睡 condvar**（`kt-kernel/cpu_backend/worker_pool.cpp:326-345` 与 `:484-500`），
+   decode 每层几百 µs 就有新活 ⇒ **稳态下 96×2 个 kt 线程全程自旋**，且每条被 `kt_bind_worker`（`:114-143`，
+   `hwloc_bitmap_singlify` + `HWLOC_CPUBIND_STRICT`）**硬绑到单个 PU**；机器 256 PU、kt 占 192、**余 64 空闲**。
+   ⇒ **这解释了 §4.20.1 微基准为何无拐点**：那里 kt 空闲 >50 ms 已睡，量到的 56.8 µs 是「无自旋」档，
+   整网 78 µs 是「192 PU 自旋」档，21 µs 的缺口与之同向（**推断，待上卡判**）。
+4. **GIL 不是中位的原因，但可能是离群的原因**（纯 CPU 实测，本次）：报告线程被唤醒后执行第一条字节码的延迟，
+   无竞争中位 **7.0 µs**；只要有 1 条别的 Python 线程在跑，默认 `switchinterval=5 ms` 下中位 **8.1 ms**
+   （0.5 ms→1.1 ms，0.05 ms→0.12 ms）。⇒ 78 µs 不是 GIL 争用；**§4.20 层 2 的 773 µs 离群点与此同形**。
+5. **sglang 走完全相同的链路**（`kt_ep_wrapper.py:98-108 / :646 / :812`）⇒ 它的 −5.37 ms **不来自派发延迟**，
+   来自 `_submit_raw_npu_graph_forked`（`:653-676`）的重叠。可抄的差异只有"捕获前就订阅主流与侧流"（与延迟无关）。
+6. 唯一可比的 host-func 往返实测：engram 图内 **38.1 µs/节点**（`DSV4.1_性能分析报告.md:478`，6 次/228.4 µs/步，**含 numpy gather**，那发没有 kt）。
+7. **未知**（不拿推测填）：`aclrtProcessReport` 内部等在什么原语（库已 strip）；**A 与 F 分不开**；
+   CANN 9.2 另有一套 `aclrtLaunchHostFunc/SubscribeHostFunc/ProcessHostFunc`（`acl_rt.h:3195-3233`，与 `aclrtLaunchCallback` 是
+   **两套机制**），torch_npu **没有引入**（`nm -D` 无符号）⇒ 哪套更快、能否在捕获下用，**完全未验**；容器能否 `SCHED_FIFO` 未验。
+
+**由此定的两条实现（默认关，代码已在做）**：① **把报告线程绑到 kt 不用的 PU**（回调里 `sched_setaffinity` + **回读断言**，
+可选 `SCHED_FIFO`）——不牺牲 kt 算力，性价比最高；② **kt 自旋时长可配**（默认仍 50 ms ⇒ 行为不变），
+上卡时必须同时读 A+F 与 E（自旋变短会把成本挪到唤醒）。执行单 `tools/kt_offload/oncard/RUNBOOK_dispatch.md`，
+三臂同时段交错 D0/D1/D2，主判据是 `seam.json` 的每层 A+F_dev，旁证 `/proc/<pid>/task/*/stat` 的 R 态线程数（192 → 更低）。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -799,3 +835,4 @@ Pearson 只有 0.361，被层 2 的 1071 µs 离群点压住 ⇒ 判据用**秩*
 - 2026-09-22（phase2）：rebase 到 clean `a0e673186`（74 提交零冲突）、换包（clean 同一份四元组，树外验收 t0/t1/t2 + GSM8K 50/50 后落地并改钉值）、整网图模式首读（KV 5.25× 并发 @32k、O6 路径在、>16k 验通：LongBench-v2 1 道区分 + 针 9/9）。四个卡上暴露的缺陷已修。见 §4.18。
 - 2026-09-22（phase2）：t4 修表后 node 52.6 µs / window 83.2 µs（形态 C 判负）；🔴「副流捕不了」作废——真因是我们自己的 int64 缓冲守卫 bug，现状参数下真实 3 层 fork/join 可捕获且 replay 逐位正确；107025 的真条件是「副流尾 record 必须被主流 join」。见 §4.19。
 - 2026-09-22（phase2）：接缝拆解首发——A+F（ACL 派发+回通知）78 µs/层 = 3.83 ms/token 占接缝 67%，我方 Python 仅 0.31 ms；埋点开销"没测出来但可能 0.4–0.8 ms"；seam.py 两条仪器问题待修。见 §4.20。
+- 2026-09-22（phase2）：查清 ACL 回调派发链路——单条报告线程、不绑核、`aclrtProcessReport(100ms)` 是阻塞上限非轮询间隔且不可调；🔴 kt worker 忙等 50 ms 才睡 ⇒ 稳态 192 个 PU 全程自旋、挤占不绑核的报告线程（解释了微基准 56.8 vs 整网 78 µs 的缺口）；GIL 只解释离群不解释中位。见 §4.21。
