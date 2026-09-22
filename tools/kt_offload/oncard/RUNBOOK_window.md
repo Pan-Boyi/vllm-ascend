@@ -1,6 +1,6 @@
 # 窗口执行单（A/A → t4 → t5，按此顺序，一条一条粘）
 
-三件同构建；**本树**的 `.so` 不换，用现值 `2b58b578e4fc720ef30f4528c5a974fa`。
+三件同构建；**本树**的 `.so` 已于 2026-09-22 换成 clean 同一份 `85331298bdeffee02b7c42c5658030ac`（旧 `2b58b578…` 作废，跨这次换包的读数不可比）。
 `ONCARD_EXPECT_SO_MD5` 是**本树期望值**（`worktrees/moe-offload`）：闸只判**这棵树**的 `.so`，
 `.so` 不是这份就**拒绝起飞**（rc=3，什么都不碰）。起飞前会并排打印
 `tree=<被检查的树>`、`.so md5`、以及该树 `vendors` 的 `sha/files(regular)/bytes` ——
@@ -9,7 +9,7 @@
 ```bash
 cd /workspace/code/dsv4_single_card/vllm_project
 export TMPDIR=/dev/shm/dsv41_tmp TMP=/dev/shm/dsv41_tmp
-export SO=2b58b578e4fc720ef30f4528c5a974fa
+export SO=85331298bdeffee02b7c42c5658030ac   # 2026-09-22 换包后；旧值 2b58b578… 已作废
 export CARD=3            # 按当时空闲的卡改
 WT=worktrees/moe-offload/tools/kt_offload/oncard
 ```

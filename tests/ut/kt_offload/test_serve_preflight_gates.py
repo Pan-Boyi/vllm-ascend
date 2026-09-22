@@ -46,15 +46,34 @@ def tree_so():
 # -- the .so gate ------------------------------------------------------------
 
 
-def test_the_placeholder_expectation_refuses_this_tree():
-    """The state this was written in: rebased onto f85267ab8, still carrying
-    the old ``.so``. The gate must refuse, and say why."""
+NEW_SO = "85331298bdeffee02b7c42c5658030ac"   # clean 同一份，2026-09-22 单卡验收后换入
+OLD_SO = "2b58b578e4fc720ef30f4528c5a974fa"   # rebase 前的 .so；新代码下会静默算错
+
+
+def test_the_default_expectation_is_the_swapped_so():
+    """State after the 2026-09-22 swap: the default expectation is the new
+    .so and this tree carries it. Reads the tree's real .so, not a proxy."""
+    assert hashlib.md5(tree_so().read_bytes()).hexdigest() == NEW_SO  # noqa: S324
     r = run(["so"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert NEW_SO in r.stdout
+    assert str(ROOT) in r.stdout          # names the tree it checked (k.14)
+
+
+def test_the_old_so_expectation_is_refused():
+    """Mutation arm: pointing the gate back at the pre-rebase .so must go red."""
+    r = run(["so"], {"SERVE_EXPECT_SO_MD5": OLD_SO})
+    assert r.returncode == 1, r.stdout + r.stderr
+
+
+def test_the_placeholder_expectation_refuses_and_says_why():
+    """The placeholder path (used between a rebase and a swap) must refuse
+    and name the silent-miscompute reason."""
+    r = run(["so"], {"SERVE_EXPECT_SO_MD5": PLACEHOLDER})
     assert r.returncode == 1, r.stdout + r.stderr
     assert "拒绝起飞" in r.stdout
     assert "静默算错" in r.stdout
     assert PLACEHOLDER in r.stdout
-    assert str(ROOT) in r.stdout          # names the tree it checked (k.14)
 
 
 def test_the_gate_passes_on_the_matching_md5():

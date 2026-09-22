@@ -35,7 +35,7 @@
 # 🔴 新 .so 待定：这个占位值不可能等于任何真实 md5 ⇒ 现在起飞必然 rc≠0。
 #    换 .so 之后由协调方给值再改这里（同一发里 oncard 的 ONCARD_EXPECT_SO_MD5
 #    也要一起改，两处期望值不许只改一处）。
-SERVE_EXPECT_SO_MD5="${SERVE_EXPECT_SO_MD5:-PENDING_NEW_SO_AFTER_f85267ab8}"
+SERVE_EXPECT_SO_MD5="${SERVE_EXPECT_SO_MD5:-85331298bdeffee02b7c42c5658030ac}"   # 2026-09-22 换包后（clean 同一份，单卡验收通过）
 
 gate_so() {
   local tree="$1"
