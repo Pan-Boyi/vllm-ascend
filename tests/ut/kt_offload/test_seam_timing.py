@@ -43,6 +43,11 @@ def _load_seam_tool():
     return mod
 
 
+def _split_parts(row: list[int]) -> int:
+    """The segments that must add up to ``cb``, in nanoseconds, for one row."""
+    return sum(row[sm.SEGMENTS.index(name)] for name in sm.ADDITIVE)
+
+
 def _spin(us: float) -> None:
     """Busy-wait: ``sleep`` on a loaded box overshoots by milliseconds, which
     would make the per-segment assertions test the scheduler, not the probe."""
@@ -259,8 +264,15 @@ def test_a_timestamp_in_the_wrong_place_is_caught_by_the_reconciliation(monkeypa
     for _ in range(3):
         kl._kt_host_forward((w, "s", 1, 1))
     rows, since = rec.drain([0, 0])
-    med_ok = sm.summarize(rows, rec.split, 1.0)["layers"]["1"]["med_us"]
-    assert sm.reconcile(med_ok, rec.split)["ok"], "control arm must be green first"
+    # The control is checked PER CALLBACK, not on the medians. Summing the
+    # per-segment medians and comparing against the median of cb compares two
+    # statistics that are not equal even on a healthy run (medians do not add),
+    # and with three samples on a loaded box it drifts past any fixed
+    # tolerance -- an arm whose colour depends on what else the machine was
+    # doing proves nothing. Per callback the identity is exact, in integers.
+    assert rows[1] and all(_split_parts(row) == row[sm.S_CB] for row in rows[1]), (
+        "control arm: every callback's segments must add up to its cb exactly")
+    assert all(row[sm.S_SYNC] > 0 for row in rows[1]), "control arm: the probe must have run"
 
     honest_submit = sm._TimedCpuInfer.submit
 
@@ -276,9 +288,15 @@ def test_a_timestamp_in_the_wrong_place_is_caught_by_the_reconciliation(monkeypa
         kl._kt_host_forward((w, "s", 1, 1))
     rows, _ = rec.drain(since)
     if rows:
-        med_bad = sm.summarize(rows, rec.split, 1.0)["layers"]["1"]["med_us"]
-        verdict = sm.reconcile(med_bad, rec.split)
-        assert not verdict["ok"], f"a misplaced stamp went unnoticed: {verdict}"
+        # record() kept the row but refused to split it: the middle is zeros
+        # while kt and cb stay whole. That is what reaches the offline tool,
+        # and both sides must call it broken.
+        assert all(row[sm.S_SYNC] == 0 for row in rows[1]), "the mutation was stored as if it were honest"
+        med_bad = sm.summarize(rows, rec.split, 1.0)["layers"]["1"]
+        assert not sm.reconcile(med_bad["med_us"], rec.split)["ok"], "a misplaced stamp went unnoticed"
+        tool = _load_seam_tool()
+        assert not tool.check_layer(med_bad["med_us"], med_bad["p90_us"], True)["ok"], (
+            "the offline criterion must be red on the same records")
     else:
         # record() refused the record outright (the stamps were not monotonic)
         assert rec.dropped[1] >= 3
@@ -330,7 +348,9 @@ def test_the_sampler_line_is_what_the_offline_tool_reads(monkeypatch):
     assert dropped == 0 and parsed
     merged = tool.merge(parsed)
     assert merged["split"] and 1 in merged["median_us"]
-    assert tool.reconcile(merged["median_us"][1], True)["ok"]
+    # check_layer, not reconcile: the latter is the median-sum residual, which
+    # is not a criterion (see seam.py's docstring) and drifts under load.
+    assert tool.check_layer(merged["median_us"][1], merged["p90_us"][1], True)["ok"]
     # and the record really is one line of JSON, not a pretty print
     assert all(len(line.splitlines()) == 1 for line in lines)
     assert json.loads(lines[0].split("[kt-seam] ", 1)[1])["layers"]
