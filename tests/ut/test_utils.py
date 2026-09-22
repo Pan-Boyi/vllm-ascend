@@ -15,6 +15,7 @@
 
 import math
 import os
+import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
@@ -604,3 +605,94 @@ def test_check_gdn_layer_returns_false_without_linear_attention():
     vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=Qwen3Config()))
 
     assert utils.check_gdn_layer(vllm_config) is False
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_custom_op_env: the operator-override vendor path
+#
+# 🔴 What makes this worth testing at all: aclnn resolution is first-wins per
+# symbol (``GetOpApiFuncAddr`` dlopens each vendor's libcust_opapi.so in
+# ASCEND_CUSTOM_OPP_PATH order and returns the first that has the symbol). An
+# override that lands *behind* the production vendor therefore does nothing --
+# and does nothing **silently**: the process starts, nothing raises, the torch
+# op exists, and production answers every call. Ordering is the whole
+# contract, so it is what these pin.
+# ---------------------------------------------------------------------------
+
+
+class TestOpOverrideVendorPath(TestBase):
+
+    _ENV = "VLLM_ASCEND_OP_OVERRIDE_VENDOR_PATH"
+
+    def _bootstrap(self, tmp_vendor, override, *, include_lib=False):
+        """Run bootstrap with a fake production vendor at ``tmp_vendor``."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ASCEND_CUSTOM_OPP_PATH", "LD_LIBRARY_PATH",
+                            self._ENV)}
+        if override is not None:
+            env[self._ENV] = override
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(utils, "_CUSTOM_OP_BASE_DIR", tmp_vendor), \
+             mock.patch.object(utils, "_CUSTOM_OP_VENDOR_DIR", "custom_transformer"):
+            utils.bootstrap_custom_op_env(include_vendor_lib=include_lib)
+            return os.environ.get("ASCEND_CUSTOM_OPP_PATH", ""), \
+                os.environ.get("LD_LIBRARY_PATH", "")
+
+    @staticmethod
+    def _make_vendor(root, name):
+        path = os.path.join(root, "_cann_ops_custom", "vendors", name)
+        os.makedirs(os.path.join(path, "op_api", "lib"), exist_ok=True)
+        return path
+
+    def test_without_the_override_only_the_production_vendor_is_on_the_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_vendor(tmp, "custom_transformer")
+            got, _ = self._bootstrap(tmp, None)
+            assert got.split(":") == [
+                os.path.realpath(
+                    os.path.join(tmp, "_cann_ops_custom", "vendors",
+                                 "custom_transformer"))
+            ]
+
+    def test_the_override_is_ahead_of_the_production_vendor(self):
+        # 🔴 The one assertion that matters. Behind it, the override resolves
+        # to nothing at all and the failure is invisible.
+        with tempfile.TemporaryDirectory() as tmp, \
+             tempfile.TemporaryDirectory() as ovr:
+            self._make_vendor(tmp, "custom_transformer")
+            got, _ = self._bootstrap(tmp, ovr)
+            entries = got.split(":")
+            assert entries[0] == os.path.realpath(ovr), entries
+            assert len(entries) == 2 and "custom_transformer" in entries[1]
+
+    def test_the_production_vendor_is_still_reachable_behind_the_override(self):
+        # Layering, not replacing: ops the override does not define must still
+        # resolve, which requires production to stay *on* the path.
+        with tempfile.TemporaryDirectory() as tmp, \
+             tempfile.TemporaryDirectory() as ovr:
+            prod = self._make_vendor(tmp, "custom_transformer")
+            got, _ = self._bootstrap(tmp, ovr)
+            assert os.path.realpath(prod) in got.split(":")
+
+    def test_an_override_that_is_not_a_directory_is_refused(self):
+        # A typo would otherwise be indistinguishable from "the override had
+        # no effect" -- the exact failure mode this whole knob exists to avoid.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_vendor(tmp, "custom_transformer")
+            with pytest.raises(ValueError, match="not a directory"):
+                self._bootstrap(tmp, os.path.join(tmp, "does_not_exist"))
+
+    def test_an_empty_override_is_the_same_as_unset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_vendor(tmp, "custom_transformer")
+            got, _ = self._bootstrap(tmp, "   ")
+            assert len(got.split(":")) == 1
+
+    def test_the_override_lib_dir_also_goes_first(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             tempfile.TemporaryDirectory() as ovr:
+            self._make_vendor(tmp, "custom_transformer")
+            os.makedirs(os.path.join(ovr, "op_api", "lib"))
+            _, ld = self._bootstrap(tmp, ovr, include_lib=True)
+            assert ld.split(":")[0] == os.path.join(
+                os.path.realpath(ovr), "op_api", "lib"), ld

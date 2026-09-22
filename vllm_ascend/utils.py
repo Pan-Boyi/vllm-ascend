@@ -337,6 +337,77 @@ def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:
         if os.path.exists(vendor_lib_path):
             _prepend_env_path("LD_LIBRARY_PATH", vendor_lib_path)
 
+    # 🔴 An override vendor is prepended at the very **end** of this function,
+    # after every production prepend above. Both lists are walked front to
+    # back, so anything inserted earlier ends up behind the production vendor.
+    # (The first draft of this put the override before the block above and a
+    # unit test caught LD_LIBRARY_PATH coming out in the wrong order.)
+    #
+    # Why the order is the whole contract: aclnn resolution is **first-wins
+    # per symbol** -- ``GetOpApiFuncAddr`` walks the colon-separated list,
+    # dlopens each vendor's ``libcust_opapi.so`` and ``return``s the first one
+    # that defines the symbol. A vendor directory holding only the ops it
+    # means to replace therefore layers correctly: those ops come from it,
+    # every other op falls through to the production vendor. But only if it is
+    # genuinely first.
+    #
+    # Getting this wrong is silent. The process starts, nothing raises, the
+    # torch op exists -- and the production version answers every call. That
+    # is why this is an explicit knob instead of "just export
+    # ASCEND_CUSTOM_OPP_PATH yourself", which lands behind the insert above.
+    #
+    # ⚠️ Must be a real path, never a symlink, for the EZ1009 reason above.
+    override = os.environ.get("VLLM_ASCEND_OP_OVERRIDE_VENDOR_PATH", "").strip()
+    if override:
+        resolved = os.path.realpath(override)
+        if not os.path.isdir(resolved):
+            # Refuse a typo rather than let it look like "the override had no
+            # effect" -- indistinguishable from the failure above.
+            raise ValueError(
+                "VLLM_ASCEND_OP_OVERRIDE_VENDOR_PATH="
+                f"{override!r} is not a directory. Point it at a vendor "
+                "directory (the one holding op_api/, op_impl/, op_proto/), "
+                "not at its parent vendors/ directory.")
+        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", resolved)
+        if include_vendor_lib:
+            override_lib = os.path.join(resolved, "op_api", "lib")
+            if os.path.exists(override_lib):
+                _prepend_env_path("LD_LIBRARY_PATH", override_lib)
+        logger.warning(
+            "Operator override vendor is in front of the production vendor: "
+            "%s. Operators it defines replace the production ones; every "
+            "other operator still comes from the production vendor. This is "
+            "NOT a production configuration.", resolved)
+
+    # An out-of-tree torch extension that registers additional operators.
+    # Loaded here, immediately after the vendor path is settled, because the
+    # two halves must agree: the extension's aclnn stubs are bound when its
+    # .so loads (``g_custom_lib_path`` is a load-time const), while the
+    # kernels are looked up per launch through ASCEND_CUSTOM_OPP_PATH. Load
+    # it before the override is in place and the host stubs resolve against a
+    # different build of the operator than the kernels do -- measured
+    # 2026-09-22, that mismatch crashes inside the kernel with "address for
+    # VEC to access UB is not aligned", which reads like a hardware fault.
+    #
+    # 🔴 ``torch.ops.load_library`` rather than importing the extension's
+    # python package: that package's __init__ walks its operators and
+    # ``setattr``s each onto the ``torch_npu`` module, which was measured to
+    # overwrite ``npu_moe_gating_top_k`` and ``npu_quant_lightning_indexer``
+    # -- both called from A5DeviceAdaptor (device_op.py), i.e. on this card's
+    # own path. load_library registers the torch.ops namespace and touches
+    # nothing else.
+    lib = os.environ.get("VLLM_ASCEND_LOAD_CUSTOM_OPS_LIB", "").strip()
+    if lib:
+        if not os.path.isfile(lib):
+            raise ValueError(
+                f"VLLM_ASCEND_LOAD_CUSTOM_OPS_LIB={lib!r} is not a file. It "
+                "must point at the extension's .so; a wrong path would "
+                "otherwise look exactly like the operators being absent, "
+                "which is a silent fallback.")
+        import torch
+        torch.ops.load_library(lib)
+        logger.warning("Loaded out-of-tree operator library %s.", lib)
+
 
 def _custom_pad(x, pad_dims):
     # pad the input tensor to the shape of pad_dims
