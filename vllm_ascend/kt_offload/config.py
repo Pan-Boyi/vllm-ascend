@@ -127,6 +127,22 @@ class KTOffloadConfig:
         if self.overlap_side_stream:
             from vllm_ascend.kt_offload import side_stream
 
+            if self.packed_transfer:
+                # layer.route() tests ``self.packed`` first, so with both on the
+                # packed branch runs and NOTHING is ever forked: the side stream
+                # is silently off while the log, the config dump and the switch
+                # all say it is on. That is the exact shape this line exists to
+                # forbid -- a switch that looks set and is not. Refused at
+                # start-up rather than reordered: changing the branch order
+                # would put the side stream on kt's slot-sharing buffers for
+                # packed users too, which is a different (and larger) change.
+                raise ValueError(
+                    "kt_offload_config: packed_transfer and overlap_side_stream cannot both be true. "
+                    "The packed path is taken first in the captured branch, so the side stream would never "
+                    "be used and every 'side stream on' reading would in fact be a packed serial reading. "
+                    "Turn one of the two off (packed_transfer=false to A/B the side stream, "
+                    "overlap_side_stream=false to A/B packed)."
+                )
             if not side_stream.enabled_by_env():
                 raise ValueError(
                     "kt_offload_config.overlap_side_stream is experimental and off by default. The 2026-09-20 "

@@ -214,3 +214,51 @@ def test_config_refuses_the_side_stream_unless_the_env_asks(monkeypatch):
 
 def test_the_switch_is_off_by_default():
     assert KTOffloadConfig().overlap_side_stream is False
+
+
+# -- 5. packed + side stream is a switch that would look on and be off --------
+
+
+def _preconditions(**kw):
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, **kw)
+    vcfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1, pipeline_parallel_size=1, enable_eplb=False
+        ),
+        speculative_config=None,
+    )
+    return cfg, vcfg
+
+
+def test_packed_and_side_stream_together_are_refused(monkeypatch):
+    """Both on = the packed branch wins in route() and nothing forks.
+
+    The service would then log "SIDE STREAM ENABLED", dump a config saying so,
+    and serve the serial packed path: a reading attributed to the side stream
+    that the side stream never produced. Mutant arm: delete the raise in
+    config._validate_preconditions and this test goes green with both switches
+    on, which is the failure being fenced.
+    """
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)  # even with the env set
+    cfg, vcfg = _preconditions(overlap_side_stream=True, packed_transfer=True)
+    with pytest.raises(ValueError, match="cannot both be true"):
+        cfg._validate_preconditions(vcfg)
+    # ...and each one alone still starts
+    cfg, vcfg = _preconditions(overlap_side_stream=True, packed_transfer=False)
+    cfg._validate_preconditions(vcfg)
+    cfg, vcfg = _preconditions(overlap_side_stream=False, packed_transfer=True)
+    cfg._validate_preconditions(vcfg)
+
+
+def test_the_route_branch_order_this_refusal_is_about_has_not_moved():
+    """If packed stops shadowing overlap in route(), revisit the refusal above."""
+    import inspect
+
+    from vllm_ascend.kt_offload.layer import KTLayerOffload
+
+    src = inspect.getsource(KTLayerOffload.route)
+    packed_at = src.index("if self.packed:")
+    overlap_at = src.index("elif self.overlap:")
+    assert packed_at < overlap_at, "route() no longer tests packed before overlap"

@@ -106,22 +106,33 @@ curl -s http://127.0.0.1:$PORT/v1/completions -H 'Content-Type: application/json
 - 判读：逐位相同 ⇒ 侧流未改数值（在 ③ 证明尺子有区分力的前提下）；
   任何一条不同 ⇒ 🔴 **侧流改了数值**，先查 host-func 计数与 join，不许拿 GSM8K 分数把它盖过去。
 
-### ① 单层逐位臂（最强、最便宜；扩 t5 现有的，**与整网可并行安排**）
+### ① 单层逐位臂（最强、最便宜；t5 已扩好，**与整网可并行安排**）
 
-真实层、图捕获 + replay，侧流开的输出**逐位等于**串行臂。覆盖：
-- **层 0 / 20 / 39**（跨 `layer_idx % 2` 两种 kt 槽位 —— A6：L 与 L+2 共用 pinned 槽）；
-- 输入 **T = 1 / 4 / 32**；每臂 **≥3 个不同输入**。
-- 保留 t5 已有判据：捕获期 host-func **0**、每 replay 每层 **+1**、**replay 两两不同**。
-- 🔴 **必须加变异臂：故意去掉副流的 join，输出必须变得不同**。没有它，"逐位相同"可能只是因为
-  **根本没并行**（这正是 09-20 静默失败的形态：更快、而且每次 replay 复用同一份 CPU 输出）。
-  注意与第 2 步 Z2 的区别：Z2 去掉的是 **join 的 wait**（期望 capture_end 107025），
-  这里去掉的是 **merge 前的 join 语义**（期望捕获成功但输出错）；两条都要有。
-- ⚠ **t5 目前只跑单层、只有 `--arm` 那几个臂**：上面的层×T×输入矩阵和"去 join"变异臂
-  **尚未实现**（写本单的这一轮只改了 `vllm_ascend/kt_offload/`、`envs.py` 与单测，没有动 t5）。
-  执行本单的人要么先扩 t5（加 `--layers 0,20,39 --tokens 1,4,32 --inputs 3 --mutant drop-join`），
-  要么把 ① 记为"未覆盖"并在报告里说明——**不要**默认它做过了。
-- CPU 侧对应的同形判据已在 `tests/ut/kt_offload/test_side_stream_overlap.py`（四个变异臂全部
-  "更快且错"）⇒ 这一步在卡上加的是**真 ACL + 真 kt + 真权重**，不是重做逻辑。
+真实层、图捕获 + replay，侧流开的输出**逐位等于**串行臂。`--layer` 与 `--tokens` 现在都收列表，
+一发扫完 3 个位置 × 3 个 token 数（每个 scenario 自带自己的串行参照，不会互相借）：
+
+```bash
+# 干净臂：9 个 scenario（层 0-2 / 20-22 / 37-39，T=1/4/32；每臂 3 个不同输入）
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 \
+  --arm off --layer 0,20,39 --tokens 1,4,32 --inputs 3
+# 🔴 变异臂（必须红）：主流不 wait 副流的 join
+ONCARD_EXPECT_SO_MD5=$SO bash $WT/run_oncard.sh $CARD t5 \
+  --arm off --layer 0,20,39 --tokens 1,4,32 --inputs 3 --mutant drop-join
+```
+- `--layer 39` 会被**下移**成 37,38,39（3 层窗口要落在 40 层以内），输出里会明说 `shifted`；
+  每个窗口都同时覆盖 kt 的两种槽位 `layer_idx%2`（A6：L 与 L+2 共用 pinned 槽）。
+- 干净臂判据（t5 原有的，全部保留）：捕获期 host-func **0**、每 replay 每层 **+1**、
+  每个 replay **逐位等于**串行臂、replay 两两不同、replay k ≠ 串行 k−1（陈旧输出指纹）。
+- 变异臂判据：**没有任何一个臂是"captured 且逐位相同"**（`must_be_red`）。它有两种红法，都接受：
+  捕获直接失败（107025：副流尾 record 无人 join），或捕获成功但输出不同。
+  🔴 若变异臂和干净臂一样过 ⇒ 逐位判据在这发里**没有区分力**（多半是副流上根本没东西在跑），
+  t5 会拒绝把干净臂报成 PASS ——**这一条就是"逐位相同不等于真的并行"的挡板**。
+  与第 2 步 Z2 的区别：Z2 在层的工作之外**额外**补一个 record（问的是 ACL 的规则），
+  ① 的变异臂动的是**本层自己的 join**（问的是我们的正确性）。
+- 一发跑 9 个 scenario 会在同一进程里连做多次捕获；t5 会给第 2 次起的每个臂加一条 note
+  （失败的捕获可能留状态）。**要把某个 scenario 当最终结论，就用 `--layer X --tokens Y` 单独重跑一遍。**
+- CPU 侧的同形判据已在 `tests/ut/kt_offload/test_side_stream_overlap.py`（四个变异臂全部"更快且错"）
+  与 `test_t5_scenarios.py`（矩阵/下移/拒绝）⇒ 卡上这一步加的是**真 ACL + 真 kt + 真权重**。
 
 ## 4. 交错 A/B（A=侧流关，B=侧流开，**同时段 A,B,A,B**）
 
@@ -140,6 +151,8 @@ cat > $RUN/cfg_A.json <<'JSON'
 JSON
 sed 's/"overlap_side_stream":false/"overlap_side_stream":true/' $RUN/cfg_A.json > $RUN/cfg_B.json
 ```
+⚠ 两臂都必须 `packed_transfer:false`：**packed 与侧流同开现在起服务就 raise**
+（packed 分支在 `route()` 里优先 ⇒ 侧流根本不会被用到，"开了却没生效"）。
 
 一轮 = 起 A → 测 → 收 → 起 B → 测 → 收，共 **两轮**（A1,B1,A2,B2）。每臂：
 

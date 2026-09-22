@@ -31,6 +31,15 @@ false green this file exists to avoid.
              different, and every layer's host-func node running exactly once
              per replay (0 during capture).
 
+2026-09-22, after the capture-buffer fix: this file also carries the
+single-layer bit-identity arm (RUNBOOK_sidestream.md item 1). ``--layer`` and
+``--tokens`` take lists, so one run sweeps several stack positions (both kt
+pinned slots, ``layer_idx % 2``) and several token counts, and ``--mutant
+drop-join`` removes the compute stream's wait on the side stream's join. The
+mutant exists because "bit-identical" on its own does not prove the work was
+overlapped: if nothing ever ran on the side stream the outputs would match
+too. A mutant that keeps matching means the arm has no discriminating power.
+
 The overlap switch itself stays refused in the config; this test flips the
 instance attribute on the layer it built, in-process, so no production path
 changes and nothing here is a way to turn overlap on for a service.
@@ -62,16 +71,87 @@ PLAN = """T5 plan (real-layer capture, one parameter changed):
             on the sub stream to deliver an event record task")
   refusals: capture success alone is NOT a pass; a positive control that does not go red
             voids the comparison; fewer than 3 inputs is refused
+  sweep   : --layer a,b,c x --tokens 1,4,32 -> one scenario each (own serial reference)
+  mutant  : --mutant drop-join -> the compute stream does NOT wait on the side stream's
+            join. Must NOT come out captured-and-bit-identical; either it fails the
+            capture (107025: the sub stream's last record is unjoined) or the output
+            differs. If it passes like the clean arm, the bit-identity criterion has no
+            discriminating power in this run and the run is void.
   scope   : this says nothing about performance. It answers one question: can the
             side-stream shape be captured and replayed correctly on this platform."""
 
 
+NUM_LAYERS = 40  # DSV4.1 main layers (npu_moe.fake_vllm_config)
+
+
+def parse_int_list(text: str, what: str) -> list[int]:
+    """"0,20,39" -> [0, 20, 39]. Order and duplicates are kept out."""
+    out: list[int] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.lstrip("-").isdigit():
+            raise ValueError(f"{what}: {part!r} is not an integer")
+        value = int(part)
+        if value < 0:
+            raise ValueError(f"{what}: {value} is negative")
+        if value not in out:
+            out.append(value)
+    if not out:
+        raise ValueError(f"{what}: empty list")
+    return out
+
+
+def plan_scenarios(layer_text: str, tokens_text: str, layers: int, num_layers: int = NUM_LAYERS) -> list[dict]:
+    """The (stack position x token count) matrix, resolved before any device is touched.
+
+    A window that would run past the last layer is shifted down rather than
+    dropped: ``--layer 39 --layers 3`` on a 40-layer model means "the last
+    three layers", and the shift is reported so nobody reads the result as
+    "layer 39 alone". Each scenario gets its own serial reference, so two
+    scenarios can never compare against each other's.
+    """
+    if layers < 3:
+        raise ValueError("layers must be >= 3 (kt's slot reuse needs layers L and L+2)")
+    if layers > num_layers:
+        raise ValueError(f"layers {layers} exceeds the model's {num_layers}")
+    starts = parse_int_list(layer_text, "--layer")
+    tokens = parse_int_list(tokens_text, "--tokens")
+    if any(t < 1 for t in tokens):
+        raise ValueError("--tokens must all be >= 1")
+    scenarios = []
+    for start in starts:
+        if start >= num_layers:
+            raise ValueError(f"--layer {start} is past the model's {num_layers} layers")
+        first = min(start, num_layers - layers)
+        for t in tokens:
+            scenarios.append(
+                {
+                    "requested_start": start,
+                    "layer_ids": list(range(first, first + layers)),
+                    "tokens": t,
+                    "shifted": first != start,
+                    # both kt pinned slots covered iff the window holds L and L+2
+                    "slots": sorted({lid % 2 for lid in range(first, first + layers)}),
+                }
+            )
+    return scenarios
+
+
+def scenario_key(name: str, sc: dict) -> str:
+    return f"{name}@L{sc['layer_ids'][0]}_T{sc['tokens']}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--layer", type=int, default=20)
+    ap.add_argument("--layer", default="20",
+                    help="comma list of stack START layers, e.g. 0,20,39; a window that would run past "
+                         "the last layer is shifted down (and said so in the output)")
     ap.add_argument("--layers", type=int, default=3, help=">=3 so two layers share kt's layer_idx % 2 slot")
     ap.add_argument("--n", type=int, default=100)
-    ap.add_argument("--tokens", type=int, default=1, help="one capture size, decode shape")
+    ap.add_argument("--tokens", default="1",
+                    help="comma list of token counts, e.g. 1,4,32; one capture size per scenario")
     ap.add_argument("--inputs", type=int, default=3)
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--numa", default="1")
@@ -79,6 +159,9 @@ def main() -> int:
     ap.add_argument("--arm", choices=("on", "off", "both", "on_evt", "off_evt", "on_evtw", "off_evtw"), default="both",
                     help="on/off = auto_dispatch_capture; the _evt variants additionally make the LAST task "
                          "on the side stream an event record, which is what error 107025 asks for")
+    ap.add_argument("--mutant", choices=("none", "drop-join"), default="none",
+                    help="drop-join: the compute stream does not wait on the side stream's join. "
+                         "Expected to be RED (capture failure or a different output).")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", default=os.environ.get("ONCARD_RUN_DIR", "."))
     args = ap.parse_args()
@@ -87,7 +170,18 @@ def main() -> int:
     if args.layers < 3:
         ap.error("--layers must be >= 3 (kt's slot reuse needs layers L and L+2)")
 
+    try:
+        scenarios = plan_scenarios(args.layer, args.tokens, args.layers)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     print(PLAN, flush=True)
+    print(f"t5 scenarios ({len(scenarios)}): "
+          + ", ".join(f"L{sc['layer_ids'][0]}-{sc['layer_ids'][-1]} T{sc['tokens']}"
+                      + (" (shifted)" if sc["shifted"] else "") for sc in scenarios), flush=True)
+    if args.mutant != "none":
+        print(f"t5 MUTANT ARM: {args.mutant} -- this arm must NOT come out captured-and-bit-identical",
+              flush=True)
     if args.dry_run or os.environ.get("ONCARD_DRY") == "1":
         print("t5: --dry-run, nothing was captured and no device was touched", flush=True)
         return 0
@@ -103,34 +197,51 @@ def main() -> int:
     rt = N.init_runtime()
     dev = rt.device
     ck = C.Ckpt()
-    T = args.tokens
     numa = [int(s) for s in args.numa.split(",")]
-    layer_ids = list(range(args.layer, args.layer + args.layers))
-    rng = np.random.default_rng(args.seed + 5000)
+    mutant = args.mutant
 
     ids_buffers_added: list[int] = []
+    results: dict[str, dict] = {}
 
     def _ensure_ids_buffer(off) -> None:
-        """Give this layer the int64 id buffer the forked capture path needs.
+        """Belt and braces: the layer must own its int64 id buffers.
 
-        ``KTLayerOffload._prepare_capture_buffers`` fills ``self._ids_i64``
-        (layer.py:416) but is guarded by a PROCESS-global
-        ``_CAPTURE_BUFFERS_READY`` (layer.py:401-404): the first layer built in
-        the process returns early for every later one, so layers 2..n -- and,
-        once a first stack has been built, every layer of the second stack --
-        keep an empty dict. ``_ids_for_kt`` then raises "no preallocated int64
-        id buffer for N tokens (prepared: [])" INSIDE the capture, which is
-        what aborted the 2026-09-22 14:17 flight before it captured anything.
-        That is a production bug (reported, not fixed here); the test prepares
-        the same buffer itself, exactly as layer.py:416 does, so the arm
-        measures the capture and not this.
+        The production bug this used to work around (a process-global
+        ``_CAPTURE_BUFFERS_READY`` skipping ``self._ids_i64`` for every layer
+        after the first) was fixed on 2026-09-22; ``_prepare_capture_buffers``
+        now fills them per instance. This test builds its layers by hand and
+        does not call that method, so it still prepares the buffers itself --
+        and records which layers it had to do it for, so a regression of the
+        fix shows up in the result json instead of aborting the capture with
+        "no preallocated int64 id buffer" (which on card reads as 107025).
         """
         if not off.graph_enabled or off._ids_i64:
             return
         off._ids_i64 = {bs: torch.empty((bs, off.top_k), dtype=torch.int64, device=dev) for bs in off.capture_sizes}
         ids_buffers_added.append(off.layer_idx)
 
-    def build(forked: bool):
+    def _drop_join(self, device) -> None:
+        """MUTANT: record the join on the side stream, never wait for it.
+
+        Not the same thing as arm ``*_evt`` (which records an EXTRA event after
+        the layers' work): here the layer's own join event is recorded and the
+        compute stream simply does not wait, so the H2D may read the pinned
+        output before the host func has written it. Two outcomes are both red:
+        ACL refuses the capture (107025 -- the sub stream's last record is
+        unjoined), or the replay output differs from the serial arm. The one
+        outcome that must NOT happen is "captured and bit-identical": that
+        would mean the join was never doing anything, i.e. nothing was running
+        on the side stream at all.
+        """
+        pending, self._pending_join = self._pending_join, None
+        self._check_capture_hostfunc()
+        self._release_side_slot()
+        if pending is None:
+            return
+        join, side, _compute = pending
+        join.record(side)
+
+    def build(layer_ids, T, forked: bool):
         """A stack of real offload layers. ``forked`` flips the *instance*
         attribute the captured path reads, so the refused config switch stays
         refused and no production code changes."""
@@ -156,33 +267,28 @@ def main() -> int:
             out = merged if out is None else out + merged
         return out
 
-    # reference: the serial shape, eager (what a correct replay must equal)
-    serial = build(forked=False)
-    pl = serial[0][0].placement
-    inputs = []
-    for _ in range(args.inputs):
-        x = torch.from_numpy(rng.standard_normal((T, C.HIDDEN)).astype(np.float32)).to(torch.bfloat16)
-        ids, w = C.make_routing(rng, T, pl.cpu_ids, list(pl.resident_ids))
-        inputs.append((x.to(dev), ids.to(dev), w.to(dev)))
-        print(f"input {len(inputs)}: {C.coverage(ids, pl.resident_mask()).line()}", flush=True)
-    ref = [run_stack(serial, *inp).float().cpu() for inp in inputs]
-    torch.npu.synchronize()
-    for off, _, _ in serial:
-        del off
-    del serial
-    torch.npu.empty_cache()
-
-    results: dict[str, dict] = {}
-
-    def attempt(auto: bool, record_evt: bool, name: str) -> dict:
+    def attempt(sc, inputs, ref, auto: bool, record_evt, name: str) -> dict:
         """One capture of the forked shape, with auto_dispatch_capture=auto."""
-        stack = build(forked=True)
+        layer_ids, T = sc["layer_ids"], sc["tokens"]
+        is_mutant = mutant != "none"
+        # A mutant arm's checks are judged as a group at the end (it MUST fail);
+        # its individual comparisons therefore record, not assert.
+        def judge(ok: bool, what: str) -> bool:
+            if is_mutant:
+                return ok
+            return v.check(ok, what)
+
+        stack = build(layer_ids, T, forked=True)
         sx, sids, sw = (t.clone() for t in inputs[0])
         calls0 = dict(KL.HOST_FUNC_CALLS)
         out: dict = {"auto_dispatch_capture": auto, "record_event_on_substream": record_evt,
-                     "captured": None, "error": None, "where": None}
+                     "layer_ids": layer_ids, "tokens": T, "mutant": mutant,
+                     "captured": None, "error": None, "where": None, "all_bit_identical": None}
         tail_events: list = []  # kept alive: the graph's nodes reference them
         g = torch.npu.NPUGraph()
+        original_join = KL.KTLayerOffload._join_side_stream
+        if is_mutant:
+            KL.KTLayerOffload._join_side_stream = _drop_join
         try:
             with torch.npu.graph(g, auto_dispatch_capture=auto):
                 sout = run_stack(stack, sx, sids, sw)
@@ -209,13 +315,15 @@ def main() -> int:
             print(f"  arm {name}: capture raised -- {out['error']}", flush=True)
             print(f"    at {out['where']}", flush=True)
             return out
+        finally:
+            KL.KTLayerOffload._join_side_stream = original_join
 
         ran = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - calls0.get(lid, 0) for lid in layer_ids}
         out["host_func_during_capture"] = ran
-        v.check(all(n == 0 for n in ran.values()), f"arm {name}: capture ran no host-func node (ran {ran})")
+        judge(all(n == 0 for n in ran.values()), f"arm {name}: capture ran no host-func node (ran {ran})")
 
         # capture success is not the answer: judge the replay separately
-        replays, checks = [], []
+        replays, checks, all_same = [], [], True
         for k, (x, ids, w) in enumerate(inputs):
             sx.copy_(x), sids.copy_(ids), sw.copy_(w)
             before = dict(KL.HOST_FUNC_CALLS)
@@ -223,20 +331,22 @@ def main() -> int:
             torch.npu.synchronize()
             grew = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - before.get(lid, 0) for lid in layer_ids}
             ok_calls = all(n == 1 for n in grew.values())
-            v.check(ok_calls, f"arm {name}: replay {k}: every layer's host-func ran once (got {grew})")
+            judge(ok_calls, f"arm {name}: replay {k}: every layer's host-func ran once (got {grew})")
             r = sout.float().cpu().clone()
             replays.append(r)
             same, how = C.bit_identical(r, ref[k])
-            v.check(same, f"arm {name}: replay {k} == serial {k}: {how}"
-                          + ("" if same else f"; rel_l2 {C.rel_l2(r, ref[k]):.3e}"))
+            all_same = all_same and same
+            judge(same, f"arm {name}: replay {k} == serial {k}: {how}"
+                        + ("" if same else f"; rel_l2 {C.rel_l2(r, ref[k]):.3e}"))
             if k:
-                v.check(not C.bit_identical(r, ref[k - 1])[0],
-                        f"arm {name}: replay {k} != serial {k - 1} (stale-output fingerprint)")
+                judge(not C.bit_identical(r, ref[k - 1])[0],
+                      f"arm {name}: replay {k} != serial {k - 1} (stale-output fingerprint)")
             checks.append({"replay": k, "host_func": grew, "bit_identical": same, "how": how})
         for i in range(len(replays)):
             for j in range(i + 1, len(replays)):
-                v.check(not C.bit_identical(replays[i], replays[j])[0], f"arm {name}: replay {i} != replay {j}")
+                judge(not C.bit_identical(replays[i], replays[j])[0], f"arm {name}: replay {i} != replay {j}")
         out["replays"] = checks
+        out["all_bit_identical"] = all_same
         out["tail_events"] = len(tail_events)
         return out
 
@@ -253,36 +363,78 @@ def main() -> int:
         "on_evtw": [("on_evtw", True, "record_wait")],
         "off_evtw": [("off_evtw", False, "record_wait")],
     }[args.arm]
-    for idx, (name, auto, record_evt) in enumerate(order):
-        if idx:
-            v.note(f"arm {name} runs after a capture in the same process; a failed capture can leave state "
-                   f"behind, so re-run it with --arm {name} in a fresh process before treating it as final")
-        print(f"\n===== arm {name} (auto_dispatch_capture={auto}, "
-              f"record_event_on_substream={record_evt}) =====", flush=True)
-        results[name] = attempt(auto, record_evt, name)
+
+    captures_done = 0
+    for sc in scenarios:
+        layer_ids, T = sc["layer_ids"], sc["tokens"]
+        print(f"\n########## scenario layers {layer_ids} T={T} "
+              f"(kt slots {sc['slots']}{', window shifted' if sc['shifted'] else ''}) ##########", flush=True)
+        if sc["shifted"]:
+            v.note(f"--layer {sc['requested_start']} was shifted to {layer_ids[0]} so the {args.layers}-layer "
+                   f"window ends at the last layer ({NUM_LAYERS - 1})")
+        rng = np.random.default_rng(args.seed + 5000 + 97 * layer_ids[0] + T)
+        # reference: the serial shape, eager (what a correct replay must equal)
+        serial = build(layer_ids, T, forked=False)
+        pl = serial[0][0].placement
+        inputs = []
+        for _ in range(args.inputs):
+            x = torch.from_numpy(rng.standard_normal((T, C.HIDDEN)).astype(np.float32)).to(torch.bfloat16)
+            ids, w = C.make_routing(rng, T, pl.cpu_ids, list(pl.resident_ids))
+            inputs.append((x.to(dev), ids.to(dev), w.to(dev)))
+            print(f"input {len(inputs)}: {C.coverage(ids, pl.resident_mask()).line()}", flush=True)
+        ref = [run_stack(serial, *inp).float().cpu() for inp in inputs]
+        torch.npu.synchronize()
+        for off, _, _ in serial:
+            del off
+        del serial
+        torch.npu.empty_cache()
+
+        for name, auto, record_evt in order:
+            if captures_done:
+                v.note(f"arm {name} (layers {layer_ids}, T={T}) runs after a capture in the same process; a "
+                       f"failed capture can leave state behind, so re-run it alone in a fresh process before "
+                       f"treating it as final")
+            print(f"\n===== arm {name} (auto_dispatch_capture={auto}, "
+                  f"record_event_on_substream={record_evt}, layers {layer_ids}, T={T}) =====", flush=True)
+            results[scenario_key(name, sc)] = attempt(sc, inputs, ref, auto, record_evt, name)
+            captures_done += 1
+
+    # the mutant must not reproduce the clean arm: if it does, bit-identity has
+    # no discriminating power here and nothing in this run may be called a pass.
+    if mutant != "none":
+        survived = [k for k, r in results.items() if r["captured"] and r["all_bit_identical"]]
+        v.must_be_red(not survived,
+                      f"mutant {mutant}: no arm came out captured-and-bit-identical (survived: {survived})")
+        if survived:
+            v.note("🔴 the mutant passed the same criteria as the clean arm ⇒ the criterion has no "
+                   "discriminating power in this run (most likely nothing ran on the side stream at all); "
+                   "the clean arm's PASS must NOT be reported")
+        else:
+            v.note("the mutant went red as required; this is what makes the clean arm's bit-identity mean "
+                   "'the side-stream work really happened and was joined'")
 
     # the positive control: the status-quo arm must reproduce the known failure
     for ctl in ("off", "off_evt", "off_evtw"):
-        if ctl not in results:
-            continue
-        off_failed = results[ctl]["captured"] is False
-        v.must_be_red(off_failed, f"status quo (auto_dispatch_capture=False) capture of the forked shape "
-                                  f"[{ctl}]")
-        if not off_failed:
-            v.note("🔴 the positive control captured: this machine is NOT in the state the three earlier "
-                   "flights measured, so nothing here can be attributed to auto_dispatch_capture")
-    if not ({"off", "off_evt", "off_evtw"} & set(results)):
+        keys = [k for k in results if k.startswith(ctl + "@")]
+        for key in keys:
+            off_failed = results[key]["captured"] is False
+            v.must_be_red(off_failed, f"status quo (auto_dispatch_capture=False) capture of the forked shape "
+                                      f"[{key}]")
+            if not off_failed:
+                v.note("🔴 the positive control captured: this machine is NOT in the state the three earlier "
+                       "flights measured, so nothing here can be attributed to auto_dispatch_capture")
+    if not [k for k in results if k.split("@")[0] in ("off", "off_evt", "off_evtw")]:
         v.note("no positive control in this run (--arm on): run --arm off before concluding")
 
     if ids_buffers_added:
-        v.note(f"the test prepared kt's int64 id buffers itself for layers {ids_buffers_added} "
-               "(KTLayerOffload._prepare_capture_buffers only fills them for the first layer built in a "
-               "process; layer.py:401-404 vs :416). Without this the capture aborts inside _ids_for_kt and "
-               "the 107025 that follows says nothing about the side stream.")
-    for key in ("on", "on_evt"):
-        if key not in results:
+        v.note(f"the test prepared kt's int64 id buffers itself for layers {sorted(set(ids_buffers_added))} "
+               "(it builds KTLayerOffload objects by hand and never calls _prepare_capture_buffers). Since "
+               "2026-09-22 production fills them per layer instance; if a layer here needed no help that is "
+               "not evidence either way.")
+    for key, res in results.items():
+        if not key.split("@")[0].startswith("on"):
             continue
-        if results[key]["captured"]:
+        if res["captured"]:
             v.note(f"arm {key} CAPTURED: the side-stream route is alive if and only if the replay checks "
                    "above passed; form C drops to fallback in that case")
         else:
@@ -290,8 +442,8 @@ def main() -> int:
                    "is decided by t4's ceiling")
 
     return v.finish(os.path.join(args.out, "t5_result.json"),
-                    {"arms": results, "layers": layer_ids, "tokens": T, "inputs": args.inputs,
-                     "ids_buffers_added_by_test": ids_buffers_added,
+                    {"arms": results, "scenarios": scenarios, "inputs": args.inputs, "mutant": mutant,
+                     "ids_buffers_added_by_test": sorted(set(ids_buffers_added)),
                      "measures_performance": False})
 
 
