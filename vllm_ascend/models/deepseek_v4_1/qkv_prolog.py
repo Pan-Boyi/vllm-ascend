@@ -111,12 +111,39 @@ def scatter_rows(cache: torch.Tensor, rows: torch.Tensor,
     the value already there, so they change nothing.
     """
     if slot_mapping.ndim == 2 and slot_mapping.shape[-1] == 2:
+        if slot_mapping.shape[0] == 0:
+            return
+        if _scatter_operator_usable(cache, slot_mapping):
+            # 🔴 The operator **skips** rows whose index is negative -- it does
+            # not wrap to the last block and does not clamp to block 0.
+            # Verified on card 2026-09-22: with indices [[1,2],[-1,-1],[2,3]],
+            # both valid rows landed, a sentinel in the last block survived
+            # (no wrap) and one in block 0 survived (no clamp).
+            # That is what makes the read-modify-write below unnecessary: the
+            # torch form gathers ``cache[b_i, o_i]`` only so that padded rows
+            # can be written back unchanged, and that gather was the most
+            # expensive step of the whole KV write (measured 429 kernels /
+            # 0.99 ms a step across the 40 layers, 适配方案 §6.9.15).
+            import torch_npu
+
+            # 🔴 ``rows[:n]``: the torch form below truncates through
+            # ``_payload_that_leaves_invalid_rows_untouched`` (``rows =
+            # rows[:n]``), and that silent truncation is load-bearing -- a
+            # dummy/graph run hands more query rows than there are slots.
+            # Dropping it here raised "shape '[1, 512]' is invalid for input
+            # of size 4096" at the first real forward, **after** the operator
+            # equivalence test had passed: that test fed matching lengths,
+            # which is exactly the case the contract does not cover.
+            n = slot_mapping.shape[0]
+            torch_npu.npu_scatter_nd_update_(
+                cache, slot_mapping.to(torch.int64).contiguous(),
+                rows[:n].reshape((n, ) + tuple(cache.shape[2:]))
+                .to(cache.dtype).contiguous())
+            return
         blocks, offsets = slot_mapping[:, 0], slot_mapping[:, 1]
         valid = blocks >= 0
         b_i = torch.where(valid, blocks, blocks.new_zeros(())).to(torch.long)
         o_i = torch.where(valid, offsets, offsets.new_zeros(())).to(torch.long)
-        if blocks.numel() == 0:
-            return
         payload = _payload_that_leaves_invalid_rows_untouched(
             cache[b_i, o_i], rows, valid)
         cache.index_put_((b_i, o_i), payload)
@@ -151,9 +178,75 @@ def qnorm_rope_kv_insert(*, q: torch.Tensor, kv: torch.Tensor,
     ignores it too when ``apply_q_norm`` is false.
     """
     cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
+    tail = _rope_tail_impl(q)
     # No q norm: V4.1 passes apply_q_norm=False (see the module docstring).
-    q_out = rope_tail(q, cos, sin, rope_head_dim)
+    q_out = tail(q, cos, sin, rope_head_dim)
     # kv arrives normed; the op's name says kv_rope, not kv_norm_rope.
-    kv_out = rope_tail(kv, cos, sin, rope_head_dim)
+    kv_out = tail(kv, cos, sin, rope_head_dim)
     scatter_rows(swa_kv_cache, kv_out, slot_mapping, swa_kv_cache.shape[1])
     return q_out.to(q.dtype)
+
+
+def _scatter_operator_usable(cache: torch.Tensor,
+                             slot_mapping: torch.Tensor) -> bool:
+    """Whether the paged-write operator can take this call.
+
+    Not a capability probe every step: ``is_npu`` is a tensor attribute read.
+    The torch form below stays for CPU (unit tests, reference runs), where the
+    operator is not registered at all.
+    """
+    return bool(getattr(cache, "is_npu", False)
+                and getattr(slot_mapping, "is_npu", False))
+
+
+def _forward_rope_operator_enabled() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_DSV41_FORWARD_ROPE_OPERATOR == "1"
+
+
+def rope_tail_operator(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                       rope_head_dim: int) -> torch.Tensor:
+    """``rope_tail`` as one ``inplace_partial_rotary_mul`` call.
+
+    The torch form upcasts to float32, slices the tail, unflattens it into
+    pairs, does four multiplies and two adds, flattens back and copies --
+    measured 351 + 312 kernels and **1.52 ms a step** for q and kv together
+    (适配方案 §6.9.15). The operator does the same rotation in one call, and
+    it is **already in this process**: the inverse rotation has used it since
+    ``rope.py:229`` (``_inverse_rope_operator``), whose docstring records that
+    it agreed with the torch form bit-for-bit on card A4.
+
+    ⚠ Bit-identity was **not** expected here -- the torch form rotates in
+    float32 and rounds once at the end, the operator was assumed to rotate in
+    the tensor dtype -- and it was **measured anyway**: on card 2026-09-22,
+    q ``[37,8,128]`` and kv ``[37,128]`` bf16 came back ``torch.equal`` to the
+    torch form (max abs diff 0.0). Kept behind a switch regardless: one shape
+    on one day is not a proof for every shape, and a switch turns an accuracy
+    question into a flip rather than a revert.
+    """
+    from vllm_ascend.models.deepseek_v4_1.rope import _partial_rotary_op
+
+    head_dim = x.shape[-1]
+    if rope_head_dim > head_dim:
+        raise ValueError(
+            f"rope width {rope_head_dim} exceeds the head width {head_dim}")
+    out = x.clone(memory_format=torch.contiguous_format)
+    # The operator takes x as 4-D [T, 1, H, D]; kv arrives as [T, D] and gets
+    # both axes, q as [T, H, D] and gets one.
+    view = out.unsqueeze(1) if out.dim() == 3 else out.unsqueeze(1).unsqueeze(1)
+    _partial_rotary_op()(
+        view,
+        cos[:, None, None, :],
+        sin[:, None, None, :],
+        rotary_mode="interleave",
+        partial_slice=[head_dim - rope_head_dim, head_dim],
+    )
+    return out
+
+
+def _rope_tail_impl(sample: torch.Tensor):
+    """``rope_tail_operator`` when it can run here, else the torch form."""
+    if getattr(sample, "is_npu", False) and _forward_rope_operator_enabled():
+        return rope_tail_operator
+    return rope_tail

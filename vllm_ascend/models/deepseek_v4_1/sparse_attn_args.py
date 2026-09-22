@@ -145,34 +145,44 @@ def ori_mask_mode_for(ori_sparse_indices) -> int:
     return NO_MASK_MODE
 
 
-def _device_scalar(t, when_capturing: int) -> int:
+def _device_scalar(reduce, when_capturing: int) -> int:
     """Read a device scalar back to the host; ``when_capturing`` under capture.
 
     ``int(t)`` synchronises the stream, which is illegal during graph capture.
     Capture only happens during warmup on dummy data, and replayed requests
     are not captured, so the check still runs on every real batch. The caller
     passes a value that lets its own check pass.
+
+    🔴 ``reduce`` is a **callable**, not a tensor, and that is the whole point
+    of this signature. Passing ``table.max()`` evaluates the reduction at the
+    call site -- including **during capture**, where the result is thrown away
+    but the kernel has already been launched, and therefore **recorded into
+    the graph and re-run on every replay for the life of the process**. The
+    check was free in eager and pure waste in FULL graph mode, which is the
+    mode production runs in. Measured 2026-09-22 (§6.9.15): these reductions
+    were 512 kernels and **0.98 ms of a 28.8 ms decode step, 3.4%**, computing
+    values nobody reads.
     """
     from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
         _stream_is_capturing
 
     if _stream_is_capturing():
         return when_capturing
-    return int(t)
+    return int(reduce())
 
 
-def _device_predicate(t) -> bool:
+def _device_predicate(reduce) -> bool:
     """A device boolean as a host boolean; treated as true under capture.
 
-    Same reasoning as ``_device_scalar``: ``bool(t)`` synchronises, which is
-    illegal during graph capture, and capture only sees warmup data.
+    Same reasoning as ``_device_scalar``, including that ``reduce`` is a
+    callable so that capture launches nothing.
     """
     from vllm_ascend.models.deepseek_v4_1.engram_embedding import \
         _stream_is_capturing
 
     if _stream_is_capturing():
         return True
-    return bool(t)
+    return bool(reduce())
 
 
 def _check(condition: bool, operator_message: str, detail: str = "") -> None:
@@ -228,7 +238,7 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any]) -> None:
                 f"{table_key} is empty, so this check did not run. An empty "
                 "table is not a batch needing no blocks; it addresses nothing.")
         # -1 under capture always passes `highest >= num_blocks`.
-        highest = _device_scalar(table.max(), -1)
+        highest = _device_scalar(lambda: table.max(), -1)
         if highest >= num_blocks:
             raise ValueError(
                 f"{table_key}'s highest block id is {highest} and {cache_key} "
@@ -244,7 +254,7 @@ def _check_block_table_addresses_this_cache(kwargs: dict[str, Any]) -> None:
                 f"not run against {cache_key}.")
         capacity = num_blocks * block_size
         # -1 under capture always passes `longest > capacity`.
-        longest = _device_scalar(used.max(), -1)
+        longest = _device_scalar(lambda: used.max(), -1)
         if longest > capacity:
             raise ValueError(
                 f"{used_key}'s longest sequence is {longest} tokens and "
@@ -295,7 +305,7 @@ def _check_descriptor_is_populated(kwargs: dict[str, Any],
             "empty batch legitimately produces")
         return
 
-    _check(_device_predicate(metadata.any()),
+    _check(_device_predicate(lambda: metadata.any()),
            "metadata must be a populated descriptor",
            f"all {DESCRIPTOR_WORDS} words are zero while this call has "
            f"{num_tokens} query tokens, so the metadata operator never wrote "
@@ -347,7 +357,7 @@ def validate_sparse_flash_mla_args(kwargs: dict[str, Any], q: torch.Tensor,
                f"got shape {tuple(cu_seqlens_q.shape)} for {num_requests} requests")
         # The detail does a host read-back, so it is built only when raising.
         if not _device_predicate(
-                torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1])):
+                lambda: torch.all(cu_seqlens_q[1:] >= cu_seqlens_q[:-1])):
             _check(False,
                    "layout_q=TND requires cu_seqlens_q, cumulative, length T+1",
                    "the values are not non-decreasing, so they are lengths "

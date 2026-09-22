@@ -17,6 +17,9 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 
+from vllm_ascend.models.deepseek_v4_1.indexer_candidate import (
+    assert_candidate_geometry, load_ds41, publish_candidates,
+    select_within_candidates)
 from vllm_ascend.models.deepseek_v4_1.indexer_select import (
     MXFP4_SCALE_DTYPE, MXFP4_VALUE_DTYPE, assert_candidate_mask_is_vacuous,
     compressed_lengths, paired_e8m0_scale, select_topk)
@@ -74,6 +77,39 @@ def rows_written(buffer) -> "int | None":
     return rows
 
 
+#: The same bookkeeping for the candidate block buffer. It is kept separate
+#: from ``_ROWS_WRITTEN_ATTR`` on purpose: that one answers "was this step's
+#: selection written", this one answers "was this step's candidate set
+#: written", the two buffers are written by different layers, and a single
+#: attribute would let one layer's mark satisfy the other's question.
+_CANDIDATES_WRITTEN_ATTR = "_dsv41_candidates_written"
+
+
+def mark_candidates_written(buffer, num_rows: int) -> None:
+    """Record that this forward pass published ``num_rows`` candidate rows."""
+    setattr(buffer, _CANDIDATES_WRITTEN_ATTR,
+            (_current_forward(), int(num_rows)))
+
+
+def candidates_written(buffer) -> "int | None":
+    """Candidate rows published **in the forward pass now running**.
+
+    ⚠ Unlike ``rows_written``, a count from an earlier step is reported as
+    ``None`` rather than warned about and returned. The distinction is not
+    stylistic: a stale selection buffer yields last step's answer for this
+    step's tokens, while stale candidates yield a *silently wrong* selection
+    computed this step, which nothing downstream could tell from a right one.
+    """
+    record = getattr(buffer, _CANDIDATES_WRITTEN_ATTR, None)
+    if record is None:
+        return None
+    marked, rows = record
+    current = _current_forward()
+    if marked is not None and current is not None and marked is not current:
+        return None
+    return rows
+
+
 _WARNED_STALE_SELECTION = False
 
 
@@ -116,8 +152,105 @@ def unpack_indexer_cache(kv_cache):
     return planes_from_bound_cache(kv_cache)
 
 
+#: The per-row candidate count buffer, kept on the shared candidate block
+#: buffer. Upstream allocates ``candidate_blocks`` in the model and has no
+#: second buffer, because its kernels take the count from the tensor's own
+#: ``-1`` padding; the ds41 consumer takes it as a separate ``[T, 1]`` input.
+_LENGTHS_ATTR = "_dsv41_candidate_lengths"
+
+
+def candidate_lengths_buffer(candidate_blocks: torch.Tensor) -> torch.Tensor:
+    """The ``[max_tokens, 1]`` companion of ``candidate_blocks``, made once.
+
+    🔴 Allocated at construction and never replaced, for the same reason
+    upstream's own buffer is (``vllm/models/deepseek_v4_1/nvidia/model.py``
+    :431, and its ``reset()`` that deliberately does nothing): a captured
+    graph replays against a **fixed address**, so a buffer reallocated per
+    step would be baked in as whatever it was at capture. This repository has
+    already been bitten by exactly that with ``seqused_cmp_kv``.
+
+    It hangs off the block buffer rather than off an indexer because the five
+    indexers that take part share one buffer and must share one companion --
+    the publisher fills it and four consumers read it. Keying on the tensor
+    makes "same blocks, same lengths" structural instead of a convention.
+    """
+    existing = getattr(candidate_blocks, _LENGTHS_ATTR, None)
+    if existing is not None:
+        return existing
+    lengths = torch.zeros(candidate_blocks.shape[0],
+                          1,
+                          dtype=torch.int32,
+                          device=candidate_blocks.device)
+    setattr(candidate_blocks, _LENGTHS_ATTR, lengths)
+    return lengths
+
+
+def _assert_copy_stays_on_device(destination: torch.Tensor,
+                                 source: torch.Tensor, where: str) -> None:
+    """Refuse a candidate copy that would cross the host boundary.
+
+    🔴 Upstream allocates ``candidate_blocks`` with a bare ``torch.empty``
+    and relies on the ``with target_device:`` around model construction
+    (``model_loader/base_loader.py:54``) to place it. That works, and it is
+    also invisible at the allocation site -- so if it ever stops working,
+    these copies silently become device-to-host: 8 KiB a row over PCIe plus
+    a sync, every step, and nothing would raise. A host-side device compare
+    costs nothing and turns that into a message.
+    """
+    if destination.device != source.device:
+        raise RuntimeError(
+            f"{where}: the candidate buffer is on {destination.device} and "
+            f"the operator returned its blocks on {source.device}. Copying "
+            "between them would go through the host every step. The buffer "
+            "is allocated by upstream's model with no explicit device and "
+            "inherits the one in force while the model is built.")
+
+
 class AscendSparseAttnIndexer(SparseAttnIndexer):
     """The Ascend selection path. Everything else is upstream's."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Three roles, decided once from what upstream handed this indexer:
+        #
+        #   publisher  (layer 20)        candidate_write, and its own top-k is
+        #                                the unfiltered one -- it is what
+        #                                defines the set, so there is nothing
+        #                                to filter it against.
+        #   consumer   (24/28/32/36)     a block buffer but no write flag.
+        #   neither    (2/8/14)          ratio-2 layers, no candidate buffer;
+        #                                they stay on the v2 operator that
+        #                                batch 1 validated.
+        if self.candidate_blocks is None:
+            return
+        assert_candidate_geometry(self.candidate_block_size,
+                                  int(self.candidate_blocks.shape[-1]))
+        # Warmed here rather than left to the first forward. Both of these
+        # allocate or compile, and neither may happen for the first time
+        # inside a graph capture: the buffer would be captured at whatever
+        # address it had, and the ds41 binding layer compiles JIT extensions
+        # on import. An import failure is not raised here -- forward_oot
+        # falls back to the geometric guard, whose message states the ceiling
+        # and the reason for it, which is more useful than an ImportError.
+        candidate_lengths_buffer(self.candidate_blocks)
+        load_ds41()
+
+    #: Roles are derived, not stored: they are a reading of what upstream
+    #: handed this indexer, and a stored copy is a second source that a
+    #: future upstream change could leave behind while it still looks right.
+    @property
+    def publishes_candidates(self) -> bool:
+        return bool(self.candidate_write)
+
+    @property
+    def consumes_candidates(self) -> bool:
+        return self.candidate_blocks is not None and not self.candidate_write
+
+    @property
+    def candidate_lengths(self) -> "torch.Tensor | None":
+        if self.candidate_blocks is None:
+            return None
+        return candidate_lengths_buffer(self.candidate_blocks)
 
     def forward_oot(self, hidden_states, q_quant, k, weights):
         if k is not None:
@@ -149,11 +282,15 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
                 "real tokens cannot select top-k without them.")
 
         num_tokens = hidden_states.shape[0]
-        assert_candidate_mask_is_vacuous(
-            metadata.max_seq_len, self.compress_ratio,
-            self.candidate_blocks.shape[1] if self.candidate_blocks is not None
-            else 0,
-            self.candidate_block_size, self.k_cache.prefix)
+        if not self.candidate_filtering_available():
+            # No ds41 operators: this layer can only take an unfiltered top-k,
+            # which is exact just while every block fits the budget. The guard
+            # says where that ends and why.
+            assert_candidate_mask_is_vacuous(
+                metadata.max_seq_len, self.compress_ratio,
+                self.candidate_blocks.shape[1]
+                if self.candidate_blocks is not None else 0,
+                self.candidate_block_size, self.k_cache.prefix)
 
         values, scales = unpack_indexer_cache(self.k_cache.kv_cache)
         q_values, q_scale = (q_quant if isinstance(q_quant, tuple)
@@ -188,7 +325,7 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
                 "k_n, d/64, 2)). An axis short is not rejected -- the bytes "
                 "are the same and only the block-to-scale mapping changes.")
 
-        topk_idxs = select_topk(
+        common = dict(
             query=q_values[:num_tokens],
             q_scale=None if q_scale is None else q_scale[:num_tokens],
             key_cache=values,
@@ -200,10 +337,10 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
             seqused_k=seqused_k,
             cmp_residual_k=cmp_residual_k,
             block_table=req.block_table,
-            metadata=self._qli_metadata(req, seqused_k, cmp_residual_k,
-                                        metadata.max_seq_len,
-                                        num_heads_q=q_values.shape[1]),
         )
+        topk_idxs = self._select(common, num_tokens, req, seqused_k,
+                                 cmp_residual_k, metadata,
+                                 num_heads_q=q_values.shape[1])
 
         # Upstream's buffer contract is "-1 where there is no token"; what the
         # operator writes into the unfilled tail of a short row is not
@@ -214,6 +351,116 @@ class AscendSparseAttnIndexer(SparseAttnIndexer):
         mark_rows_written(self.topk_indices_buffer, num_tokens)
 
         return self.topk_indices_buffer
+
+    def candidate_filtering_available(self) -> bool:
+        """Whether this layer can express V4.1's candidate filter.
+
+        A layer with no candidate buffer (2/8/14) has nothing to express and
+        answers True: the question it gates is "may this run past the budget",
+        and the budget never applies to those layers. The four consumers and
+        the publisher answer for the ds41 operators, which is the only thing
+        that can apply or produce a mask.
+        """
+        if self.candidate_blocks is None:
+            return True
+        return load_ds41()
+
+    def _select(self, common: dict, num_tokens: int, req, seqused_k,
+                cmp_residual_k, metadata, *, num_heads_q: int):
+        """One of three selection paths, by this indexer's role.
+
+        The v2 operator stays underneath layers 2/8/14 -- the ones with no
+        candidate buffer -- rather than moving everything to ds41 the way
+        upstream's Ascend branch does. Those layers are what batch 1 validated
+        end to end, the two operators disagree on the argument spelling, the
+        quantisation-mode encoding and the metadata descriptor, and nothing
+        about the 16k ceiling comes from them.
+        """
+        # 🔴 Role is not enough: without the ds41 operators there is nothing
+        # to publish *into* and nothing that can read a mask, so every layer
+        # falls back to v2 -- which the guard above has already established
+        # is exact at this length. Dispatching on role alone made layer 20
+        # call an operator that is not there, and the failure was at graph
+        # capture during startup, not at import: the service refused to come
+        # up at max_model_len 16384, a length that has nothing to do with
+        # candidates. Found by running the unchanged 16k configuration.
+        if not self.candidate_filtering_available():
+            return select_topk(
+                **common,
+                metadata=self._qli_metadata(req, seqused_k, cmp_residual_k,
+                                            metadata.max_seq_len,
+                                            num_heads_q=num_heads_q),
+            )
+        if self.publishes_candidates:
+            topk_idxs, candidate_indices, candidate_lengths = (
+                publish_candidates(
+                    **common,
+                    candidate_topk_blocks=int(self.candidate_blocks.shape[-1]),
+                    candidate_block_size=self.candidate_block_size,
+                    where=self.k_cache.prefix))
+            _assert_copy_stays_on_device(self.candidate_blocks,
+                                         candidate_indices,
+                                         self.k_cache.prefix)
+            # The operator allocates its own outputs; what has to stay at a
+            # fixed address is the buffer they are copied into, which is why
+            # this is a copy and not a rebind.
+            # ⚠ Both copies are device-to-device: 2048 int32 a row, so 8 KiB
+            # per query row, once per step, on the publisher only. Next to
+            # the operator's own cost (its QK loop runs block_table_width x
+            # 128 tiles regardless of how long the request actually is) this
+            # is small. What it must never become is a device-to-host copy,
+            # which is what the assertion above is for.
+            # ⚠ The reshapes are no-ops on this wheel -- it returns
+            # [T, 1, 2048] and [T, 1] already -- and are written out because
+            # the destination is 2-D and because the two sides are *not*
+            # guaranteed to agree: upstream's Ascend branch bridges a real
+            # rank difference at the same point (dsa_v41.py:1060).
+            self.candidate_blocks[:num_tokens].copy_(
+                candidate_indices.reshape(num_tokens, -1))
+            self.candidate_lengths[:num_tokens].copy_(
+                candidate_lengths.reshape(num_tokens, 1))
+            mark_candidates_written(self.candidate_blocks, num_tokens)
+            return topk_idxs
+        if self.consumes_candidates:
+            self._assert_candidates_are_this_steps(num_tokens)
+            return select_within_candidates(
+                **common,
+                candidate_indices=self.candidate_blocks[:num_tokens].
+                unsqueeze(1),
+                candidate_lengths=self.candidate_lengths[:num_tokens],
+                candidate_block_size=self.candidate_block_size)
+        return select_topk(
+            **common,
+            metadata=self._qli_metadata(req, seqused_k, cmp_residual_k,
+                                        metadata.max_seq_len,
+                                        num_heads_q=num_heads_q),
+        )
+
+    def _assert_candidates_are_this_steps(self, num_tokens: int) -> None:
+        """Refuse to filter against blocks this step's publisher did not write.
+
+        🔴 The buffer is one step's scratch, not state: it is padded with -1,
+        it is never cleared, and a consumer reading a row the publisher did
+        not fill this step would mask its logits to **the previous step's**
+        blocks -- a wrong answer, arrived at without a single wrong shape.
+        Layer 20 runs before 24/28/32/36 in the same forward, so the only way
+        this fires is a real ordering or row-count break.
+        """
+        written = candidates_written(self.candidate_blocks)
+        if written is None:
+            raise RuntimeError(
+                f"{self.k_cache.prefix}: the candidate block buffer has not "
+                "been written in this forward pass, so there is nothing to "
+                "filter against. The publishing layer "
+                "(candidate_source_layer_id) either did not run or took a "
+                "different path this step.")
+        if written < num_tokens:
+            raise RuntimeError(
+                f"{self.k_cache.prefix}: the publisher filled {written} rows "
+                f"of the candidate block buffer and this layer has "
+                f"{num_tokens} query rows. The tail rows still hold the -1 "
+                "padding or an earlier step's blocks, and masking to either "
+                "silently selects the wrong tokens.")
 
     def _qli_metadata(self, req, seqused_k, cmp_residual_k, max_seq_len: int,
                       *, num_heads_q: int) -> torch.Tensor:
