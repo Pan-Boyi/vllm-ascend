@@ -53,7 +53,9 @@ grep -q "$SO" $RUN/build_fingerprint.json || { echo "❌ .so 不是 $SO，停"; 
 产物完好）⇒ 这次服务只用一次，采完 profile 就收。
 
 ```bash
-bash build_artifacts/card_lease.sh acquire $CARD $OWNER $PORT
+# 租约不在这里拿：launcher 自己用 LEASE_PID=$$ acquire（末尾 exec，PID 不变）。
+# 在这里手动 acquire 会被 card_lease.sh 拒绝（"acquire 必须显式给 LEASE_PID"），
+# 给了 shell 的 PID 又会随 shell 退出失效 —— 2026-09-22 首发实测踩到，就地删掉。
 PROFDIR=/dev/shm/dsv41_prof_seam; rm -rf $PROFDIR; mkdir -p $PROFDIR
 cat > $RUN/cfg.json <<'JSON'
 {"kt_offload_config":{"enabled":true,"resident_strategy":"prefix","num_resident_experts":100,
@@ -128,6 +130,20 @@ python3 $WT/seam.py $RUN/serve.log --ktphase $RUN/ktphase.json \
 **判红条件**（rc=1）：任一层 `|T_cb − Σ分段| > 2 µs` ⇒ 分段本身错了，表不要读。
 ⚠ `--nw-csv` 里的"层序号"是**步内顺序**，不是层 id；只有每层都有节点时两者才对得上
 （`VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG` 那条日志正好证明这一点：每层每步恰一次、无丢层）。
+🔴 **原样喂 `task_time.csv` 会错位两格**（2026-09-22 首发实测）：本构建每步 **42** 个 NOTIFY_WAIT，
+前 2 个不是 kt 层（§4.18 基线同样如此，"后 40 个是我们的 40 层"），而 `seam.py` 按位置 j = 层 j 配对，
+只在 `len(nw)!=40` 时打一行警告、照样出表。对位验证：`corr(NW, cb)` 位移 0/1/2 = −0.19 / 0.06 / **0.75**。
+⇒ 先派生一份只含"每步恰 42 个的步、去掉步内前 2 个"的 csv 再喂（首发用的派生脚本在该 run 目录
+`make_nw_ours40.py`，未入库）。
+⚠ `[kt-seam]` 的窗口：`seam.py` 读整份日志的全部记录，**没有窗口参数** ⇒ 先把 profile 窗口内的记录行
+（按日志时间戳，每条覆盖其前 `interval_s` 秒）抽到单独文件再喂；ktphase 的字节区间取
+`POST /start_profile` 那行到 EngineCore 退出那行。`profile_window_end.txt` **不是**窗口终点
+（capture 脚本在 EngineCore 死后会挂满自己的超时，首发晚了 10 min）；窗口以 `cap/capture.json` 的
+`capture_start`/`capture_end` 为准。
+⚠ 对账判红的口径：`seam_timing.record()` 里各段是**首尾相接的同一串时间戳**，逐回调 Σ段 ≡ cb；
+而对账比的是"各段中位之和 vs cb 的中位"，二者本来就不相等（中位不可加）。首发两组读数残差都**有正有负**
+（窗口 −3.2…+10.2 µs/层，全程 −26…+24），不像一个放错位置的时间戳（那会是单侧常数）。
+这条是对判据的疑问，**不是放行**：rc=1 仍如实报告，改判据要另行决定。
 
 ## 读完之后
 
