@@ -24,6 +24,9 @@ than derived from the docstring of the thing being called.
 
 from __future__ import annotations
 
+import weakref
+from collections import OrderedDict
+
 import torch
 
 
@@ -72,19 +75,87 @@ def neg_sin_for_slice(cos_sin_cache: torch.Tensor, positions: torch.Tensor,
     every time.
     """
     cos, sin = cos_sin_for_slice(cos_sin_cache, positions, rope_head_dim)
-    entry = _CACHE.get("entry")
-    if entry is not None and entry[1] is cos:
-        if entry[2] is None:
-            entry[2] = -sin
-        return cos, entry[2]
+    entry = _lookup(cos_sin_cache, positions, rope_head_dim)
+    # ``entry.cos is cos`` and not just "an entry exists": it proves the entry
+    # is the one that produced *this* ``cos`` (and so this ``sin``), rather
+    # than one that happened to be looked up under the same key afterwards.
+    if entry is not None and entry.cos is cos:
+        if entry.neg_sin is None:
+            entry.neg_sin = -sin
+        return cos, entry.neg_sin
     return cos, -sin
 
 
-#: One entry, holding ``[key, cos, neg_sin_or_None, sin]``. Not an LRU: within
-#: a forward pass every caller asks for the same ``(cache, positions)``, and
-#: across passes the old entry is dead, so anything larger would only keep
-#: dead tensors alive.
-_CACHE: dict[str, object] = {}
+#: How many distinct ``(table, positions)`` pairs one forward pass may keep.
+#:
+#: 🔴 Why this used to be ONE entry, and why it can now be more. With one
+#: caller (the main KV RoPE: forward in ``qkv_prolog``, inverse in ``rope``)
+#: every lookup in a pass wanted the same pair, so one entry was enough. The
+#: indexer's q RoPE (its own ``index_q_cos_sin_cache``) and k RoPE (on a
+#: ``compressed_pos`` rebuilt every layer, ``indexer_k_store.py:339``) are
+#: moving onto this function too; with one entry they would evict the main KV
+#: pair every layer and give back the 0.86 ms it saved. Two things made more
+#: entries unsafe before and are what this version adds:
+#:
+#:   1. the key carried ``id(forward_context)``. An id is an address, and once
+#:      the pass's context is freed the next pass's context can be allocated
+#:      at the same address -- same id, same persistent ``positions`` address,
+#:      last step's angles. The whole table is now dropped when the pass
+#:      changes, with the pass held by weak reference (``is``, not ``id``).
+#:   2. the key held ``data_ptr()`` but not the tensor. A temporary such as
+#:      ``compressed_pos`` is freed after its layer, and the caching allocator
+#:      hands the same address to the next layer's temporary -- which at the
+#:      ratio-2 -> ratio-1 boundary (layers 19/20 of V4.1-Flash's
+#:      ``compress_ratios``) has the same shape and *different values*. With
+#:      one entry, the main KV call between the two indexer calls evicted it
+#:      first, so this never surfaced: **the eviction was the guard**. Each
+#:      entry now holds its input tensors, so an address that is in the table
+#:      cannot be recycled while it is there.
+#:
+#: The number. One pass of V4.1-Flash asks for at most five pairs that are
+#: reused: the main KV pair on two tables (``rope_params_for_layer`` gives
+#: ratio-0 layers a different table from the rest, and upstream's ``get_rope``
+#: shares one instance per parameter set), the indexer q pair, and the
+#: indexer k pair for each of the two indexer ratios once ``compressed_pos``
+#: is built once per ratio instead of per layer. Eight leaves room for keys
+#: that are never reused (a per-layer ``compressed_pos`` inserts one per
+#: layer) to churn through without pushing out a live one. Worst-case memory
+#: is 8 x (cos + sin + -sin) = 8 x 3 x T x 64 x 4 bytes, ~100 MB at a
+#: 16k-token prefill and nothing at decode sizes, and it is released when the
+#: next pass starts.
+_CAPACITY = 8
+
+
+class _Entry:
+    """One remembered pair.
+
+    ``cos_sin_cache`` and ``positions`` are kept **only** to hold their memory:
+    while this entry exists, nothing else can be allocated at the addresses its
+    key names, so a key match cannot be a recycled address. They are never
+    read.
+    """
+
+    __slots__ = ("cos_sin_cache", "positions", "cos", "sin", "neg_sin")
+
+    def __init__(self, cos_sin_cache, positions, cos, sin):
+        self.cos_sin_cache = cos_sin_cache
+        self.positions = positions
+        self.cos = cos
+        self.sin = sin
+        self.neg_sin: torch.Tensor | None = None
+
+
+#: key -> _Entry, least recently used first. LRU rather than FIFO because the
+#: pairs worth keeping are the ones touched every layer: a fresh key evicts
+#: the pair that has gone longest unused, which is a dead temporary or the
+#: ratio-0 table after layer 1, never the pair the next layer is about to ask
+#: for. Not ``functools.lru_cache``: it would key on the tensors' hash, which
+#: is object identity -- a new view of the same buffer every layer would
+#: miss, and a recycled object would hit.
+_CACHE: OrderedDict[tuple, _Entry] = OrderedDict()
+
+#: Weak reference to the forward pass ``_CACHE`` belongs to.
+_CACHE_PASS: list = [None]
 
 
 def _forward_token() -> object | None:
@@ -105,41 +176,84 @@ def _forward_token() -> object | None:
         return None
 
 
-def _slice_key(cos_sin_cache: torch.Tensor, positions: torch.Tensor,
-               rope_head_dim: int, token: object) -> tuple:
-    return (id(token), cos_sin_cache.data_ptr(), positions.data_ptr(),
-            tuple(positions.shape), int(positions.dtype.itemsize),
-            rope_head_dim)
+def _table_for_this_pass() -> OrderedDict[tuple, _Entry] | None:
+    """``_CACHE``, emptied first if it was filled by another pass. None: don't cache.
 
-
-def _cached_slice(cos_sin_cache, positions, rope_head_dim):
-    """The ``(cos, sin)`` computed earlier **in this same forward pass**.
-
-    V4.1 asks for exactly one ``(cache, positions)`` pair per step and then
-    rotates with it 80 times: the forward RoPE in ``qkv_prolog`` and the
-    inverse in ``rope`` each call this once per layer, on the same table and
-    the same positions. Measured 2026-09-22 (§6.9.15): the repeated widening
-    was 312 kernels and **0.86 ms of a 28.8 ms decode step**, recomputing an
-    identical answer.
-
-    ⚠ Under FULL graph capture this Python runs once and the reused tensor
-    becomes a graph-internal value, which is the same saving at replay.
+    Compared with ``is`` through a weak reference, not by ``id``: a dead
+    pass's weakref returns None and a live one returns that object, so neither
+    can compare equal to a new pass that reuses its address. Weak, so the
+    cache does not keep a finished pass's attention metadata alive.
     """
     token = _forward_token()
     if token is None:
         return None
-    entry = _CACHE.get("entry")
-    if entry is None or entry[0] != _slice_key(cos_sin_cache, positions,
-                                               rope_head_dim, token):
+    ref = _CACHE_PASS[0]
+    if ref is None or ref() is not token:
+        _CACHE.clear()
+        try:
+            _CACHE_PASS[0] = weakref.ref(token)
+        except TypeError:
+            # Not weak-referenceable: no way to tell this pass from the next
+            # one without keeping it alive, so do not cache at all.
+            _CACHE_PASS[0] = None
+            return None
+    return _CACHE
+
+
+def _slice_key(cos_sin_cache: torch.Tensor, positions: torch.Tensor,
+               rope_head_dim: int) -> tuple:
+    """Addresses, not identities: callers pass a fresh *view* of the same
+    persistent buffer every layer (``positions[:num_tokens]``), which is a new
+    tensor object each time and must still hit. Shape, strides and dtype make
+    two views of one address that read different elements different keys."""
+    return (cos_sin_cache.device, cos_sin_cache.data_ptr(),
+            tuple(cos_sin_cache.shape), cos_sin_cache.dtype,
+            positions.device, positions.data_ptr(), tuple(positions.shape),
+            positions.stride(), positions.dtype, rope_head_dim)
+
+
+def _lookup(cos_sin_cache, positions, rope_head_dim) -> _Entry | None:
+    """The entry computed earlier **in this same forward pass**, if any.
+
+    The main KV path asks for one ``(cache, positions)`` pair per layer and
+    rotates with it twice: the forward RoPE in ``qkv_prolog`` and the inverse
+    in ``rope`` each call this once per layer, on the same table and the same
+    positions, 80 calls a step. (Two tables across the 40 layers, see
+    ``_CAPACITY``; the indexer adds its own pairs.) Measured 2026-09-22 (§6.9.15): the repeated widening
+    was 312 kernels and **0.86 ms of a 28.8 ms decode step**, recomputing an
+    identical answer.
+
+    ⚠ Contract: within one pass, a hit trusts that nothing wrote the inputs in
+    place since the entry was made -- the address is live (the entry holds
+    it), but its bytes are not re-read. True of every caller: positions are
+    filled before the pass and tables at load time.
+
+    ⚠ Under FULL graph capture this Python runs once and the reused tensor
+    becomes a graph-internal value, which is the same saving at replay.
+    """
+    table = _table_for_this_pass()
+    if table is None:
         return None
-    return entry[1], entry[3]
+    key = _slice_key(cos_sin_cache, positions, rope_head_dim)
+    entry = table.get(key)
+    if entry is not None:
+        table.move_to_end(key)
+    return entry
+
+
+def _cached_slice(cos_sin_cache, positions, rope_head_dim):
+    entry = _lookup(cos_sin_cache, positions, rope_head_dim)
+    if entry is None:
+        return None
+    return entry.cos, entry.sin
 
 
 def _remember_slice(cos_sin_cache, positions, rope_head_dim, cos, sin) -> None:
-    token = _forward_token()
-    if token is None:
+    table = _table_for_this_pass()
+    if table is None:
         return
-    _CACHE["entry"] = [
-        _slice_key(cos_sin_cache, positions, rope_head_dim, token), cos, None,
-        sin
-    ]
+    key = _slice_key(cos_sin_cache, positions, rope_head_dim)
+    table[key] = _Entry(cos_sin_cache, positions, cos, sin)
+    table.move_to_end(key)
+    while len(table) > _CAPACITY:
+        table.popitem(last=False)
