@@ -140,7 +140,9 @@ grep -n "\[kt\] NUMA . core order" $RUN/serve.log >> $RUN/report_thread.txt     
   `in_effect=False` ⇒ **这一臂作废**（绑了没生效，不能当绑核臂读）。
   那行里的 `tid=` 就是报告线程，可以回到 `threads.txt` 里核对它确实只允许一个 PU。
 - D2 必须有 `[kt] worker spin before condvar sleep: 1 ms`；**没有这行 = wheel 没换** ⇒ D2 未覆盖。
-- D0 里这两行都**不应该**出现（开关默认关的自证）。
+- D0 里绑核那行**不应该**出现（开关默认关的自证）。
+  🔴 **spin 那行是例外，见 §8.4**：它在新构建上**无条件**打印一次，D0 上写的是 `50 ms`。
+  能分开 D0/D2 的是**行里的数字**，不是这行在不在。
 
 ## 3. 离线判读
 
@@ -287,3 +289,78 @@ I1 必须有这一行；**没有 = wheel 没换或 env 没传进 worker** ⇒ �
 **本单不覆盖**：`packed_transfer=true` 的回调（`_kt_packed_forward` 里的 submit/sync 是我们自己调的，
 **没有**接内联，要接是另一处改动）；以及 I1 与 D1（报告线程绑核）同时开 —— 那是第三变量，
 要看就单独起一发（I1+D1），不要混在一发里读。
+
+## 8. 切换到新 kt 构建（`kt_site_v2`）：改哪些地方，改完必须重跑什么
+
+第 1 节的 D2（`KT_WORKER_SPIN_MS`）和第 7 节的 I0/I1（`KT_CPUINFER_INLINE`）都是 **C++ 改动**，
+今天服务在用的 `build_artifacts/moe_offload_ref/kt_site/` 里**没有**这两个开关（老 wheel
+`kt_wheel/…whl` sha256 `1b8e9b21…`，`hasattr(ext, "cpuinfer_inline_enabled")` 为 False）。
+新构建已经建好，**放在旁边，没有覆盖旧目录**：
+
+| | 旧（今天在跑） | 新（待切换） |
+|---|---|---|
+| 站点目录 | `build_artifacts/moe_offload_ref/kt_site/` | `build_artifacts/moe_offload_ref/kt_site_v2/` |
+| wheel | `kt_wheel/kt_kernel-0.7.0.post4-…whl`<br>sha256 `1b8e9b211476c2fd…` | `kt_wheel_v2/kt_kernel-0.7.0.post4-…whl`<br>sha256 `46a2f22ad99b6eb4…` |
+| kt 分支 HEAD | `033ea76` | `53eab3c`（= `033ea76` + `1a8d1df` + `53eab3c`） |
+| `.so` sha256 | `ddefc36bc14d4881…` | `08266de8dc17a76e…` |
+
+两份站点各 104 个文件（不含 `__pycache__`），**逐文件比只有 2 个不同**：`kt_kernel/experts_base.py`
+与 `kt_kernel/kt_kernel_ext.…so`（另加 dist-info 的 `RECORD`/`direct_url.json`，记的是 wheel 自己的哈希）。
+
+### 8.1 切换要改的五处（都在本线自己的树里）
+
+```
+tools/kt_offload/serve_v41_singlecard.sh:614     PYTHONPATH 末尾追加的 kt_site
+tools/kt_offload/oncard/run_oncard.sh:121-122    KT_SITE= 与 KT_WHEEL=（两行都要，wheel 路径进指纹）
+tools/kt_offload/oncard/run_packed_ab.sh:115,119 预检的 kt_site 路径 + 打印的 experts.py 指纹
+tools/kt_offload/bench/run_cpu_bench.sh:15       KT_SITE=
+tools/kt_offload/build_fingerprint.py:94         KT_WHEEL_GLOB = …/kt_wheel/*.whl
+```
+
+🔴 **`build_fingerprint.py` 那一行是最容易漏的**：它写死了 `kt_wheel/*.whl`，**和站点目录无关**。
+只改起服务脚本的 `kt_site` 而不改这一行，指纹会继续报告**旧 wheel 的 sha256**，于是
+「新构建的发次」和「旧构建的发次」在指纹上看起来是同一个构建 —— `same_build()` 放行，两份读数
+直接相减，**而且不会报错**。这正是这个文件开头那段话要挡的那种失败。切换时把 glob 指向
+`kt_wheel_v2`（或改成可被 env 覆盖），并在切换后的第一发里用肉眼核对
+`build_fingerprint.txt` 里的 `kt 46a2f22ad99b`。
+
+`oncard` 侧另有一处冗余：`run_oncard.sh:236` 在指纹工具失败时自己写一份兜底 JSON，
+里面的 `kt_wheel.sha256` 取自同文件的 `KT_WHEEL` 变量 —— 改了 121-122 行它就跟着对，**不用单独改**。
+
+### 8.2 换构建之后必须重跑什么
+
+- **t0 / t1 / t2 全部重跑**（`run_oncard.sh <card> t0|t1|t2`）。不是保险起见：`kt_wheel_sha256`
+  在 `build_fingerprint.py` 的 `BLOCKING` 里，换 wheel 之后**旧的 t0/t1/t2 产物与新发次不可比**，
+  判读脚本会直接拒绝，而不是给个警告。
+- **第 1 节的 D0/D1（以及任何已经采过的臂）若要和新构建上的臂相减，也必须在新构建上重跑一遍。**
+  D0 是「两行 env 都留空」的对照臂 —— 它的值取决于构建，不是取决于 env，老构建上的 D0
+  不能当新构建的对照。同理 §4.20 那批 A/F、submit/E 读数只在老构建上成立，引用时要写明构建。
+- GSM8K 验收（§4.1）在新构建上重跑一遍，再谈 I1 的正确性闸。
+
+### 8.3 自证「确实换过来了」（判据读被判对象，不看 env）
+
+```bash
+env -u LD_PRELOAD PYTHONPATH=<kt_site> python3 -c '
+import kt_kernel, kt_kernel.kt_kernel_ext as ext
+print(kt_kernel.__file__, kt_kernel.__cpu_variant__)
+print("inline switch present:", hasattr(ext, "cpuinfer_inline_enabled"),
+      "| default:", getattr(ext, "cpuinfer_inline_enabled", lambda: None)())'
+```
+
+新站点应打印 `…/kt_site_v2/kt_kernel/__init__.py`、`avx512_bf16`、`present: True | default: False`；
+老站点是 `present: False`。**这比 grep serve.log 更早、更硬**：`.so` 没换的话第二行就是 False。
+
+### 8.4 🔴 修正 §2c 的一条判据：`[kt] worker spin` 那行**默认也会出现**
+
+`worker_pool.cpp` 的 `kt_worker_spin_ms()` 在第一次被 worker 线程调到时**无条件** printf 一行
+`[kt] worker spin before condvar sleep: <N> ms`，不设 `KT_WORKER_SPIN_MS` 时 N = 50。
+所以在**新构建**上：
+
+- §2c 写的「D0 里这两行都不应该出现」对 **spin 这一行不成立** —— D0 上它照样出现，写着 `50 ms`。
+  能区分 D0/D2 的是**行里的数字**，不是这行在不在。判据改成：D0 必须是 `50 ms`，D2 必须是 `1 ms`；
+  **这行整个缺席 = 站点还是老的**（老 `.so` 里根本没有这个字符串，已用 `strings` 核过）。
+- 第 7 节的 `[kt] CPUInfer: inline execution ON` 那一行**只在 `KT_CPUINFER_INLINE=1` 时打印**
+  （`task_queue.cpp` 里在 `if (on)` 里面），所以 §7 的「I0 里不应该出现」是对的，不用改。
+
+行为本身没变：默认 50 ms 与老构建逐字节一致（`test/cpp/test_worker_spin_ms.cpp` 的 10 档全过，
+未设/空/非法都回落 50），多出来的只是这一行 stdout。
