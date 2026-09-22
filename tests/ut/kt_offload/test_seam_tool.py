@@ -501,3 +501,48 @@ def test_the_record_sides_own_counts_reach_the_verdict(tmp_path, capsys):
     rc = tool.main([str(log), "--layers", "2", "--year", "2026"])
     out = capsys.readouterr().out
     assert rc == 1 and "n_unsplit=7" in out, out
+
+
+def test_the_zero_middles_of_our_own_split_are_not_a_missing_probe():
+    """🔴 The forked (and packed) path stamps submit/sync itself, so
+    ``between`` and ``kt_tail`` are zero BY CONSTRUCTION -- sync is called
+    straight after submit, and kt_tail ends where sync ends. The
+    "a zero middle means the probe did not run" rule was written for the
+    probe-based split and turned the first healthy forked run red on 40/40
+    layers, while that run's exact counters said n_unsplit=0 over 661,285
+    callbacks and max|resid| = 0.0 us. So the proxy applies only where the
+    exact count is missing.
+    """
+    med, p90 = _healthy()
+    for k in ("between", "kt_tail"):
+        med[k] = p90[k] = 0.0
+    exact = tool.check_layer(med, p90, True, {"n_unsplit": 0, "resid_us": {"max": 0.0}})
+    assert exact["ok"], exact["violations"]
+    # a record from before the exact counters existed keeps the proxy
+    old = tool.check_layer(med, p90, True)
+    assert not old["ok"] and any("split run" in s for s in old["violations"]), old
+    # and the exact counter still decides when it says there IS contamination
+    assert not tool.check_layer(med, p90, True, {"n_unsplit": 2})["ok"]
+
+
+def test_a_constant_clock_offset_is_named_as_such_and_bounded(tmp_path):
+    """🔴 An offset between the profile's timebase and CLOCK_REALTIME moves A
+    up and F down by the same amount: A+F (and ``diff``) survive, the split
+    does not. Its fingerprint is med(F) < 0 on every layer with a small
+    spread; a mis-pairing scatters instead. Seen on the card 2026-09-22 --
+    med(F) = -84.6 us on 40/40 layers. The tool must say which of the two it
+    is, and bound the offset, instead of listing forty layer complaints.
+    """
+    rows, calls, _cb = _af_run(a_us=30.0, f_us=20.0, clock_shift_ns=100_000)
+    csv_path = tmp_path / "task_time.csv"
+    _write_af_csv(csv_path, rows)
+    out = tool.split_a_f(calls, tool.hostfunc_pairs(str(csv_path)))
+    assert not out["ok"] and out["layers"] == {}
+    assert "CONSTANT offset" in out["why"][0], out["why"]
+    lo, hi = out["clock_offset_bound_us"]
+    assert lo <= 100.0 <= hi, (lo, hi)
+    # the control arm: no offset, same fixture, and the split comes back
+    rows0, calls0, _ = _af_run(a_us=30.0, f_us=20.0, clock_shift_ns=0)
+    csv0 = tmp_path / "t0.csv"
+    _write_af_csv(csv0, rows0)
+    assert tool.split_a_f(calls0, tool.hostfunc_pairs(str(csv0)))["ok"]

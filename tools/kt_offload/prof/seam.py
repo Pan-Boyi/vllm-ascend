@@ -62,7 +62,12 @@ per-callback identity, each of them valid without assuming additivity:
   union bound  med(cb) <= p90(pre) + p90(kt) + p90(post): P(sum > sum of the
                p90s) <= 3 * 10% < 50%, so the median cannot exceed it. With
                ``split``, med(kt) <= sum of the five middle p90s (5 * 10%).
-  non-zero     with ``split``, no middle segment may have a zero median.
+  non-zero     with ``split``, no middle segment may have a zero median --
+               but ONLY as a stand-in for ``n_unsplit`` on records that do not
+               carry it, and never where the split is ours rather than the
+               probe's: on the packed and side-stream paths ``between`` and
+               ``kt_tail`` are zero by construction, so this proxy is skipped
+               whenever ``n_unsplit`` is present (see check_layer).
   n_unsplit    the record side reports, per layer and sample, how many rows of
                a split run had no middle (``n_unsplit``) and the per-callback
                residual of largest magnitude (``resid_us.max``); both are exact
@@ -332,12 +337,23 @@ def check_layer(med: dict[str, float], p90: dict[str, float], split: bool,
         bad.append(f"med(cb)={cb_med:.2f} > p90(pre)+p90(kt)+p90(post)={bound_lumped:.2f}")
     slack = bound_lumped - cb_med if bound_lumped else None
     slack_mid = None
+    # 🔴 "a zero middle means the probe did not run" is a PROXY for unsplit
+    # callbacks, and it is only sound on the probe-based split. Where WE make
+    # the submit/sync calls -- ``packed``, and since 2026-09-22 the side stream
+    # (layer.py:_kt_packed_forward) -- ``between`` and ``kt_tail`` are zero BY
+    # CONSTRUCTION: sync is called right after submit with nothing between, and
+    # kt_tail ends where sync ends. The proxy turned the first healthy forked
+    # run red on 40/40 layers while that run's exact counters said
+    # n_unsplit=0 over 661,285 callbacks and max|resid| = 0.0 us.
+    # When the record carries ``n_unsplit`` the question is answered exactly a
+    # few lines below, so the proxy is not applied at all.
+    exact_unsplit = (extra or {}).get("n_unsplit") is not None
     if split:
         kt_med = float(med.get("kt", 0.0))
         for k in MIDDLE:
             if k in med and float(med[k]) > kt_med + eps_us:
                 bad.append(f"med({k})={med[k]:.2f} > med(kt)={kt_med:.2f}")
-            if k in med and float(med[k]) <= 0.0:
+            if not exact_unsplit and k in med and float(med[k]) <= 0.0:
                 bad.append(f"med({k})=0 in a split run (the probe did not run for these callbacks)")
         bound_mid = sum(float(p90.get(k, 0.0)) for k in MIDDLE)
         if bound_mid and kt_med > bound_mid + eps_us:
@@ -618,6 +634,27 @@ def split_a_f(callbacks, pairs, tol_us: float = 5.0, max_unmatched: float = 0.01
         if abs(row["diff_med_us"]) >= tol_us:
             why.append(f"layer {layer}: med((A+F) - (NW - cb)) = {row['diff_med_us']:+.2f} us, "
                        f"|.| must be < {tol_us:g}")
+    # 🔴 Name the one failure that is NOT a mis-pairing: a constant offset
+    # between the profile's timebase and the host's CLOCK_REALTIME shifts A up
+    # and F down by the same amount, so A+F (and therefore ``diff``) survives
+    # while the split does not. Its fingerprint is med(F) < 0 on essentially
+    # every layer with a small spread -- a mis-pairing scatters instead. The
+    # offset is then bounded without being known: it must be at least
+    # max(-med(F)) for F to be non-negative and at most min(med(A)) for A to
+    # stay non-negative. First seen 2026-09-22 on the forked path, where every
+    # layer read med(F) = -84.6 us (-89.1..-65.7) -> offset in [89, 132] us.
+    if res["layers"]:
+        fs = [v["F_med_us"] for v in res["layers"].values()]
+        as_ = [v["A_med_us"] for v in res["layers"].values()]
+        neg = [x for x in fs if x < 0]
+        if len(neg) >= 0.9 * len(fs) and max(fs) - min(fs) < abs(st.median(fs)):
+            res["clock_offset_bound_us"] = [round(-max(fs), 2), round(min(as_), 2)]
+            why.insert(0,
+                f"med(F) < 0 on {len(neg)}/{len(fs)} layers with a spread of only "
+                f"{max(fs) - min(fs):.1f} us: this is a CONSTANT offset between the profile's "
+                f"timebase and CLOCK_REALTIME, not a mis-pairing. A+F survives it, the split does "
+                f"not. The offset lies in [{-max(fs):.1f}, {min(as_):.1f}] us; until it is "
+                f"calibrated, read A+F_dev and do not split it")
     res["ok"] = not why
     if res["ok"]:
         L = res["layers"]
