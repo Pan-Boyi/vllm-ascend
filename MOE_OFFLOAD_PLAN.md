@@ -544,7 +544,10 @@ perf＝`perf_baseline.sh` bs1（并发 1、16 条、random IN 128 / OUT 256、ig
   数值判据留在 t0/t1/t2 层级。⚠ 没跑两发 c1 互比（用户为省时取消），"并发 1 是否自身确定"未测。
   旁证：旧 packed A/B 的"19/50 相同"在这把尺子下**不构成** packed 改数值的证据。
 
-**decode profile（bs1 稳态，卡 2，同基线配置 + `KT_MOE_PHASE_TIMING=1`；`p2_prof_0922_131258/SUMMARY.md`【可复验，2.2 GB 未跟踪】）**
+**decode profile（bs1 稳态，卡 2，同基线配置 + `KT_MOE_PHASE_TIMING=1`；`p2_prof_0922_131258/SUMMARY.md`）**
+> 🔴 **出处降级（2026-09-23）**：这发的**原始 trace 已于 09-23 根盘写满时删除**（腾 1.7 G）⇒ 本节与 §4.22 的
+> F1/F2/F3 由【可复验】降为【**已记录、不可再验**】。仍在的是聚合结果（`SUMMARY.md`、`kernel_agg.*`、
+> `tpot_decomp.txt`、`kt_phase_*`、`devgaps` 相关）与本文内联的数；**要再算新的口径必须重采**。
 分析脚本入库 `tools/kt_offload/prof/{kd,nw,ktphase}.py`（区间并集 / NOTIFY_WAIT 步切分 / kt 相位解析）。
 `prof_decode_breakdown.py` 在本版**结构性不可用**（`kernel_details.csv` 已无 `Model ID`/`Step Id` 列）。
 
