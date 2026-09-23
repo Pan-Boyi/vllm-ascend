@@ -29,7 +29,7 @@ kt 何时算完决定。剩下的杠杆只有三条：CPU 计算本身（带宽 
 | ✅ 共享专家进窗口 | §4.31–§4.32。每次 route 恰一次 merge 的运行时守卫；t5r 替身用 MXFP8 生产链 + 判别力硬自检 |
 | ✅ 第一版合版本（侧流+事件等待） | §4.32：单轮 Δ4.22（稳妥 3.3–4.2）、decode 1174/1174、GSM8K 50/50 |
 | ✅ 第二版合版本（再加共享专家） | `RUNBOOK_merge_v2.md`：单轮 −1.71、decode 1170/1170、GSM8K 50/50、1319 = 1283 |
-| 🟡 **三项默认开** | 在 `staging/moe-offload-shared` 做：侧流 cfg+env 默认开；事件等待/共享专家三态（未设=跟随侧流，显式 1 前提不满足仍报错，显式 0 关）；P1b 显式开时 P1a 自动让位。**合回后要上卡冒烟**：不设任何开关起服务，三项有效值都开 + 与第二版 D4 的 lp 逐位对比（`RUNBOOK_defaults_on.md`） |
+| 🟡 **三项默认开** | 已合入 `dsv41-moe-offload`（`5a4dc4ebf`，单测 641/0），语义见 PLAN §4.33，唯一解析点 `kt_offload/switches.py`。原设计：侧流 cfg+env 默认开；事件等待/共享专家三态（未设=跟随侧流，显式 1 前提不满足仍报错，显式 0 关）；P1b 显式开时 P1a 自动让位。**合回后要上卡冒烟**：不设任何开关起服务，三项有效值都开 + 与第二版 D4 的 lp 逐位对比（`RUNBOOK_defaults_on.md`） |
 | ⛔ P1b 计数器启动 | 默认关。机制不成立（§4.30） |
 | ⛔ P2 kt inline | 跳过不测（§4.30 推论同样无效）。kt 树 `53eab3c` 有 `run_inline`/`KT_WORKER_SPIN_MS`，**未重建 wheel、未切站点** |
 | 报告页 | https://claude.ai/artifact/7jpcSsWTme7E5KXbeyA2zH（私有）：流程/框图、3 ms 逐层对账、NPU 窗口算子表、roofline、甘特图、核心代码、验收 |
@@ -90,6 +90,6 @@ kt 何时算完决定。剩下的杠杆只有三条：CPU 计算本身（带宽 
 ## 6. 接手第一步
 
 1. 读 `MOE_OFFLOAD_PLAN.md` §0–§2、§4.18–§4.33，再读本文 §2–§3。
-2. 看 `staging/moe-offload-shared` 上"三项默认开"的提交是否已合回 `dsv41-moe-offload`；没合就先合，跑 `tests/ut/kt_offload`。
+2. "三项默认开"已合入（`5a4dc4ebf`）；跑一遍 `tests/ut/kt_offload`（应 641 passed）。注意：之后重跑 `seq_merge_v2.sh` 要显式给新的 `RUNTIME_BASE`，否则 rc=3 拒飞。
 3. 按 `tools/kt_offload/oncard/RUNBOOK_defaults_on.md` 做上卡冒烟（先与 stream2 协调用卡、先预检、先声明判据）。
 4. 再按 §4 往下排。
