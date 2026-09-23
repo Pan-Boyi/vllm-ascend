@@ -51,6 +51,7 @@ bash $T/accept_v2.sh $RUN rest   # 仅当 VERDICT_perf 成立：C4(lp)、D4(lp�
 | `perf_verdict.py` | `--arms CD`、`--signed` | 🔴 旧写法判 `|Δ|`：候选臂**慢** 3×地板也打「收益成立」（下表变异臂实证）。前几发 Δ 全为正所以没咬到；第二版用带符号 |
 | `lp_verdict.py`（新） | 调 `logprob_cmp.py` + 数退化步，按 5.1 六条机械判 | 判据不靠人读输出 |
 | `seq_merge_v2.sh`（新） | C/D 交错；`cmp -s cfg_C cfg_D cfg_v1B`；每臂预检（与 `seq_merge.sh` 同口径）；卡 3 硬拦 | — |
+| `accept_v2.sh` rest 的 `REST_OVERRIDE=<addendum>`（11:47 后加） | 用户决定跳过 perf 判定时，显式指向 run 目录内带 md5 的 addendum 放行；不伪造 `VERDICT_perf.txt` | 变异：无判定无 override rc=10、override 在 run 目录外 rc=2、addendum 与 md5 不符 rc=2、合法 override + 脏树 rc=3（拒飞） |
 | `accept_v2.sh`（新） | 整段驱动，分 perf / rest 两段 | 协调方要求 perf 段结束先报一声 |
 
 ### 2.1 干跑与变异臂（阶段一，不占卡）

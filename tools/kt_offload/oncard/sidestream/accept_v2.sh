@@ -33,9 +33,20 @@ cat $RUN/VERDICT_perf.txt | tee -a $ST
 log "perf 段结束：成立"; exit 0
 fi
 [ "$STAGE" = rest ] || { echo "stage 只认 perf|rest"; exit 2; }
-grep -q '🟢 收益成立' $RUN/VERDICT_perf.txt 2>/dev/null || { log "❌ VERDICT_perf.txt 不是「收益成立」—— rest 段拒跑"; exit 10; }
-CARD=$(cat $RUN/card.txt)
-log "perf 成立 ⇒ 逐位 + GSM8K（卡 $CARD）"
+# REST_OVERRIDE=<run 目录里的 addendum 文件>：用户决定跳过 perf 判定、直接放行 rest 时用。
+# 🔴 不伪造 VERDICT_perf.txt —— 放行依据是那份 addendum（须只读、在本 run 目录、带 md5 落盘），日志里点名它。
+if [ -n "${REST_OVERRIDE:-}" ]; then
+  case "$REST_OVERRIDE" in "$RUN"/*) ;; *) log "❌ REST_OVERRIDE 必须是本 run 目录里的文件"; exit 2;; esac
+  [ -f "$REST_OVERRIDE" ] || { log "❌ REST_OVERRIDE 不存在"; exit 2; }
+  M=${REST_OVERRIDE%.txt}.md5
+  cmp -s <(md5sum < "$REST_OVERRIDE" | cut -c1-32) <(cut -c1-32 "$M" 2>/dev/null) || { log "❌ $REST_OVERRIDE 与其 md5 不符/缺 md5"; exit 2; }
+  log "⚠ 不依 perf 判定、依用户决定放行 rest：$REST_OVERRIDE（md5 $(cut -c1-32 "$M")）"
+else
+  grep -q '🟢 收益成立' $RUN/VERDICT_perf.txt 2>/dev/null || { log "❌ VERDICT_perf.txt 不是「收益成立」—— rest 段拒跑"; exit 10; }
+fi
+CARD=$(cat $RUN/card.txt 2>/dev/null || echo 2)
+[ "$CARD" = 2 ] || [ "$CARD" = 1 ] || { log "❌ card.txt 里是 '$CARD'"; exit 2; }
+log "进入逐位 + GSM8K（卡 $CARD；放行依据见上一行）"
 ARM_OFFSET=3 bash $S $RUN $CARD lp lp,gsm,gsm1319if50 1; rc=$?
 if [ -s $RUN/C4/lp.jsonl ] && [ -s $RUN/D4/lp.jsonl ]; then
   python3 $T/lp_verdict.py $RUN/C4/lp.jsonl $RUN/D4/lp.jsonl "C4 vs D4 (跨臂)" --skip-first=13 > $RUN/lp_cmp_C4_D4.txt 2>&1; lrc=$?
