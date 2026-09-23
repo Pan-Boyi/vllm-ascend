@@ -279,7 +279,7 @@ def test_submits_are_completed_in_order():
         c.stop()
     seen = [e for e in log if e[0] in ("sync", "record")]
     assert [e[1] for e in seen] == [x for i in range(6) for x in (f"L{i}", f"ev{i}")], seen
-    assert aw.RECORDS == {i: 1 for i in range(6)}
+    assert {i: 1 for i in range(6)} == aw.RECORDS
 
 
 def test_submit_never_blocks_the_callback():

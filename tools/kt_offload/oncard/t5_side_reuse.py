@@ -459,7 +459,6 @@ def main() -> int:  # noqa: C901
 
     # ------------------------------------------------------ the P1a mutants
     original_complete = AW.Completer._complete
-    original_ext_reset = KL._ext_reset
     skipped = {"reset": 0, "wait": 0}
 
     def _complete_early_record(self, wrapper, layer_idx, event):
