@@ -81,12 +81,16 @@ ACL 错码 0（显式五码 + **非数字边界** + 排掉 `kt-seam` 埋点行�
 判读：**同臂跨轮地板先算出来，再看 A−B**；差值 > 1 ms 且 > 地板才算收益。
 🔴 跨发不得相减（§4.25 的教训：绝对值跨发差 ~1.5 ms）。
 
-逐位（perf 有结论之后再排，两臂各一发）：
+逐位（perf 有结论之后再排，两臂各一发；`seq_p1a.sh` 跑的是四臂，逐位直接点 `run_arm.sh`）：
 ```bash
-python3 $WT/sidestream/make_prompts.py --out $RUN/prompts.jsonl --seed <新种子>
-bash $WT/sidestream/seq_p1a.sh $RUN $CARD lp          # 之后 logprob_cmp.py --skip-first=12
+python3 $WT/sidestream/make_prompts.py $RUN/prompts.jsonl <新种子>   # 位置参数，不是 --out
+SIDE=1 P1A=0 bash $WT/sidestream/run_arm.sh $RUN A3 $CARD lp
+SIDE=1 P1A=1 bash $WT/sidestream/run_arm.sh $RUN B3 $CARD lp
+python3 $WT/sidestream/logprob_cmp.py $RUN/A3/lp.jsonl $RUN/B3/lp.jsonl "A3 vs B3" --skip-first=12
 ```
 `--skip-first=12` **按臂校准**，不许拿结果反推截断点（§4.25/§4.26）。
+⚠ 两臂各一发**没有同臂地板**：逐位全同的话不需要地板（没有差异要解释），
+一旦出现差异，**先补一发同臂（A4）算跨进程地板再判**，不许直接读成「P1a 改了数值」。
 
 ## 3. profile：默认不采
 用户 2026-09-23 明确：**默认只跑 perf + 精度判据，profile 太慢 ⇒ 非必要不采**。
