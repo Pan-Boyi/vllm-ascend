@@ -7,7 +7,7 @@
 
 | 事 | 产物目录 | 状态 |
 |---|---|---|
-| **合版本验收**（侧流 + 事件等待 P1a 两开 vs 两关） | `oncard_runs/20260923_082414_merge/` | 卡 0，08:47 起租约。步骤：交错 ≥3 轮 perf（判据写在该目录 `EXPECTED.txt`，先声明后跑）→ 整网 logprob 逐位（四臂，skip=13）→ GSM8K 50 两臂 → **B 臂 1319 全量** |
+| **合版本验收**（侧流 + 事件等待 P1a 两开 vs 两关） | `oncard_runs/20260923_091123_merge/`（第一发 `082414` 因外部租户占卡 0+1 作废，见其 `VOID.txt`） | **卡 2**。步骤：交错 ≥3 轮 perf（判据写在该目录 `EXPECTED.txt`，先声明后跑）→ 整网 logprob 逐位（四臂，skip=13）→ GSM8K 50 两臂 → **B 臂 1319 全量** |
 | **trace 切片 + 甘特图** | `build_artifacts/moe_offload_ref/trace_slices/`（尚未生成） | 离线。从 `/dev/shm/dsv41_prof_seam`（串行）与 `_seam_side`（侧流）各抽 2–3 个稳态 step，出 `prof/trace_slice.py` + `prof/trace_gantt_section.html`；**必须与已内联聚合读数对上**，对不上就停下报告 |
 
 ⚠️ `/dev/shm/dsv41_prof_*` 是内存盘，**机器重启就没**；P1b 那份原始 trace 已删（09-23 根盘写满时）。
