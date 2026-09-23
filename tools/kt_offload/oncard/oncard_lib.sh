@@ -31,6 +31,24 @@ oc_scan_anomaly() {
   return 1
 }
 
+# The ACL error codes that must be 0, and the pattern to look for them with.
+# Explicitly enumerated, never a range: a range silently takes in codes that do
+# not exist yet and (the 10701[0-9] version did exactly this) leaves out 107025,
+# the one the side stream fails with.
+#   107011 duplicate subscribe (we swallow it by design; escaping = a bug)
+#   107015 submitted to a stream that is not being captured
+#   107025 cross-stream capture failed (the side stream)
+#   107027 an eager path ran during a capture
+#   107030 an H2D was refused during a capture
+# 🔴 ONCARD_ERRCODE_RE adds a NON-DIGIT boundary on both sides. Without it a
+# nanosecond timestamp matches by pure chance: on 2026-09-23 an arm was voided
+# because 1790123465521070247 contains "107024"... and three healthy arms hit
+# 136/145/176 times. Excluding our own instrument's lines (grep -v kt-seam)
+# is the other half of the fix and does not replace this one: a callback
+# duration of exactly 107015 ns is comma-delimited and still matches.
+ONCARD_ERRCODES="107011|107015|107025|107027|107030"
+ONCARD_ERRCODE_RE="(^|[^0-9])(${ONCARD_ERRCODES})([^0-9]|\$)"
+
 # oc_count <regex> <file|dir>...  -> total matching lines (never piped into a rc check)
 oc_count() {
   local re="$1"; shift

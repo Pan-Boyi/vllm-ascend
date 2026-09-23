@@ -8,7 +8,13 @@ PORT=${PORT:-8041}; OWNER=dsv41_vllm_singlecard
 export TMPDIR=/dev/shm/dsv41_tmp TMP=/dev/shm/dsv41_tmp
 D=$RUN/$ARM; mkdir -p $D; SUM=$D/arm_summary.txt; : > $SUM
 say(){ echo "[$(date +%T)] $*" | tee -a $SUM; }
-X=${ARM:0:1}; CFG=$RUN/cfg_$X.json; SIDE=$([ "$X" = B ] && echo 1 || echo 0)
+X=${ARM:0:1}; CFG=$RUN/cfg_$X.json
+# 默认：A 臂侧流关、B 臂侧流开（§4.26 那一轮的口径）。
+# 🔴 P1a 的 A/B 是【两臂都开侧流】、只差 async wait 这一个开关，所以两者都可被调用方
+#    显式覆盖（SIDE=1 P1A=0 / SIDE=1 P1A=1）。覆盖之后下面的必检也跟着这两个值走 ——
+#    检查项必须判【这一臂实际要的】，否则一个写死 40/0 的必检会把正确的臂判成作废。
+SIDE=${SIDE:-$([ "$X" = B ] && echo 1 || echo 0)}
+P1A=${P1A:-0}
 # 🔴 Read the score from metrics.json, never by grepping the progress log: the
 # runner prints "[n/N] acc=..." every 50 items, so `grep -m1 acc` picks the
 # score after the FIRST 50 and calls it the result. With --limit 50 that is
@@ -22,7 +28,7 @@ print(f'{m["num_correct"]}/{m["num_examples"]} acc={m["aggregate"]["score"]:.4f}
       f'{m["latency_seconds"]:.0f}s')
 PYEOF
 }
-say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE extra=[$*] steps=$STEPS"
+say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A extra=[$*] steps=$STEPS"
 python3 worktrees/moe-offload/tools/kt_offload/build_fingerprint.py stamp $D --label sidestream_$ARM > $D/fp.txt 2>&1
 grep -q 85331298bdeffee02b7c42c5658030ac $D/build_fingerprint.json || { say "❌ .so mismatch"; exit 3; }
 npu-smi info > $D/card_before.txt 2>&1
@@ -30,7 +36,8 @@ npu-smi info > $D/card_before.txt 2>&1
     WT=moe-offload DSV41_VLLM_TREE=$ROOT/worktrees/moe-offload-vllm LEASE_OWNER=$OWNER \
     KT_OFFLOAD=1 NPUS=$CARD PORT=$PORT EAGER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
     KT_ADDITIONAL_CONFIG="$(cat $CFG)" MAXLEN=8192 MAXSEQS=8 MAXBATCH=4096 \
-    VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$SIDE VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30 "$@" \
+    VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$SIDE VLLM_ASCEND_DSV41_KT_ASYNC_WAIT=$P1A \
+    VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30 "$@" \
     bash worktrees/moe-offload/tools/kt_offload/serve_v41_singlecard.sh ) > $D/serve.log 2>&1 &
 SP=$!; sleep 2; PGID=$(ps -o pgid= -p $SP | tr -d ' '); echo "pgid=$PGID" > $D/pgid.txt; say "serve pid=$SP pgid=$PGID"
 stop(){ say "stopping"; OWNED_CARDS=$CARD STOP_PGID=$PGID bash build_artifacts/stop_by_port.sh $PORT > $D/stop.log 2>&1; say "stop rc=$? $(tail -1 $D/stop.log)"
@@ -54,10 +61,17 @@ VA=$(grep -m1 'vllm_ascend = ' $D/serve.log); NSS=$(grep -c 'SIDE STREAM ENABLED
 # do not help -- a cb_ns of exactly 107015 is comma-delimited. So the check
 # excludes our own dumps; a real 107025 in a t5 log still matches (checked).
 # An arm that passed this check while rt lines existed was not checked at all.
-NE=$(grep -v 'kt-seam' $D/serve.log | grep -cE '1070[12][0-9]')
-say "check vllm_ascend: $VA"; say "check SIDE STREAM ENABLED count=$NSS (want $([ $SIDE = 1 ] && echo 40 || echo 0))"; say "check 1070[12]x count=$NE (want 0)"
+# 🔴 并且要有【非数字边界】：19 位纳秒时间戳里碰巧含 1070[12]x，09-22 夜就有一臂
+# （BD0r2）被 1790123465521070247 里的一段误判作废。两条一起用才干净；口径与
+# oncard_lib.sh 的 ONCARD_ERRCODE_RE 一致，selftest_cpu.sh 里有钉住它的变异臂。
+ERRRE='(^|[^0-9])(107011|107015|107025|107027|107030)([^0-9]|$)'
+NE=$(grep -v 'kt-seam' $D/serve.log | grep -cE "$ERRRE")
+NAW=$(grep -c 'ASYNC WAIT ENABLED' $D/serve.log)
+say "check vllm_ascend: $VA"; say "check SIDE STREAM ENABLED count=$NSS (want $([ $SIDE = 1 ] && echo 40 || echo 0))"
+say "check ASYNC WAIT ENABLED count=$NAW (want $([ $P1A = 1 ] && echo 40 || echo 0))"; say "check ACL errcode lines count=$NE (want 0)"
 bad=0; echo "$VA" | grep -q 'worktrees/moe-offload/vllm_ascend/__init__.py' || bad=1
 [ $SIDE = 1 ] && [ $NSS -ne 40 ] && bad=1; [ $SIDE = 0 ] && [ $NSS -ne 0 ] && bad=1; [ $NE -ne 0 ] && bad=1
+[ $P1A = 1 ] && [ $NAW -ne 40 ] && bad=1; [ $P1A = 0 ] && [ $NAW -ne 0 ] && bad=1
 [ $bad = 1 ] && { say "❌ mandatory check failed -> arm void"; stop; exit 5; }
 for s in ${STEPS//,/ }; do case $s in
   probe) curl -s http://127.0.0.1:$PORT/v1/completions -H 'Content-Type: application/json' \

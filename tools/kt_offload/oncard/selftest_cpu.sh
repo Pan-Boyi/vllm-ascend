@@ -47,7 +47,8 @@ oc_scan_anomaly "$RE" "$W/clean.log" > /dev/null; r=$?; [ $r -eq 1 ]; ok $? "cle
 oc_scan_anomaly "$RE" "$W/does_not_exist" > /dev/null; r=$?; [ $r -eq 2 ]; ok $? "nothing scannable -> rc $r (want 2, not 'clean')"
 mkdir -p "$W/plog/debug"; printf 'x\n[ERROR] EZ9999 from plog\n' > "$W/plog/debug/p.log"
 hit=$(oc_scan_anomaly "$RE" "$W/clean.log" "$W/plog"); ok $? "marker inside a plog directory detected -> $hit"
-ERRC="107011|107015|107025|107027|107030"
+ERRC="$ONCARD_ERRCODES"   # the one definition, from oncard_lib.sh
+[ "$ERRC" = "107011|107015|107025|107027|107030" ]; ok $? "the code list is the explicit five: $ERRC"
 c=$(oc_count "$ERRC" "$W/clean.log" "$W/plog"); [ "$c" = 0 ]; ok $? "ACL err count on clean inputs = $c"
 printf 'rt error 107011 x\n107027 y\n' > "$W/plog/debug/q.log"
 c=$(oc_count "$ERRC" "$W/plog"); [ "$c" = 2 ]; ok $? "the list sees both 107011 and 107027 (design 要求这五个都为 0): $c"
@@ -58,6 +59,19 @@ printf 'capture failed 107025 z
 c=$(oc_count "$ERRC" "$W/plog"); [ "$c" = 3 ]; ok $? "107025 is counted by the list ($c, was 2) -- the whole point of the fix"
 c=$(oc_count "10701[0-9]" "$W/plog"); [ "$c" = 1 ]; ok $? "the old pattern still misses 107025 (counts $c) -- that is what shipped as \"0 lines\""
 rm -f "$W/plog/debug/r.log"
+
+# 🔴 数字边界（2026-09-23 加）。seam 埋点把纳秒时间戳原样打进 serve.log，19 位整数里
+# 碰巧含 1070[12]x（如 1790123465107025999）：健康臂上命中 136/145/176 次，且 09-22 夜真的有一臂被这样误判作废。
+# 下面三条是同一份输入上的【变异臂】：无边界的正则数到 3，有边界的只数到真错码那 1 条。
+printf 'kt-seam rt layer 7 enter_rt=1790123465107025999 cb_ns=53412\n' >  "$W/plog/debug/ts.log"
+printf 'kt-seam rt layer 8 enter_rt=1790123465107011999 cb_ns=51077\n' >> "$W/plog/debug/ts.log"
+printf 'EZ0000 capture_end failed with 107025\n'                       >> "$W/plog/debug/ts.log"
+c=$(oc_count "$ERRC" "$W/plog/debug/ts.log"); [ "$c" = 3 ]; ok $? "变异臂：无边界的老写法把两行纳秒时间戳也算成错码（$c 条，只有 1 条是真的）"
+c=$(oc_count "$ONCARD_ERRCODE_RE" "$W/plog/debug/ts.log"); [ "$c" = 1 ]; ok $? "非数字边界只留下那条真的 107025（$c 条）"
+printf 'kt-seam rt layer 9 cb_ns=107015, dur=12\n' > "$W/plog/debug/ts2.log"
+c=$(oc_count "$ONCARD_ERRCODE_RE" "$W/plog/debug/ts2.log"); [ "$c" = 1 ]; ok $? "边界救不了【正好等于错码】的埋点值（$c 条）-- 这就是为什么还要 grep -v kt-seam"
+c=$(grep -v 'kt-seam' "$W/plog/debug/ts2.log" | grep -cE "$ONCARD_ERRCODE_RE"); [ "$c" = 0 ]; ok $? "两条一起用才干净（$c 条）"
+rm -f "$W/plog/debug/ts.log" "$W/plog/debug/ts2.log"
 
 echo "== 4. monitor stops a test that prints a marker (process group, no retry)"
 setsid bash -c "sleep 2; echo 'EZ9999 fake'; sleep 60" > "$W/mon.log" 2>&1 < /dev/null &
