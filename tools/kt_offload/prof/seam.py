@@ -806,6 +806,7 @@ def main(argv=None) -> int:
     # ---- NOTIFY_WAIT, sliced and checked before it is allowed into the table
     nw: dict[int, float] = {}
     align = None
+    totals_aggregate = None
     if args.nw_csv:
         n_layers = args.layers or len(layers)
         nw_skip, nw_stream = args.nw_skip, (args.nw_stream if args.nw_stream not in ("auto", "") else None)
@@ -838,6 +839,30 @@ def main(argv=None) -> int:
                 nw = {}
         else:
             print("  ⚠ no step had exactly the expected number of NOTIFY_WAIT -- nothing to align")
+        # An aggregate that needs no per-layer assignment at all, printed
+        # whether or not the alignment check passed: when one stream holds
+        # exactly our layers, the sum of its waits over a step minus the sum
+        # of the per-layer cb medians IS A+F for the whole net. It cannot say
+        # which layer moved -- that is what the per-layer column is for, and
+        # what the alignment check is guarding. Both are printed so a refused
+        # alignment does not leave an arm with no number at all.
+        if nw_stream is not None:
+            all_steps, _m2 = notify_wait_steps(args.nw_csv, nw_stream)
+            full = [v for v in all_steps if len(v) == n_layers]
+            flat = sorted(d for v in full for d in v)
+            if full and flat:
+                nw_sum = sum(flat) / len(full) / 1000.0
+                cb_sum = sum(med[l].get("cb", 0.0) for l in layers) / 1000.0
+                agg = {"nw_med_us": round(st.median(flat), 2),
+                       "nw_p90_us": round(flat[int(0.9 * len(flat))], 2),
+                       "nw_sum_ms": round(nw_sum, 4), "cb_sum_ms": round(cb_sum, 4),
+                       "a_f_ms": round(nw_sum - cb_sum, 4), "steps": len(full)}
+                totals_aggregate = agg
+                print(f"  alignment-free aggregate (stream {nw_stream}, {len(full)} full steps): "
+                      f"NW med {agg['nw_med_us']} p90 {agg['nw_p90_us']} us; "
+                      f"NW sum {agg['nw_sum_ms']} - cb sum {agg['cb_sum_ms']} = "
+                      f"A+F {agg['a_f_ms']} ms/token ({agg['a_f_ms'] * 1000 / n_layers:.1f} us/layer). "
+                      f"Sum-based, so not the same statistic as the per-layer medians below.")
 
     cols = ADDITIVE if split else ADDITIVE_LUMPED
     head = "layer     n  " + "".join(f"{c:>9s}" for c in cols) + "       cb      gap"
@@ -950,6 +975,7 @@ def main(argv=None) -> int:
         json.dump(
             {"split": split, "samples": m["samples"], "dropped": dropped,
              "window": window_note, "alignment": align, "totals": totals, "a_f": af,
+             "aggregate": totals_aggregate,
              "layers": {str(k): v for k, v in out_layers.items()}},
             open(args.json_out, "w"), indent=1, default=float)
         print(f"wrote {args.json_out}")

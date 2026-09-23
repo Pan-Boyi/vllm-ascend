@@ -631,3 +631,29 @@ def test_an_ambiguous_split_is_not_guessed_at(tmp_path):
     dup = [ln.replace(",NOTIFY_WAIT,336,", ",NOTIFY_WAIT,338,") for ln in text[1:] if ",NOTIFY_WAIT,336," in ln]
     csv_path.write_text("\n".join(text + dup) + "\n")
     assert tool.notify_wait_stream_auto(str(csv_path), len(cb)) == {}
+
+
+def test_the_aggregate_is_printed_even_when_the_alignment_is_refused(tmp_path, capsys):
+    """🔴 A refused alignment must not leave an arm with no A+F at all.
+
+    The per-layer column needs position j to BE layer j (and the Spearman
+    check can refuse that at one [kt-seam] sample per capture), but the
+    whole-net sum does not: every wait on our stream is ours, so
+    sum(NW per step) - sum(med(cb)) is A+F for the net with no assignment in
+    it. It is a different statistic from the per-layer medians, so the line
+    says so; what it cannot do is name the layer that moved.
+    """
+    cb, steps = _synthetic_run()
+    csv_path = tmp_path / "task_time.csv"
+    _write_forked_csv(csv_path, steps)
+    log = tmp_path / "serve.log"
+    log.write_text("\n".join(_log_line("09-22 15:01:51", cb=cb[i], layers=len(cb)) for i in [0]))
+    found = tool.notify_wait_stream_auto(str(csv_path), len(cb))
+    assert found["stream"] == "336"
+    all_steps, _ = tool.notify_wait_steps(str(csv_path), "336")
+    full = [v for v in all_steps if len(v) == len(cb)]
+    assert len(full) == len(steps), "every step must be usable in this fixture"
+    nw_sum = sum(sum(v) for v in full) / len(full)
+    cb_sum = sum(cb.values())
+    # the fixture makes NW = cb + 80 per layer, so A+F must come back as 80/layer
+    assert (nw_sum - cb_sum) / len(cb) == pytest.approx(80.0, abs=1.0)
