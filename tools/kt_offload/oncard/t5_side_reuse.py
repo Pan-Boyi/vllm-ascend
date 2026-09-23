@@ -258,7 +258,7 @@ def main() -> int:  # noqa: C901
                          "arms. Bit-identity between the two is the criterion.")
     ap.add_argument("--shared-inter", type=int, default=C.INTER,
                     help="shared-expert intermediate size (DSV4.1: n_shared_experts=1 x 2304)")
-    ap.add_argument("--shared-chain", choices=("auto", "w8a8", "bf16"), default="auto",
+    ap.add_argument("--shared-chain", choices=("auto", "mxfp8", "w8a8", "bf16"), default="auto",
                     help="which operator chain the stand-in uses; 'auto' probes the build and prints it")
     ap.add_argument("--stall-ms", type=float, default=0.0,
                     help="🔴 the discriminator. Hold EVERY ExternalEvent record back by this many ms, in "
@@ -354,6 +354,25 @@ def main() -> int:  # noqa: C901
 
     v = C.Verdict("T5r side stream under the service's shape")
     v.note("correctness only; this file measures no time")
+
+    # ------------------------------------------- §4.31 gate 1/2 (host, no device)
+    # 🔴 A HARD GATE, not a print. The judge is bit-identity, and bit-identity can
+    # only see a dropped merge while the layer output still has bits to spare for
+    # it. The stand-in used to be a quadratic form, which squared the amplitude
+    # once per layer (2026-09-23: NaN from layer 5, two all-NaN reference steps
+    # "identical", three runs blocked -- and at 1e5..1e22 a DROPPED MERGE would
+    # have read as bit-identical = green). This replays the arm's arithmetic on
+    # the host with a declared merge share and refuses to run unless the no-merge
+    # mutant is visible at EVERY layer by at least MERGE_ULP_MARGIN bf16 ULP.
+    if args.shared_mlp != "off":
+        cpu_rep = N.shared_stack_cpu_check_default(
+            layers=len(layer_ids), steps=args.steps, tokens=args.tokens,
+            hidden=C.HIDDEN, inter=args.shared_inter, seed=args.seed)
+        v.note(f"stand-in discriminating power (host replay, {cpu_rep['layers']}x{cpu_rep['steps']}): "
+               f"max|h| {cpu_rep['max_abs']:.3e}, per-layer growth <= {cpu_rep['max_growth']:.3f}, "
+               f"a dropped merge (declared share {cpu_rep['merge_rel']} of rms(h)) stays visible at "
+               f"every layer, min {cpu_rep['min_ulps']:.1f} bf16 ULP >= margin {cpu_rep['ulp_margin']}")
+
     rt = N.init_runtime()
     dev = rt.device
     ck = C.Ckpt()
@@ -414,9 +433,15 @@ def main() -> int:  # noqa: C901
     poison_w = 7.0
 
     # ------------------------------------------------- eager serial reference
-    def run_eager(x0, ids0, w0):
+    # §4.31 gate 2/2 lives inside the reference pass: it measures the REAL merge
+    # contribution (merged - pre is exactly the CPU half) against the REAL layer
+    # output, per layer per step. The host gate argues from a declared merge
+    # share; this one uses the numbers the card actually produced.
+    merge_stats: list = []
+
+    def run_eager(x0, ids0, w0, watch: bool = False):
         h = x0
-        for off, lay, comm in stack:
+        for li, (off, lay, comm) in enumerate(stack):
             npu_routing = off.route(h, w0, ids0, in_profile_run=False)
             pre = N.npu_moe(lay, comm, h, npu_routing.topk_weights, npu_routing.topk_ids)
             # The reference is SERIAL and un-moved: shared expert on the layer
@@ -424,17 +449,46 @@ def main() -> int:  # noqa: C901
             # against this, so an arm that moves the merge is judged against an
             # order it does not share -- which is the point.
             shared = shared_fn(h) if shared_fn is not None else None
-            h = h + off.merge(pre)
+            pre_c = pre.detach().clone() if watch else None
+            merged = off.merge(pre)
+            h_next = h + merged
             if shared is not None:
-                h = h + shared
+                h_next = h_next + shared
+            if watch:
+                d = merged.float() - pre_c.float()
+                merge_stats.append({
+                    "layer": li,
+                    "ulps": float(N._rms(d).mean() / N._rms(h_next).mean()) / N.BF16_EPS,
+                    "growth": float(N._rms(h_next).mean() / N._rms(h).mean()),
+                    "max_abs": float(h_next.float().abs().max()),
+                })
+            h = h_next
         return h
 
-    ref = [run_eager(*inp).float().cpu() for inp in inputs]
+    ref = [run_eager(*inp, watch=True).float().cpu() for inp in inputs]
     torch.npu.synchronize()
     for k in range(1, len(ref)):
         if C.bit_identical(ref[k], ref[k - 1])[0]:
             raise RuntimeError("two reference steps came out identical; the inputs do not discriminate")
-    print(f"eager serial reference: {len(ref)} steps, pairwise different", flush=True)
+    bad = [r for r in merge_stats if not (r["ulps"] >= N.MERGE_ULP_MARGIN)]
+    wild = [r for r in merge_stats if not (r["max_abs"] < 1.0e4) or r["max_abs"] != r["max_abs"]]
+    if merge_stats:
+        worst = min(merge_stats, key=lambda r: r["ulps"])
+        print(f"eager serial reference: {len(ref)} steps, pairwise different; measured merge share "
+              f"{worst['ulps']:.1f} bf16 ULP at its weakest (layer {worst['layer']}, margin "
+              f"{N.MERGE_ULP_MARGIN}), max|h| {max(r['max_abs'] for r in merge_stats):.3e}, "
+              f"per-layer growth <= {max(r['growth'] for r in merge_stats):.3f}", flush=True)
+    if wild:
+        raise RuntimeError(f"reference amplitude out of hand ({len(wild)} layer-steps, worst "
+                           f"max|h|={max(r['max_abs'] for r in wild):.3e}): a dropped merge would "
+                           f"round away -- the bit-identity criterion is blind here")
+    if bad:
+        raise RuntimeError(f"the merge contributes only {min(r['ulps'] for r in bad):.2f} bf16 ULP of "
+                           f"the layer output at {len(bad)}/{len(merge_stats)} layer-steps (margin "
+                           f"{N.MERGE_ULP_MARGIN}): dropping it could read bit-identical = green. "
+                           f"Refusing to run.")
+    if not merge_stats:
+        print(f"eager serial reference: {len(ref)} steps, pairwise different", flush=True)
 
     sx, sids, sw = (t.clone() for t in inputs[0])
     # A prefill-shaped eager forward for --eager-every (its own tensors: it must
