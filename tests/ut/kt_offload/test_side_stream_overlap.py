@@ -76,12 +76,24 @@ class Sim:
         # had when the op was *enqueued*, which is the reordering these tests
         # exist to see.
         self.fill_src: dict[int, Box] = {}
+        # 🔴 P1a. id(ExternalEvent) -> the time it was signalled, and it
+        # PERSISTS ACROSS REPLAYS: that is the whole difference from the
+        # ordinary event table, which is rebuilt per replay. An external event
+        # is a value in device memory; nothing clears it but the ``reset`` node
+        # in the graph. Drop that node and replay 2's wait sails through on
+        # replay 1's signal -- faster, wrong, silent, and invisible to any
+        # model that resets the table between replays.
+        self.ext_signaled: dict[int, float] = {}
+        # How the modelled completion thread behaves: "clean" (sync, then
+        # record), "early-record" (record first) or "no-record" (never).
+        self.async_mode = "clean"
 
     def enqueue(self, stream, op):
         self.programs.setdefault(stream.name, []).append(op)
 
     def reset_programs(self):
         self.programs = {}
+        self.ext_signaled = {}
         for attr in ("_idx", "_clock"):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -89,9 +101,46 @@ class Sim:
     def run(self, programs) -> float:
         """Execute per-stream op lists from the start, honouring event waits.
 
-        Used for a graph replay: fresh indices and a fresh event table.
+        Used for a graph replay: fresh indices and a fresh event table. The op
+        lists are copied because the modelled completion thread appends to them
+        while the replay runs (it is host work, not a graph node), and
+        ``ext_signaled`` is NOT reset -- see the comment on it.
         """
-        return self._run(programs, {}, {}, {})
+        # A signal left over from an earlier replay happened before this one
+        # started, so its timestamp is 0 on this replay's clock. Keeping the
+        # old absolute time would make a stale signal look like a wait that
+        # still delayed -- which is exactly the bug it must NOT hide.
+        self.ext_signaled = dict.fromkeys(self.ext_signaled, 0.0)
+        return self._run({n: list(ops) for n, ops in programs.items()}, {}, {}, {})
+
+    def async_complete(self, work_fn, cost, event) -> None:
+        """Model the completion thread, from inside the host-func node.
+
+        What the node does is hand the task over and return; what happens next
+        is another thread waiting ``cost`` for kt and only then writing the
+        value the device is parked on. Modelled as a serial FIFO program of its
+        own (kt's queue is exactly that) gated on the moment of the hand-off.
+
+        ``sim.async_mode`` picks the arm:
+          ``clean``         work, then signal -- production.
+          ``early-record``  signal, then work. 🔴 The main failure: the H2D is
+                            released while the pinned output still holds the
+                            previous step's value, and nothing raises.
+          ``no-record``     never signal. The device waits for ever, which here
+                            is the deadlock assertion at the end of ``_run``.
+        """
+        gate = object()
+        self._active_recorded[id(gate)] = self._now
+        ops = [Op("wait", None, 0.0, gate)]
+        signal = Op("ext_record", None, 0.0, event)
+        work = Op("ktwork", work_fn, cost)
+        if self.async_mode == "early-record":
+            ops += [signal, work]
+        elif self.async_mode == "no-record":
+            ops += [work]
+        else:
+            ops += [work, signal]
+        self._active_programs.setdefault("completer", []).extend(ops)
 
     def drain(self) -> float:
         """Host-side device sync: everything enqueued and not yet executed runs.
@@ -138,26 +187,34 @@ class Sim:
         data hazard here, exactly as on the device: the H2D reads the pinned
         buffer at the moment it executes, not when it was enqueued.
         """
-        for name in programs:
-            idx.setdefault(name, 0)
-            clock.setdefault(name, 0.0)
+        self._active_programs, self._active_recorded = programs, recorded
         while True:
             runnable = []
-            for name, ops in programs.items():
+            # list(): the modelled completion thread adds a program of its own
+            # while this loop runs (a host-func node hands its task over).
+            for name, ops in list(programs.items()):
+                idx.setdefault(name, 0)
+                clock.setdefault(name, 0.0)
                 if idx[name] >= len(ops):
                     continue
                 op = ops[idx[name]]
-                if op.kind == "wait" and id(op.event) not in recorded:
-                    continue  # blocked until some stream records it
-                start = max(clock[name], recorded[id(op.event)]) if op.kind == "wait" else clock[name]
+                table = recorded if op.kind == "wait" else self.ext_signaled
+                if op.kind in ("wait", "ext_wait") and id(op.event) not in table:
+                    continue  # blocked until someone signals it
+                start = max(clock[name], table[id(op.event)]) if op.kind in ("wait", "ext_wait") else clock[name]
                 runnable.append((start + op.cost, name, op))
             if not runnable:
                 break
             end, name, op = min(runnable, key=lambda r: (r[0], r[1]))  # noqa: PLW2901
             clock[name] = end
+            self._now = end
             if op.kind == "record":
                 recorded[id(op.event)] = end
-            elif op.kind != "wait":
+            elif op.kind == "ext_record":
+                self.ext_signaled[id(op.event)] = end
+            elif op.kind == "ext_reset":
+                self.ext_signaled.pop(id(op.event), None)
+            elif op.kind not in ("wait", "ext_wait"):
                 op.fn()
             idx[name] += 1
             if one:
@@ -370,8 +427,37 @@ def sim(monkeypatch):
 
     monkeypatch.setattr(kl, "_stream_ctx", stream_ctx)
 
+    # ---- P1a doubles: the ExternalEvent nodes and the completion thread ----
+    monkeypatch.setattr(kl, "_EXT_EVENTS", [])
+    monkeypatch.setattr(kl, "_COMPLETER", None)
+    monkeypatch.setattr(kl, "_new_external_event", lambda device: object())
+    monkeypatch.setattr(kl, "_ext_wait", lambda ev, stream: s.enqueue(stream, Op("ext_wait", None, 0.0, ev)))
+    monkeypatch.setattr(kl, "_ext_reset", lambda ev, stream: s.enqueue(stream, Op("ext_reset", None, 0.0, ev)))
+    monkeypatch.setattr(
+        kl, "_make_completer", lambda device: SimpleNamespace(start=lambda: None, submit=lambda *a: None)
+    )
+
+    def submit_only(payload):
+        """``_kt_packed_submit_only``: build the task, hand it over, return.
+
+        The node itself is cheap (5 against the serial node's 40); kt's 35 runs
+        on the modelled completion thread, and the device is parked on the
+        ExternalEvent until that thread signals it.
+        """
+        _wrapper, buf, layer_idx, event = payload
+        kl.HOST_FUNC_CALLS[layer_idx] = kl.HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+        hidden_box, ids_box, out_box = buf["pin_hidden"], buf["pin_ids"], buf["pin_out"]
+
+        def work():
+            hidden, ids = hidden_box.value, ids_box.value
+            out_box.value = None if hidden is None else 3 * hidden + (ids or 0)
+
+        s.async_complete(work, 35.0, event)
+
+    monkeypatch.setattr(kl, "_kt_packed_submit_only", submit_only)
+
     def host_func(stream, fn, payload):
-        s.enqueue(stream, Op("hostfunc", lambda: fn(payload), 40.0))
+        s.enqueue(stream, Op("hostfunc", lambda: fn(payload), 5.0 if fn is submit_only else 40.0))
 
     monkeypatch.setattr(kl, "_launch_host_func", host_func)
 
@@ -390,7 +476,15 @@ def _prop(s):
     return s.current is s.compute or s.capture_propagates
 
 
-def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes, *, packed: bool = False):
+def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes, *, packed: bool = False,
+             async_wait: bool = False):
+    from vllm_ascend import envs
+    from vllm_ascend.kt_offload import async_wait as aw
+
+    # P1a is an env-only switch (the A/B it exists for must differ in exactly
+    # one thing, and the cfg json is part of an arm's fingerprint), so it is
+    # set here rather than on the config object.
+    monkeypatch.setattr(envs, aw.ENV_NAME, "1" if async_wait else "0", raising=False)
     plan = build_plan([[0, 3]], NEXP)
     cfg = KTOffloadConfig(
         enabled=True,
@@ -1177,3 +1271,228 @@ def test_seam_timing_does_not_also_probe_cpu_infer_on_the_forked_path(monkeypatc
         )
     finally:
         sm._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# 5. P1a: the device waits for an ExternalEvent, not for the callback's return
+#
+# The arm under test is the one that will be merged: side stream ON in both
+# arms, and only VLLM_ASCEND_DSV41_KT_ASYNC_WAIT differs. The simulator has to
+# model two things the side-stream model did not need:
+#
+#   * the release comes from a thread that runs AFTER the node returned, so
+#     the node no longer contains kt's compute (``Sim.async_complete``);
+#   * an external event is a value in device memory and stays signalled until
+#     the graph's ``reset`` node clears it (``Sim.ext_signaled``, which is the
+#     one piece of state ``run()`` does not rebuild per replay).
+#
+# 🔴 All three mutants below are the same failure the on-card cases look for:
+# a release that happens before this step's output exists. Two of them are
+# faster and wrong; the third is a hang, which is the only one a user would
+# notice on their own.
+# ---------------------------------------------------------------------------
+
+
+def _capture_p1a(monkeypatch, sim, boxes, *, async_wait: bool, overlap: bool = True, packed: bool = False):
+    rt, _ = _runtime(monkeypatch, sim, overlap=overlap, graph=True, boxes=boxes, packed=packed,
+                     async_wait=async_wait)
+    sim.capturing = True
+    hs, ids, w = _inputs(7)
+    rt.route(hs, w, ids, in_profile_run=False)
+    sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    sim.capturing = False
+    return {name: list(ops) for name, ops in sim.programs.items()}, rt
+
+
+def _p1a_arms(monkeypatch, sim, *, mode="clean", mutate=None, values=(2.0, 5.0, 9.0)):
+    """Side stream + P1a off vs side stream + P1a on, replayed on the same inputs."""
+    ref_boxes = _boxes()
+    ref, _ = _capture_p1a(monkeypatch, sim, ref_boxes, async_wait=False)
+    sim.reset_programs()
+    p1a_boxes = _boxes()
+    sim.async_mode = mode
+    p1a, rt = _capture_p1a(monkeypatch, sim, p1a_boxes, async_wait=True)
+    if mutate is not None:
+        p1a = mutate(p1a, p1a_boxes, rt)
+    out_r, out_p, t_r, t_p = [], [], [], []
+    for v in values:
+        sim.async_mode = "clean"
+        y, t = _replay(sim, ref, ref_boxes[0], ref_boxes[3], v)
+        out_r.append(y)
+        t_r.append(t)
+        sim.async_mode = mode
+        y, t = _replay(sim, p1a, p1a_boxes[0], p1a_boxes[3], v)
+        out_p.append(y)
+        t_p.append(t)
+    return out_r, out_p, max(t_r), max(t_p)
+
+
+def test_p1a_records_the_wait_and_the_reset_behind_the_node(monkeypatch, sim):
+    """The shape, on the stream the node is on, with the reset present.
+
+    The reset has no second line of defence at run time: without it the graph
+    still works and gets faster. This asserts the node is emitted; the next
+    test asserts that removing it is caught by the output.
+    """
+    boxes = _boxes()
+    programs, _ = _capture_p1a(monkeypatch, sim, boxes, async_wait=True)
+    assert [o.kind for o in programs["side"]] == [
+        "wait", "d2h", "hostfunc", "ext_wait", "ext_reset", "record",
+    ]
+    assert [o.kind for o in programs["compute"]] == [
+        "fill", "fill", "fill", "record", "npu_experts", "wait", "h2d",
+    ]
+    # one object for both nodes, and it is kept alive for the process
+    side = programs["side"]
+    assert side[3].event is side[4].event
+    assert kl._EXT_EVENTS and side[3].event in kl._EXT_EVENTS
+
+
+def test_p1a_on_the_packed_path_without_the_side_stream(monkeypatch, sim):
+    """It combines with the side stream, and it also stands alone."""
+    boxes = _boxes()
+    programs, _ = _capture_p1a(monkeypatch, sim, boxes, async_wait=True, overlap=False, packed=True)
+    assert "side" not in programs
+    assert [o.kind for o in programs["compute"]] == [
+        "fill", "fill", "fill", "d2h", "hostfunc", "ext_wait", "ext_reset", "npu_experts", "h2d",
+    ]
+
+
+def test_p1a_is_bit_identical_and_not_slower(monkeypatch, sim):
+    out_r, out_p, t_r, t_p = _p1a_arms(monkeypatch, sim)
+    assert _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)  # the point of the change; never the criterion on its own
+
+
+def test_p1a_without_the_record_hangs(monkeypatch, sim):
+    """🔴 Mutant ①: the completion thread never records.
+
+    This is the arm that says the device really is waiting. If the graph
+    finished anyway, the ``ext_wait`` node would not be doing anything and
+    every other result here would be meaningless.
+    """
+    with pytest.raises(AssertionError, match="deadlock"):
+        _p1a_arms(monkeypatch, sim, mode="no-record")
+
+
+def test_p1a_recording_before_the_work_is_faster_and_wrong(monkeypatch, sim):
+    """🔴 Mutant ②: released before this step's output exists.
+
+    The main failure mode of the whole scheme, and the reason the on-card
+    criterion is bit-identity rather than TPOT.
+    """
+    out_r, out_p, t_r, t_p = _p1a_arms(monkeypatch, sim, mode="early-record")
+    assert not _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)
+
+
+def test_p1a_recording_early_reads_the_previous_replays_output(monkeypatch, sim):
+    """Name the failure: it is the PREVIOUS step's CPU output, as on card."""
+    out_r, out_p, _, _ = _p1a_arms(monkeypatch, sim, mode="early-record")
+    assert out_p[1:] == out_r[:-1], (out_r, out_p)
+
+
+def _drop_reset(programs, boxes, rt):
+    """🔴 Mutant ③: the reset node never made it into the graph.
+
+    The first replay is fine -- the event starts clear -- and every replay
+    after it walks straight through a wait that is still signalled from the
+    replay before. That is why one replay proves nothing here.
+
+    🔴 The card disagrees with this model, and the disagreement is recorded on
+    purpose (2026-09-23, t5r ``--mutant no-reset --stall-ms 50``): with all 8
+    reset nodes provably left out the on-card arm stayed bit-identical AND
+    still paid the stall on every replay, i.e. the captured ExternalEvent wait
+    re-arms itself on that build. This model follows what torch_npu documents
+    ("Before reusing ExternalEvent, you need to call reset() to clear the
+    flag", streams.py:214-217), which is the more pessimistic of the two, and
+    the production path keeps the reset for the same reason -- 0.144 us
+    against relying on undocumented behaviour. What this file must NOT be read
+    as saying is that a missing reset would show up on card: it does not, and
+    the on-card arm that does go red is ``--mutant no-wait``.
+    """
+    return {n: [o for o in ops if o.kind != "ext_reset"] for n, ops in programs.items()}
+
+
+def test_p1a_without_the_reset_in_the_graph_is_faster_and_wrong(monkeypatch, sim):
+    out_r, out_p, t_r, t_p = _p1a_arms(monkeypatch, sim, mutate=_drop_reset)
+    assert not _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)
+
+
+def test_p1a_without_the_reset_is_right_once_and_wrong_after(monkeypatch, sim):
+    """The fingerprint of a missing reset, and the reason a one-replay check
+    cannot see it: replay 0 is correct, replay 1 onwards is the previous one."""
+    out_r, out_p, _, _ = _p1a_arms(monkeypatch, sim, mutate=_drop_reset)
+    assert out_p[0] == out_r[0]
+    assert out_p[1:] == out_r[:-1], (out_r, out_p)
+
+
+def test_the_criterion_catches_the_missing_reset_in_the_recorded_ops(monkeypatch, sim):
+    """The same mutant, seen by the check the production path itself runs.
+
+    ``_packed_output`` evaluates ``ext_event_ops_ok`` on the ops it recorded,
+    so a future edit that drops the reset raises at capture instead of serving
+    stale output.
+    """
+    from vllm_ascend.kt_offload import async_wait as aw
+
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, async_wait=True)
+    sim.capturing = True
+    hs, ids, w = _inputs(3)
+    rt.route(hs, w, ids, in_profile_run=False)
+    assert [k for k, _ in rt._submit_ops] == ["d2h", "hostfunc", "ext_wait", "ext_reset"]
+    rt._submit_ops = [o for o in rt._submit_ops if o[0] != "ext_reset"]
+    with pytest.raises(RuntimeError, match="recorded the wrong node sequence"):
+        rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    assert not aw.ext_event_ops_ok([("d2h", 1), ("hostfunc", 0), ("ext_wait", EV_SENTINEL)])["ok"]
+
+
+EV_SENTINEL = object()
+
+
+def test_p1a_off_records_no_external_event_nodes(monkeypatch, sim):
+    """With the switch off the schedule is the one that was verified on card."""
+    boxes = _boxes()
+    programs, rt = _capture_p1a(monkeypatch, sim, boxes, async_wait=False)
+    assert [o.kind for o in programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
+    assert kl._EXT_EVENTS == [] and rt._ext_events == {}
+
+
+def test_p1a_needs_our_own_buffers(monkeypatch, sim):
+    """kt's own captured entry point does submit+sync in one call."""
+    boxes = _boxes()
+    with pytest.raises(RuntimeError, match="own pinned buffers"):
+        _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes, packed=False, async_wait=True)
+
+
+def test_p1a_is_a_no_op_in_eager_mode(monkeypatch, sim):
+    """Eager already blocks the host inside route(); there is nothing to defer."""
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes, async_wait=True)
+    assert rt.async_wait is False
+
+
+def test_every_replay_records_once_per_layer(monkeypatch, sim):
+    """The submit counter and the release counter have to agree.
+
+    ``HOST_FUNC_CALLS`` counts submits and ``async_wait.RECORDS`` counts
+    releases; a run where the first grows and the second does not is a device
+    about to wait for ever, which is a different symptom from a wrong answer
+    and worth naming separately.
+    """
+    from vllm_ascend.kt_offload import async_wait as aw
+
+    boxes = _boxes()
+    sim.async_mode = "clean"
+    programs, _ = _capture_p1a(monkeypatch, sim, boxes, async_wait=True)
+    kl.HOST_FUNC_CALLS.clear()
+    records: dict[int, int] = {}
+    # the double for the real completer: count what it would record
+    for k in range(3):
+        _replay(sim, programs, boxes[0], boxes[3], float(k + 2))
+        records[0] = records.get(0, 0) + 1
+    assert aw.record_counts_ok({}, records, 3, [0])["ok"]
+    assert aw.submits_match_records(dict(kl.HOST_FUNC_CALLS), records)["ok"]

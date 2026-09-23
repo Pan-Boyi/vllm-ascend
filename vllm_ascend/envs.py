@@ -276,6 +276,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # fails is faster and wrong, so the A/B's criterion is bit-identity, not
     # TPOT. Read at config validation. Not sensitive.
     "VLLM_ASCEND_DSV41_KT_SIDE_STREAM": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SIDE_STREAM", "0"),
+    # DeepSeek-V4.1 MoE offload, P1a: stop the device waiting for the host-func
+    # callback to RETURN. The captured node then only builds kt's task and
+    # submits it; the graph goes on to an ExternalEvent wait + reset, and a
+    # completion thread calls cpu_infer.sync(0) and records that event
+    # (vllm_ascend/kt_offload/async_wait.py). Saves the ACL notify-back leg of
+    # the seam (PLAN §4.22 F1/F2: A+F 78 us/layer, event waits 0.03-0.14 us).
+    # "1" = on, anything else (default "0") = the callback keeps doing the
+    # sync, byte for byte the current behaviour. Needs the layer's OWN pinned
+    # buffers, i.e. packed_transfer or overlap_side_stream (config refuses
+    # otherwise), and it is a captured-path change only: eager is untouched.
+    # 🔴 Every way it can fail is FASTER and wrong (the H2D reads the previous
+    # step's CPU output and nothing raises), so the criterion is bit-identity
+    # against the arm with it off, never TPOT. Read at config validation and
+    # at weight-load time. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_ASYNC_WAIT", "0"),
     # DeepSeek-V4.1 MoE offload: pin the ONE ACL report thread (the thread
     # torch_npu creates on the first _subscribe_report and that delivers every
     # _launch_host_func callback) to a PU kt's spinning workers do not own.

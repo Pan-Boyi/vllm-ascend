@@ -152,6 +152,23 @@ class KTOffloadConfig:
                     "(tools/kt_offload/oncard/RUNBOOK_sidestream.md), and compare bit-for-bit against the "
                     "serial arm -- every known failure of this path is FASTER and wrong."
                 )
+        # P1a (VLLM_ASCEND_DSV41_KT_ASYNC_WAIT): the captured host-func node
+        # only submits, and a completion thread records the ExternalEvent the
+        # graph waits on. It is an env-only switch on purpose -- the A/B it
+        # exists for must differ in exactly ONE thing, and the cfg json is part
+        # of an arm's fingerprint -- but it still has a precondition, and the
+        # place to refuse is here, at start-up, not at the first decode step.
+        from vllm_ascend.kt_offload import async_wait
+
+        if async_wait.enabled_by_env() and not (self.packed_transfer or self.overlap_side_stream):
+            raise ValueError(
+                f"{async_wait.ENV_NAME}=1 needs kt_offload_config.packed_transfer or "
+                "overlap_side_stream. Splitting kt's submit from its sync is only possible where WE build "
+                "the task (moe.forward_task + cpu_infer.submit/sync on this layer's own pinned buffers); "
+                "kt's own captured entry point (run_pinned_forward_sync) does both in one call, and its "
+                "pinned buffers are shared by layer_idx % 2, which is exactly the sharing the device-side "
+                "wait would stop ordering. Turn on one of the two, or unset the variable."
+            )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

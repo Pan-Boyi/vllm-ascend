@@ -49,7 +49,7 @@ import torch
 # (vllm/logger.py:204-214). 132 files in this tree use the import below.
 from vllm.logger import logger
 
-from vllm_ascend.kt_offload import report_affinity, seam_timing, side_stream
+from vllm_ascend.kt_offload import async_wait, report_affinity, seam_timing, side_stream
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
     NpuRouting,
@@ -86,6 +86,11 @@ _SIDE_EVENTS: list = []
 # which is what this path stopped using; two layers turning up on one store
 # would be that sharing coming back. See side_stream.buffer_ownership_ok.
 _SIDE_BUFFER_OWNER: dict[int, int] = {}
+# P1a: the one completion thread of this process (async_wait.Completer), and
+# the ExternalEvent objects the captured graph waits on. Like _SIDE_EVENTS,
+# the events must outlive the capture: a graph node points at each one.
+_COMPLETER = None
+_EXT_EVENTS: list = []
 
 
 def _layer_index(layer_name: str) -> int:
@@ -207,7 +212,19 @@ class KTLayerOffload:
         self._hostfunc_at_capture: int | None = None
         self.overlap = bool(getattr(cfg, "overlap_side_stream", False))
         self.packed = bool(getattr(cfg, "packed_transfer", False))
+        # P1a, env-only (async_wait.ENV_NAME). The captured node submits and
+        # returns; the device waits on this layer's ExternalEvent instead of on
+        # the callback's return. Captured path only -- eager already blocks the
+        # host, so there is nothing there to hand to another thread.
+        self.async_wait = async_wait.enabled_by_env()
         self._packed: dict[int, dict] = {}
+        # bs -> this layer's ExternalEvent. One per (layer, batch size): the
+        # graph's wait/reset nodes point at the object, so a second layer
+        # sharing one would release the wrong layer's H2D.
+        self._ext_events: dict[int, Any] = {}
+        # The op sequence of the captured submit in flight, for the P1a
+        # criterion (async_wait.ext_event_ops_ok). None outside one.
+        self._submit_ops: list | None = None
         # Graph mode: capture sizes are known from the config before any
         # capture; kt needs them registered and their buffers allocated first.
         mc, cc = vllm_config.model_config, getattr(vllm_config, "compilation_config", None)
@@ -319,8 +336,60 @@ class KTLayerOffload:
             # the only sizes that matter.
             for bs in self.capture_sizes:
                 self._packed_buffers(bs, device)
+        if self.async_wait:
+            self._enable_async_wait(device)
         if self.graph_enabled:
             self._prepare_capture_buffers(device)
+
+    def _enable_async_wait(self, device) -> None:
+        """P1a: this layer's ExternalEvents, and the one completion thread.
+
+        Both happen here, at weight-load time, because both have to exist
+        before any capture: an ``ExternalEvent`` created inside a capture would
+        not be the object the graph's node points at, and a stream created
+        there is not a stream the graph may use. ``Completer.start`` is
+        synchronous, so a thread that cannot take an ACL context is a start-up
+        error rather than a hang at the first replay.
+        """
+        global _COMPLETER
+        if not self.graph_enabled:
+            # Eager already blocks the host inside route(): there is no
+            # callback to return early from, and no graph to hold the H2D back.
+            logger.warning(
+                "kt_offload: %s=1 has no effect in eager mode (the async wait is a captured-path change); "
+                "layer %d runs the ordinary submit+sync.",
+                async_wait.ENV_NAME,
+                self.layer_idx,
+            )
+            self.async_wait = False
+            return
+        if not self._packed_supported():
+            raise RuntimeError(
+                f"kt_offload: {async_wait.ENV_NAME}=1 needs kt's moe.forward_task and "
+                f"cpu_infer.submit/sync to split the submit from the sync; this kt build "
+                f"({type(self.wrapper).__name__}) does not expose them."
+            )
+        if not (self.packed or self.overlap):
+            raise RuntimeError(
+                f"kt_offload: {async_wait.ENV_NAME}=1 needs this layer's own pinned buffers "
+                "(packed_transfer or overlap_side_stream); config._validate_preconditions should have "
+                "refused this already."
+            )
+        for bs in self.capture_sizes:
+            self._ext_events[bs] = _new_external_event(device)
+            _EXT_EVENTS.append(self._ext_events[bs])
+        if _COMPLETER is None:
+            _COMPLETER = _make_completer(device)
+            _COMPLETER.start()
+        logger.warning(
+            "kt_offload: ASYNC WAIT ENABLED for layer %d (%s=1). 图里的 host-func 节点只 submit 就返回，"
+            "设备改等 ExternalEvent，由完成线程 sync 完再 record。实验性，默认关；"
+            "判据是与关着的那一臂逐位相同，不是 TPOT —— 放行早 = 更快且算错，且不报错 "
+            "(every known failure of this path is faster and wrong). %d capture size(s).",
+            self.layer_idx,
+            async_wait.ENV_NAME,
+            len(self._ext_events),
+        )
 
     # -- packed transfer (cfg.packed_transfer) ------------------------------
 
@@ -415,6 +484,46 @@ class KTLayerOffload:
     def _packed_payload(self, bs: int) -> tuple:
         buf = self._packed[bs]
         return (self.wrapper, buf, self.layer_idx)
+
+    def _launch_cpu_node(self, stream, bs: int) -> None:
+        """The captured CPU-expert node(s) for this layer, on ``stream``.
+
+        One place for both own-buffer captured paths -- packed on the compute
+        stream and forked on the side stream -- so the two cannot drift apart,
+        and so the op sequence the P1a criterion reads is recorded exactly
+        where the nodes are emitted. The caller has already enqueued the D2H of
+        the combined input buffer on this same stream; ``merge`` enqueues the
+        H2D, which appends to ``_submit_ops`` and is where the criterion runs
+        (by then the whole shape exists).
+
+        With ``async_wait`` off this is byte for byte what it replaced: one
+        host-func node that submits, waits and returns.
+        """
+        self._submit_ops = [("d2h", bs)]
+        if not self.async_wait:
+            payload = self._packed_payload(bs)
+            _CAPTURED_PAYLOADS.append(payload)
+            _launch_host_func(stream, _kt_packed_forward, payload)
+            self._submit_ops.append(("hostfunc", self.layer_idx))
+            return
+        event = self._ext_events.get(bs)
+        if event is None:
+            raise RuntimeError(
+                f"kt_offload async wait: layer {self.layer_idx} has no ExternalEvent for {bs} tokens "
+                f"(prepared: {sorted(self._ext_events)}); creating one inside a capture would not be the "
+                "object the graph's node points at."
+            )
+        payload = (*self._packed_payload(bs), event)
+        _CAPTURED_PAYLOADS.append(payload)
+        _launch_host_func(stream, _kt_packed_submit_only, payload)
+        self._submit_ops.append(("hostfunc", self.layer_idx))
+        # The device waits here for the completion thread, and then clears the
+        # flag so the NEXT replay waits too. Both are graph nodes; neither is a
+        # host-side record.
+        _ext_wait(event, stream)
+        self._submit_ops.append(("ext_wait", event))
+        _ext_reset(event, stream)
+        self._submit_ops.append(("ext_reset", event))
 
     def host_ops(self) -> dict[str, int]:
         """Host-device operations this layer costs per step (for the accounting)."""
@@ -581,9 +690,7 @@ class KTLayerOffload:
                     self._packed_submit(hs, topk_ids, topk_weights)
                     stream = torch.npu.current_stream(hs.device)
                     _subscribe_stream(stream)
-                    payload = self._packed_payload(hs.shape[0])
-                    _CAPTURED_PAYLOADS.append(payload)
-                    _launch_host_func(stream, _kt_packed_forward, payload)
+                    self._launch_cpu_node(stream, hs.shape[0])
                     self._pending_own_out = True
                 else:
                     self._submit_captured(hs, topk_ids, topk_weights)
@@ -647,6 +754,20 @@ class KTLayerOffload:
         """H2D of our own pinned output; ordered after the host-func node."""
         buf = self._packed[hs.shape[0]]
         _host_copy(buf["dev_out"], buf["pin_out"])
+        if self.async_wait and self._submit_ops is not None:
+            # The whole recorded shape exists only now, so this is where the
+            # criterion runs. 🔴 It is the only in-process evidence that the
+            # RESET went into the graph next to the wait: on card a missing
+            # reset shows up as the second and every later replay reading the
+            # previous step's CPU output, with nothing raised.
+            ops = [*self._submit_ops, ("h2d", hs.shape[0])]
+            self._submit_ops = None
+            report = async_wait.ext_event_ops_ok(ops)
+            if not report["ok"]:
+                raise RuntimeError(
+                    f"kt_offload async wait: layer {self.layer_idx} recorded the wrong node sequence "
+                    f"({report['detail']}): {report['why']}."
+                )
         return buf["dev_out"]
 
     def _submit_captured(self, hs: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
@@ -747,8 +868,6 @@ class KTLayerOffload:
         _SIDE_EVENTS.append((fork, join))  # the graph's nodes reference these
         fork.record(compute)  # AFTER the fills: that is what orders them
         side.wait_event(fork)
-        payload = self._packed_payload(bs)
-        _CAPTURED_PAYLOADS.append(payload)
         with _stream_ctx(side, device):
             # The capture follows the event wait onto the side stream. If it did
             # not, everything below would run once, at capture time, and every
@@ -762,7 +881,7 @@ class KTLayerOffload:
                     "an event wait onto another stream."
                 )
             _host_copy(buf["pin"], buf["dev"])  # the one D2H, our own buffer
-            _launch_host_func(side, _kt_packed_forward, payload)
+            self._launch_cpu_node(side, bs)
         self._pending_join = (join, side, compute)
 
     def _claim_side_buffers(self, buf: dict) -> None:
@@ -949,6 +1068,83 @@ def _kt_packed_forward(payload) -> None:
             layer_idx,
             exc,
         )
+
+
+def _kt_packed_submit_only(payload) -> None:
+    """P1a graph node: build kt's task, submit it, return. Do NOT wait.
+
+    Everything this reads has to be in place before the node runs, which the
+    graph supplies: the D2H of the combined input buffer is the op immediately
+    before it on the same stream. What changes against ``_kt_packed_forward``
+    is only where the waiting happens -- here the task is handed to the
+    completion thread, which syncs and records the ExternalEvent the next two
+    graph nodes wait on and reset.
+
+    🔴 Every exit path must hand the event over. A callback that raised and
+    stopped there would leave the device waiting on an event nobody records:
+    the replay never finishes, the engine wedges, and the log says nothing
+    about a MoE layer. So a failure before the submit still enqueues
+    ``wrapper=None`` ("nothing to wait for, let it through"), which degrades
+    to exactly the failure the serial node already has -- the H2D reads the
+    previous step's CPU output -- with the same message.
+    """
+    wrapper, buf, layer_idx, event = payload
+    report_affinity.apply_in_callback()  # no-op unless the switch is on; once per process
+    rec = seam_timing.RECORDER
+    ts = seam_timing.TS
+    if rec is not None:
+        ts[seam_timing.T_ENTER_RT] = clock_gettime_ns(CLOCK_REALTIME)
+        ts[seam_timing.T_SUBMIT_IN] = 0
+        ts[seam_timing.T_ENTER] = perf_counter_ns()
+    handed_over = False
+    try:
+        _assert_no_pending(wrapper, layer_idx, layer_idx - 1, "before this node's submit")
+        if rec is not None:
+            ts[seam_timing.T_PRE] = perf_counter_ns()
+        task = wrapper.moe.forward_task(
+            buf["bsz"].data_ptr(),
+            buf["pin_ids"].shape[-1],
+            buf["pin_ids"].data_ptr(),
+            buf["pin_weights"].data_ptr(),
+            buf["pin_hidden"].data_ptr(),
+            buf["pin_out"].data_ptr(),
+            False,  # incremental: no deferred experts
+        )
+        if rec is not None:
+            ts[seam_timing.T_SUBMIT_IN] = perf_counter_ns()
+        wrapper.cpu_infer.submit(task)
+        _COMPLETER.submit(wrapper, layer_idx, event)
+        handed_over = True
+        HOST_FUNC_CALLS[layer_idx] = HOST_FUNC_CALLS.get(layer_idx, 0) + 1
+        if rec is not None:
+            # 🔴 With this switch on, kt's compute (segment D) and the drain
+            # (segment E) happen on the completion thread, so the callback no
+            # longer contains them: the sync stamps collapse onto the submit
+            # and seam.py's D/E columns read ~0 BY CONSTRUCTION, not because
+            # the CPU got faster. A+F still mean what they meant.
+            ts[seam_timing.T_SUBMIT_OUT] = ts[seam_timing.T_SYNC_IN] = perf_counter_ns()
+            ts[seam_timing.T_SYNC_OUT] = ts[seam_timing.T_KT_OUT] = ts[seam_timing.T_SYNC_IN]
+            rec.record(layer_idx, ts, perf_counter_ns())
+    except BaseException as exc:  # noqa: BLE001
+        logger.error(
+            "kt_offload async-wait host-func for layer %d raised: %r. The CPU-expert output of this step "
+            "is NOT this step's -- the device reads whatever the pinned buffer held.",
+            layer_idx,
+            exc,
+        )
+    finally:
+        if not handed_over:
+            # Nothing was submitted (or the hand-off itself failed): release the
+            # device rather than leaving the graph waiting for ever.
+            try:
+                _COMPLETER.submit(None, layer_idx, event)
+            except BaseException as exc:  # noqa: BLE001
+                logger.critical(
+                    "kt_offload async wait: layer %d could not hand its ExternalEvent to the completion "
+                    "thread (%r); this replay will not finish.",
+                    layer_idx,
+                    exc,
+                )
 
 
 def _kt_host_forward(payload) -> None:
@@ -1195,6 +1391,51 @@ def _new_stream(device):
 def _new_event(device):
     del device
     return torch.npu.Event()
+
+
+def _new_external_event(device):
+    """An event the device can wait on BEFORE anyone records it.
+
+    ``torch.npu.ExternalEvent`` is ``graph_external=True``
+    (torch_npu/npu/streams.py:211-228): under ACL it is the
+    ``aclrtValueWait``/``aclrtValueWrite`` pair (acl_rt.h:3802/3814), it is
+    captured as a node rather than executed, and unlike a plain Event its
+    ``wait`` may precede its ``record``. Same object as the one the attention
+    path already captures (attention_v1.py:1036-1038, mla_v1.py:1744-1747) and
+    releases from the host during replay (mla_v1.py:968).
+    """
+    del device
+    return torch.npu.ExternalEvent()
+
+
+def _ext_wait(event, stream) -> None:
+    """Record ``wait`` into the graph: the device stops here until it is signalled."""
+    event.wait(stream)
+
+
+def _ext_reset(event, stream) -> None:
+    """🔴 Record ``reset`` into the graph, right behind the wait.
+
+    Without this node the event stays signalled after the first replay and
+    every later replay's wait is a no-op, so the H2D copies the pinned output
+    before this step's CPU task has written it. Faster, wrong, silent. The
+    order (wait, then reset) is the one attention_v1.py:1036-1038 uses.
+    """
+    event.reset(stream)
+
+
+def _make_completer(device):
+    """The process-wide completion thread, with its own ACL context and stream."""
+    index = device.index if getattr(device, "index", None) is not None else torch.npu.current_device()
+
+    def set_device() -> None:
+        # 🔴 The one part of this mechanism with no precedent in this tree: the
+        # record comes from a thread that is neither the main thread nor ACL's
+        # report thread, while a replay is in flight. Without a context of its
+        # own every ACL call from here fails.
+        torch.npu.set_device(index)
+
+    return async_wait.Completer(set_device, lambda: _new_stream(torch.device("npu", index)))
 
 
 def _stream_ctx(stream, device):
