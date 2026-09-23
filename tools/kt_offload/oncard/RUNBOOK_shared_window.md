@@ -123,6 +123,21 @@ bash $OC/run_oncard.sh $CARD t5r --arms serial,fork     --shared-mlp both --muta
 | `--mutant no-wait` | RED，`nodes_skipped.wait = 8` |
 | `--mutant drop-join` | RED |
 | 阳性对照 `--stall-ms 50` | 干净 p1a 臂 8 次 replay ≥ 0.7×8×8×50 ms = **2.24 s**；同发 fork 臂 ~0.03 s。🔴 差不出来 ⇒ 本发所有「逐位相同」不算证据 |
+| ACL 五码 | ①② **0 条**；③ drop-join 那发**预期有 107025**（`capture model contains a stream that was not joined to the origin stream`）—— 那正是这个变异臂的死法（§5），不是异常。除此之外一条都不许有 |
+
+### 2026-09-23 已跑（工具提交 `9309e3d03`，卡 0，三发全绿）
+
+三发都是 `tree=staging/moe-offload-shared @ 9309e3d03`、`.so md5=85331298bdef…`、`vendors files=787`；
+判据原文在每个 run 目录的 `EXPECTED.txt`（跑之前写的，三发同一份）。
+替身链探到的是生产那条：`[shared-mlp] chain 'mxfp8(clamp_value=10.0)'`，增益实测 0.500、齐次性 1.67e-13。
+两道判别力闸：主机 `min 50.9 bf16 ULP`（margin 8）、卡上实测 `merge share 28.9 bf16 ULP at its weakest
+(layer 7)`、`max|h| 9.44e2`。
+
+| 发 | run 目录 | 耗时 | 结果 |
+|---|---|---|---|
+| ① no-merge | `oncard_runs/20260923_105952_t5r` | 59 s | 84 checks / 0 failed；6 个干净臂各 8/8 逐位；serial/fork/p1a 三条 after==before 哈希逐步相同；`mutant no-merge ... RED BY ITS BITS`（0/8，step 0 起）+ `guard_raised 8/8`；ACL 0 |
+| ② no-wait + stall 50 ms | `oncard_runs/20260923_110146_t5r` | 40 s | 84 / 0；同上 6 臂 8/8；`no-wait` RED 且 `nodes_skipped.wait=8`；阳性对照 p1a 3.229 s ≥ 2.24 s（无 async wait 同臂 0.029 s）；ACL 0 |
+| ③ drop-join | `oncard_runs/20260923_110255_t5r` | 31 s | 51 / 0；4 个干净臂 8/8；两条 after==before；`drop-join` RED（捕获死于 107025）；ACL 4 条全部是该变异臂的 107025 |
 
 rc：Verdict 要求每发至少一个变异臂；干净臂全绿、变异臂全红时 rc=0。任何一条不满足 ⇒ **停**，不往下做。
 
