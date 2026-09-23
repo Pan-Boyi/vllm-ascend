@@ -43,3 +43,9 @@
 `device_signal.py`+`poll_native.c`（计数器启动，实测无收益、默认关）、`side_stream.py`、`config.py`、`envs.py`、`seam_timing.py`。
 工具：`tools/kt_offload/prof/*`（seam/devgaps/bench）、`oncard/t5_side_reuse.py`、`oncard/sidestream/*`、`oncard/RUNBOOK_*.md`。
 kt 树 `worktrees/ktransformers`（HEAD `53eab3c`）：`run_inline` 与 `KT_WORKER_SPIN_MS`，**未重建 wheel、未切站点**（P2 跳过不测）。
+
+## 10:10 追加
+- **共享专家挪进窗口**：改动在独立 worktree `staging/moe-offload-shared`（分支 `dsv41-shared-window`）里做，**不在本树**。
+  原因：09:48–09:52 改动曾直接写进本树，而合版本验收正从本树起服务 ⇒ A4 作废、改为重跑 A4r。
+- 合版本（卡 2）：单轮 perf 达预期（A1 35.60 / B1 31.38，Δ 4.22，判据 `EXPECTED_addendum_0936.txt`）；
+  按用户 09:56 决定：逐位 A4r/B4 → GSM8K 50（仅 B 臂）→ 暂停，**1319 等共享专家合第二版再跑**。
