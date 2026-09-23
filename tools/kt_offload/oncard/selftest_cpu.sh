@@ -141,6 +141,38 @@ print("t4_model positive controls all red where they must be")
 PY
 [ $r -eq 0 ]; ok $? "t4 decision model: every control goes red when it must ($(tail -n 1 "$W/t4model.out"))"
 
+echo "== 7b. t4p (mechanism proxy): declared criterion, and the refusals that keep it honest"
+ONCARD_DRY=1 python3 "$D/t4_proxy.py" > "$W/t4pdry.out" 2>&1; r=$?
+[ $r -eq 0 ]; ok $? "t4p dry run exits 0 without touching a device (rc $r)"
+command grep -q "no device was touched" "$W/t4pdry.out"; ok $? "t4p dry run says it touched nothing"
+command grep -q "MEASURES TIME ONLY" "$W/t4pdry.out" || command grep -q "validates no numerical result" "$W/t4pdry.out"
+ok $? "t4p plan says it validates no numerical result"
+command grep -q "fork2" "$W/t4pdry.out"; ok $? "t4p plan names the null-mechanism arm (the proxy's own floor)"
+python3 "$D/t4_proxy.py" --reps 5 > "$W/t4pfew.out" 2>&1; r=$?
+[ $r -eq 2 ]; ok $? "t4p refuses fewer than 20 reps (rc $r)"
+python3 "$D/t4_proxy.py" --arms serial,fork,p1a,p1b --dry-run > "$W/t4pboth.out" 2>&1; r=$?
+[ $r -eq 2 ]; ok $? "t4p refuses p1a and p1b in one process (they share the ExternalEvents) (rc $r)"
+python3 "$D/t4_proxy.py" --arms serial,p1a --dry-run > "$W/t4pnf.out" 2>&1; r=$?
+[ $r -eq 2 ]; ok $? "t4p refuses p1a without the fork arm it is measured against (rc $r)"
+[ -f "$D/PROXY_CRITERIA.md" ] && command grep -q "PROXY_REL_TOL = 0.50" "$D/PROXY_CRITERIA.md"
+ok $? "PROXY_CRITERIA.md ships next to the tool and names the constant the code uses"
+python3 - "$D" <<'PY2' > "$W/t4pmodel.out" 2>&1; r=$?
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("t4_model", sys.argv[1] + "/t4_model.py")
+M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
+assert M.PROXY_REL_TOL == 0.50 and M.PROXY_MIN_CALIBRATED == 2, "the declared criterion moved"
+assert M.calibrate(-0.01, -3.00)["state"] == "sign_only", "a 100x miss read as calibrated"
+assert M.calibrate(+3.00, -3.00)["state"] == "sign_disagrees", "the wrong sign read as agreement"
+assert M.proxy_verdict({"a": M.calibrate(+3.0, -3.0)})["state"] == "unusable", "a sign flip left the proxy usable"
+assert M.proxy_verdict({"a": M.calibrate(-3.1, -3.0)})["state"] == "unusable", "one mechanism was enough"
+v = M.proxy_verdict({"a": M.calibrate(-3.1, -3.0), "b": M.calibrate(-0.01, -0.53)})
+assert v["state"] == "ranking_only", "an out-of-tolerance mechanism still read as usable"
+d = {"median": 1.0, "p10": -2.0, "p90": 3.0}
+assert not M.resolved(d)[0], "a difference straddling zero read as resolved"
+print("t4p criterion constants and refusals all hold")
+PY2
+[ $r -eq 0 ]; ok $? "t4p criterion: declared constants and every refusal ($(tail -n 1 "$W/t4pmodel.out"))"
+
 echo "== 8. t5 (auto_dispatch_capture): refuses a run that could not tell a stale replay from a fresh one"
 ONCARD_DRY=1 python3 "$D/t5_auto_dispatch.py" > "$W/t5dry.out" 2>&1; r=$?
 [ $r -eq 0 ]; ok $? "t5 dry run exits 0 without touching a device (rc $r)"

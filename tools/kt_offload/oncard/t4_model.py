@@ -150,3 +150,128 @@ def verdict(ceil: dict, packed_gain_ms: float | None = None) -> dict:
         line += f"; measured alternative gain {packed_gain_ms:.2f} ms/step, so {cheaper} is the bigger of the two"
         return {"worth_it": per_step > packed_gain_ms, "why": line}
     return {"worth_it": None, "why": line + "; no measured alternative to compare against yet"}
+
+
+# ---------------------------------------------------------------------------
+# The proxy (t4_proxy.py): per-layer device time -> a predicted ms/token, and
+# the calibration against whatever the whole-network A/B already measured.
+#
+# 🔴 The numbers below are the criterion this line declared BEFORE the first
+# proxy flight ran (tools/kt_offload/oncard/PROXY_CRITERIA.md, committed in the
+# same change as this code). They are constants here so that "we moved the bar
+# after seeing the result" would show up as a diff.
+# ---------------------------------------------------------------------------
+
+PROXY_REL_TOL = 0.50        # |pred - meas| / |meas| must be <= this to call a mechanism calibrated
+PROXY_MIN_CALIBRATED = 2    # how many mechanisms have to clear it before the proxy may be used
+
+
+def per_layer_delta(a_samples, b_samples, layers: int) -> dict:
+    """Arm A minus arm B, per layer of the measured stack.
+
+    Both arms replay the SAME ``layers``-deep stack, interleaved round by
+    round, so the difference is paired first and divided afterwards. Dividing
+    two medians instead would throw away the pairing that makes a drift
+    common to both arms cancel.
+    """
+    if layers < 1:
+        raise ValueError(f"per_layer_delta: layers must be >= 1, got {layers}")
+    d = paired_delta(a_samples, b_samples)
+    out = {k: (v / layers if k in ("median", "p10", "p90", "min", "max") else v) for k, v in d.items()}
+    out["layers"] = layers
+    return out
+
+
+def predict_ms_per_token(per_layer_us: dict, model_layers: int = 40) -> dict:
+    """The whole-network figure the proxy predicts: per-layer us x layers.
+
+    This is an extrapolation and says so: it assumes every layer of the model
+    behaves like the layers in the measured stack, and that the mechanism
+    changes nothing outside the device timeline.
+    """
+    out = {k: (v * model_layers / 1000.0 if k in ("median", "p10", "p90", "min", "max") else v)
+           for k, v in per_layer_us.items()}
+    out["model_layers"] = model_layers
+    out["per_layer_us"] = per_layer_us["median"]
+    return out
+
+
+def resolved(delta: dict) -> tuple[bool, str]:
+    """Did the proxy resolve this difference at all?
+
+    p10 and p90 of the PAIRED difference must land on the same side of zero as
+    the median. If they straddle it, the arms are not separated by this
+    instrument in this run and the median is a coin flip with a decimal point.
+    """
+    m, lo, hi = delta["median"], delta["p10"], delta["p90"]
+    if m == 0:
+        return False, "the paired difference has a median of exactly 0: nothing to resolve"
+    same = (lo > 0 and hi > 0 and m > 0) or (lo < 0 and hi < 0 and m < 0)
+    return same, (f"paired difference median {m:.3f}, p10 {lo:.3f}, p90 {hi:.3f}: "
+                  + ("resolved (p10 and p90 are on the median's side of zero)"
+                     if same else "NOT resolved -- p10/p90 straddle zero"))
+
+
+def calibrate(pred_ms: float, meas_ms: float | None, rel_tol: float = PROXY_REL_TOL) -> dict:
+    """One mechanism's proxy prediction against its whole-network measurement.
+
+    Never returns a corrected or preferred value: a proxy that has to be
+    rescaled by a factor nobody measured is not a proxy, it is a fudge.
+    """
+    if meas_ms is None:
+        return {"state": "unmeasured", "line": "no whole-network measurement given: not calibrated"}
+    if meas_ms == 0:
+        return {"state": "inconclusive",
+                "line": "the whole-network measurement is 0 ms/token: a relative error would be meaningless"}
+    same_sign = (pred_ms > 0) == (meas_ms > 0) and pred_ms != 0
+    rel = abs(pred_ms - meas_ms) / abs(meas_ms)
+    if not same_sign:
+        state = "sign_disagrees"
+    elif rel <= rel_tol:
+        state = "agree"
+    else:
+        state = "sign_only"
+    return {
+        "state": state,
+        "pred_ms": pred_ms,
+        "meas_ms": meas_ms,
+        "rel_err": rel,
+        "bias": "over" if abs(pred_ms) > abs(meas_ms) else "under",
+        "line": f"proxy {pred_ms:+.2f} vs measured {meas_ms:+.2f} ms/token: "
+                f"relative error {rel:.0%} (tol {rel_tol:.0%}), "
+                + {"agree": "CALIBRATED",
+                   "sign_only": "same sign, outside tolerance -- ordering only",
+                   "sign_disagrees": "OPPOSITE SIGN -- the proxy is wrong about this mechanism"}[state],
+    }
+
+
+def proxy_verdict(calibrations: dict, min_calibrated: int = PROXY_MIN_CALIBRATED) -> dict:
+    """Is the proxy usable, and for what.
+
+    ``usable``        every measured mechanism calibrated, and there are at
+                      least ``min_calibrated`` of them: the proxy's ms/token
+                      may be quoted as an estimate (still not as a result).
+    ``ranking_only``  every measured mechanism got the sign right but at least
+                      one is outside tolerance: the proxy may order candidates
+                      and screen them, and its magnitudes may not be quoted.
+    ``unusable``      any mechanism came out with the wrong sign, or fewer than
+                      ``min_calibrated`` mechanisms were available to judge on.
+    """
+    measured = {k: c for k, c in calibrations.items() if c["state"] not in ("unmeasured", "inconclusive")}
+    if any(c["state"] == "sign_disagrees" for c in measured.values()):
+        bad = sorted(k for k, c in measured.items() if c["state"] == "sign_disagrees")
+        return {"state": "unusable", "n_measured": len(measured),
+                "why": f"the proxy got the SIGN wrong on {', '.join(bad)}: it does not even order these mechanisms"}
+    if len(measured) < min_calibrated:
+        return {"state": "unusable", "n_measured": len(measured),
+                "why": f"only {len(measured)} mechanism(s) had a whole-network number to calibrate against; "
+                       f"the criterion asks for {min_calibrated}. Not enough evidence either way."}
+    n_ok = sum(1 for c in measured.values() if c["state"] == "agree")
+    if n_ok == len(measured):
+        return {"state": "usable", "n_measured": len(measured),
+                "why": f"all {len(measured)} calibrated mechanisms are within the declared tolerance; "
+                       "the proxy may be quoted as an estimate for screening, never as a result"}
+    weak = sorted(k for k, c in measured.items() if c["state"] == "sign_only")
+    return {"state": "ranking_only", "n_measured": len(measured),
+            "why": f"every mechanism has the right sign but {', '.join(weak)} is outside the tolerance: "
+                   "use the proxy to ORDER and SCREEN candidates only, never for a number"}

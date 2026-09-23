@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t5 | t5r
+#  run_oncard.sh <card> <test> [test args...]    test = t0 | t1 | t2 | t3 | t4 | t4p | t5 | t5r
 #                                                     | e2p | e5 | e2w | h2d  (gate-clearing checks)
 #
 #  The only way the single-layer on-card checks touch a card. The shell enforces:
@@ -72,7 +72,7 @@ fi
 export DSV41_VLLM_ASCEND_TREE="$VA_TREE"
 CARD="${1:-}"; TEST="${2:-}"
 [ $# -ge 2 ] && shift 2
-usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t5|t5r|e2p|e5|e2w|h2d> [test args...]"; exit 2; }
+usage() { echo "usage: $0 <card> <t0|t1|t2|t3|t4|t4p|t5|t5r|e2p|e5|e2w|h2d> [test args...]"; exit 2; }
 [[ "$CARD" =~ ^[0-9]+$ ]] || usage
 case "$TEST" in
   t0) PY=t0_offload_off.py; DEF_TIMEOUT=2400;;
@@ -80,6 +80,11 @@ case "$TEST" in
   t2) PY=t2_graph.py;       DEF_TIMEOUT=2400;;
   t3) PY=t3_side_stream.py; DEF_TIMEOUT=2400;;
   t4) PY=t4_overlap_ceiling.py; DEF_TIMEOUT=1800;;
+  # t4p: the mechanism proxy (PROXY_CRITERIA.md / RUNBOOK_proxy.md). Same device
+  # timing and the same two controls as t4, pointed at serial/fork/p1a/p1b instead
+  # of at form C. Minutes, not the 1-2 h a whole-network A/B costs -- and its
+  # numbers are for ORDERING candidates, never for the benefit ledger.
+  t4p) PY=t4_proxy.py; DEF_TIMEOUT=1800;;
   t5) PY=t5_auto_dispatch.py; DEF_TIMEOUT=1800;;
   # t5r: the same forked path under a service's shape (>=8 layers, K replays
   # back to back with no synchronize, routing buffers written/freed right after

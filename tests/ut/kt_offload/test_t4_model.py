@@ -188,3 +188,117 @@ def test_per_step_scales_with_the_layer_count_and_nothing_else():
     a = M.ceiling(400.0, 100.0, 5.0, 40)["per_step_ms"]
     b = M.ceiling(400.0, 100.0, 5.0, 20)["per_step_ms"]
     assert math.isclose(a, 2 * b)
+
+
+# -- the proxy (t4_proxy.py): the declared criterion, and its refusals ------
+#
+# 🔴 These constants are the criterion PROXY_CRITERIA.md declared BEFORE the
+# first proxy flight. A test that asserts them is what makes "we moved the bar
+# after seeing the number" a visible diff rather than a memory.
+
+
+def test_the_declared_proxy_criterion_is_the_one_in_the_file():
+    assert M.PROXY_REL_TOL == 0.50
+    assert M.PROXY_MIN_CALIBRATED == 2
+
+
+def test_per_layer_delta_pairs_first_and_divides_afterwards():
+    # arm A is 80 us slower per round over an 8-layer stack, with a drift on top
+    a = [1000.0 + 80.0 + 3.0 * i for i in range(24)]
+    b = [1000.0 + 3.0 * i for i in range(24)]
+    d = M.per_layer_delta(a, b, 8)
+    assert d["median"] == pytest.approx(10.0)
+    assert d["layers"] == 8
+
+
+def test_per_layer_delta_refuses_a_stack_with_no_layers():
+    with pytest.raises(ValueError, match="layers must be >= 1"):
+        M.per_layer_delta([1.0] * 24, [0.0] * 24, 0)
+
+
+def test_the_prediction_is_the_per_layer_figure_times_the_model_depth():
+    d = M.per_layer_delta([-75.0 * 8] * 24, [0.0] * 24, 8)
+    p = M.predict_ms_per_token(d, 40)
+    assert p["median"] == pytest.approx(-3.0)
+    assert p["per_layer_us"] == pytest.approx(-75.0)
+    assert p["model_layers"] == 40
+
+
+def test_a_difference_that_straddles_zero_is_not_resolved():
+    ok, line = M.resolved({"median": 1.0, "p10": -2.0, "p90": 3.0})
+    assert not ok and "NOT resolved" in line
+    ok, _ = M.resolved({"median": -1.0, "p10": -3.0, "p90": -0.2})
+    assert ok
+
+
+def test_a_difference_of_exactly_zero_is_not_resolved_either():
+    ok, line = M.resolved({"median": 0.0, "p10": -1.0, "p90": 1.0})
+    assert not ok and "nothing to resolve" in line
+
+
+def test_calibrate_accepts_a_prediction_inside_the_declared_tolerance():
+    c = M.calibrate(-3.9, -3.00)
+    assert c["state"] == "agree" and c["rel_err"] == pytest.approx(0.30)
+    assert c["bias"] == "over"
+
+
+def test_calibrate_rejects_a_prediction_outside_it_without_rescaling_anything():
+    c = M.calibrate(-0.01, -3.00)
+    assert c["state"] == "sign_only"
+    # the point of the refusal: it never hands back a corrected number
+    assert "factor" not in c and c["pred_ms"] == -0.01
+
+
+def test_calibrate_calls_the_wrong_sign_what_it_is():
+    assert M.calibrate(+3.00, -3.00)["state"] == "sign_disagrees"
+    assert M.calibrate(0.0, -3.00)["state"] == "sign_disagrees"
+
+
+def test_calibrate_says_so_when_there_is_nothing_to_calibrate_against():
+    assert M.calibrate(-3.0, None)["state"] == "unmeasured"
+    assert M.calibrate(-3.0, 0.0)["state"] == "inconclusive"
+
+
+def test_one_mechanism_is_never_enough_to_declare_the_proxy_usable():
+    v = M.proxy_verdict({"sidestream": M.calibrate(-3.1, -3.00)})
+    assert v["state"] == "unusable" and "only 1 mechanism" in v["why"]
+
+
+def test_two_mechanisms_inside_the_tolerance_make_it_usable():
+    v = M.proxy_verdict({"sidestream": M.calibrate(-3.1, -3.00), "p1a": M.calibrate(-0.60, -0.53)})
+    assert v["state"] == "usable" and v["n_measured"] == 2
+
+
+def test_the_right_sign_but_the_wrong_size_buys_ordering_only():
+    v = M.proxy_verdict({"sidestream": M.calibrate(-3.1, -3.00), "p1a": M.calibrate(-0.05, -0.53)})
+    assert v["state"] == "ranking_only" and "p1a" in v["why"]
+
+
+def test_a_single_sign_flip_makes_the_whole_proxy_unusable():
+    v = M.proxy_verdict({"sidestream": M.calibrate(-3.1, -3.00), "p1a": M.calibrate(+0.60, -0.53)})
+    assert v["state"] == "unusable" and "SIGN" in v["why"]
+
+
+def test_an_unresolved_mechanism_does_not_count_towards_the_criterion():
+    cals = {"sidestream": M.calibrate(-3.1, -3.00),
+            "p1a": {"state": "inconclusive", "line": "the proxy did not resolve p1a in this run"}}
+    assert M.proxy_verdict(cals)["state"] == "unusable"
+
+
+def test_the_null_mechanism_must_not_calibrate_as_the_side_stream():
+    """The mutation arm t4_proxy runs on card, here with the numbers it needs.
+
+    Two captures of one configuration differ by nothing, so whatever the proxy
+    reads between them is its own floor. If +-50% were wide enough to accept
+    that floor as -3.00 ms/token, the criterion would have no discriminating
+    power at all.
+    """
+    for floor_ms in (0.0, 0.05, -0.2, 0.4):
+        assert M.calibrate(floor_ms, -3.00)["state"] != "agree"
+    # and the criterion is not vacuous: a floor that really were -3 would pass
+    assert M.calibrate(-3.0, -3.00)["state"] == "agree"
+
+
+def test_a_fat_node_read_as_a_mechanism_comes_out_with_the_wrong_sign():
+    # 500 us/layer x 40 layers = +20 ms/token, against a measured -3.00 saving
+    assert M.calibrate(500.0 * 40 / 1000.0, -3.00)["state"] == "sign_disagrees"
