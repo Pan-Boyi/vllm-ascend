@@ -76,6 +76,11 @@ bash $T/accept_v2.sh $RUN rest   # 仅当 VERDICT_perf 成立：C4(lp)、D4(lp�
 | 同上 | cfg_C = cfg_D 但都 ≠ 第一版 cfg_B | 红 | ✅ rc=2 |
 | 同上 | 卡 3 | 红 | ✅ rc=2 |
 | `seq_merge_v2.sh` + `DRY_RUN=1` | 本树有未提交改动（本仪器自己的 4 个文件） | 拒飞 | ✅ rc=3，`git status` 4 行打进臂日志，服务未起 |
+| 同上，提交 e00dc3012 后 | 干净树、三轮六臂 | 绿，C 臂 SIW=0 / D 臂 SIW=1 | ✅ rc=0；每臂 HEAD e00dc3012、git-status 0 行、dirty_files vllm=0 vllm_ascend=0、运行时差 0 文件 |
+| 同上 `RUNTIME_BASE=f8eff083d`（§4.31 合入之前） | vllm_ascend/ 有 6 个文件差 | 拒飞 | ✅ rc=3 |
+
+🔴 干跑**不覆盖**的部分（只有上卡才验得到）：env 真进了服务进程（靠必检计数 40/0）、预检的「等待→放行」分支
+（干跑时卡 2 已空，只走了立即放行）、`gsm1319if50` 的两个分支、`accept_v2.sh` 的换卡分支。
 
 ## 3. 读数
 
