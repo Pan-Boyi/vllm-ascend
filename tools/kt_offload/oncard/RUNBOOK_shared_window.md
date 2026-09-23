@@ -19,6 +19,51 @@
 - 预期（来自离线 trace 对账，不是本执行单的读数）：共享专家 38.25 µs/层 × 40 层 ≈ 1.5 ms/token 上限；
   窗口 77 + 38 = 115 µs，远小于副流链 ~370 µs ⇒ 不会产生新的关键路径。
 
+## 0.5 判别力前置闸（2026-09-23 加，三发被拦之后）
+
+🔴 **替身把判据毁掉过一次，所以判别力现在是硬闸，不是打印。** 2026-09-23 的三发在跑到任何臂之前
+就停了：替身 `silu(gate)*up` 是二次型（增益 O(|x|)），t5r 把 8 层串成残差栈且每层复用同一个 `shared_fn`
+⇒ 幅值每层平方一次（18.8 → 6.4e2 → 4.0e5 → 3.1e11 → 9.4e22 → NaN），第 6 层起全 NaN；`bit_identical`
+对 NaN 感知 ⇒ 两个参照步「逐位相同」⇒ 判别性自检开火。**减层数不是绕路**：幅值到 1e5~1e22 时，merge 的
+O(|h|) 贡献低于该层输出的 1 个 bf16 ULP，**漏 merge 会被读成逐位相同 = 绿**（同一 CPU 复现里第 5 层起
+确实如此）。
+
+修法（`npu_moe._normalized`）：替身做成**齐次、非扩张**——输入先归一到 RMS 1（生产里共享专家读的本来
+就是 post-attention-norm 之后的 hidden），权重 1/sqrt(fan_in)，输出按声明增益放回：
+
+```
+shared(x) = SHARED_GAIN * rms(x) * core(x/rms(x)) / rms(core(x/rms(x)))      # SHARED_GAIN = 0.5
+```
+
+于是 (a) `rms(shared(x)) == 0.5*rms(x)`，每层增长 ≤ 1+0.5+merge 份额而不是平方；(b) `shared(cx)=c·shared(x)`
+⇒ `rms(merge)/rms(h)` 层间不变，merge 永远浮在 ULP 地板之上；(c) 保证来自 wrapper 而不是 core
+⇒ W8A8 链和 bf16 链同样成立。
+
+两道闸，**不满足就 raise、不跑**（判据常数：`npu_moe.MERGE_ULP_MARGIN = 8` 个 bf16 ULP，`BF16_EPS = 2^-8`）：
+
+| 闸 | 在哪 | 查什么 |
+|---|---|---|
+| 1/2 主机复算（不占卡） | `npu_moe.shared_stack_cpu_check_default`，t5r 起手、`init_runtime` 之前 | 按声明的 merge 份额（0.25×rms(h)）复算 L 层 × S 步的臂算术，要求：幅值有界无 NaN/Inf、每层增长在 [1/4, 4]、**no-merge 变异在每一层每一步都逐位不同且 ≥ 8 bf16 ULP**、两个参照步不同 |
+| 2/2 卡上实测 | t5r 参照步内（`merged - pre` 就是 CPU 那一半） | 用**卡上真实数字**而不是声明值：每层每步 `rms(merged-pre)/rms(h_next) ≥ 8 ULP`，且 `max|h| < 1e4` |
+
+单测（`selftest_cpu.py`，`bash tools/kt_offload/oncard/selftest_cpu.sh`）证明这道闸**会红**：旧的二次型替身红、
+纯放大（增益 40/层）替身红、merge 份额压到 2^-12 红，而修好的替身绿。
+
+算子链：`--shared-chain auto` 现在**先试生产那条 MXFP8 链**（`shared_experts.py` 的 `QuantType.W4A8MXFP` 分支，
+~367-398）：`npu_dynamic_mx_quant(x, e4m3)` → gate_up（W4A8_MXFP 线性：`npu_quant_matmul`，`scale_dtype=e8m0fnu`、
+`pertoken_scale_dtype=e8m0fnu`、`x2_dtype=float4_e2m1fn_x2`、`group_sizes=[0,0,32]`，权重按
+`w4a8_mxfp4.AscendW4A8MXFPDynamicLinearMethod.process_weights_after_loading` 的 format_cast/转置/scale 重排预处理）
+→ `npu_swiglu_group_quant(dst_type=e4m3, quant_mode=2, clamp_value=swiglu_limit)` → down（同款线性）。
+权重随机，算子序列与参数形态是服务的。救不回才退到归一化 bf16（那时读数里必须写明「非量化替身」）。
+
+W8A8 **不在 auto 里**（生产的共享专家不走它），只能 `--shared-chain w8a8` 显式选。它在本构建上还有一道坎：
+`DequantSwigluQuant` 的 tiling（CANN 9.1.0 built-in `libophost_nn.so`）要求 **`clamp_limit` 严格 > 0**
+（`clamp_limit should be positive finite`），而本仓 `csrc` 只要求 `>= 0`、proto 头还写着「0.0 = 关闭 clamp」——
+两边不一致，传 0.0 必挂 EZ0026；探针按 `(10.0, 7.0, 1.0)` 依次试。
+🔴 **顺带的生产隐患（本执行单不改）**：`vllm_ascend/ops/fused_moe/shared_experts.py:86` 把 `swiglu_limit=None`
+映射成 `0.0`，再在 `:351`（W8A8/W4A8 分支）无条件以 `swiglu_mode=1` 传下去 —— 在这台机器的 CANN 上是必挂路径，
+值得单独修。
+
 ## 1. 前置（不占卡）
 
 ```bash
@@ -71,7 +116,9 @@ bash $OC/run_oncard.sh $CARD t5r --arms serial,fork     --shared-mlp both --muta
 |---|---|
 | 每个干净臂 × {after, before} | **8/8 逐位等于 eager 串行参照** |
 | after vs before 直接比 | `arm X: the merge AFTER ... and BEFORE ... produced the same bytes` 每个基础臂一条 ✅（`step_hashes` 逐步相同） |
-| `[shared-mlp] chain ...` | 记下是哪条链；是 `bf16` 就在读数里写明「非量化替身」 |
+| `[cpu-check] ...` 两行 | 主机闸过了（幅值、增长、最小 ULP 余量）；没有这两行 ⇒ 这一发不是新工具跑的 |
+| `eager serial reference: ... measured merge share X bf16 ULP at its weakest` | 卡上闸过了，记下 X（余量 ≥ 8） |
+| `[shared-mlp] chain ...` | 记下是哪条链（含 `clamp_limit`）；是 `bf16` 就在读数里写明「非量化替身」 |
 | `--mutant no-merge` | **RED**，并且 `mutant no-merge is red BY ITS BITS (captured=True, bit_identical=False)` ✅（在**串行**基础臂上跑：侧流开时漏 merge 也就漏了 join，捕获会先死于 107025 —— 那是 drop-join 的事，红得不是这个原因）；`guard_raised = 8/8`（生产守卫 `_assert_merge_balance` 每层都看见了） |
 | `--mutant no-wait` | RED，`nodes_skipped.wait = 8` |
 | `--mutant drop-join` | RED |

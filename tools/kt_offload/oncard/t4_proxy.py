@@ -139,7 +139,7 @@ def main() -> int:  # noqa: C901
                          "the kt merge) and the g_npu_shared control; reports the per-layer difference")
     ap.add_argument("--shared-inter", type=int, default=None,
                     help="shared-expert intermediate size (default: oncard_common.INTER, DSV4.1 2304)")
-    ap.add_argument("--shared-chain", choices=("auto", "w8a8", "bf16"), default="auto",
+    ap.add_argument("--shared-chain", choices=("auto", "mxfp8", "w8a8", "bf16"), default="auto",
                     help="stand-in operator chain; 'auto' probes the build and prints what it got")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and exit without touching the device")
     ap.add_argument("--out", default=os.environ.get("ONCARD_RUN_DIR", "."))

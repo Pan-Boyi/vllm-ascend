@@ -133,6 +133,50 @@ v.check(C.col_rel_max(_a, _b) > 2.0, f"the per-column ratio reads {C.col_rel_max
                                      "3-ULP error -- why tier B stopped using it at small T")
 v.check(C.ulp_max(_b * 2, _b) > 100, "ulp_max still separates a wrong tensor by a mile")
 
+# -- §4.31 shared-expert stand-in: does the criterion still see a dropped merge? ------
+# npu_moe imports torch only (torch_npu is imported inside the functions that need a
+# device), so this half runs on the host. The point of these checks is the GATE
+# itself: it has to go RED on a stand-in that inflates the residual stack, because
+# that is how the 2026-09-23 runs produced two all-NaN "bit-identical" reference
+# steps -- and, at amplitudes just below NaN, would have read a DROPPED MERGE as green.
+import npu_moe as NM  # noqa: E402
+
+v.check("torch_npu" not in sys.modules, "npu_moe imports no torch_npu at module level")
+_rep = NM.shared_stack_cpu_check_default(layers=8, steps=4, tokens=1, hidden=C.HIDDEN,
+                                         inter=C.INTER, verbose=False)
+v.check(_rep["max_abs"] < 1e4 and _rep["max_growth"] < 4.0,
+        f"fixed stand-in: 8 layers stay bounded (max|h| {_rep['max_abs']:.3e}, "
+        f"per-layer growth <= {_rep['max_growth']:.3f})")
+v.check(all(not r["same"] for r in _rep["rows"]),
+        "fixed stand-in: no-merge differs bit for bit at every layer of every step")
+v.check(_rep["min_ulps"] >= NM.MERGE_ULP_MARGIN,
+        f"fixed stand-in: weakest merge contribution {_rep['min_ulps']:.1f} bf16 ULP "
+        f">= margin {NM.MERGE_ULP_MARGIN} (at step/layer {_rep['min_ulps_at']})")
+_g = NM._normalized(NM._shared_bf16_core(C.HIDDEN, C.INTER, 41, torch.device("cpu")))
+_x = torch.randn(2, C.HIDDEN).to(torch.bfloat16) * 17.0
+v.check(abs(float((NM._rms(_g(_x)) / NM._rms(_x)).mean()) - NM.SHARED_GAIN) < 0.02 * NM.SHARED_GAIN,
+        f"fixed stand-in: rms(out)/rms(in) == declared gain {NM.SHARED_GAIN}")
+v.check(float(NM._rms(_g(_x * 8.0).float() - 8.0 * _g(_x).float()).max() / NM._rms(8.0 * _g(_x).float()).max()) < 0.05,
+        "fixed stand-in: f(8x) == 8 f(x) -- homogeneous, so rms(merge)/rms(h) is layer-invariant")
+
+
+def _gate_red(fn, **kw) -> bool:
+    try:
+        NM.shared_stack_cpu_check(fn, layers=8, steps=3, tokens=1, hidden=C.HIDDEN,
+                                  verbose=False, **kw)
+        return False
+    except RuntimeError:
+        return True
+
+
+v.must_be_red(_gate_red(NM.legacy_quadratic_core(C.HIDDEN, C.INTER, 41, torch.device("cpu"))),
+              "the pre-2026-09-23 quadratic stand-in (silu(gate)*up, /32 weights, no RMSNorm)")
+v.must_be_red(_gate_red(lambda x: (x.float() * 40.0).to(x.dtype)),
+              "a merely EXPANDING stand-in (gain 40/layer): amplitude runs away, merge rounds off")
+v.must_be_red(_gate_red(_g, merge_rel=2.0 ** -12),
+              "a merge contributing 2^-12 of rms(h): below the bf16 ULP margin even though bounded")
+v.check(not _gate_red(_g), "the same gate stays GREEN on the fixed stand-in (it is not red for everyone)")
+
 # -- T1: explicit set and the split contract with the real placement code ------------
 try:
     sys.path.insert(0, HERE)
