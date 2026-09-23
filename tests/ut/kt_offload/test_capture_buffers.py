@@ -205,8 +205,12 @@ def test_gate_report_is_red_if_any_check_is():
 # -- 4. the switch itself ---------------------------------------------------
 
 
-def test_config_refuses_the_side_stream_unless_the_env_asks(monkeypatch):
+def test_the_env_is_a_kill_switch_not_a_permit_since_4_33(monkeypatch):
+    """Before PLAN §4.33 the config refused overlap_side_stream unless the env
+    said "1". Now the side stream is on by default: unset and "1" leave it on,
+    "0" turns it off, and nothing here raises."""
     from vllm_ascend import envs
+    from vllm_ascend.kt_offload import switches
 
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=True)
     vcfg = SimpleNamespace(
@@ -216,14 +220,20 @@ def test_config_refuses_the_side_stream_unless_the_env_asks(monkeypatch):
         speculative_config=None,
     )
     monkeypatch.setattr(envs, ss.ENV_NAME, "0", raising=False)
-    with pytest.raises(ValueError, match=ss.ENV_NAME):
-        cfg._validate_preconditions(vcfg)
+    cfg._validate_preconditions(vcfg)  # no longer refused
+    assert str(switches.resolve(cfg).side_stream).startswith("off(env")
     monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
-    cfg._validate_preconditions(vcfg)  # allowed, loudly
+    cfg._validate_preconditions(vcfg)
+    assert str(switches.resolve(cfg).side_stream).startswith("on(env")
+    monkeypatch.setattr(envs, ss.ENV_NAME, "", raising=False)
+    cfg._validate_preconditions(vcfg)
+    assert str(switches.resolve(cfg).side_stream) == "on(default)"
 
 
-def test_the_switch_is_off_by_default():
-    assert KTOffloadConfig().overlap_side_stream is False
+def test_the_switch_is_on_by_default():
+    """PLAN §4.33 (user decision 2026-09-23 10:40/10:55, after the second
+    merged-version acceptance)."""
+    assert KTOffloadConfig().overlap_side_stream is True
 
 
 # -- 5. packed + side stream is a switch that would look on and be off --------

@@ -1195,16 +1195,18 @@ def _preconditions_cfg(packed: bool = False):
     return cfg, vcfg
 
 
-def test_production_refuses_the_switch_without_the_env(monkeypatch):
+def test_env_zero_turns_it_off_in_production_and_eager_alike(monkeypatch):
+    """PLAN §4.33: "0" is the kill switch now (it used to be the refusal)."""
     from vllm_ascend import envs
+    from vllm_ascend.kt_offload import switches
 
     monkeypatch.setattr(envs, ss.ENV_NAME, "0", raising=False)
     cfg, vcfg = _preconditions_cfg()
-    with pytest.raises(ValueError, match=ss.ENV_NAME):
-        cfg._validate_preconditions(vcfg)
+    cfg._validate_preconditions(vcfg)
+    assert switches.resolve(cfg).side_stream.on is False
     vcfg.model_config.enforce_eager = True
-    with pytest.raises(ValueError, match=ss.ENV_NAME):
-        cfg._validate_preconditions(vcfg)  # eager too: it would be a no-op there anyway
+    cfg._validate_preconditions(vcfg)
+    assert switches.resolve(cfg).side_stream.on is False
 
 
 def test_the_env_opens_it(monkeypatch):
@@ -1229,14 +1231,22 @@ def test_packed_and_the_side_stream_together_are_accepted(monkeypatch):
     cfg._validate_preconditions(vcfg)
 
 
-def test_a_typo_in_the_env_does_not_open_it(monkeypatch):
+def test_a_typo_in_the_env_refuses_to_start(monkeypatch):
+    """Before §4.33 a typo read as "not 1" = refused. With the default on, a
+    typo must not read as on (the default) or as off (a would-be "0"): it
+    refuses, naming the variable. "" is unset, i.e. the default."""
     from vllm_ascend import envs
+    from vllm_ascend.kt_offload import switches
 
-    for value in ("true", "yes", "", "0", "01"):
+    for value in ("true", "yes", "01", " 0"):
         monkeypatch.setattr(envs, ss.ENV_NAME, value, raising=False)
         cfg, vcfg = _preconditions_cfg()
         with pytest.raises(ValueError, match=ss.ENV_NAME):
             cfg._validate_preconditions(vcfg)
+    monkeypatch.setattr(envs, ss.ENV_NAME, "", raising=False)
+    cfg, vcfg = _preconditions_cfg()
+    cfg._validate_preconditions(vcfg)
+    assert switches.resolve(cfg).side_stream.on is True
 
 
 def test_enabling_it_says_so_in_the_log(monkeypatch, sim):

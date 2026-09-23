@@ -78,18 +78,20 @@ class KTOffloadConfig:
     # Eager (M1): run kt's synchronous submit/sync path rather than ACL
     # stream callbacks. Sets KT_FORCE_SYNC_SUBMIT=1 for the process.
     force_sync_submit: bool = True
-    # M3, REFUSED (2026-09-20). Narrowly: forking work onto a SECOND stream
-    # and joining it back inside a capture fails at capture_end with ACL
-    # 107025 -- three independent on-card runs (three layers in one capture,
-    # one capture per layer, and the whole-model A/B whose captured path then
-    # served 34/50 GSM8K with 38/50 answers different from the serial arm).
-    # This says nothing against host work *in* a graph: a host-func node on the
-    # stream being captured is a delivered production path (engram's host
-    # gather, models/deepseek_v4_1/engram_embedding.py, and our own overlap=off
-    # arm, 50/50). init_ascend_config rejects this switch; the code path and
-    # its tests are kept for whatever mechanism replaces it. A test harness may
-    # still build the config object directly to bisect the limit (tools/.../t3).
-    overlap_side_stream: bool = False
+    # The side stream (CPU-expert D2H + host-func node captured onto a second
+    # stream, joined back in merge). ON by default since PLAN §4.33, after
+    # §4.25/§4.26 (whole-network bit-identity, GSM8K 50/50, 1319 = 1275/1319)
+    # and the merged-version acceptances §4.32 (with P1a) and §4.33 (with P1a
+    # and the shared expert in the window: decode 1170/1170 bit-identical,
+    # GSM8K 50/50, 1319 = 1283/1319). Captured path only: eager never forks.
+    # Off: set this false, or VLLM_ASCEND_DSV41_KT_SIDE_STREAM=0 (which wins).
+    # The effective value -- and the automatic defaults of P1a and of the
+    # shared-expert move, which follow it -- come from kt_offload/switches.py,
+    # never from reading this field directly.
+    # History: refused 2026-09-20 (ACL 107025 at capture_end), withdrawn
+    # 2026-09-22 (the on-card case was failing on our own capture-buffer
+    # guard; a real three-layer side-stream capture captures and replays).
+    overlap_side_stream: bool = True
     # Fold kt's three separate host-device input copies into one, and use our
     # own pinned buffers instead of kt's slot-reuse pair. Off by default; the
     # criterion is bit-identical output with the switch flipped.
@@ -124,72 +126,39 @@ class KTOffloadConfig:
         """Parallel/runtime settings the M1 implementation depends on."""
         if not self.enabled:
             return
-        if self.overlap_side_stream:
-            from vllm_ascend.kt_offload import side_stream
+        # PLAN §4.33: the side stream, P1a and the shared-expert move are on by
+        # default; P1b is off. What each switch actually is -- cfg, env and
+        # the automatic defaults together -- comes from ONE function, so this
+        # check, the layer runtime and the log below cannot disagree about
+        # what "unset" means. It raises on what was asked for explicitly and
+        # cannot be had (P1a/P1b "1" without packed_transfer or the side
+        # stream; P1a and P1b both "1").
+        #
+        # packed_transfer + overlap_side_stream used to be refused here
+        # (2026-09-22, morning): ``route()`` tested ``packed`` first, so with
+        # both on nothing was ever forked. ``route()`` now tests ``overlap``
+        # first and the forked path uses the packed per-layer buffers, so the
+        # combination is accepted; "on means on" is asserted in
+        # tests/ut/kt_offload/test_side_stream_overlap.py.
+        from vllm.logger import logger
 
-            # packed_transfer + overlap_side_stream used to be refused here
-            # (2026-09-22, morning): ``route()`` tested ``packed`` first, so with
-            # both on the packed branch ran and nothing was ever forked -- a
-            # switch that looked set and was not. That reason is gone: the
-            # forked path now *is* the packed per-layer buffers (it was moved
-            # onto them to stop the side stream reading kt's shared pinned slots
-            # and the caller's short-lived routing tensors), and ``route()``
-            # tests ``overlap`` first. With both on, the captured path forks and
-            # the eager path is packed; with only overlap on, the captured path
-            # is identical and the eager path is kt's own. So the combination is
-            # accepted, and the thing the refusal protected -- "on means on" --
-            # is asserted where it belongs, in
-            # tests/ut/kt_offload/test_side_stream_overlap.py.
-            if not side_stream.enabled_by_env():
-                raise ValueError(
-                    "kt_offload_config.overlap_side_stream is experimental and off by default. The 2026-09-20 "
-                    "refusal (ACL 107025 at capture_end) was withdrawn on 2026-09-22: the on-card case that "
-                    "produced it was failing on our own capture-buffer guard, and with that fixed a real "
-                    "three-layer capture on the side stream captures and replays correctly. The one arm that "
-                    "still fails with 107025 is the one whose side-stream event record nobody joins, which is "
-                    "not what this code does. It is still unproven in a service: no TPOT reading, and the ACL "
-                    f"capture itself has no CPU coverage. Set {side_stream.ENV_NAME}=1 to run the B arm "
-                    "(tools/kt_offload/oncard/RUNBOOK_sidestream.md), and compare bit-for-bit against the "
-                    "serial arm -- every known failure of this path is FASTER and wrong."
-                )
-        # P1a (VLLM_ASCEND_DSV41_KT_ASYNC_WAIT): the captured host-func node
-        # only submits, and a completion thread records the ExternalEvent the
-        # graph waits on. It is an env-only switch on purpose -- the A/B it
-        # exists for must differ in exactly ONE thing, and the cfg json is part
-        # of an arm's fingerprint -- but it still has a precondition, and the
-        # place to refuse is here, at start-up, not at the first decode step.
-        from vllm_ascend.kt_offload import async_wait
+        from vllm_ascend.kt_offload import device_signal, shared_window, switches
 
-        if async_wait.enabled_by_env() and not (self.packed_transfer or self.overlap_side_stream):
-            raise ValueError(
-                f"{async_wait.ENV_NAME}=1 needs kt_offload_config.packed_transfer or "
-                "overlap_side_stream. Splitting kt's submit from its sync is only possible where WE build "
-                "the task (moe.forward_task + cpu_infer.submit/sync on this layer's own pinned buffers); "
-                "kt's own captured entry point (run_pinned_forward_sync) does both in one call, and its "
-                "pinned buffers are shared by layer_idx % 2, which is exactly the sharing the device-side "
-                "wait would stop ordering. Turn on one of the two, or unset the variable."
-            )
+        sw = switches.resolve(self, validate=True)
+        eager = bool(getattr(getattr(vllm_config, "model_config", None), "enforce_eager", False))
+        logger.info(
+            "kt_offload switches (PLAN §4.33; value(source[: why])): %s%s",
+            sw.summary(),
+            " -- enforce_eager: the side stream / async wait / device signal are captured-path "
+            "changes and an automatic shared-window move is not made, so eager runs its original path"
+            if eager
+            else "",
+        )
         # P1b (VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL): no host-func node at all --
         # an 8-byte copy of a per-step device counter is the start signal and a
-        # polling thread does the rest. Same precondition as P1a and for the
-        # same reason (only where WE build the task), plus two of its own.
-        from vllm_ascend.kt_offload import device_signal
-
-        if device_signal.enabled_by_env():
-            if not (self.packed_transfer or self.overlap_side_stream):
-                raise ValueError(
-                    f"{device_signal.ENV_NAME}=1 needs kt_offload_config.packed_transfer or "
-                    "overlap_side_stream. With no callback in the graph, the polling thread is what calls "
-                    "moe.forward_task + cpu_infer.submit/sync, which only exists where the layer owns its "
-                    "pinned buffers; kt's own captured entry point (run_pinned_forward_sync) needs a "
-                    "callback to call it, and its buffers are shared by layer_idx % 2."
-                )
-            if async_wait.enabled_by_env():
-                raise ValueError(
-                    f"{device_signal.ENV_NAME}=1 and {async_wait.ENV_NAME}=1 are two ways to start the same "
-                    "work (P1b replaces the host-func node; P1a keeps it and only moves the waiting), and "
-                    "an A/B arm must differ in exactly one thing. Turn on one of them."
-                )
+        # polling thread does the rest. Its precondition and its conflict with
+        # an explicit P1a are refused in switches.resolve; this one is its own.
+        if sw.device_signal.on:
             from vllm_ascend import envs
 
             if envs.VLLM_ASCEND_DSV41_KT_SEAM_TIMING:
@@ -200,23 +169,19 @@ class KTOffloadConfig:
                     "against HOSTFUNC_CALLBACK rows that do not exist. Refusing rather than printing a "
                     "report about nothing (§4.26 cost two nights to a pair of instruments that did)."
                 )
-        # §4.31 (VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW): the shared-expert MLP
-        # moves in front of the kt merge. Not refused without the side stream
-        # -- the order is still correct there, and an A/B with the side stream
-        # off is how "correct, just pointless" gets shown -- but say so, because
-        # a run that expects 1.4 ms/token from it and has no window to fill
-        # would otherwise look like the change not working.
-        from vllm_ascend.kt_offload import shared_window
-
-        if shared_window.enabled_by_env() and not self.overlap_side_stream:
-            from vllm.logger import logger
-
+        # §4.31: the shared-expert MLP moves in front of the kt merge. An
+        # explicit "1" without the side stream is not refused -- the order is
+        # still correct there, and an A/B with the side stream off is how
+        # "correct, just pointless" gets shown -- but say so. (Unset follows
+        # the side stream, so it cannot land here.)
+        if sw.shared_in_window.on and not sw.side_stream.on:
             logger.warning(
-                "%s=1 without kt_offload_config.overlap_side_stream: the merge still moves behind the "
+                "%s=1 without the side stream (%s): the merge still moves behind the "
                 "shared-expert MLP and the result is unchanged, but there is no idle window to hide it in "
                 "(the main stream waits for the CPU experts inside merge() either way), so expect no "
                 "TPOT difference.",
                 shared_window.ENV_NAME,
+                sw.side_stream,
             )
         pc = vllm_config.parallel_config
         sizes = {

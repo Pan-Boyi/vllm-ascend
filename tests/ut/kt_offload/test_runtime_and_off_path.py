@@ -202,7 +202,9 @@ class FakeKT:
 def _runtime(monkeypatch, resident_sets, num_experts=16, fake=None):
     monkeypatch.setattr(kl, "_stream_handle", lambda device: 0)
     plan = build_plan(resident_sets, num_experts)
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1)
+    # Serial (kt's own) path under test: the side stream is on by default
+    # since PLAN §4.33, so it is switched off explicitly.
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(hidden_size=8, moe_intermediate_size=4, num_experts_per_tok=2),

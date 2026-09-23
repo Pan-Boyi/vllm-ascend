@@ -40,7 +40,7 @@
 | `chunked_prefill_size` | 0=`max_num_batched_tokens` | kt 单次最大 token 数；超出 kt 直接 raise |
 | `skip_cpu_in_profile_run` | `true` | 见 §h |
 | `force_sync_submit` | `true` | eager 下设 `KT_FORCE_SYNC_SUBMIT=1`，走 kt 的同步 submit/sync |
-| `overlap_side_stream` | `false` | M3 预留（sglang `KT_SIDE_STREAM` 的对应物）；设 `true` 目前直接报错 |
+| `overlap_side_stream` | `true`（PLAN §4.33 起） | 侧流（sglang `KT_SIDE_STREAM` 的对应物），只作用于捕获路径；`VLLM_ASCEND_DSV41_KT_SIDE_STREAM=0` 可关（压过 cfg）。它与 P1a / 共享专家进窗口的有效值统一由 `kt_offload/switches.py` 解析，启动行 `kt_offload switches` 打印有效值与来源 |
 
 前置条件（`config.py` `_validate_preconditions`）：TP=DP=PP=1、无 EPLB、无投机解码。M2 起不再要求 `--enforce-eager`。
 层级前置条件（`layer.py:100-116`）：层号 < `num_hidden_layers`（MTP 层拒绝）、无冗余专家、`ep_size=tp_size=1`、

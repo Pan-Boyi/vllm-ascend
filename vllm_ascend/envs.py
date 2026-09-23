@@ -268,29 +268,42 @@ env_variables: dict[str, Callable[[], Any]] = {
     # reads clocks: no device operation and no output byte changes. Diagnostic;
     # read once per layer at weight-load time. Not sensitive.
     "VLLM_ASCEND_DSV41_KT_SEAM_TIMING": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", ""),
-    # DeepSeek-V4.1 MoE offload: allow kt_offload_config.overlap_side_stream
-    # (the CPU-expert D2H + host-func node captured onto a side stream, joined
-    # back in merge). "1" = allowed, anything else (default "0") = the config
-    # refuses to start. Experimental and unproven in a service: it is the B arm
-    # of tools/kt_offload/oncard/RUNBOOK_sidestream.md and every known way it
-    # fails is faster and wrong, so the A/B's criterion is bit-identity, not
-    # TPOT. Read at config validation. Not sensitive.
-    "VLLM_ASCEND_DSV41_KT_SIDE_STREAM": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SIDE_STREAM", "0"),
+    # DeepSeek-V4.1 MoE offload: the side stream (the CPU-expert D2H +
+    # host-func node captured onto a second stream, joined back in merge).
+    # ON BY DEFAULT since MOE_OFFLOAD_PLAN §4.33, after the whole-network
+    # acceptances §4.26 (bit-identical, GSM8K 50/50, 1319 = 1275/1319), §4.32
+    # and §4.33 (merged version: decode 1170/1170 bit-identical, GSM8K 50/50,
+    # 1319 = 1283/1319). Unset/"" (default) = follow
+    # kt_offload_config.overlap_side_stream (default true); "0" = off whatever
+    # the config says (the kill switch); "1" = on if the config allows it (the
+    # pre-§4.33 explicit permit, now redundant). Any other value refuses to
+    # start. Captured path only: eager never forks. Resolved together with the
+    # three switches below in vllm_ascend/kt_offload/switches.py, the only
+    # reader; the start-up log line "kt_offload switches" prints every
+    # effective value and its source. 🔴 Every known way it fails is faster
+    # and wrong: a change to it is judged by bit-identity, never TPOT.
+    # Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_SIDE_STREAM": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SIDE_STREAM", ""),
     # DeepSeek-V4.1 MoE offload, P1a: stop the device waiting for the host-func
     # callback to RETURN. The captured node then only builds kt's task and
     # submits it; the graph goes on to an ExternalEvent wait + reset, and a
     # completion thread calls cpu_infer.sync(0) and records that event
     # (vllm_ascend/kt_offload/async_wait.py). Saves the ACL notify-back leg of
     # the seam (PLAN §4.22 F1/F2: A+F 78 us/layer, event waits 0.03-0.14 us).
-    # "1" = on, anything else (default "0") = the callback keeps doing the
-    # sync, byte for byte the current behaviour. Needs the layer's OWN pinned
-    # buffers, i.e. packed_transfer or overlap_side_stream (config refuses
-    # otherwise), and it is a captured-path change only: eager is untouched.
+    # ON BY DEFAULT since MOE_OFFLOAD_PLAN §4.33 (accepted in §4.28: 0.53
+    # ms/token, bit-identical; §4.32/§4.33 as part of the merged version).
+    # Three states: unset/"" (default) = automatic -- on when the layer owns
+    # its pinned buffers (packed_transfer or the side stream), off otherwise
+    # and off when VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL=1, never an error;
+    # "1" = on, and refuses to start without packed_transfer or the side
+    # stream, or together with an explicit DEVICE_SIGNAL=1; "0" = off (the
+    # callback keeps doing the sync). Any other value refuses to start.
+    # Captured-path change only: in eager an automatic value is off.
+    # Resolved in vllm_ascend/kt_offload/switches.py.
     # 🔴 Every way it can fail is FASTER and wrong (the H2D reads the previous
-    # step's CPU output and nothing raises), so the criterion is bit-identity
-    # against the arm with it off, never TPOT. Read at config validation and
-    # at weight-load time. Not sensitive.
-    "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_ASYNC_WAIT", "0"),
+    # step's CPU output and nothing raises), so the criterion for any change
+    # is bit-identity against the arm with it off, never TPOT. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_ASYNC_WAIT", ""),
     # DeepSeek-V4.1 MoE offload, P1b: take the host-func node out of the graph
     # altogether. The layer becomes D2H(inputs) -> D2H(8-byte step counter) ->
     # ExternalEvent wait -> reset -> H2D, and a resident polling thread watches
@@ -298,16 +311,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (vllm_ascend/kt_offload/device_signal.py). What it saves on top of P1a is
     # the dispatch leg AND the 35.75 us of device idle that sits in front of
     # every HOSTFUNC_CALLBACK and in front of no other node type (PLAN §4.22
-    # F1). "1" = on, anything else (default "0") = the graph keeps its
-    # host-func node. Needs the layer's OWN pinned buffers (packed_transfer or
-    # overlap_side_stream) and graph mode; refused together with
-    # VLLM_ASCEND_DSV41_KT_ASYNC_WAIT, which starts the same work a different
-    # way. Builds a small .so at start-up (the spin must not hold the GIL) and
-    # refuses to start if it cannot.
+    # F1). OFF BY DEFAULT, also after §4.33 (§4.30: the mechanism did not
+    # hold on card). "1" = on; unset/"" or "0" = the graph keeps its host-func
+    # node; any other value refuses to start. Needs the layer's OWN pinned
+    # buffers (packed_transfer or the side stream) and graph mode. With it on,
+    # an automatic (unset) VLLM_ASCEND_DSV41_KT_ASYNC_WAIT turns itself off;
+    # both set to "1" explicitly refuses to start -- they start the same work
+    # two ways. Resolved in vllm_ascend/kt_offload/switches.py. Builds a small
+    # .so at start-up (the spin must not hold the GIL) and refuses to start if
+    # it cannot.
     # 🔴 Every way it can fail is FASTER and wrong, so the criterion is
     # bit-identity against the arm with it off, never TPOT. Read at config
     # validation and at weight-load time. Not sensitive.
-    "VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL", "0"),
+    "VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL", ""),
     # Where the polling helper of the switch above is compiled to. Empty
     # (default) = ~/.cache, then /tmp: the build has to land on a mount that is
     # not noexec, and this project points TMPDIR at /dev/shm, which often is.
@@ -321,16 +337,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     # routed_experts.forward_impl, the shared MLP only after it returns). With
     # "1" the routed path hands back an UN-merged routed_out and
     # fused_moe._forward_impl merges after ascend_shared_experts.forward(),
-    # still before it returns, so nothing reads routed_out in between. Anything
-    # else (default "0") keeps the merge where it is. Only useful together with
-    # kt_offload_config.overlap_side_stream (there is no idle window without
-    # it); with the side stream off the order still runs and is equivalent.
+    # still before it returns, so nothing reads routed_out in between.
+    # ON BY DEFAULT since MOE_OFFLOAD_PLAN §4.33 (the D arm of the second
+    # merged-version acceptance: decode 1170/1170 bit-identical against C,
+    # GSM8K 50/50, 1319 = 1283/1319). Three states: unset/"" (default) =
+    # follow the side stream (on when it is on; off in eager); "1" = on (a
+    # warning without the side stream: correct, but no idle window to fill);
+    # "0" = the merge stays where it is. Any other value refuses to start.
+    # Resolved in vllm_ascend/kt_offload/switches.py.
     # 🔴 A dropped merge is SILENT (the CPU half of the experts vanishes and
     # the tensor still looks fine), so the criterion is bit-identity against
     # the arm with it off, never TPOT; the layer counts its merge calls per
-    # route (vllm_ascend/kt_offload/shared_window.py). Read at config
-    # validation and at weight-load time. Not sensitive.
-    "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW", "0"),
+    # route (vllm_ascend/kt_offload/shared_window.py). Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW", ""),
     # DeepSeek-V4.1 MoE offload: pin the ONE ACL report thread (the thread
     # torch_npu creates on the first _subscribe_report and that delivers every
     # _launch_host_func callback) to a PU kt's spinning workers do not own.

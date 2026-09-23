@@ -49,16 +49,17 @@ ENV_NAME = "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW"
 
 
 def enabled_by_env() -> bool:
-    """Whether the operator explicitly asked for the shared MLP to move.
+    """Whether the operator explicitly set ``ENV_NAME=1``.
 
-    Read from ``envs`` when asked rather than cached, for the reason
-    ``side_stream.enabled_by_env`` gives: the message that refuses or reports
-    names the variable, so the answer must come from the environment the
-    service was started with.
+    NOT whether the shared-MLP move is on: since PLAN §4.33 unset means "default", and
+    the effective value (cfg, env and the automatic defaults together) comes
+    only from ``kt_offload.switches.resolve``. Nothing on the production path
+    calls this any more; it is kept for harnesses that ask the narrower
+    question.
     """
-    from vllm_ascend import envs
+    from vllm_ascend.kt_offload import switches
 
-    return getattr(envs, ENV_NAME, "0") == "1"
+    return switches.raw(ENV_NAME) == "1"
 
 
 # -- the criteria -----------------------------------------------------------

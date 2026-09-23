@@ -112,15 +112,17 @@ def _note_error(layer_idx: int, what: str) -> None:
 
 
 def enabled_by_env() -> bool:
-    """Whether the operator explicitly asked for the device-signal path.
+    """Whether the operator explicitly set ``ENV_NAME=1``.
 
-    Read from ``envs`` when asked rather than cached, like
-    ``side_stream.enabled_by_env``: the refusal names the variable, so the
-    answer has to come from the environment the service was started with.
+    NOT whether the device-signal path is on: since PLAN §4.33 unset means "default", and
+    the effective value (cfg, env and the automatic defaults together) comes
+    only from ``kt_offload.switches.resolve``. Nothing on the production path
+    calls this any more; it is kept for harnesses that ask the narrower
+    question.
     """
-    from vllm_ascend import envs
+    from vllm_ascend.kt_offload import switches
 
-    return getattr(envs, ENV_NAME, "0") == "1"
+    return switches.raw(ENV_NAME) == "1"
 
 
 # -- the native waiter -------------------------------------------------------
