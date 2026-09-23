@@ -1,9 +1,9 @@
 # DSV4.1-flash 单卡 MoE offload（vLLM + kt-kernel）计划与跟踪
 
-> 👉 **2026-09-22 现状**：rebase（目标最终是 clean **`a0e673186`**，不是 `f85267ab8`）、换包、整网首读**都已完成** ⇒ 见 **§4.18**。
-> `HANDOFF_next_session.md` 的 §3（rebase 怎么做）**已执行完毕，只剩坑与纪律可读，状态别照抄**。
-> 两条线在岗：`dsv41_vllm_single_card_phase2`（§4.18.1 的 ①接缝拆解／②t4／③t5，用卡 0–2）；
-> **`dsv41_single_card_stream_prefill`（流式 prefill + 动态热专家，用卡 3；计划另见 `STREAM_PREFILL_PLAN.md`，尚未并入本文）**。
+> 👉 **2026-09-23 现状**：bs1 decode 串行 ≈35.6 → 三项全开 ≈30.3 ms/token。已交付：**侧流**（§4.26，−3.00）、**事件等待**（§4.28，−0.53）、
+> **共享专家挪进窗口**（§4.31–§4.32，−1.71 单轮）；两版合版本验收全过（整网 decode 逐位全同，GSM8K 1319 = 1283/1319）。
+> 接缝（host 侧调起/返回）这条线已收敛（§4.30）。三项改默认开：进行中（§4.33）。下一个 session 从 `HANDOFF_next_session.md` 读起。
+> 同机另一条线 `dsv41_singlecard_stream2`（流式 prefill + 动态热专家；计划见 `STREAM_PREFILL_PLAN.md`）**用卡优先级高于本线**，上卡前先与其协调。
 
 > 本文是这条线的**唯一跟踪文档**。⚠️ 原维护者 `dsv41_vllm_singlecard` 已交接（上下文满），
 > 现由在岗的两条线维护（phase2: §4.18／§4.19；stream_prefill 的计划暂放 `STREAM_PREFILL_PLAN.md`），公共节改动前先说一声。
@@ -14,7 +14,7 @@
 
 | 仓 | 路径 | 分支 | 起点 |
 |---|---|---|---|
-| vllm-ascend | `worktrees/moe-offload` | `dsv41-moe-offload` | dsv41-clean `1b1ad396b`（09-19 变基；旧头备份 `dsv41-moe-offload-pre-rebase-0919`） |
+| vllm-ascend | `worktrees/moe-offload` | `dsv41-moe-offload` | dsv41-clean **`a0e673186`**（09-22 rebase，§4.18；更早的备份 `dsv41-moe-offload-pre-rebase-0919`）；改代码用独立树 `staging/moe-offload-shared`（分支 `dsv41-shared-window`） |
 | vllm | `worktrees/moe-offload-vllm` | `dsv41-moe-offload` | dsv41-clean `a9686bc6e6`（09-20 快进；我们在 vllm 侧无提交） |
 | ktransformers | `worktrees/ktransformers` | `dsv41_vllm_offload_dev` | kvcache-ai upstream/main `105359b` |
 
@@ -576,17 +576,19 @@ perf＝`perf_baseline.sh` bs1（并发 1、16 条、random IN 128 / OUT 256、ig
 
 **待办**：launcher 起服务不自动盖构建指纹（本次事后补盖）。
 
-### 4.18.1 优化队列（用户 2026-09-22 定：主指标仍是 bs1 延迟；本 session 只做 ①–③）
+### 4.18.1 优化队列（用户 2026-09-22 定：主指标 bs1 延迟；09-23 更新状态）
 
-| # | 项 | 预计收益 | 状态 |
+| # | 项 | 结果 / 预计 | 状态 |
 |---|---|---|---|
-| ① | **接缝拆解**：NOTIFY_WAIT 353.6 − kt 计算 246.1 = 107.5 µs/层（≈4.3 ms/token，实测差值）逐段打时间戳，再对最大段下手 | 上限 4.3 ms | 🟡 埋点已入库，**未上卡** |
-| ② | t4：节点成本 + 窗口（含 shared expert / dispatch 能否挪进窗口） | 决定 ③ 值不值 | ⬜ |
-| ③ | **实现侧流**（先修 §4.19③ 的进程级缓冲守卫 → 服务里打开 → 交错 A/B + 噪声地板） | 上限 ≈ 窗口 83.2 µs/层 × 40 ≈ **3.3 ms/token**（推断，t4 实测窗口外推） | ⬜ 形态 C 已 ⛔（节点费 105.2 > 窗口 83.2） |
-| ④ | L3 容量（SWA block 32→128） | 32k 下 3.58×；TPOT ≤1 ms | 📒 记账，本 session 不做 |
-| ⑤ | 频率放置（M0c） | 0.9–3.1 ms（推断） | 📒 记账，本 session 不做（需多卡采频率表） |
-| P2 | kt 内联（`KT_CPUINFER_INLINE`，微基准 0.45 ms） | 📒 **跳过不测**（用户 2026-09-23）：P1b 已证削 host 侧换不来 TPOT，P2 的 10 µs/层同族 ⇒ 预期 0；代码留树、默认关 |
-| ⑥ | 吞吐轴 MAXSEQS 8→32 | ×1.3–1.8 吞吐（推断：均匀路由下 8 条 ≈75 tok/s → 32 条 ≈128 tok/s，单请求 TPOT ≈106→≈250 ms） | 📒 记账，本 session 不做；硬前提 ④；若主指标改成单卡吞吐应提到最前 |
+| ① | 接缝拆解 | 107.5 µs/层拆成 A+F / C / E（§4.20–§4.22）；P1a 取到 −0.53（§4.28）；P1b 证明削 host 侧换不来 TPOT（§4.30） | ✅ 收敛 |
+| ② | t4：节点成本 + 窗口 | 窗口 t4 估 83.2 µs/层；整网 trace 逐层中位 78（§4.32） | ✅ |
+| ③ | 侧流 | −3.00 ms/token（§4.26） | ✅ |
+| ③′ | 共享专家挪进窗口 | −1.71 ms/token 单轮（§4.31–§4.32） | ✅；正式三轮交错补测**往后排**（用户 09-23） |
+| — | 三项默认开 | 侧流 / 事件等待 / 共享专家进窗口；P1b 保持关 | 🟡 §4.33（上卡冒烟等卡） |
+| ④ | L3 容量（SWA block 32→128） | 32k 下 3.58×；TPOT ≤1 ms | 📒 记账 |
+| ⑤ | 频率放置（M0c） | 0.9–3.1 ms（推断） | ⛔ **本线不做**（用户 09-23） |
+| P2 | kt 内联（`KT_CPUINFER_INLINE`） | 同族预期 0 | ⛔ 跳过不测（§4.30）；代码留 kt 树、默认关、未重建 wheel |
+| ⑥ | 吞吐轴 MAXSEQS 8→32 | ×1.3–1.8 吞吐（推断） | 📒 记账；硬前提 ④；若主指标改成单卡吞吐应提到最前 |
 
 ① 的仪器（2026-09-22，只写代码、**没碰卡**）：`VLLM_ASCEND_DSV41_KT_SEAM_TIMING=<采样秒>` 开
 （默认关；开时只读时钟，不改设备操作、不改输出字节），回调内分段见
@@ -1292,3 +1294,4 @@ t5r `--shared-mlp both` ×3 发（干净臂 after/before 两顺序互相、对�
 - 2026-09-23（phase2）：🔴 P1b 机制不成立——节点确实归零、35.75 µs 中位代价确实消失，但副流链每层只少 0.25 µs、step 周期只动 0.07 ms（时间从 wait 挪进 idle）⇒ 主流停等由 kt 何时算完决定，削 host 侧换不来 TPOT；推论：P2/P3 预期同样无效。代理层判 unusable（只有 1 个标定点、分辨率 ±1 ms）；perf 口径不许砍半（噪声翻倍）。见 §4.30。
 - 2026-09-23（phase2）：§4.31 共享专家 MLP 挪到 kt join 之前（`VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW`，默认关）——trace 对账 38.25 µs/层在 join 之后且无数据依赖，上限 ≈1.5 ms/token；每次 route 恰一次 merge 的运行时守卫 + 生产 `_forward_impl` 源码变异全红；CPU 595/0；上卡 t5r/t4p 执行单已备、未跑。见 §4.31。
 - 2026-09-23（phase2）：合版本（侧流+事件等待）验收——单轮 perf Δ4.22（稳妥 3.3–4.2）、整网 decode 1174/1174 逐位、GSM8K 50/50；1319 暂缓。侧流 3 ms 逐层对账：窗口是 13 个算子 78 µs/层（不是只有 GMM），D2H 与调起空隙挪到副流基本抵消，profiler 开销两臂不对称不能报收益。见 §4.32。
+- 2026-09-23（phase2）：刷新文首现状与 §0 分支起点；§4.18.1 队列更新状态（①②③ 完成、共享专家进窗口完成、频率放置本线不做、三轮补测往后排）。
