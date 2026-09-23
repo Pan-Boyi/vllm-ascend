@@ -1,17 +1,20 @@
 # 单卡 MoE offload：交接给下一个 session
 
-> 写于 2026-09-22，上一条线是 `dsv41_vllm_singlecard`（上下文将满，故交接）。
-> 🟢 **2026-09-22 phase2 进展**：rebase（目标改为 clean `a0e673186`）、换包、验收都已完成，读数见 `MOE_OFFLOAD_PLAN.md` §4.18。下文 §3 的步骤已执行完，§3.2 的风险 1–4 已关闭；§4 的基线正在测。
-> **唯一事实源仍是 `MOE_OFFLOAD_PLAN.md`（§1–§4.17）与 `docs/moe_offload_design.md`（k.* / m.*）。本文只给"接下来做什么、怎么做、坑在哪"。**
-> 状态标记：✅ 已完成且有实测 · 🟡 代码就绪待上卡 · ⬜ 未开始 · ⛔ 已否决
+> 写于 2026-09-23 下午，由 `dsv41_vllm_single_card_phase2` 交出。上一版（09-22 早上，"去做 rebase"）已全部执行完，被本文替换。
+> **唯一事实源是 `MOE_OFFLOAD_PLAN.md`**（本轮读数在 §4.18–§4.33）。本文只给"现在是什么状态、接下来做什么、坑在哪"。
+> 标记：✅ 已完成且有实测 · 🟡 代码就绪待上卡 · ⬜ 未开始 · ⛔ 已否决
 
 ---
 
 ## 0. 三十秒版
 
-单卡（TP1/DP1/EP1）+ CPU 专家 offload **已经整网跑通并有精度**：图模式 GSM8K 50 题 50/50，bs1 TPOT ≈40.3 ms（旧基线）。
-差距的三分之一是**等 CPU 专家**（每层 ≈372 µs，实测）。**用户已禁止跨层** ⇒ 精确类优化的上限只有 1.8–4.4 ms/token。
-现在的头等任务是 **rebase 到重构后的 clean**（用户 2026-09-22 拍定：**做 rebase，不重新分叉**），因为主干已交付 O6（>16k）与 −16.4%（四卡口径）的 decode 优化，而我们的对标值和读数已全部过期。
+单卡（TP1/DP1/EP1，40 层 × 384 专家，~100 驻留 NPU、284 在 CPU）bs1 decode 这一轮从串行 **≈35.6 ms/token 压到 ≈30.3 ms/token**，
+三项改动：**侧流**（CPU 专家路径拆到副流，−3.00 ms）、**事件等待**（设备停在 ExternalEvent 上而不是等回调返回，−0.53 ms）、
+**共享专家挪进窗口**（−1.71 ms，单轮）。整网 decode 每项前后逐位全同，GSM8K 1319 = **1283/1319**（多卡带 1276–1281，无可检出回归）。
+按用户决定，这三项**改为默认开**（进行中，见 §1）；计数器启动（P1b）实测无收益，保持默认关。
+
+**接缝（host 侧调起/返回）这条线已经收敛**：P1b 把每层 ~110 µs 的 host 侧步骤从链上拿掉，链长和 TPOT 都没动（§4.30）——主流停多久由
+kt 何时算完决定。剩下的杠杆只有三条：CPU 计算本身（带宽 428 GB/s = 整机 86%，已近 roofline）、窗口宽度（本层内已无可挪的东西）、吞吐轴。
 
 ---
 
@@ -19,109 +22,73 @@
 
 | | 状态 |
 |---|---|
-| 两棵树 | `worktrees/moe-offload`（vllm-ascend，分支 `dsv41-moe-offload` @ `d5476630c`，66 个提交）、`worktrees/moe-offload-vllm`（vllm @ `a9686bc6e6`，**我方零改动**） |
-| 分叉点 / clean 头 | `1b1ad396b` / **`f85267ab8`**（落后 24 个提交；vllm 侧两边同 commit） |
-| 代码 | ✅ M1 eager 集成、✅ M2 图模式 host-func、✅ 频率计数器、✅ packed_transfer（默认关）、⛔ 侧流（图模式下直接拒绝启动）、🟡 L3 SWA block_size（默认关） |
-| 测试 | kt_offload 单测 266（rebase 后 283，含 SWA 判据）；`selftest_cpu` 70、`selftest_packed_ab` 98 |
-| 上卡就绪未跑 | 🟡 **A/A → t4 → t5**（执行单 `tools/kt_offload/oncard/RUNBOOK_window.md`）——⚠️ rebase 后期望值与基线都要改，见 §3 |
-| kt-kernel | 分支 `dsv41_vllm_offload_dev`（`worktrees/ktransformers`），已含 A5 两个 cherry-pick + `set_capture_probe` + `sync_cpu_only`；wheel 装在 `build_artifacts/moe_offload_ref/kt_site`（sha256 `1b8e9b21…`）。**用户尚未 push 过这条分支** |
+| 树 | `worktrees/moe-offload`（分支 `dsv41-moe-offload`，基于 clean `a0e673186`，**未 push**）；`worktrees/moe-offload-vllm`（vllm，我方零改动）；`staging/moe-offload-shared`（分支 `dsv41-shared-window`，改代码用的独立树，见 §3 坑 1） |
+| .so / 算子包 | 与 clean 同一份：`.so` md5 `85331298…`、vendors 786/787 文件；共享闸 moe-offload 钉值行已按验收更新（build_artifacts `5c87ee2`） |
+| ✅ 侧流 | §4.19–§4.26。修过一次"更快 2.74 ms 且算错"（fork 事件记在填充之前，§4.23–§4.25） |
+| ✅ 事件等待（P1a） | §4.28。阳性对照（放行推迟 50 ms ⇒ replay 0.027→3.4 s）才让"逐位相同"有证据力 |
+| ✅ 共享专家进窗口 | §4.31–§4.32。每次 route 恰一次 merge 的运行时守卫；t5r 替身用 MXFP8 生产链 + 判别力硬自检 |
+| ✅ 第一版合版本（侧流+事件等待） | §4.32：单轮 Δ4.22（稳妥 3.3–4.2）、decode 1174/1174、GSM8K 50/50 |
+| ✅ 第二版合版本（再加共享专家） | `RUNBOOK_merge_v2.md`：单轮 −1.71、decode 1170/1170、GSM8K 50/50、1319 = 1283 |
+| 🟡 **三项默认开** | 在 `staging/moe-offload-shared` 做：侧流 cfg+env 默认开；事件等待/共享专家三态（未设=跟随侧流，显式 1 前提不满足仍报错，显式 0 关）；P1b 显式开时 P1a 自动让位。**合回后要上卡冒烟**：不设任何开关起服务，三项有效值都开 + 与第二版 D4 的 lp 逐位对比（`RUNBOOK_defaults_on.md`） |
+| ⛔ P1b 计数器启动 | 默认关。机制不成立（§4.30） |
+| ⛔ P2 kt inline | 跳过不测（§4.30 推论同样无效）。kt 树 `53eab3c` 有 `run_inline`/`KT_WORKER_SPIN_MS`，**未重建 wheel、未切站点** |
+| 报告页 | https://claude.ai/artifact/7jpcSsWTme7E5KXbeyA2zH（私有）：流程/框图、3 ms 逐层对账、NPU 窗口算子表、roofline、甘特图、核心代码、验收 |
 
 ---
 
-## 2. 不可违反的约束（用户 / 协调方定的）
+## 2. 不可违反的约束
 
-1. 🔴 **不允许跨层**（用户 2026-09-22 前定）：任何把 CPU 专家贡献推迟到下一层/下一步的机制一律不做，含 kt 的 `max_deferred_experts_per_token`。已做成会 raise 的硬拦截（A3/A4 读真实状态位）。
-2. 🔴 **单卡的改动只在本线自己的树/脚本里**；integration 的树、共享脚本、多卡基线保持原样（只调用不改）。共享件清单见 PLAN §5。
-3. 🔴 **不重编 `.so`、不动共享算子包**——起飞闸查全部注册的树，重编会挡住所有人。真要动先找 `dsv4.1_flash_dev`。
-4. **碰卡先拿租约**（`build_artifacts/card_lease.sh acquire`，`LEASE_PID` 给活得够久的进程，不要 `$$`）；卡 1 不用；卡号每次去问，不引用旧约定。
-5. **代理只给 GitHub/Claude**，其它外部访问 unset proxy。**不用 `pkill -f`**（会杀掉自己的 shell，栽过两次）。
-6. 性能 A/B **两臂必须同时段、交错轮次**（机器会自漂 2.5×），并报噪声地板；**地板没测到而又测出差值 ⇒ 判 fail**。跨发读数**不得相减**。
-
----
-
-## 3. 任务一：rebase 到 `f85267ab8`（不占卡的部分先做完）
-
-**已实测的代价**（临时 worktree 上真跑过 `git rebase dsv41-clean` 后丢弃）：**1 处相邻行冲突**（`envs.py`），`caches.py` 自动合；我们 283 条测试全过；`models`/`attention` 的失败集合与 clean 单独跑**逐条相同**（47/47），我们多 17 个通过。我方依赖的十余个文件在新 clean 上**逐位未变**（`routed_experts.py`、`token_dispatcher.py`、`prepare_finalize.py`、`moe_comm_method.py`、`w4a8_mxfp4.py`、`acl_graph.py`、`model_runner_v1.py`、`engram_embedding.py`、`ascend_config.py`…）。
-
-### 3.1 步骤
-
-1. **打快照分支**：`git branch dsv41-moe-offload-pre-rebase-0922 HEAD`（先例：`-pre-rebase-0919`、`-pre-ff-0920`）。
-2. `git rebase dsv41-clean`；`envs.py` 冲突取 clean 那一行 + 保留我们两项（`EXPERT_COUNT`、`KT_HOSTFUNC_LOG`、`SWA_BLOCK_SIZE` 等，按实际）。
-3. **五项跟改**（缺一就会静默出错）：
-   - `tools/kt_offload/kv_budget_singlecard.py:57` 写死 `P_IDX=16896` ⇒ index-K 页已降为 8,704 B；且 `DEFAULT_LOGS` 指旧 log 会一直绿着掩护它。
-   - `tests/ut/models/test_deepseek_v4_1_swa_block_size.py:267/333` 与 `test_kv_budget.py:66` **手搭 spec、不调真对象** ⇒ 生产池块 542,208→517,632 它们照样绿（**假绿灯**）。改成调真的 `get_kv_cache_spec`。
-   - `tools/kt_offload/serve_v41_singlecard.sh`：补 **DS41 段**（照共享 `cookbook/serve_multicard.sh:66` 的 ③.1，约 20 行，`DS41=/workspace/code/dsv4_single_card/ds41_site` 前置 PYTHONPATH；**缺了不报错、只是退回旧路径没有 O6**）＋ **显式 `VLLM_USE_BREAKABLE_CUDAGRAPH=1`**（新 O15 闸：真捕图不传就 raise；`--enforce-eager` 豁免）。
-   - `RUNBOOK_window.md` 的 `ONCARD_EXPECT_SO_MD5` 与 `build_fingerprint.py` 的期望值换成**新 `.so`**，否则三发全部 rc=3 拒绝起飞。
-   - **指纹要覆盖新四件**（`custom_ops_dsv41/*` 三轮子+`.run` 与 `ds41_site`）——现在只盯 `.so`+`vendors/`，**它们换了"同构建"判定发现不了**。
-4. **跑测试的位置有讲究**：worktree 必须摆在 `<proj>/worktrees/<name>`，否则 `test_kv_budget.py:24` 按 `parents[1]` 找 `build_artifacts/` 会**静默 skip 14 条**（读数是"269 passed, 14 skipped"，看起来像通过）。
-5. **不要从 `worktrees/clean` 的工作树拷文件**（那里现在有别人的未提交改动）；以已提交的 `f85267ab8` 为准。
-
-### 3.2 rebase 的风险（按严重度）
-
-1. 🔴 **旧 `.so` + 新代码 = 静默算错，不是崩**。clean 改了 csrc（`op_api_common.h` 的 4-bit nibble 分支）并默认把 `float4_e2m1fn_x2` 喂给新算子；我们的 `.so`（`2b58b578e4fc`）里那 6 个符号 0 命中。⇒ **rebase 完成后到换 `.so` 之前，绝对不要在卡上跑任何"结论性"的发次**。换完先跑 t0（单层逐位/地板判据 + 6 条变异臂，约 44 s）当 sanity。
-2. 🔴 **换 `.so` 与算子包不是我们能单方面做的**：钉值按树拆在 `verify_shared_artifacts.sh:144-180`，我们那一行现在钉的是 9.1.0/759 文件那份，**且理由字串写的是"从 clean 分出时未变"——rebase 后这句为假而闸仍然绿**（它比产物、从不比源码）。必须与 `dsv4.1_flash_dev` / `dsv41-integration` 协调：换包 → 重跑 GSM8K → 再改钉值（他们的规矩）。
-3. 🔴 **"先不换包"这条退路被堵死**：`INDEXER_QUANT_CACHE` 默认已是 "1"，index-K 已是 MXFP4，**不能单独关**（要连 `caches.py` 的 spec 一起改）。⇒ 要么换包，要么别 rebase。
-4. **ds41 缺失的症状是"能跑但没有 O6"**（退回 v2、>16k 被守卫挡），不是报错 ⇒ 不加那 20 行 launcher 代码，会静默失去 >16k。
-5. **所有旧读数作废，跨 rebase 的比较无效**：§4.6 全表（40.47 ms、device 忙 57.1%、43 段/17.91 ms）、§4.10 的 NOTIFY_WAIT 371.8 µs/层、§4.5 的 KV 绝对数（42,733 / 164,420 / 27.34 GiB / 670.7 KiB）全要重算重测。**不受影响**：§4.3 的 CPU 曲线（428 GB/s、10 ms 地板，与 `.so` 无关）与 L3 的**相对**倍数（3.85×、省 20.2 GiB）。
-6. **对标值变了**：多卡 26.84 ms 作废，新的是 **≈22.7 ms（四卡、同时段 A/B、−16.4%）**；⚠️ **单卡能拿到多少没有读数**，别把四卡的降幅当成我们的。
-7. **形态 C 的窗口变小了**：clean 把 NPU 侧 decode 压掉 16.4%，而重叠上限 = min(CPU/层, **本层 MoE 的 NPU 时间**) − 回调成本。§4.7/§4.9 的天花板要按新 device 时间重算。
-8. 历史重写本身风险低：**这条分支从未 push 过**（本容器 ssh 推 GitHub 无权限），没有别人基于它开发；但仍要打快照分支。
+1. 🔴 **不允许跨层**（用户 09-22 前定）：任何把 CPU 专家贡献推迟到下一层/下一步的机制一律不做。
+2. 🔴 **kt 可改**（改完重建 wheel 必须重跑 t0/t1/t2，跨构建读数不可比）；**共享脚本（`build_artifacts/*`、`cookbook/*`）一律不碰**，问题通知协调方。
+3. **碰卡先拿租约**，起飞前 HBM+aicore **连采 ≥3 次**（只看 HBM 分不开"有人在跑"和"拆解残留"）；卡号每次去问。**不用 `pkill -f`**；停服务按 PGID。
+4. **判据先声明再验**：写进 run 目录 `EXPECTED.txt`、存 md5、只读；读数出来后不改。门槛（§4.27）：Δ ≥ 3×同臂跨轮地板 **且** ≥ 0.3 ms，**带符号**判（旧 `perf_verdict.py` 判 |Δ|，候选臂变慢也会打"成立"，已修 `--signed`）。
+5. **测量口径**：默认只跑 perf + 整网逐位，profile 非必要不采（一发 25 min 起）。**收益只按 perf 报**——profiler 自身开销两臂不对称（串行 +5.4 ms、侧流 ≈+3.2 ms），profiler 下的步长差不是收益。bs1 采样 `CASES="bs1 1 16" REPEAT=3`，不许砍半。
+6. **整网逐位**：并发 1、跳过前 13 条热身后服务逐位确定；任何"逐位相同"都要配**开关确实生效**的计数（每层 `… ENABLED` 日志 40 条）和能变红的变异臂/阳性对照，否则可能只是开关没开。
 
 ---
 
-## 4. 任务二：重测基线（换完 `.so` 之后，1 张卡约 2.5–3 h）
+## 3. 本轮踩过、下一个 session 最容易再踩的坑
 
-最小集：起服务 ×2 各 ~6 min｜`perf_baseline.sh` bs1 **交错 A,B,A,B 4 轮** ~40 min（含噪声地板）｜1 份 decode profile ~15 min｜serve.log 取新的 KV `available` 与池块 517,632｜GSM8K 50 题 ~30 min（口径校验，非精度验收）｜判读 20 min。
-产出要盖构建指纹（`build_fingerprint.py`），**跨构建判读会拒绝给差值**（这是设计，不是故障）。
+1. 🔴 **改代码的 agent 不能和"正从这棵树起服务"的验收共用一棵树**。09-23 一个 agent 在验收树里写未提交改动，恰落在一臂起服务后 20–70 s（vLLM 在引擎启动过程中才导入模型代码）⇒ 该臂作废。现在的做法：改代码在 `staging/<name>` 另开 worktree（不放 `worktrees/`，共享闸会扫那里）；验收脚本每臂起服务前核 `git status` 为空、指纹 dirty_files=0、`vllm_ascend/` 相对基准零差。
+2. 🔴 **"更快且算错、什么都不报"是这条线所有机制的共同失效形态**（侧流 fork 顺序、事件未重置、漏合并）。判据必须是逐位，不是 TPOT；逐位必须有区分力（t5r 的替身曾在 8 层残差栈里溢出成 NaN，NaN 感知的比较把"漏合并"读成绿——被判别性自检拦下）。
+3. **窗口不是只有 GMM**：侧流收益 3 ms 的来源是 13 个算子 78 µs/层（GMM 45.6、InitRouting 13.6、Cumsum 5.0、Finalize 4.0、Swiglu 3.1、Index/Cast/Mul 6.9）。把 D2H 和 host-func 调起前空隙挪到副流**净收益 ≈0**（副流链是关键路径，在链上原样加回，空隙还从 30.75 涨到 35.75 µs）。
+4. **"中段"不等于"稳态"**：从 trace 抽步要按"周期最贴整发中位"选；step 90–102 那一带周期高 10%，读数全对不上。两发 trace 的时间戳是 CLOCK_REALTIME，不能叠在同一绝对轴上。
+5. **外部租户会跑到一半上来**：整段开头预检一次不够，每臂起飞前都要预检；作废要凭产物内证据（例如"从没碰过的卡 1 同时 +16 GB"），不凭读数合不合意。`set -o pipefail` 在 `card_clear | tee` 里是承重的。
+6. **错码判定**：`ONCARD_ERRCODES` 五码显式名单 + 两头非数字边界 + 排除埋点行，三者缺一不可（19 位时间戳里出现 107025 是概率问题）。
+7. **`/dev/shm/engram_stage`（189 GB）是 engram 表本体，不是暂存**，所有 V4.1 服务都 mmap 它。**不许删、不许重铺。**
+8. 🔴 **共享闸 `build_artifacts/verify_shm_sharing.py:266` 的 S-2 在有并发租户时必红**（分母用本发 rank 数，而 Pss 按实际映射进程数均摊），且 `:213` 的补救提示"重铺"会毁掉好表。本线重启时若别人的服务正挂着 engram 表，会撞到这条——**别照提示重铺**。已尝试转报 `dsv4.1_flash_dev`（09-23 13:40 不在线，未送达），stream2 线有完整取证。
+9. **生产隐患（未修，不影响 DSV4.1）**：`vllm_ascend/ops/fused_moe/shared_experts.py:86` 把 `swiglu_limit=None` 映射成 0.0，W8A8/W4A8 分支 `:351` 以 `swiglu_mode=1` 传下去；本机 CANN 9.1 的 `DequantSwigluQuant` 要求 `clamp_limit` 严格 > 0 ⇒ 走 W8A8 的模型在这里必挂。DSV4.1 走 MXFP8 分支。
+10. 旧坑仍有效（详见 PLAN 与 design 的 k.* 节）：kt 任务异常要到下次 sync 才抛（报错记在下一层账上）；eval harness 默认 temperature=1.0，跑精度要显式贪心；E8M0 scale 只能按字节搬；未跟踪的产物会消失 ⇒ 读数内联进文档。
 
 ---
 
-## 5. 任务三：优化队列（重测之后，按此优先级）
+## 4. 下一阶段（按用户 09-22 的队列 §4.18.1，①–③ 已做完）
 
-| 优先级 | 项 | 预计收益 | 前提 / 备注 |
+| 优先级 | 项 | 预计 | 前提 / 备注 |
 |---|---|---|---|
-| **1** | **L3：SWA `block_size` 32→128**（`VLLM_ASCEND_DSV41_SWA_BLOCK_SIZE`，已实现默认关） | **容量 3.85×**（KV token 数、并发倍数）；TPOT ≤1 ms | **O6 已交付 ⇒ 现在能验证收益**（262144 起得来）。clean **没做** KV 回收（L4/L6 零命中），机制仍是我们的；《适配方案》§6.9.10 已点名解除 O6 后合入我们这个开关。⚠️ 绝对数要按新页大小重算；上卡判据必须**并发跑满让块回收真的发生**（不跑满的话"容量提升"和"分配器没压力"读数相同） |
-| **2** | **t5：侧流能不能救回** | 若成功 **1.8–4.4 ms**（sglang 同版 torch_npu 实测 −5.37 ms） | 唯一可能翻盘的变量。验那条具名差异：`acl_graph.py:187` 的 `auto_dispatch_capture` 默认 False，sglang 传 True。**必须用真实层**（标量微型图给过假绿灯）；`--arm off` 报 107025 是阳性对照——**没有它，"成功"可能只是参数没生效**；捕获成功 ≠ 会重放，要 replay 逐位 + 逐层计数 |
-| **3** | **t4 → 形态 C** | 0.9–2.4 ms（窗口 45–110 µs/层 − 回调成本） | t4 先测三个数（node_us / window_us / ceiling），**node ≥ window 就当场作废**。形态 C = engram 已交付的形态（同一捕获流上两个 host-func 节点），**必须建在 packed 的每层自有缓冲之上**（kt 的 `layer_idx%2` 槽位会让 L 与 L+2 撞车，今天没炸只是被那次整卡同步救了） |
-| **4** | **A/A 对照**（可与上面任一发搭车） | 不给收益，**校仪器** | 两档（并发 8 + 并发 1）定"服务层逐位判据有没有区分力"，并把两臂之差当**噪声地板** |
-| **5** | **频率放置（M0c）** | 0.9–3.1 ms（若偏斜成立） | 需多卡一发 eager 采频率表（代码与判据就绪，卡由 flash_dev 排）。偏斜倍数只有 sglang DSV4 的旁证，DSV4.1 未实测 |
-| 6 | 吞吐轴（`MAXSEQS` 8→32） | 吞吐 ×1.3–1.8（推断） | **硬前置是 L3**（现在 KV 只够 5.22 条满长请求）。若主指标改成"一张卡的吞吐/成本"，这条应上调 |
-| ⛔ | packed_transfer | 在能区分的设计下未测到收益 | 默认关；长尾（>3 ms 等待段 6→125）当**缺陷记录**，而底噪里本来就有与 packed 无关的 CPU 长尾 |
-| ⛔ | 跨层 / deferred | — | 用户禁止 |
-| ⛔ | 热专家动态缓存 / 权重再压缩 / 只读部分专家 / 激活降精度 | ≈0 | HBM 已顶格、无部分读接口、MXFP4+compact 已是下限、搬运只占 0.5% |
+| 0 | **三项默认开：合回 + 上卡冒烟** | — | §1。冒烟 ≈15 min（起服务 + 200 条 lp 对 D4） |
+| 1 | **频率放置（M0c）** | 0.9–3.1 ms（若偏斜成立） | 需一发采频率表。🔴 判据别用"热集合覆盖了多少"——stream2 实测它会把"全局热"读成"有用"（全局热 84.3% > 逐请求热 81.9%）；要用"换一个同类集合是不是一样好"做对照 |
+| 2 | **吞吐轴**：L3（SWA `block_size` 32→128，已实现默认关）→ `MAXSEQS` 8→32 | 容量 3.85×；吞吐 ×1.3–1.8（推断） | L3 上卡判据必须并发跑满让块回收真的发生。若主指标从 bs1 延迟改成"一张卡的吞吐"，这条应上调 |
+| 3 | 补一发**三轮交错**给共享专家进窗口定正式收益 | — | 现在的 −1.71 是单轮（门槛 1.65，只差 0.06），按用户决定采纳；要进正式收益账需补 |
+| — | 待查：§4.30「那 78 µs 去哪了」 | — | 开放问题，不阻塞 |
+| ⛔ | 削 host 侧（P1b/P2/P3）、跨层/deferred、packed_transfer 单独开、热专家动态缓存/权重再压缩 | ≈0 | 见 PLAN 各节 |
 
 ---
 
-## 6. 交接时必须知道的坑（详见 design 的 k.* 节）
-
-- **判据要读它所判断的那个对象**（踩过 3 次）：护栏读"当前有捕获在进行"≠"这条流的工作会进图"；探针用标量微型图（替身比被测对象弱）⇒ 在真实层全失败的平台上通过；指纹盯 `build_artifacts/vendor92` 而真正加载的是本树的包。
-- **占卡判据三维**：HBM 高 + aicore 非零 = 有人在跑（等/协调，别 kill）；HBM 高 + aicore 恒 0 = 拆解残留（等它落）。**只看 HBM 分不开这两者，而该做的事相反**；连采 ≥3 次；读不到当忙。
-- **租约跨容器不可见** ⇒ acquire 成功 ≠ 卡可用（原因不是"上下文没回收"）。
-- **"一个永不等待的等待和一个成功的等待，输出完全一样"**：小写 `process id` 让拆除等待循环从没生效过（npu-smi 印大写，空卡印 `No process in device.`）。
-- **profiler 开法**：本版 vLLM 不认 `VLLM_TORCH_PROFILER_DIR`，要用 `EXTRA_ARGS='--profiler-config {...}'`；`prof_decode_capture.py` 在 404 时**照样打印成功** ⇒ 采完自己数 `*_ascend_pt`；`prof_decode_breakdown.py` 会因"无图 Model ID"拒绝出结果 ⇒ 直接聚合 `kernel_details.csv` 并按**区间并集**算真实 device 忙。
-- **未跟踪的产物会消失**（三个 run 目录已在 09-21 清理中永久丢失）⇒ 结论落地就把读数内联进文档，出处标「可复验 / 已记录不可再验」。
-- **eval harness 默认 `temperature=1.0`** ⇒ 跑精度必须显式覆盖成贪心。
-- **E8M0 scale 只能按字节搬**，不能 `.to()`；判据是字节往返，不是比 dtype 名。
-- **kt 的任务异常要到下次 sync 才抛** ⇒ 报错记在下一层账上，定位要把层号往前推一格；kt `new Args{}` 无 delete，长跑像"跨层缓冲没释放"。
-
----
-
-## 7. 对口
+## 5. 对口
 
 | 事 | 找谁 |
 |---|---|
-| 卡、窗口、共享脚本、闸与钉值 | `dsv4.1_flash_dev`（协调方） |
-| clean 的代码/迁移/算子包细节 | `dsv41_vllm_pm`、`dsv41-integration` |
-| kt-kernel 接口与重建 wheel | kt 侧 agent（本线自己的 M0 agent 线） |
-| 官方代码比对（engram_offload / MegaMoE） | `dsv41_vllm_official_code_invest` |
+| 卡、窗口、共享脚本、闸与钉值 | `dsv4.1_flash_dev`（协调方；09-23 下午不在线） |
+| clean 的代码/迁移/算子包 | `dsv41_vllm_pm`、`dsv41-integration`（已退休，问 pm） |
+| 同机另一条单卡线（流式 prefill + 热专家、engram、主机内存/CPU 协调） | `dsv41_singlecard_stream2` |
 | sglang 单卡参考实现 | `dsv4_a5_single_card`（另一台机器，Remote Control） |
 
 ---
 
-## 8. 接手第一步建议
+## 6. 接手第一步
 
-1. 读 `MOE_OFFLOAD_PLAN.md` §0–§2 与 §4.9–§4.17（约束、作废的数字、仪表纪律），再读本文。
-2. 打快照分支 → 按 §3 做 rebase 与五项跟改 → 跑三套测试（单测 + 两个 selftest），**位置要对**。
-3. 找 `dsv4.1_flash_dev` 谈换 `.so` + 算子包 + `ds41_site` 的钉值与指纹覆盖。
-4. 拿到新 `.so` 后：t0 sanity（44 s）→ 重测基线（§4）→ 按 §5 的优先级往下做。
-5. **不要**在换 `.so` 之前跑任何结论性的卡上发次。
+1. 读 `MOE_OFFLOAD_PLAN.md` §0–§2、§4.18–§4.33，再读本文 §2–§3。
+2. 看 `staging/moe-offload-shared` 上"三项默认开"的提交是否已合回 `dsv41-moe-offload`；没合就先合，跑 `tests/ut/kt_offload`。
+3. 按 `tools/kt_offload/oncard/RUNBOOK_defaults_on.md` 做上卡冒烟（先问卡、先预检、先声明判据）。
+4. 再按 §4 往下排。
