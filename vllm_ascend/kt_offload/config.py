@@ -169,6 +169,37 @@ class KTOffloadConfig:
                 "pinned buffers are shared by layer_idx % 2, which is exactly the sharing the device-side "
                 "wait would stop ordering. Turn on one of the two, or unset the variable."
             )
+        # P1b (VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL): no host-func node at all --
+        # an 8-byte copy of a per-step device counter is the start signal and a
+        # polling thread does the rest. Same precondition as P1a and for the
+        # same reason (only where WE build the task), plus two of its own.
+        from vllm_ascend.kt_offload import device_signal
+
+        if device_signal.enabled_by_env():
+            if not (self.packed_transfer or self.overlap_side_stream):
+                raise ValueError(
+                    f"{device_signal.ENV_NAME}=1 needs kt_offload_config.packed_transfer or "
+                    "overlap_side_stream. With no callback in the graph, the polling thread is what calls "
+                    "moe.forward_task + cpu_infer.submit/sync, which only exists where the layer owns its "
+                    "pinned buffers; kt's own captured entry point (run_pinned_forward_sync) needs a "
+                    "callback to call it, and its buffers are shared by layer_idx % 2."
+                )
+            if async_wait.enabled_by_env():
+                raise ValueError(
+                    f"{device_signal.ENV_NAME}=1 and {async_wait.ENV_NAME}=1 are two ways to start the same "
+                    "work (P1b replaces the host-func node; P1a keeps it and only moves the waiting), and "
+                    "an A/B arm must differ in exactly one thing. Turn on one of them."
+                )
+            from vllm_ascend import envs
+
+            if envs.VLLM_ASCEND_DSV41_KT_SEAM_TIMING:
+                raise ValueError(
+                    f"{device_signal.ENV_NAME}=1 removes the host-func callback, and the seam instrument "
+                    "(VLLM_ASCEND_DSV41_KT_SEAM_TIMING) measures segments *inside* that callback: with P1b "
+                    "on it would report on a callback that never runs and its A/F columns would be joined "
+                    "against HOSTFUNC_CALLBACK rows that do not exist. Refusing rather than printing a "
+                    "report about nothing (§4.26 cost two nights to a pair of instruments that did)."
+                )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

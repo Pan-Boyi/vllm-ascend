@@ -58,10 +58,14 @@ def host_func_report(before: dict[int, int], after: dict[int, int], expected_lay
     }
 
 
-def format_report(report: dict, interval_s: float) -> str:
+def format_report(report: dict, interval_s: float, what: str = "host-func") -> str:
+    """``what`` names the counter that was sampled, because since P1b there are
+    two of them and a reader cannot otherwise tell which path the line is about
+    (``host-func`` = a node in the graph, ``device-signal`` = the polling
+    thread that replaced it)."""
     z = report["zero_layers"]
     head = (
-        f"kt_offload host-func over {interval_s:.1f}s: {report['total']} calls across {report['layers']} layers, "
+        f"kt_offload {what} over {interval_s:.1f}s: {report['total']} calls across {report['layers']} layers, "
         f"per-layer min/max {report['min']}/{report['max']}"
     )
     if report["partial"]:
@@ -75,7 +79,9 @@ def format_report(report: dict, interval_s: float) -> str:
     return f"{head}; uniform"
 
 
-def start(interval_s: float, counters: dict[int, int], expected_layers: int) -> threading.Thread | None:
+def start(
+    interval_s: float, counters: dict[int, int], expected_layers: int, what: str = "host-func"
+) -> threading.Thread | None:
     """Start the one sampler of this process (idempotent). Returns the thread."""
     global _MONITOR
     if _MONITOR is not None or interval_s <= 0:
@@ -87,7 +93,7 @@ def start(interval_s: float, counters: dict[int, int], expected_layers: int) -> 
             after = dict(counters)
             report = host_func_report(before, after, expected_layers)
             if report["total"] or report["partial"]:
-                logger.info("%s", format_report(report, interval_s))
+                logger.info("%s", format_report(report, interval_s, what))
             before = after
 
     _MONITOR = threading.Thread(target=run, name="kt-offload-hostfunc", daemon=True)
@@ -95,8 +101,9 @@ def start(interval_s: float, counters: dict[int, int], expected_layers: int) -> 
     _MONITOR.start()
     atexit.register(stop)
     logger.info(
-        "kt_offload: host-func counter sampling every %.1fs for %d layers "
+        "kt_offload: %s counter sampling every %.1fs for %d layers "
         "(VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG); diagnostic only",
+        what,
         interval_s,
         expected_layers,
     )

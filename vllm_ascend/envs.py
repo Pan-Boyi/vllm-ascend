@@ -291,6 +291,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # against the arm with it off, never TPOT. Read at config validation and
     # at weight-load time. Not sensitive.
     "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_ASYNC_WAIT", "0"),
+    # DeepSeek-V4.1 MoE offload, P1b: take the host-func node out of the graph
+    # altogether. The layer becomes D2H(inputs) -> D2H(8-byte step counter) ->
+    # ExternalEvent wait -> reset -> H2D, and a resident polling thread watches
+    # the counter word, runs kt and records the event
+    # (vllm_ascend/kt_offload/device_signal.py). What it saves on top of P1a is
+    # the dispatch leg AND the 35.75 us of device idle that sits in front of
+    # every HOSTFUNC_CALLBACK and in front of no other node type (PLAN §4.22
+    # F1). "1" = on, anything else (default "0") = the graph keeps its
+    # host-func node. Needs the layer's OWN pinned buffers (packed_transfer or
+    # overlap_side_stream) and graph mode; refused together with
+    # VLLM_ASCEND_DSV41_KT_ASYNC_WAIT, which starts the same work a different
+    # way. Builds a small .so at start-up (the spin must not hold the GIL) and
+    # refuses to start if it cannot.
+    # 🔴 Every way it can fail is FASTER and wrong, so the criterion is
+    # bit-identity against the arm with it off, never TPOT. Read at config
+    # validation and at weight-load time. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL", "0"),
+    # Where the polling helper of the switch above is compiled to. Empty
+    # (default) = ~/.cache, then /tmp: the build has to land on a mount that is
+    # not noexec, and this project points TMPDIR at /dev/shm, which often is.
+    # Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_POLL_CACHE": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_POLL_CACHE", ""),
     # DeepSeek-V4.1 MoE offload: pin the ONE ACL report thread (the thread
     # torch_npu creates on the first _subscribe_report and that delivers every
     # _launch_host_func callback) to a PU kt's spinning workers do not own.

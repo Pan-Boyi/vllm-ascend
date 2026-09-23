@@ -49,7 +49,7 @@ import torch
 # (vllm/logger.py:204-214). 132 files in this tree use the import below.
 from vllm.logger import logger
 
-from vllm_ascend.kt_offload import async_wait, report_affinity, seam_timing, side_stream
+from vllm_ascend.kt_offload import async_wait, device_signal, report_affinity, seam_timing, side_stream
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
     NpuRouting,
@@ -91,6 +91,14 @@ _SIDE_BUFFER_OWNER: dict[int, int] = {}
 # the events must outlive the capture: a graph node points at each one.
 _COMPLETER = None
 _EXT_EVENTS: list = []
+# P1b: the process-wide parts of the device-signal path -- the polling thread,
+# the pinned words the graph's 8-byte copies land in, the device step counter,
+# and which layers are on this path (the lowest of them owns the one increment
+# per replay). All created at weight-load time; none may be made in a capture.
+_POLLER = None
+_SIGNALS = None
+_STEP_COUNTER = None
+_SIGNAL_LAYERS: set[int] = set()
 
 
 def _layer_index(layer_name: str) -> int:
@@ -217,7 +225,23 @@ class KTLayerOffload:
         # the callback's return. Captured path only -- eager already blocks the
         # host, so there is nothing there to hand to another thread.
         self.async_wait = async_wait.enabled_by_env()
+        # P1b, env-only (device_signal.ENV_NAME). No host-func node at all: an
+        # 8-byte copy of a per-step device counter behind the input copy is the
+        # start signal, and a polling thread runs kt and records the same
+        # ExternalEvent P1a uses. Refused together with async_wait in config --
+        # they are two ways to start the same work, and an arm must differ in
+        # one thing.
+        self.device_signal = device_signal.enabled_by_env()
         self._packed: dict[int, dict] = {}
+        # bs -> (slot index in the pinned signal array, the 1-element view the
+        # graph's counter copy writes). P1b only.
+        self._signal_words: dict[int, tuple] = {}
+        # Set in route() while capturing: did THIS layer emit the step
+        # counter's increment? Exactly the lowest signal layer must.
+        self._ops_prefix: list = []
+        # device_signal.STEPS for this layer when its node was emitted, so the
+        # merge can prove the polling thread did not run during the capture.
+        self._steps_at_capture: int | None = None
         # bs -> this layer's ExternalEvent. One per (layer, batch size): the
         # graph's wait/reset nodes point at the object, so a second layer
         # sharing one would release the wrong layer's H2D.
@@ -338,6 +362,8 @@ class KTLayerOffload:
                 self._packed_buffers(bs, device)
         if self.async_wait:
             self._enable_async_wait(device)
+        if self.device_signal:
+            self._enable_device_signal(device)
         if self.graph_enabled:
             self._prepare_capture_buffers(device)
 
@@ -390,6 +416,119 @@ class KTLayerOffload:
             async_wait.ENV_NAME,
             len(self._ext_events),
         )
+
+    def _enable_device_signal(self, device) -> None:
+        """P1b: this layer's ExternalEvents and signal words, and the poller.
+
+        Everything here happens at weight-load time because everything here is
+        forbidden inside a capture: allocating the pinned words, creating the
+        device counter, creating an ``ExternalEvent`` the graph's nodes will
+        point at, and starting a thread that needs an ACL context.
+
+        The self-test at the end is the part worth arguing for. It drives the
+        whole signal path once, eagerly -- increment the counter on the device,
+        copy the 8 bytes into a pinned word, read that word from the spin loop
+        -- and refuses to start if any link of it does not work. Three things
+        it settles that nothing else would settle before the first decode step:
+        an int64 add and an 8-byte D2H are supported here, the DMA write is
+        visible to a plain acquire load on the host (a cached stale word would
+        otherwise be an unexplained hang), and the compiled helper loads and
+        runs from wherever it landed (``/dev/shm`` is ``noexec`` on many hosts,
+        and that only shows at ``dlopen``).
+        """
+        global _POLLER, _SIGNALS, _STEP_COUNTER
+        if not self.graph_enabled:
+            # Eager blocks the host inside route(); there is no graph to hold
+            # the H2D back and no node to remove.
+            logger.warning(
+                "kt_offload: %s=1 has no effect in eager mode (removing the host-func node is a "
+                "captured-path change); layer %d runs the ordinary submit+sync.",
+                device_signal.ENV_NAME,
+                self.layer_idx,
+            )
+            self.device_signal = False
+            return
+        if not self._packed_supported():
+            raise RuntimeError(
+                f"kt_offload: {device_signal.ENV_NAME}=1 needs kt's moe.forward_task and "
+                f"cpu_infer.submit/sync -- with no callback in the graph, the polling thread is what calls "
+                f"them; this kt build ({type(self.wrapper).__name__}) does not expose them."
+            )
+        if not (self.packed or self.overlap):
+            raise RuntimeError(
+                f"kt_offload: {device_signal.ENV_NAME}=1 needs this layer's own pinned buffers "
+                "(packed_transfer or overlap_side_stream); config._validate_preconditions should have "
+                "refused this already."
+            )
+        device_signal.load_native()  # a start-up error here, not a hang at the first replay
+        if _SIGNALS is None:
+            # Capacity for every layer of the model at every capture size, so a
+            # layer that loads later never has to grow (and never has to move)
+            # an array the polling thread is already reading.
+            _SIGNALS = _SignalWords(max(self.num_layers, self.layer_idx + 1) * max(len(self.capture_sizes), 1))
+            _STEP_COUNTER = _StepCounter(device)
+            _selftest_signal_path(_SIGNALS, _STEP_COUNTER)
+        for bs in self.capture_sizes:
+            # One event per (layer, bs) like P1a: the graph's wait/reset nodes
+            # point at the object, so two layers sharing one would release the
+            # wrong layer's H2D.
+            event = self._ext_events.get(bs)
+            if event is None:
+                event = _new_external_event(device)
+                self._ext_events[bs] = event
+                _EXT_EVENTS.append(event)
+            slot, word = _SIGNALS.take()
+            self._signal_words[bs] = (slot, word)
+        _SIGNAL_LAYERS.add(self.layer_idx)
+        if _POLLER is None:
+            _POLLER = _make_poller(device)
+            _POLLER.start()
+        for bs in self.capture_sizes:
+            slot, _word = self._signal_words[bs]
+            _POLLER.register(device_signal.Entry(self.layer_idx, bs, slot, self._poll_run, self._ext_events[bs]))
+        logger.warning(
+            "kt_offload: DEVICE SIGNAL ENABLED for layer %d (%s=1). 图里不再有 host-func 节点：输入 D2H 之后"
+            "再挂一次 8 字节计数器 D2H 作为启动信号，常驻轮询线程看到本步步号就跑 kt 并 record，设备等的是"
+            " ExternalEvent。实验性，默认关；判据是与关着的那一臂逐位相同，不是 TPOT —— 放行早 = 更快且算错，"
+            "且不报错 (every known failure of this path is faster and wrong). %d capture size(s), slots %s.",
+            self.layer_idx,
+            device_signal.ENV_NAME,
+            len(self._signal_words),
+            sorted(s for s, _ in self._signal_words.values()),
+        )
+
+    def _poll_run(self, bs: int) -> None:
+        """This layer's CPU experts, called on the polling thread.
+
+        What ``_kt_packed_forward`` does inside the callback, minus the
+        callback: the graph's counter copy has already landed, and the input
+        copy in front of it on the same stream has therefore landed too, so the
+        pinned buffer holds this step's routing. Exceptions are NOT caught here
+        -- ``device_signal.Poller._handle`` logs them and records the event
+        anyway, which is the only way a failure degrades to "stale output with
+        a message" rather than "the device waits for ever".
+
+        🔴 The ``forward_task`` call below is deliberately a literal copy of
+        the one in ``_kt_packed_forward`` (see its docstring for the four
+        properties of that C++ task this depends on). The two must not drift;
+        ``test_device_signal.py::test_the_poller_builds_the_same_kt_task``
+        compares the arguments both of them pass.
+        """
+        wrapper = self.wrapper
+        buf = self._packed[bs]
+        _assert_no_pending(wrapper, self.layer_idx, self.layer_idx - 1, "before this step's submit")
+        task = wrapper.moe.forward_task(
+            buf["bsz"].data_ptr(),
+            buf["pin_ids"].shape[-1],
+            buf["pin_ids"].data_ptr(),
+            buf["pin_weights"].data_ptr(),
+            buf["pin_hidden"].data_ptr(),
+            buf["pin_out"].data_ptr(),
+            False,  # incremental: no deferred experts
+        )
+        wrapper.cpu_infer.submit(task)
+        wrapper.cpu_infer.sync(0)
+        _assert_no_pending(wrapper, self.layer_idx, self.layer_idx, "after this step drained")
 
     # -- packed transfer (cfg.packed_transfer) ------------------------------
 
@@ -498,8 +637,16 @@ class KTLayerOffload:
 
         With ``async_wait`` off this is byte for byte what it replaced: one
         host-func node that submits, waits and returns.
+
+        With ``device_signal`` on there is no host-func node at all: the layer
+        is four ordinary device ops, and the only host involvement is a thread
+        watching the word the third of them writes.
         """
-        self._submit_ops = [("d2h", bs)]
+        self._submit_ops = [*self._ops_prefix, ("d2h", bs)]
+        self._ops_prefix = []
+        if self.device_signal:
+            self._launch_signal_node(stream, bs)
+            return
         if not self.async_wait:
             payload = self._packed_payload(bs)
             _CAPTURED_PAYLOADS.append(payload)
@@ -526,6 +673,43 @@ class KTLayerOffload:
         # stays because 0.144 us is a cheap price for not depending on
         # undocumented behaviour. Both are graph NODES; neither is a host-side
         # record (that one belongs to the completion thread, at replay time).
+        _ext_wait(event, stream)
+        self._submit_ops.append(("ext_wait", event))
+        _ext_reset(event, stream)
+        self._submit_ops.append(("ext_reset", event))
+
+    def _launch_signal_node(self, stream, bs: int) -> None:
+        """P1b: the 8-byte start signal, then the same wait/reset pair.
+
+        🔴 A **second copy on the same stream**, never a tail field appended to
+        the input copy: same-stream tasks run in order, so "the counter landed"
+        implies "the inputs landed", whereas the write order *inside* one DMA
+        is not specified. That implication is the entire safety argument for
+        letting another thread start kt without being told by the device.
+
+        Everything the polling thread will read must be written before this
+        copy (§4.25). Today that is the combined pinned input buffer, written
+        by the copy immediately in front of this one, on this stream.
+        """
+        event = self._ext_events.get(bs)
+        entry = self._signal_words.get(bs)
+        if event is None or entry is None:
+            raise RuntimeError(
+                f"kt_offload device signal: layer {self.layer_idx} has no ExternalEvent/signal word for {bs} "
+                f"tokens (prepared: {sorted(self._signal_words)}); creating either inside a capture would "
+                "not be the object the graph's nodes point at."
+            )
+        if _STEP_COUNTER is None:
+            raise RuntimeError("kt_offload device signal: the step counter was never created")
+        _slot, word = entry
+        _host_copy(word, _STEP_COUNTER.value)
+        self._submit_ops.append(("signal", (self.layer_idx, bs)))
+        if _capturing():
+            self._steps_at_capture = device_signal.STEPS.get(self.layer_idx, 0)
+        # Same pair as P1a, and for the same reasons: the wait is the only
+        # thing holding the H2D back, and the reset is kept although this build
+        # re-arms the captured wait by itself (t5r --mutant no-reset, 2026-09-23)
+        # because relying on undocumented behaviour costs more than 0.144 us.
         _ext_wait(event, stream)
         self._submit_ops.append(("ext_wait", event))
         _ext_reset(event, stream)
@@ -683,6 +867,19 @@ class KTLayerOffload:
                 # No runtime condition here (not even the profile flag): a
                 # branch the capture run skips is missing from every replay.
                 hs = hidden_states.contiguous()
+                # P1b: the one increment per replay, on the compute stream,
+                # before anything this step copies. It goes in the lowest
+                # signal layer only -- one add per step, ~1.5 us, and every
+                # layer's word then carries the SAME number, which is what
+                # makes "this word is not this step's" detectable at all.
+                # Ordered in front of every layer's counter copy by
+                # construction: on the compute stream those copies come later,
+                # and on the side stream they sit behind a fork event this
+                # layer records after its own fills.
+                self._ops_prefix = []
+                if self.device_signal and self.layer_idx == min(_SIGNAL_LAYERS):
+                    _STEP_COUNTER.bump()
+                    self._ops_prefix = [("bump", self.layer_idx)]
                 # overlap first, packed second: with both on, the side stream
                 # uses the packed per-layer buffers, so the two are the same
                 # buffers and only the stream differs. Testing packed first (as
@@ -760,6 +957,38 @@ class KTLayerOffload:
         """H2D of our own pinned output; ordered after the host-func node."""
         buf = self._packed[hs.shape[0]]
         _host_copy(buf["dev_out"], buf["pin_out"])
+        if self.device_signal and self._submit_ops is not None:
+            # Same place, same reason as the P1a criterion below: the whole
+            # recorded shape exists only now. What it adds is the one check
+            # that says P1b actually happened -- **no host-func node** -- and
+            # the order of the two copies, which is what makes the start signal
+            # safe at all.
+            ops = [*self._submit_ops, ("h2d", hs.shape[0])]
+            self._submit_ops = None
+            report = device_signal.signal_ops_ok(ops)
+            first = min(_SIGNAL_LAYERS) if _SIGNAL_LAYERS else self.layer_idx
+            bumped = any(k == "bump" for k, _ in ops)
+            if bumped != (self.layer_idx == first):
+                raise RuntimeError(
+                    f"kt_offload device signal: layer {self.layer_idx} "
+                    f"{'emitted' if bumped else 'did not emit'} the step counter's increment, but the "
+                    f"layer that must emit it (and only it) is {first}. Two increments per replay make "
+                    "every word run ahead of its expected step; none makes every replay wait for ever."
+                )
+            if not report["ok"]:
+                raise RuntimeError(
+                    f"kt_offload device signal: layer {self.layer_idx} recorded the wrong node sequence "
+                    f"({report['detail']}): {report['why']}."
+                )
+            if _capturing() and self._steps_at_capture is not None:
+                grew = device_signal.STEPS.get(self.layer_idx, 0) - self._steps_at_capture
+                self._steps_at_capture = None
+                if grew:
+                    raise RuntimeError(
+                        f"kt_offload device signal: the polling thread ran layer {self.layer_idx}'s CPU "
+                        f"experts {grew} time(s) DURING its capture. The counter copy was executed instead "
+                        "of recorded, so every replay would reuse that one CPU output -- faster and wrong."
+                    )
         if self.async_wait and self._submit_ops is not None:
             # The whole recorded shape exists only now, so this is where the
             # criterion runs. 🔴 It is the only in-process evidence that the
@@ -1444,6 +1673,122 @@ def _make_completer(device):
     return async_wait.Completer(set_device, lambda: _new_stream(torch.device("npu", index)))
 
 
+class _SignalWords:
+    """The pinned words P1b's 8-byte copies land in, one array for the process.
+
+    One allocation, handed out in 128-byte slots (``device_signal.STRIDE_WORDS``):
+    the polling thread scans every slot while the device DMAs into one of them,
+    so two layers on one cache line would mean each write invalidating the line
+    the spin is reading for the other. One array rather than one tensor per
+    layer because the spin loop takes a base pointer and a stride -- and
+    because it must never be reallocated while that thread is reading it.
+    """
+
+    def __init__(self, capacity: int):
+        # +1: the self-test gets a slot of its own. Driving a real layer's word
+        # would leave it holding the step the poller is waiting for, and the
+        # poller would run that layer's kt before a single replay happened.
+        self.capacity = int(capacity) + 1
+        self.words = _pinned_empty((self.capacity * device_signal.STRIDE_WORDS,), torch.int64)
+        self.words.zero_()
+        self.n = 0
+
+    def take(self) -> tuple[int, torch.Tensor]:
+        if self.n >= self.capacity:
+            raise RuntimeError(
+                f"kt_offload device signal: out of signal slots ({self.capacity}); the array is sized for "
+                "every layer at every capture size and must not be reallocated while the polling thread "
+                "reads it."
+            )
+        slot, self.n = self.n, self.n + 1
+        off = slot * device_signal.STRIDE_WORDS
+        return slot, self.words[off : off + 1]
+
+
+class _StepCounter:
+    """One device scalar, incremented once per replay by the lowest signal layer."""
+
+    def __init__(self, device):
+        self.value = torch.zeros((1,), dtype=torch.int64, device=device)
+        # Pre-allocated addend: ``add_(1)`` would turn a Python int into a
+        # tensor, and nothing may allocate inside a capture.
+        self.one = torch.ones((1,), dtype=torch.int64, device=device)
+
+    def bump(self) -> None:
+        _device_add(self.value, self.one)
+
+
+def _selftest_signal_path(signals: _SignalWords, counter: _StepCounter) -> None:
+    """Drive the whole signal path once, eagerly, before any capture.
+
+    Cheap, and it turns three silent hangs into start-up errors: an int64 add
+    or an 8-byte D2H the platform will not do, a DMA write the host cannot see
+    without a cache flush (the pinned word would just never change), and a
+    compiled helper that loaded but does not agree with what torch reads.
+    """
+    slot, word = signals.take()
+    counter.bump()
+    _host_copy(word, counter.value)
+    torch.npu.synchronize()
+    got = int(word.item())
+    if got != 1:
+        raise RuntimeError(
+            f"kt_offload device signal: the self-test counter copy left {got} in the pinned word, want 1. "
+            "The device increment or the 8-byte D2H did not do what the whole mechanism assumes; refusing "
+            "to start rather than waiting for a signal that will not come."
+        )
+    waiter = device_signal.Waiter(signals.words.data_ptr(), signals.capacity)
+    native = waiter.read(slot)
+    if native != 1:
+        raise RuntimeError(
+            f"kt_offload device signal: torch reads {got} in the self-test word and the polling helper "
+            f"reads {native}. The thread that matters is the one that reads {native}."
+        )
+    waiter.set_expected(slot, 1)
+    if waiter.wait(50_000_000, 0, 200_000) != slot:
+        raise RuntimeError("kt_offload device signal: the polling helper did not see an already-set word")
+    waiter.set_expected(slot, 2)
+    if waiter.wait(20_000_000, 0, 200_000) != -1:
+        raise RuntimeError(
+            "kt_offload device signal: the polling helper matched a word that has not reached its step. "
+            "A waiter that returns early would start kt before the inputs are there."
+        )
+    # Back to 0: the first replay must write step 1, which is what every
+    # layer's poller entry starts out expecting.
+    counter.value.zero_()
+    torch.npu.synchronize()
+    logger.info(
+        "kt_offload device signal: self-test passed (device add -> 8-byte D2H -> pinned word -> spin loop), "
+        "%d slots of %d bytes",
+        signals.capacity,
+        device_signal.STRIDE_WORDS * 8,
+    )
+
+
+def _make_poller(device):
+    """The process-wide polling thread, with its own ACL context and stream.
+
+    🔴 Not bound to a core, and there is no knob to bind it. The "the report
+    thread is fighting kt for a PU" hypothesis has now failed three times on
+    this line (§4.20.1 microbenchmark with no knee, kt holding only 96 of 256
+    PUs, and on-card pinning coming out 0.7-0.95 ms *slower*), and this thread
+    spins less than that one did: it is idle whenever a layer is not being
+    signalled, and it goes cold after a second of nothing.
+    """
+    index = device.index if getattr(device, "index", None) is not None else torch.npu.current_device()
+
+    def set_device() -> None:
+        # Same requirement as the P1a completion thread: the record is an ACL
+        # call from a thread that is neither the main thread nor ACL's report
+        # thread, so it needs a context of its own.
+        torch.npu.set_device(index)
+
+    def make_waiter():
+        return device_signal.Waiter(_SIGNALS.words.data_ptr(), _SIGNALS.capacity)
+
+    return device_signal.Poller(set_device, lambda: _new_stream(torch.device("npu", index)), make_waiter)
+
+
 def _stream_ctx(stream, device):
     del device
     return torch.npu.stream(stream)
@@ -1476,7 +1821,16 @@ def _install_capture_probe(kt_wrapper_cls) -> None:
 
 
 def _maybe_start_host_func_log(num_layers: int) -> None:
-    """Start the per-layer host-func sampler if the env var asks for it."""
+    """Start the per-layer sampler if the env var asks for it.
+
+    🔴 Which counter it samples has to follow the path in use. With P1b on
+    there is no host-func node, so ``HOST_FUNC_CALLS`` stays at 0 for every
+    layer for ever -- and ``host_func_report`` says nothing at all about a
+    run where nothing grew, so the sampler would look *clean* on the arm it
+    was meant to police ("every layer ran" and "no layer ran" produce the same
+    empty output). It samples the polling thread's counter instead, and the
+    log line says which one it read.
+    """
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import hostfunc_log
 
@@ -1488,7 +1842,10 @@ def _maybe_start_host_func_log(num_layers: int) -> None:
     except ValueError:
         logger.warning("kt_offload: VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=%r is not a number of seconds", raw)
         return
-    hostfunc_log.start(interval, HOST_FUNC_CALLS, num_layers)
+    if device_signal.enabled_by_env():
+        hostfunc_log.start(interval, device_signal.STEPS, num_layers, what="device-signal")
+    else:
+        hostfunc_log.start(interval, HOST_FUNC_CALLS, num_layers)
 
 
 def _pinned_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -1499,6 +1856,16 @@ def _pinned_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
 def _device_fill(dst: torch.Tensor, src: torch.Tensor) -> None:
     """A device-side copy into the combined buffer (not a host-device operation)."""
     dst.copy_(src)
+
+
+def _device_add(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """The step counter's increment: one device-side add, ~1.5 us, once per replay.
+
+    Its own indirection for the same reason ``_device_fill`` has one -- the CPU
+    model has to see it as an op ON A STREAM, because where it sits relative to
+    the counter's copy to the host is part of the protocol.
+    """
+    dst.add_(src)
 
 
 def _host_copy(dst: torch.Tensor, src: torch.Tensor) -> None:

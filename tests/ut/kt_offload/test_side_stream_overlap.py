@@ -41,6 +41,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.kt_offload import device_signal as ds
 from vllm_ascend.kt_offload import layer as kl
 from vllm_ascend.kt_offload import side_stream as ss
 from vllm_ascend.kt_offload.config import KTOffloadConfig
@@ -404,6 +405,36 @@ def sim(monkeypatch):
                     d.value = sr.value
 
             s.enqueue(s.current, Op("d2h", d2h, 2.0))
+        elif isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor) and dst.dtype == torch.int64:
+            # 🔴 P1b's start signal: 8 bytes, its own copy, behind the D2H
+            # above on the same stream. When it EXECUTES, the word carries this
+            # step's number and the polling thread has its cue -- which is the
+            # whole mechanism, and why its position in this list is the thing
+            # the mutants move.
+            slot = (dst.data_ptr() - kl._SIGNALS.words.data_ptr()) // (8 * ds.STRIDE_WORDS)
+
+            def signal():
+                dst.copy_(src)
+                entry = s.signal_entries[slot]
+                layer = entry.run.__self__
+                buf = layer._packed[entry.bs]
+                # 🔴 The snapshot is taken HERE, when the counter copy lands,
+                # because that is when the polling thread starts reading the
+                # pinned buffer. Reading it 35 units later (when the modelled
+                # kt finishes) would quietly repair every ordering mistake this
+                # file exists to catch: the input copy would have overtaken the
+                # signal by then and the arm would look clean.
+                seen_hidden, seen_ids = buf["pin_hidden"].value, buf["pin_ids"].value
+
+                def work():
+                    ds.STEPS[layer.layer_idx] = ds.STEPS.get(layer.layer_idx, 0) + 1
+                    buf["pin_out"].value = (
+                        None if seen_hidden is None else 3 * seen_hidden + (seen_ids or 0)
+                    )
+
+                s.async_complete(work, 35.0, entry.event)
+
+            s.enqueue(s.current, Op("signal", signal, 1.0))
         else:  # the H2D of the pinned output into this layer's device tensor
             def h2d():
                 v = src.value
@@ -411,7 +442,12 @@ def sim(monkeypatch):
 
             s.enqueue(s.current, Op("h2d", h2d, 5.0))
 
+    def device_add(dst, src):
+        """The step counter's increment, as a compute-stream op."""
+        s.enqueue(s.current, Op("bump", lambda: dst.add_(src), 1.0))
+
     monkeypatch.setattr(kl, "_device_fill", device_fill)
+    monkeypatch.setattr(kl, "_device_add", device_add)
     monkeypatch.setattr(kl, "_host_copy", host_copy)
     monkeypatch.setattr(kl, "_pinned_empty", lambda shape, dtype: torch.empty(shape, dtype=dtype))
 
@@ -436,6 +472,40 @@ def sim(monkeypatch):
     monkeypatch.setattr(
         kl, "_make_completer", lambda device: SimpleNamespace(start=lambda: None, submit=lambda *a: None)
     )
+
+    # ---- P1b doubles: no host-func node at all, a counter copy instead ----
+    monkeypatch.setattr(kl, "_SIGNAL_LAYERS", set())
+    monkeypatch.setattr(kl, "_POLLER", None)
+    monkeypatch.setattr(kl, "_SIGNALS", None)
+    monkeypatch.setattr(kl, "_STEP_COUNTER", None)
+    monkeypatch.setattr(ds, "STEPS", {})
+    monkeypatch.setattr(ds, "RECORDS", {})
+    monkeypatch.setattr(ds, "ERRORS", [])
+    # The polling helper is real C and is exercised for real in
+    # test_device_signal.py; here the poller is the simulator's completion
+    # program, so neither the .so nor the device self-test belongs in the way.
+    monkeypatch.setattr(ds, "load_native", lambda force=False: None)
+    monkeypatch.setattr(kl, "_selftest_signal_path", lambda signals, counter: None)
+    s.signal_entries = {}
+
+    def make_poller(device):
+        def register(entry):
+            s.signal_entries[entry.slot] = entry
+
+        return SimpleNamespace(start=lambda: None, register=register)
+
+    monkeypatch.setattr(kl, "_make_poller", make_poller)
+
+    def poll_run(self, bs):
+        """``_poll_run`` must never be reached in this file: what the polling
+        thread does is modelled by the signal op below, because the moment it
+        READS the pinned buffer is the property under test and a function
+        called at completion time cannot express it. The real one is covered in
+        test_device_signal.py (including that it builds the same kt task the
+        host-func node does)."""
+        raise AssertionError("the simulator models the poller through the signal op")
+
+    monkeypatch.setattr(kl.KTLayerOffload, "_poll_run", poll_run)
 
     def submit_only(payload):
         """``_kt_packed_submit_only``: build the task, hand it over, return.
@@ -477,9 +547,15 @@ def _prop(s):
 
 
 def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes, *, packed: bool = False,
-             async_wait: bool = False):
+             async_wait: bool = False, device_signal: bool = False):
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import async_wait as aw
+
+    # 🔴 setenv, not setattr(envs, ...): a setattr here would be written back
+    # as a real module attribute on undo and shadow envs.__getattr__ for the
+    # rest of the session, so any later test that sets this variable in the
+    # environment would be quietly ignored.
+    monkeypatch.setenv(ds.ENV_NAME, "1" if device_signal else "0")
 
     # P1a is an env-only switch (the A/B it exists for must differ in exactly
     # one thing, and the cfg json is part of an arm's fingerprint), so it is
@@ -1496,3 +1572,256 @@ def test_every_replay_records_once_per_layer(monkeypatch, sim):
         records[0] = records.get(0, 0) + 1
     assert aw.record_counts_ok({}, records, 3, [0])["ok"]
     assert aw.submits_match_records(dict(kl.HOST_FUNC_CALLS), records)["ok"]
+
+
+# ---------------------------------------------------------------------------
+# 6. P1b: no host-func node at all -- an 8-byte counter copy is the start signal
+#
+# The device side loses its last host task: D2H(inputs) -> D2H(counter) ->
+# ExternalEvent wait -> reset -> H2D. What the simulator has to model that
+# section 5 did not:
+#
+#   * the hand-off happens when a COPY executes, not when a node calls into
+#     Python. So the position of that copy in the stream's op list IS the
+#     protocol: behind the input copy it means "the inputs are there", in front
+#     of it it means nothing at all;
+#   * there is no callback left to count, so what the harness watches per
+#     replay is device_signal.STEPS, not HOST_FUNC_CALLS.
+#
+# The release mutants (never record / record before the work) are unchanged --
+# they live in Sim.async_mode and apply to whatever hands work over, which is
+# now the counter copy. The mutant that is new here is the ORDER of the two
+# copies, and it is the one with no second line of defence on card: it is
+# faster, wrong, and raises nothing.
+# ---------------------------------------------------------------------------
+
+
+def _capture_p1b(monkeypatch, sim, boxes, *, device_signal: bool, overlap: bool = True, packed: bool = False):
+    rt, _ = _runtime(monkeypatch, sim, overlap=overlap, graph=True, boxes=boxes, packed=packed,
+                     device_signal=device_signal)
+    sim.capturing = True
+    hs, ids, w = _inputs(7)
+    rt.route(hs, w, ids, in_profile_run=False)
+    sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    sim.capturing = False
+    return {name: list(ops) for name, ops in sim.programs.items()}, rt
+
+
+def _p1b_arms(monkeypatch, sim, *, mode="clean", mutate=None, values=(2.0, 5.0, 9.0)):
+    """Side stream + P1b off (the host-func node) vs side stream + P1b on."""
+    ref_boxes = _boxes()
+    ref, _ = _capture_p1b(monkeypatch, sim, ref_boxes, device_signal=False)
+    sim.reset_programs()
+    p1b_boxes = _boxes()
+    sim.async_mode = mode
+    p1b, rt = _capture_p1b(monkeypatch, sim, p1b_boxes, device_signal=True)
+    if mutate is not None:
+        p1b = mutate(p1b, p1b_boxes, rt)
+    out_r, out_p, t_r, t_p = [], [], [], []
+    for v in values:
+        sim.async_mode = "clean"
+        y, t = _replay(sim, ref, ref_boxes[0], ref_boxes[3], v)
+        out_r.append(y)
+        t_r.append(t)
+        sim.async_mode = mode
+        y, t = _replay(sim, p1b, p1b_boxes[0], p1b_boxes[3], v)
+        out_p.append(y)
+        t_p.append(t)
+    return out_r, out_p, max(t_r), max(t_p)
+
+
+def test_p1b_has_no_host_func_node_and_signals_behind_the_input_copy(monkeypatch, sim):
+    """The shape. Two claims, and the whole point of P1b is the first one."""
+    boxes = _boxes()
+    programs, rt = _capture_p1b(monkeypatch, sim, boxes, device_signal=True)
+    assert [o.kind for o in programs["side"]] == [
+        "wait", "d2h", "signal", "ext_wait", "ext_reset", "record",
+    ]
+    assert not any(o.kind == "hostfunc" for ops in programs.values() for o in ops)
+    # the counter's increment is a compute-stream op, once, in front of everything
+    assert [o.kind for o in programs["compute"]] == [
+        "bump", "fill", "fill", "fill", "record", "npu_experts", "wait", "h2d",
+    ]
+    assert [k for k, _ in rt._submit_ops or []] == []  # consumed by the criterion in merge
+
+
+def test_p1b_on_the_packed_path_without_the_side_stream(monkeypatch, sim):
+    """Both switches stand alone, and they combine -- the combination is the
+    form that gets merged, so neither may depend on the other."""
+    boxes = _boxes()
+    programs, _ = _capture_p1b(monkeypatch, sim, boxes, device_signal=True, overlap=False, packed=True)
+    assert "side" not in programs
+    assert [o.kind for o in programs["compute"]] == [
+        "bump", "fill", "fill", "fill", "d2h", "signal", "ext_wait", "ext_reset", "npu_experts", "h2d",
+    ]
+
+
+def test_p1b_is_bit_identical_and_not_slower(monkeypatch, sim):
+    out_r, out_p, t_r, t_p = _p1b_arms(monkeypatch, sim)
+    assert _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)  # the point of the change; never the criterion on its own
+
+
+def test_p1b_without_the_record_hangs(monkeypatch, sim):
+    """🔴 Mutant ①: nothing ever records the event.
+
+    The arm that says the device really is parked on it. It is a CPU test and
+    not an on-card one on purpose: on card it would leave a device waiting for
+    ever and the next arm would have no card (the bounded version there is
+    --stall-ms).
+    """
+    with pytest.raises(AssertionError, match="deadlock"):
+        _p1b_arms(monkeypatch, sim, mode="no-record")
+
+
+def test_p1b_recording_before_the_work_is_faster_and_wrong(monkeypatch, sim):
+    """🔴 Mutant ②: released before this step's CPU output exists."""
+    out_r, out_p, t_r, t_p = _p1b_arms(monkeypatch, sim, mode="early-record")
+    assert not _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)
+    assert out_p[1:] == out_r[:-1], (out_r, out_p)  # it is the PREVIOUS step's output
+
+
+def _signal_before_the_inputs(programs, boxes, rt):
+    """🔴 Mutant ③: the counter copy moved in FRONT of the input copy.
+
+    This is the one the whole design rests on. Same stream, one place earlier,
+    and "the counter arrived" stops meaning "the inputs arrived": the polling
+    thread starts kt on whatever the pinned buffer still held, which is the
+    previous step's routing. Nothing raises, and the step gets faster.
+
+    It is also why the counter is a copy of its own rather than a field
+    appended to the input copy: inside one DMA this order is not something the
+    platform promises, so the mutant would be the *default*.
+    """
+    out = {}
+    for name, ops in programs.items():
+        kinds = [o.kind for o in ops]
+        if "signal" in kinds and "d2h" in kinds:
+            i, j = kinds.index("d2h"), kinds.index("signal")
+            ops = list(ops)
+            ops[i], ops[j] = ops[j], ops[i]
+        out[name] = ops
+    return out
+
+
+def test_p1b_signalling_before_the_inputs_are_copied_is_faster_and_wrong(monkeypatch, sim):
+    out_r, out_p, t_r, t_p = _p1b_arms(monkeypatch, sim, mutate=_signal_before_the_inputs)
+    assert not _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)
+
+
+def test_p1b_signalling_early_reads_the_previous_replays_input(monkeypatch, sim):
+    """Name the failure rather than calling it "different": the fingerprint is
+    the same one the side stream's early fork produced on card."""
+    out_r, out_p, _, _ = _p1b_arms(monkeypatch, sim, mutate=_signal_before_the_inputs)
+    assert out_p[1:] == out_r[:-1], (out_r, out_p)
+
+
+def test_p1b_without_the_wait_node_is_faster_and_wrong(monkeypatch, sim):
+    """The load-bearing half of the pair, reached from the graph side.
+
+    (Its twin, the missing reset, is modelled in section 5 and does NOT go red
+    on this build -- see _drop_reset. Keeping the wait's arm here is what makes
+    "the device waits" a checked property of P1b too.)
+    """
+    def drop_wait(programs, boxes, rt):
+        return {n: [o for o in ops if o.kind != "ext_wait"] for n, ops in programs.items()}
+
+    out_r, out_p, t_r, t_p = _p1b_arms(monkeypatch, sim, mutate=drop_wait)
+    assert not _bits_equal(out_r, out_p), (out_r, out_p)
+    assert t_p <= t_r, (t_p, t_r)
+
+
+def test_the_criterion_catches_a_host_func_node_coming_back(monkeypatch, sim):
+    """The check the production path runs on its own recorded ops.
+
+    Two edits it has to catch: a host-func node creeping back in (P1b would
+    then be P1a with extra steps, and the readings would be attributed to the
+    wrong change), and the two copies swapping places.
+    """
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, device_signal=True)
+    sim.capturing = True
+    hs, ids, w = _inputs(3)
+    rt.route(hs, w, ids, in_profile_run=False)
+    assert [k for k, _ in rt._submit_ops] == ["bump", "d2h", "signal", "ext_wait", "ext_reset"]
+    good = [*rt._submit_ops, ("h2d", 1)]
+    assert ds.signal_ops_ok(good)["ok"]
+    assert not ds.signal_ops_ok([*good, ("hostfunc", 0)])["ok"]
+    swapped = [good[0], good[2], good[1], *good[3:]]
+    rep = ds.signal_ops_ok(swapped)
+    assert not rep["ok"] and any("BEFORE the input copy" in p for p in rep["detail"]), rep
+    rt._submit_ops = swapped[:-1]
+    with pytest.raises(RuntimeError, match="recorded the wrong node sequence"):
+        rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+
+
+def test_only_the_lowest_layer_increments_the_counter(monkeypatch, sim):
+    """One add per replay, in one layer, or every word means something else.
+
+    Two increments and every layer's word runs a step ahead of what the poller
+    expects; none and the words never move. Both are caught here at capture
+    rather than at the first replay.
+    """
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, device_signal=True)
+    kl._SIGNAL_LAYERS.add(rt.layer_idx + 1)  # a second, higher layer on this path
+    sim.capturing = True
+    hs, ids, w = _inputs(3)
+    rt.route(hs, w, ids, in_profile_run=False)
+    assert [k for k, _ in rt._submit_ops][0] == "bump", "the lowest layer must emit the increment"
+    rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+    # ... and a layer that is NOT the lowest must not. Here a lower layer joins
+    # the path, so this one's increment becomes a SECOND one per replay: every
+    # word would then run a step ahead of what the poller waits for.
+    kl._SIGNAL_LAYERS.add(rt.layer_idx - 1 if rt.layer_idx else -1)
+    rt.route(hs, w, ids, in_profile_run=False)
+    assert [k for k, _ in rt._submit_ops][0] == "d2h", "a layer that is not the lowest must not bump"
+    rt._submit_ops = [("bump", rt.layer_idx), *rt._submit_ops]
+    with pytest.raises(RuntimeError, match="emitted the step counter"):
+        rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
+
+
+def test_p1b_off_records_no_signal_nodes(monkeypatch, sim):
+    """With the switch off the schedule is the one that was verified on card."""
+    boxes = _boxes()
+    programs, rt = _capture_p1b(monkeypatch, sim, boxes, device_signal=False)
+    assert [o.kind for o in programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
+    assert rt._signal_words == {} and kl._SIGNALS is None
+
+
+def test_p1b_needs_our_own_buffers(monkeypatch, sim):
+    boxes = _boxes()
+    with pytest.raises(RuntimeError, match="own pinned buffers"):
+        _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes, packed=False, device_signal=True)
+
+
+def test_p1b_is_a_no_op_in_eager_mode(monkeypatch, sim):
+    boxes = _boxes()
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes, device_signal=True)
+    assert rt.device_signal is False
+
+
+def test_every_replay_signals_and_records_once_per_layer(monkeypatch, sim):
+    """STEPS and RECORDS are what HOST_FUNC_CALLS was, and they must agree.
+
+    🔴 With P1b on, HOST_FUNC_CALLS stays 0 for ever. Anything still reading it
+    -- the sampler, the on-card cases -- is reading an instrument that has been
+    unplugged, and a flat counter and a healthy one look the same in a log.
+    """
+    boxes = _boxes()
+    sim.async_mode = "clean"
+    programs, _ = _capture_p1b(monkeypatch, sim, boxes, device_signal=True)
+    kl.HOST_FUNC_CALLS.clear()
+    ds.STEPS.clear()
+    records: dict[int, int] = {}
+    for k in range(3):
+        _replay(sim, programs, boxes[0], boxes[3], float(k + 2))
+        records[0] = records.get(0, 0) + 1  # the double for the real poller's record
+    assert ds.STEPS == {0: 3}, ds.STEPS
+    assert kl.HOST_FUNC_CALLS == {}, "P1b left a host-func node behind"
+    assert ds.signals_per_replay_ok({}, ds.STEPS, 3, [0])["ok"]
+    assert ds.records_match_signals(dict(ds.STEPS), records)["ok"]
+    assert not ds.records_match_signals({0: 3}, {0: 2})["ok"]
