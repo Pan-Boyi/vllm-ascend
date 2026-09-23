@@ -45,7 +45,16 @@ while [ $w -lt 900 ]; do
 done
 [ $ready = 1 ] || { [ $w -ge 900 ] && say "❌ curl 超时 900s"; grep -nE '(^|\) )Traceback|EngineCore failed|进程退出|Error' $D/serve.log | tail -5 | tee -a $SUM; stop; exit 4; }
 say "ready after ${w}s"
-VA=$(grep -m1 'vllm_ascend = ' $D/serve.log); NSS=$(grep -c 'SIDE STREAM ENABLED' $D/serve.log); NE=$(grep -cE '1070[12][0-9]' $D/serve.log)
+VA=$(grep -m1 'vllm_ascend = ' $D/serve.log); NSS=$(grep -c 'SIDE STREAM ENABLED' $D/serve.log); # 🔴 grep the ACL error codes on the lines that could carry one -- NOT on our
+# own instrument's output. With VLLM_ASCEND_DSV41_KT_SEAM_TIMING on, the P0
+# [kt-seam-rt] lines dump raw CLOCK_REALTIME nanoseconds and callback
+# durations in ns, and a 19-digit integer contains "1070[12][0-9]" by pure
+# chance: 136 / 145 / 176 hits on three healthy arms of 2026-09-23, and one of
+# them (BD0r2) was VOIDED by a match inside 1790123465521070247. Word anchors
+# do not help -- a cb_ns of exactly 107015 is comma-delimited. So the check
+# excludes our own dumps; a real 107025 in a t5 log still matches (checked).
+# An arm that passed this check while rt lines existed was not checked at all.
+NE=$(grep -v 'kt-seam' $D/serve.log | grep -cE '1070[12][0-9]')
 say "check vllm_ascend: $VA"; say "check SIDE STREAM ENABLED count=$NSS (want $([ $SIDE = 1 ] && echo 40 || echo 0))"; say "check 1070[12]x count=$NE (want 0)"
 bad=0; echo "$VA" | grep -q 'worktrees/moe-offload/vllm_ascend/__init__.py' || bad=1
 [ $SIDE = 1 ] && [ $NSS -ne 40 ] && bad=1; [ $SIDE = 0 ] && [ $NSS -ne 0 ] && bad=1; [ $NE -ne 0 ] && bad=1

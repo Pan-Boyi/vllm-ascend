@@ -102,6 +102,12 @@ task on the sub stream lacks the corresponding event wait task」；`_160358_t5`
   永远判不了 PASS。现在只有 `off_evt` 必须红，`off`/`off_evtw` 必须 captured（提交 b35a700ca）。
 - 🔴 **107025 不在 `10701[0-9]` 里**。run_oncard 的 "10701x lines" 计数和下面 §4 那条
   `grep -c '10701[0-9]'` 都**漏掉 107025**；要查侧流的错码请用 `grep -cE '1070[12][0-9]'`。
+  🔴 **2026-09-23 追加：这条 grep 必须先把我们自己的埋点行排掉**（`grep -v 'kt-seam' 先过一道`）。
+  `VLLM_ASCEND_DSV41_KT_SEAM_TIMING` 一开，P0 的 `[kt-seam-rt]` 行会打出 19 位的 CLOCK_REALTIME
+  纳秒整数和 ns 级回调时长，里面**碰巧**含 `1070[12][0-9]`：三个健康臂上分别命中 136/145/176 次，
+  其中一发（BD0r2）就是被 `1790123465521070247` 里那个 `107024` 判死的。加 `\b` 也没用 ——
+  `cb_ns` 里正好等于 `107015` 的那一项两边都是逗号。⇒ **开着埋点时，这条检查在修之前等于没做**；
+  真 107025 的 t5 日志用排除法仍然命中（已核）。
 
 ## 3. 精度判据：三层，跑的顺序是 ③ → ② → ①（用户 2026-09-22 定）
 
@@ -251,7 +257,7 @@ SERVE_PID=$!; PGID=$(ps -o pgid= -p $SERVE_PID | tr -d ' '); echo "pgid=$PGID" |
 ```bash
 grep -m1 'vllm_ascend = ' $D/serve.log            # 必须是 worktrees/moe-offload/vllm_ascend/__init__.py
 grep -c 'SIDE STREAM ENABLED' $D/serve.log        # B 臂 = 40（每层一条）；A 臂 = 0
-grep -cE '1070[12][0-9]' $D/serve.log             # 必须 0（🔴 107025 不在 10701x 里，见 §2）
+grep -v 'kt-seam' $D/serve.log | grep -cE '1070[12][0-9]'   # 必须 0（🔴 107025 不在 10701x 里，且要排掉埋点行，见 §2）
 ```
 🔴 **A 臂出现 `SIDE STREAM ENABLED`，或 B 臂一条都没有 ⇒ 两臂其实是同一臂，整发作废。**
 另：`VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30` 的周期报告在 B 臂必须是 **uniform、40 层每层都在长**；
