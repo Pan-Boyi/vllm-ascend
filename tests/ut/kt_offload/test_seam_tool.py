@@ -22,6 +22,7 @@ of a service whose seam records cover all of it.
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import json
 import random
@@ -227,11 +228,24 @@ def test_the_window_keeps_only_the_records_covering_it():
     recs, dropped = tool.parse_records(text)
     assert dropped == 0 and len(recs) == 5
     since = tool.parse_window_arg("2026-09-22T15:01:48Z", 2026)
-    until = tool.parse_window_arg("15:01:56", 2026)
+    # 🔴 the date is written out on BOTH ends. A bare "15:01:56" means "today"
+    # (documented in parse_window_arg), so this test used to pass only while
+    # today was 09-22 and went red by itself at midnight on 2026-09-23 --
+    # which is also the trap for a human analysing at 00:05 a capture taken at
+    # 23:15. The convenience stays; nothing may depend on it.
+    until = tool.parse_window_arg("2026-09-22T15:01:56Z", 2026)
     kept, note = tool.select_window(recs, since, until, 2026)
     stamps = [r["_stamp"][2] for r in kept]
     assert stamps == [15 * 3600 + 1 * 60 + 51, 15 * 3600 + 1 * 60 + 56], (stamps, note)
     assert "2/5" in note
+
+
+def test_a_bare_time_means_today_and_says_which_day_that_is():
+    """The convenience form, pinned so it cannot silently mean another day."""
+    today = datetime.date.today()
+    mon, day, secs = tool.parse_window_arg("15:01:56", 2026)
+    assert (mon, day) == (today.month, today.day)
+    assert secs == 15 * 3600 + 1 * 60 + 56
 
 
 def test_no_window_means_the_whole_log_and_says_so():
@@ -546,3 +560,74 @@ def test_a_constant_clock_offset_is_named_as_such_and_bounded(tmp_path):
     csv0 = tmp_path / "t0.csv"
     _write_af_csv(csv0, rows0)
     assert tool.split_a_f(calls0, tool.hostfunc_pairs(str(csv0)))["ok"]
+
+
+def _write_forked_csv(path: Path, steps, ours_stream="336", other_stream="337", head_extra=2,
+                      interleave=False):
+    """A forked-arm task_time.csv: OUR waits on the side stream, the two that
+    are not ours on the main one. ``interleave`` drops the foreign pair into
+    the middle of ours -- which the position slice would then get wrong and
+    the stream selection still gets right."""
+    lines = ["Device_id,kernel_name,kernel_type,stream_id,task_id,task_time(us),task_start(us),task_stop(us)"]
+    t = 1_000_000.0
+    for durations in steps:
+        lines.append(f"2,N/A,MODEL_EXECUTE,65535,1,3.0,{t:.3f},{t + 3:.3f}")
+        t += 10.0
+        head = [(other_stream, 40.0 + 10 * i) for i in range(head_extra)]
+        ours = [(ours_stream, d) for d in durations]
+        seq = (ours[:2] + head + ours[2:]) if interleave else (head + ours)
+        for sid, d in seq:
+            lines.append(f"2,N/A,NOTIFY_WAIT,{sid},1,{d:.3f},{t:.3f},{t + d:.3f}")
+            t += d + 1.0
+        t += 5000.0
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_the_stream_that_holds_exactly_our_layers_is_found_and_used(tmp_path):
+    """🔴 The forked path puts our host-func nodes on the side stream and
+    leaves the two that are not ours on the main one, so they separate by
+    stream id -- position j is then layer j with nothing to skip. The position
+    slice only works there while the foreign pair happens to stay at the head
+    of every step, which nothing enforces once the two streams run at once.
+    """
+    cb, steps = _synthetic_run()
+    csv_path = tmp_path / "task_time.csv"
+    _write_forked_csv(csv_path, steps, interleave=True)
+    found = tool.notify_wait_stream_auto(str(csv_path), len(cb))
+    assert found and found["stream"] == "336", found
+    assert found["steps_with_exactly_layers"] == found["steps"]
+    nw, meta, shifted = tool.notify_wait_ours(str(csv_path), len(cb), skip=0, stream="336")
+    assert meta["per_step"] == len(cb) and list(shifted) == [0]
+    assert tool.check_alignment(shifted, cb, 0)["ok"]
+    for i in cb:
+        assert nw[i] == pytest.approx(cb[i] + 80.0, abs=6.0), (i, nw[i], cb[i])
+    # 🔴 the control, and the reason the selector exists: on the SAME csv the
+    # position slice hands back the two foreign waits as layers 0 and 1 --
+    # and the alignment check does not necessarily catch it, because the other
+    # 6 layers still line up. A structurally correct pick beats a statistical
+    # one that can be outvoted.
+    bad, _m, _bs = tool.notify_wait_ours(str(csv_path), len(cb), skip=2)
+    assert bad and bad != nw, "the fixture must actually separate the two readings"
+    assert bad[0] != pytest.approx(cb[0] + 80.0, abs=6.0), (bad[0], cb[0])
+    assert bad[1] != pytest.approx(cb[1] + 80.0, abs=6.0), (bad[1], cb[1])
+
+
+def test_one_stream_holding_everything_is_left_to_the_position_slice(tmp_path):
+    """The serial arm: one stream, layers + 2 per step, nothing to pick."""
+    cb, steps = _synthetic_run()
+    csv_path = tmp_path / "task_time.csv"
+    _write_csv(csv_path, steps)
+    assert tool.notify_wait_stream_auto(str(csv_path), len(cb)) == {}
+
+
+def test_an_ambiguous_split_is_not_guessed_at(tmp_path):
+    """Two streams both holding exactly n_layers per step: the selector has no
+    ground to choose, so it declines instead of picking one."""
+    cb, steps = _synthetic_run()
+    csv_path = tmp_path / "task_time.csv"
+    _write_forked_csv(csv_path, steps, head_extra=0)
+    # a second stream with the same shape
+    text = csv_path.read_text().splitlines()
+    dup = [ln.replace(",NOTIFY_WAIT,336,", ",NOTIFY_WAIT,338,") for ln in text[1:] if ",NOTIFY_WAIT,336," in ln]
+    csv_path.write_text("\n".join(text + dup) + "\n")
+    assert tool.notify_wait_stream_auto(str(csv_path), len(cb)) == {}

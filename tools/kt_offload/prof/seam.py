@@ -82,6 +82,12 @@ invisible to any median/p90 record and needs the record side to count it.
 
 Aligning NOTIFY_WAIT (--nw-csv)
 -------------------------------
+``--nw-stream auto`` (the default) first asks whether one stream holds exactly
+``--layers`` waits per step. On the forked path one does -- our host-func nodes
+are on the side stream and the two that are not ours stay on the main one --
+and then position j IS layer j with nothing to skip and only one feasible
+shift. Otherwise (the serial path, one stream, 42 per step) it falls back to:
+
 A step of this build contains 42 NOTIFY_WAIT, and the first 2 are not ours, so
 position j is layer j-2. Feeding task_time.csv straight in shifts every layer
 by two and still prints a full table. So the slicing is now part of the tool
@@ -372,18 +378,21 @@ def check_layer(med: dict[str, float], p90: dict[str, float], split: bool,
 # ------------------------------------------------------------------ NOTIFY_WAIT
 
 
-def notify_wait_steps(csv_path: str) -> tuple[list[list[float]], dict]:
+def notify_wait_steps(csv_path: str, stream: str | None = None) -> tuple[list[list[float]], dict]:
     """NOTIFY_WAIT durations grouped by step, in step order.
 
     A step is the window between two MODEL_EXECUTE starts; the n-th
     NOTIFY_WAIT inside it is position n. Nothing is dropped here -- the caller
-    decides which step shapes it trusts.
+    decides which step shapes it trusts. ``stream`` keeps only the waits of
+    one stream id (see notify_wait_stream_auto).
     """
     rows: dict[str, list[tuple[float, float]]] = defaultdict(list)
     with open(csv_path, newline="") as f:
         for r in csv.DictReader(f):
             k = (r.get("kernel_type") or "").strip()
             if k not in ("NOTIFY_WAIT", "MODEL_EXECUTE"):
+                continue
+            if k == "NOTIFY_WAIT" and stream is not None and (r.get("stream_id") or "").strip() != stream:
                 continue
             rows[k].append((float(r["task_start(us)"].strip()), float(r["task_time(us)"])))
     starts = sorted(s for s, _ in rows["MODEL_EXECUTE"])
@@ -396,7 +405,66 @@ def notify_wait_steps(csv_path: str) -> tuple[list[list[float]], dict]:
     shapes: dict[int, int] = defaultdict(int)
     for v in steps:
         shapes[len(v)] += 1
-    return steps, {"steps": len(steps), "shapes": dict(sorted(shapes.items()))}
+    return steps, {"steps": len(steps), "shapes": dict(sorted(shapes.items())), "stream": stream}
+
+
+def notify_wait_stream_auto(csv_path: str, n_layers: int, min_frac: float = 0.9) -> dict:
+    """Which stream carries OUR NOTIFY_WAIT, when a side stream owns them.
+
+    Serial: every wait is on the one compute stream and a step holds
+    ``n_layers + 2``, the first two of which are not ours -- that is what
+    ``--nw-skip`` slices off. Forked (2026-09-22): our ``n_layers`` host-func
+    nodes sit on the side stream while the two that are not ours stay on the
+    main stream, so the two groups are separable *by stream id*, and then
+    position j IS layer j with nothing to skip.
+
+    Why by stream rather than by position: the position slice sorts the waits
+    of BOTH streams by time and then assumes the two foreign ones keep the
+    head of every step. On 2026-09-22 they did (the medians come out identical
+    either way, checked on two forked arms), but nothing makes them: once the
+    two streams run concurrently that ordering is a coincidence, not a rule.
+    Selecting by stream makes it a fact instead -- each step then holds
+    exactly ``n_layers`` waits, all ours, and there is only one feasible shift
+    left for the alignment check to consider.
+
+    🔴 It does NOT rescue a weak Spearman: that is set by how many [kt-seam]
+    samples fall inside the profile window (one 5 s record inside an 8 s
+    capture gives ~130 callbacks per layer). BD0r1 refused at rho 0.498 both
+    before and after this change. The fix for that is more samples -- a longer
+    capture or a shorter VLLM_ASCEND_DSV41_KT_SEAM_TIMING interval -- never a
+    lower threshold.
+
+    Returns {} when no stream holds exactly ``n_layers`` waits in at least
+    ``min_frac`` of the steps, or when more than one does (ambiguous ->
+    fall back to the position slice and let the alignment check judge).
+    """
+    rows: dict[str, list[tuple[float, str]]] = defaultdict(list)
+    starts: list[float] = []
+    with open(csv_path, newline="") as f:
+        for r in csv.DictReader(f):
+            k = (r.get("kernel_type") or "").strip()
+            if k == "MODEL_EXECUTE":
+                starts.append(float(r["task_start(us)"].strip()))
+            elif k == "NOTIFY_WAIT":
+                rows[(r.get("stream_id") or "").strip()].append((float(r["task_start(us)"].strip()), ""))
+    starts.sort()
+    if not starts or len(rows) < 2:
+        return {}
+    counts: dict[str, dict[int, int]] = {}
+    for sid, waits in rows.items():
+        per_step: dict[int, int] = defaultdict(int)
+        for s, _ in waits:
+            i = bisect.bisect_right(starts, s) - 1
+            if i >= 0:
+                per_step[i] += 1
+        counts[sid] = per_step
+    hits = {sid: sum(1 for v in ps.values() if v == n_layers) for sid, ps in counts.items()}
+    good = [sid for sid, h in hits.items() if h >= min_frac * len(starts)]
+    if len(good) != 1:
+        return {}
+    sid = good[0]
+    return {"stream": sid, "steps_with_exactly_layers": hits[sid], "steps": len(starts),
+            "per_stream_totals": {k: len(v) for k, v in rows.items()}}
 
 
 def notify_wait_by_position(csv_path: str) -> dict[int, float]:
@@ -439,7 +507,8 @@ def spearman(a: list[float], b: list[float]) -> float:
     return _pearson(_ranks(a), _ranks(b))
 
 
-def notify_wait_ours(csv_path: str, n_layers: int, skip: int = 2, per_step: int | None = None):
+def notify_wait_ours(csv_path: str, n_layers: int, skip: int = 2, per_step: int | None = None,
+                     stream: str | None = None):
     """Per-layer NOTIFY_WAIT medians for *our* layers, with the slicing stated.
 
     Only steps holding exactly ``per_step`` (default ``n_layers + skip``) waits
@@ -449,7 +518,7 @@ def notify_wait_ours(csv_path: str, n_layers: int, skip: int = 2, per_step: int 
     make_nw_ours40.py applied by hand.
     """
     per_step = per_step or (n_layers + skip)
-    steps, meta = notify_wait_steps(csv_path)
+    steps, meta = notify_wait_steps(csv_path, stream)
     full = [v for v in steps if len(v) == per_step]
     by_pos: list[list[float]] = [[] for _ in range(per_step)]
     for v in full:
@@ -677,6 +746,9 @@ def main(argv=None) -> int:
     ap.add_argument("--ktphase", help="JSON from ktphase.py (4th arg): kt's own per-layer compute D")
     ap.add_argument("--nw-csv", help="profile task_time.csv: NOTIFY_WAIT per layer position")
     ap.add_argument("--nw-median-us", type=float, help="one NOTIFY_WAIT median for every layer")
+    ap.add_argument("--nw-stream", default="auto",
+                    help="stream id whose NOTIFY_WAIT are ours ('auto' = the one holding exactly "
+                         "--layers per step, then --nw-skip 0; '' = every stream, position slice)")
     ap.add_argument("--nw-skip", type=int, default=2,
                     help="NOTIFY_WAIT at the head of a step that are not our layers (default 2)")
     ap.add_argument("--nw-per-step", type=int, default=0,
@@ -736,13 +808,26 @@ def main(argv=None) -> int:
     align = None
     if args.nw_csv:
         n_layers = args.layers or len(layers)
+        nw_skip, nw_stream = args.nw_skip, (args.nw_stream if args.nw_stream not in ("auto", "") else None)
+        if args.nw_stream == "auto":
+            found = notify_wait_stream_auto(args.nw_csv, n_layers)
+            if found:
+                nw_stream, nw_skip = found["stream"], 0
+                print(f"  NOTIFY_WAIT stream: {nw_stream} holds exactly {n_layers} waits in "
+                      f"{found['steps_with_exactly_layers']}/{found['steps']} steps "
+                      f"(per stream {found['per_stream_totals']}) -> using it alone, --nw-skip 0. "
+                      f"On the forked path our nodes are on the side stream and the two that are not "
+                      f"ours stay on the main one; slicing by position would mix them by time.")
         nw, nwmeta, shifted = notify_wait_ours(
-            args.nw_csv, n_layers, skip=args.nw_skip, per_step=args.nw_per_step or None)
-        print(f"  NOTIFY_WAIT from {args.nw_csv}: {nwmeta['steps']} steps, shapes {nwmeta['shapes']}, "
-              f"{nwmeta['steps_used']} with exactly {nwmeta['per_step']} used, first {args.nw_skip} dropped")
+            args.nw_csv, n_layers, skip=nw_skip, per_step=args.nw_per_step or None, stream=nw_stream)
+        print(f"  NOTIFY_WAIT from {args.nw_csv}"
+              f"{'' if nw_stream is None else ' stream ' + nw_stream}: {nwmeta['steps']} steps, "
+              f"shapes {nwmeta['shapes']}, {nwmeta['steps_used']} with exactly {nwmeta['per_step']} used, "
+              f"first {nw_skip} dropped")
         if nw:
             align = check_alignment(shifted, {l: med[l].get("cb", 0.0) for l in layers},
-                                    args.nw_skip, args.nw_align_min, args.nw_align_margin)
+                                    nw_skip, args.nw_align_min, args.nw_align_margin)
+            align["stream"] = nw_stream
             print(f"  alignment: Spearman(NW, cb) by shift {align['rho_by_shift']} -> "
                   f"shift {align['chosen_shift']} rho {align['rho']} "
                   f"(need >= {align['min_rho']} and +{align['margin']} over the others): "
