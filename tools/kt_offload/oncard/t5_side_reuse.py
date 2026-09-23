@@ -68,6 +68,40 @@ That is what turns "the output is wrong" into "the weights buffer of step 3
 layer 5 held 7.0 -- the poison -- instead of this step's routing weights".
 The probe adds host work inside the callback, so the verdict run is probe-free
 by default and the probe is a separate, named run.
+
+P1a: the device waits for an ExternalEvent instead of for the callback
+----------------------------------------------------------------------
+``--arms ...,p1a`` adds an arm with ``VLLM_ASCEND_DSV41_KT_ASYNC_WAIT=1``: the
+captured node only builds kt's task and submits it, the graph goes on to an
+``ExternalEvent`` wait + reset, and a completion thread calls
+``cpu_infer.sync(0)`` and records that event. It is the same stack, the same
+poison and the same judge -- bit-identity against the eager serial reference --
+because every way it can go wrong is *faster and wrong*, exactly like the side
+stream. Three mutants, and the third is the one with no other line of defence:
+
+  ``--stall-ms M``  not a mutant: every ExternalEvent record is held back M ms
+                    in every async-wait arm. 🔴 This is the only thing here
+                    that can say whether the device is really parked on that
+                    event: if the wait blocks, the clean arm's replays cost
+                    steps x layers x M; if it does not, they cost what they
+                    always did, whatever the completion thread is doing. It is
+                    also what separates ``no-reset`` from clean in TIME --
+                    without the reset only the first replay ever waits. The
+                    unbounded version ("never record") is a CPU unit test
+                    (test_side_stream_overlap.py::test_p1a_without_the_record_hangs),
+                    not an arm here: on card it would leave a device waiting
+                    for ever and the next arm would have no card.
+  ``early-record``  the record moves to BEFORE ``cpu_infer.sync(0)``. The H2D
+                    is released while kt is still writing the pinned output.
+                    MUST be red.
+  ``no-wait``       the ``ExternalEvent.wait`` node never made it into the
+                    graph -- the load-bearing half, reached from the graph side
+                    instead of the thread side. MUST be red.
+  ``no-reset``      ``_ext_reset`` becomes a no-op, i.e. the reset node never
+                    made it into the graph. Replay 0 is correct (the event
+                    starts clear) and every replay after it walks through a
+                    wait still signalled by the one before. MUST be red, and
+                    ``--steps`` >= 3 is why it can be seen at all.
 """
 
 from __future__ import annotations
@@ -75,6 +109,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,10 +129,16 @@ PLAN = """t5r plan (the service's shape, not the single-layer one):
   arms    : serial (side off, captured)  -> MUST be bit-identical: the negative
             control that says the poison alone breaks nothing
             fork   (side on,  captured)  -> the arm under test
+            p1a    (side on + async wait) -> P1a, the form that will be merged
   mutants : drop-join / early-fork -> MUST be RED
+            early-record / no-wait / no-reset -> MUST be RED (P1a)
+  control : --stall-ms M delays every ExternalEvent record -> the clean p1a arm
+            MUST get about steps x layers x M slower (else nothing waits)
   judge   : bit-identity against an EAGER serial reference computed first, per step;
             plus host-func = K per layer, and the K replays pairwise different
-  scope   : correctness only. No timing is measured here."""
+  scope   : correctness. The ONE timing here is the --stall-ms positive
+            control (does the device really wait on the ExternalEvent); it is
+            not a performance measurement and must never be quoted as one."""
 
 
 def plan_layers(start: int, layers: int, num_layers: int = NUM_LAYERS) -> list[int]:
@@ -140,10 +181,20 @@ def main() -> int:  # noqa: C901
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--recycle", choices=("off", "inplace", "realloc"), default="inplace",
                     help="what happens to the routing buffers right after route() returns")
-    ap.add_argument("--arms", default="serial,fork", help="comma list of serial,fork")
-    ap.add_argument("--mutant", choices=("none", "drop-join", "early-fork"), default="drop-join",
+    ap.add_argument("--arms", default="serial,fork", help="comma list of serial,fork,p1a")
+    ap.add_argument("--mutant", choices=("none", "drop-join", "early-fork", "early-record",
+                                         "no-reset", "no-wait"),
+                    default="drop-join",
                     help="the arm that MUST be red; --mutant none only to bisect (the verdict then fails "
-                         "on 'zero mutation arms', by design)")
+                         "on 'zero mutation arms', by design). early-record/no-reset are the P1a ones and "
+                         "need an arm with the async wait on")
+    ap.add_argument("--stall-ms", type=float, default=0.0,
+                    help="🔴 the discriminator. Hold EVERY ExternalEvent record back by this many ms, in "
+                         "every async-wait arm. The clean p1a arm then has to take about "
+                         "steps x layers x stall-ms (that, and nothing else, is what says the device is "
+                         "really parked on the event rather than walking through a wait that never "
+                         "blocks); an arm whose wait does not block finishes in its usual time whatever "
+                         "the completion thread does. 0 = off")
     ap.add_argument("--eager-every", type=int, default=0,
                     help="run an EAGER forward through the stack every N replays -- what a service does "
                          "when a prefill lands between two decode steps (eager never forks, but it writes "
@@ -175,8 +226,20 @@ def main() -> int:  # noqa: C901
         ap.error(str(exc))
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     for a in arms:
-        if a not in ("serial", "fork"):
+        if a not in ("serial", "fork", "p1a"):
             ap.error(f"--arms: unknown arm {a!r}")
+    P1A_MUTANTS = ("early-record", "no-reset", "no-wait")
+    want_p1a = "p1a" in arms or args.mutant in P1A_MUTANTS
+    if args.stall_ms and "p1a" not in arms:
+        ap.error("--stall-ms measures the async-wait arms; add 'p1a' to --arms")
+    if args.mutant in P1A_MUTANTS and "p1a" not in arms:
+        ap.error(f"--mutant {args.mutant} mutates the async-wait path; add 'p1a' to --arms")
+    if want_p1a:
+        # Before ANY layer is built: the ExternalEvents and the completion
+        # thread are created in after_weights_loaded, and neither may be made
+        # inside a capture. The per-arm switch below only flips which path a
+        # built layer takes.
+        os.environ["VLLM_ASCEND_DSV41_KT_ASYNC_WAIT"] = "1"
     if args.steps < 3:
         ap.error("--steps must be >= 3 (a stale replay output repeats the previous one)")
     if args.tokens < 1:
@@ -186,7 +249,8 @@ def main() -> int:  # noqa: C901
     print(f"t5r: layers {layer_ids[0]}-{layer_ids[-1]} ({len(layer_ids)}), steps {args.steps}, "
           f"tokens {args.tokens}, recycle {args.recycle}, arms {arms}, mutant {args.mutant}, "
           f"stress {args.stress}{'' if args.stress == 'none' else f'x{args.stress_reps}'}, "
-          f"probe {'on' if args.probe else 'off'}", flush=True)
+          f"probe {'on' if args.probe else 'off'}, "
+          f"async wait {'ON for the p1a arm' if want_p1a else 'off'}", flush=True)
     if args.dry_run or os.environ.get("ONCARD_DRY") == "1":
         print("t5r: --dry-run, nothing was captured and no device was touched", flush=True)
         return 0
@@ -195,6 +259,7 @@ def main() -> int:  # noqa: C901
     import numpy as np
     import torch
 
+    import vllm_ascend.kt_offload.async_wait as AW
     import vllm_ascend.kt_offload.layer as KL
 
     v = C.Verdict("T5r side stream under the service's shape")
@@ -318,6 +383,7 @@ def main() -> int:  # noqa: C901
     probe_log: list[dict] = []
     original_host_forward = KL._kt_host_forward
     original_packed_forward = KL._kt_packed_forward
+    original_submit_only = KL._kt_packed_submit_only
 
     def _snapshot_kt(payload) -> dict:
         """kt's own pinned slot buffers (the layer_idx % 2 pair)."""
@@ -328,8 +394,12 @@ def main() -> int:  # noqa: C901
                 "ids": bufs[1][slot].clone(), "w": bufs[3][slot].clone()}
 
     def _snapshot_packed(payload) -> dict:
-        """Our own per-layer pinned buffers (the packed layout)."""
-        _wrapper, buf, layer_idx = payload
+        """Our own per-layer pinned buffers (the packed layout).
+
+        The async-wait node's payload carries the ExternalEvent as a fourth
+        field; everything the probe reads is in the same first three.
+        """
+        _wrapper, buf, layer_idx = payload[:3]
         return {"layer": int(layer_idx), "slot": -1, "where": "own buffer",
                 "ids": buf["pin_ids"].clone(), "w": buf["pin_weights"].clone()}
 
@@ -387,23 +457,87 @@ def main() -> int:  # noqa: C901
             KL._launch_host_func(side, KL._kt_packed_forward, payload)
         self._pending_join = (join, side, compute)
 
+    # ------------------------------------------------------ the P1a mutants
+    original_complete = AW.Completer._complete
+    original_ext_reset = KL._ext_reset
+    skipped = {"reset": 0, "wait": 0}
+
+    def _complete_early_record(self, wrapper, layer_idx, event):
+        """MUTANT: record BEFORE the sync -- the device is released while kt is
+        still writing this layer's pinned output.
+
+        The main failure mode of P1a, and it raises nothing: the H2D copies
+        whatever the buffer held, which is the previous step's CPU experts.
+        """
+        try:
+            event.record(self._stream)
+            AW.RECORDS[layer_idx] = AW.RECORDS.get(layer_idx, 0) + 1
+            if wrapper is not None:
+                wrapper.cpu_infer.sync(0)
+        finally:
+            self.depth -= 1
+
+    def _complete_stalled(self, wrapper, layer_idx, event):
+        """POSITIVE CONTROL: hold EVERY record back by --stall-ms.
+
+        Not a mutation -- the output must stay bit-identical -- and the only
+        thing that can answer "is the device actually parked on this event?".
+        A wait that never blocks costs nothing however long this thread takes,
+        so the clean arm's replay wall time is the measurement:
+        steps x layers x stall-ms if the wait blocks, unchanged if it does not.
+        Bounded on purpose: never recording at all would leave a device waiting
+        for ever and cost the next arm its card, so THAT arm is a CPU unit test
+        (test_side_stream_overlap.py::test_p1a_without_the_record_hangs).
+        """
+        time.sleep(args.stall_ms / 1000.0)
+        return original_complete(self, wrapper, layer_idx, event)
+
+    def _ext_reset_noop(event, stream) -> None:
+        """MUTANT: the reset node never made it into the graph.
+
+        Replay 0 is right (the event starts clear); every later replay walks
+        through a wait its predecessor left signalled and reads the pinned
+        output before this step's task has written it. With --stall-ms on, the
+        two arms also separate in TIME: the clean one pays the stall on every
+        replay, this one only on the first.
+        """
+        skipped["reset"] += 1
+        return None
+
+    def _ext_wait_noop(event, stream) -> None:
+        """MUTANT: the wait node never made it into the graph.
+
+        The load-bearing half. Without it the H2D is behind nothing at all and
+        copies the pinned output while the completion thread is still syncing
+        kt: the same "faster and wrong" as early-record, reached from the graph
+        side instead of the thread side. With --stall-ms on it is also the
+        cheapest way to see that the clean arm's slowdown really came from this
+        node -- this arm does not pay it.
+        """
+        skipped["wait"] += 1
+        return None
+
     # --------------------------------------------------------- the arm runner
-    def arm(name: str, forked: bool, mutant: str) -> dict:  # noqa: C901
+    def arm(name: str, forked: bool, mutant: str, p1a: bool = False) -> dict:  # noqa: C901
         key = f"{name}{'' if mutant == 'none' else '+' + mutant}"
-        is_mutant = mutant != "none"
+        # stall-record is a POSITIVE control, not a mutation: its output must
+        # be bit-identical and its wall time must not be. So it is judged.
+        is_mutant = mutant not in ("none", "stall-record")
 
         def judge(ok: bool, what: str) -> bool:
             return ok if is_mutant else v.check(ok, what)
 
         for off, _, _ in stack:
             off.overlap = forked
+            off.async_wait = p1a
             off._pending = None
             off._pending_captured = False
             off._pending_join = None
             off._side_inflight = False  # harmless on a build without the guard
+            off._submit_ops = None
         getattr(KL, "_SIDE_BUFFER_OWNER", getattr(KL, "_SIDE_INFLIGHT", {})).clear()
-        out: dict = {"forked": forked, "mutant": mutant, "recycle": args.recycle, "captured": None,
-                     "error": None, "where": None, "all_bit_identical": None}
+        out: dict = {"forked": forked, "p1a": p1a, "mutant": mutant, "recycle": args.recycle,
+                     "captured": None, "error": None, "where": None, "all_bit_identical": None}
         ghost_hits: list = []
 
         def one_layer(off, lay, comm, h, ids_src, w_src):
@@ -440,6 +574,21 @@ def main() -> int:  # noqa: C901
             # fork.record; with the fix they are a _device_fill BEFORE it.
             KL.KTLayerOffload._ids_for_kt = _ids_for_kt_delayed
             KL._device_fill = _device_fill_delayed
+        saved_complete = AW.Completer._complete
+        saved_ext_reset = KL._ext_reset
+        saved_ext_wait = KL._ext_wait
+        skipped0 = dict(skipped)
+        if mutant == "early-record":
+            AW.Completer._complete = _complete_early_record
+        elif p1a and args.stall_ms:
+            # every async-wait arm, clean and mutant alike -- the comparison is
+            # between them, so only one of them carrying the stall would say
+            # nothing.
+            AW.Completer._complete = _complete_stalled
+        if mutant == "no-reset":
+            KL._ext_reset = _ext_reset_noop
+        elif mutant == "no-wait":
+            KL._ext_wait = _ext_wait_noop
         if mutant == "drop-join":
             KL.KTLayerOffload._join_side_stream = _drop_join
         elif mutant == "early-fork":
@@ -452,6 +601,7 @@ def main() -> int:  # noqa: C901
         if args.probe:
             KL._kt_host_forward = _probing(original_host_forward, _snapshot_kt)
             KL._kt_packed_forward = _probing(original_packed_forward, _snapshot_packed)
+            KL._kt_packed_submit_only = _probing(original_submit_only, _snapshot_packed)
         probe_log.clear()
         calls0 = dict(KL.HOST_FUNC_CALLS)
         try:
@@ -469,16 +619,29 @@ def main() -> int:  # noqa: C901
                        where=(mine[-1] if mine else tb[-2] if len(tb) > 1 else ""))
             print(f"  arm {key}: capture raised -- {out['error']}\n    at {out['where']}", flush=True)
             KL._kt_host_forward, KL._kt_packed_forward = original_host_forward, original_packed_forward
+            KL._kt_packed_submit_only = original_submit_only
             KL.KTLayerOffload._join_side_stream = saved_join
             KL.KTLayerOffload._submit_captured_forked = saved_forked
             KL.KTLayerOffload._ids_for_kt = saved_ids
             KL._device_fill = saved_fill
+            KL._ext_reset = saved_ext_reset
+            KL._ext_wait = saved_ext_wait
+            AW.Completer._complete = saved_complete
             return out
         finally:
             KL.KTLayerOffload._join_side_stream = saved_join
             KL.KTLayerOffload._submit_captured_forked = saved_forked
             KL.KTLayerOffload._ids_for_kt = saved_ids
             KL._device_fill = saved_fill
+            # capture-time hooks: the wait and the reset are graph NODES, so
+            # these are done being patched the moment the capture is. The
+            # completion thread's patch is not -- it has to survive the replays.
+            KL._ext_reset = saved_ext_reset
+            KL._ext_wait = saved_ext_wait
+            # 🔴 Did the mutation happen at all? A mutant that quietly did
+            # nothing looks exactly like a criterion with no discriminating
+            # power from the verdict line, and they need different answers.
+            out["nodes_skipped"] = {k: skipped[k] - skipped0[k] for k in skipped}
 
         if args.recycle == "realloc":
             hit_ids = sum(1 for a, _ in ghost_hits if a)
@@ -499,7 +662,10 @@ def main() -> int:  # noqa: C901
         outs = [torch.empty_like(sout) for _ in range(args.steps)]
         probe_log.clear()
         before = dict(KL.HOST_FUNC_CALLS)
+        rec_before = dict(AW.RECORDS)
+        err_before = len(AW.ERRORS)
         eager_passes = 0
+        t_replay0 = time.monotonic()
         try:
             for k, (x, ids, w) in enumerate(inputs):
                 if args.eager_every and k and k % args.eager_every == 0:
@@ -512,10 +678,29 @@ def main() -> int:  # noqa: C901
                 outs[k].copy_(sout)
             torch.npu.synchronize()  # the only one
         finally:
+            out["replay_wall_s"] = round(time.monotonic() - t_replay0, 3)
             KL._kt_host_forward, KL._kt_packed_forward = original_host_forward, original_packed_forward
+            KL._kt_packed_submit_only = original_submit_only
+            AW.Completer._complete = saved_complete
         grew = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - before.get(lid, 0) for lid in layer_ids}
         out["host_func_per_layer"] = grew
         out["eager_passes"] = eager_passes
+        if p1a:
+            # The submit counter and the release counter have to agree. A layer
+            # whose submits grow while its records do not is a device about to
+            # wait for ever -- a hang, not a wrong answer, and worth naming.
+            rec_grew = {lid: AW.RECORDS.get(lid, 0) - rec_before.get(lid, 0) for lid in layer_ids}
+            out["ext_records_per_layer"] = rec_grew
+            out["completer_errors"] = AW.ERRORS[err_before:][:5]
+            rep = AW.record_counts_ok(rec_before, AW.RECORDS, args.steps, layer_ids)
+            judge(rep["ok"], f"arm {key}: every layer's ExternalEvent was recorded once per replay "
+                             f"({rep['detail']})")
+            pair = AW.submits_match_records(grew, rec_grew)
+            judge(pair["ok"], f"arm {key}: submits and releases pair up per layer ({pair['detail']})")
+            judge(len(AW.ERRORS) == err_before,
+                  f"arm {key}: the completion thread swallowed no error "
+                  f"({AW.ERRORS[err_before:][:3]}) -- it records the event even when kt raises, so an "
+                  "error here is silently stale output, not a hang")
         judge(all(n == args.steps for n in grew.values()),
               f"arm {key}: every layer's host-func ran once per replay (want {args.steps}, "
               f"got {min(grew.values())}..{max(grew.values())}; {eager_passes} eager passes do not "
@@ -596,21 +781,76 @@ def main() -> int:  # noqa: C901
     # --------------------------------------------------------------- run it
     results: dict[str, dict] = {}
     for name in arms:
-        print(f"\n===== arm {name} (side stream {'ON' if name == 'fork' else 'off'}, "
-              f"recycle {args.recycle}) =====", flush=True)
-        results[name] = arm(name, forked=(name == "fork"), mutant="none")
+        forked = name in ("fork", "p1a")
+        print(f"\n===== arm {name} (side stream {'ON' if forked else 'off'}, "
+              f"async wait {'ON' if name == 'p1a' else 'off'}, recycle {args.recycle}) =====", flush=True)
+        results[name] = arm(name, forked=forked, mutant="none", p1a=(name == "p1a"))
         v.check(results[name]["captured"] is True,
                 f"arm {name} captured (error: {results[name]['error']})")
+        if results[name].get("replay_wall_s") is not None:
+            print(f"  arm {name}: {args.steps} replays + one synchronize took "
+                  f"{results[name]['replay_wall_s']}s", flush=True)
     if args.mutant != "none":
-        print(f"\n===== MUTANT arm fork+{args.mutant} (must be RED) =====", flush=True)
-        m = arm("fork", forked=True, mutant=args.mutant)
-        results[f"fork+{args.mutant}"] = m
+        mut_p1a = args.mutant in P1A_MUTANTS
+        base = "p1a" if mut_p1a else "fork"
+        print(f"\n===== MUTANT arm {base}+{args.mutant} (must be RED) =====", flush=True)
+        m = arm(base, forked=True, mutant=args.mutant, p1a=mut_p1a)
+        results[f"{base}+{args.mutant}"] = m
+        if args.mutant in ("no-reset", "no-wait"):
+            which = "reset" if args.mutant == "no-reset" else "wait"
+            got = (m.get("nodes_skipped") or {}).get(which)
+            v.check(got == len(layer_ids),
+                    f"mutant {args.mutant} really left the {which} node out: {got} skipped during its "
+                    f"capture (want {len(layer_ids)}, one per layer). Without this, a mutant that quietly "
+                    f"did nothing is indistinguishable from a criterion with no discriminating power.")
         red = (m["captured"] is not True) or (m["all_bit_identical"] is not True)
-        v.must_be_red(red, f"mutant {args.mutant}: captured={m['captured']} "
-                           f"bit_identical={m['all_bit_identical']} error={m['error']}")
-        if not red:
-            v.note("🔴 the mutant passed the same criteria as the clean arm ⇒ the criterion has no "
-                   "discriminating power in this run; no arm here may be called a pass")
+        if args.mutant == "no-reset":
+            # 🔴 2026-09-23, measured, not assumed. On this build the captured
+            # ExternalEvent wait re-arms itself on every replay: with all 8 reset
+            # nodes provably left out (nodes_skipped.reset == layers) the arm
+            # stayed bit-identical AND still paid the --stall-ms delay on every
+            # replay -- i.e. the device waited 8 times without a single reset.
+            # torch_npu documents the opposite ("Before reusing ExternalEvent,
+            # you need to call reset()"), and the production path keeps the
+            # reset for that reason: 0.144 us against relying on undocumented
+            # behaviour. But the arm CANNOT go red here, so requiring red would
+            # be requiring a lie. What is pinned instead is the observation, so
+            # that it failing EITHER way says the platform moved.
+            stall_floor = 0.7 * args.steps * len(layer_ids) * args.stall_ms / 1000.0
+            waited = args.stall_ms and (m.get("replay_wall_s") or 0) >= stall_floor
+            v.check(not red and (waited or not args.stall_ms),
+                    f"platform fact (pinned 2026-09-23): with every reset node left out the arm is STILL "
+                    f"bit-identical ({m['all_bit_identical']}) and still paid the stall "
+                    f"({m.get('replay_wall_s')}s, floor {stall_floor:.2f}s) -- the captured ExternalEvent "
+                    f"wait re-arms itself on this build. If this check ever fails, the platform changed "
+                    f"and the reset became load-bearing again; the arm that IS load-bearing here is "
+                    f"--mutant no-wait.")
+            v.note("🔴 --mutant no-reset has NO discriminating power on this build; the reset is kept as "
+                   "belt and braces (torch_npu documents it as required) and its only red arm is the CPU "
+                   "model, test_side_stream_overlap.py::test_p1a_without_the_reset_*")
+            if args.stall_ms == 0:
+                v.note("⚠ without --stall-ms this arm cannot even show that the device still waited; "
+                       "run it with --stall-ms 50 or do not quote it")
+            v.note("⚠ this run therefore has ZERO mutation arms and exits 1 by design (same as a "
+                   "clean-arms-only run): read it paired with a --mutant no-wait run, which is the "
+                   "required-red one for this path")
+        else:
+            v.must_be_red(red, f"mutant {args.mutant}: captured={m['captured']} "
+                               f"bit_identical={m['all_bit_identical']} error={m['error']}")
+            if not red:
+                v.note("🔴 the mutant passed the same criteria as the clean arm ⇒ the criterion has no "
+                       "discriminating power in this run; no arm here may be called a pass")
+    # ---- the positive control: is the device really parked on the event? ----
+    if args.stall_ms and "p1a" in results:
+        want = 0.7 * args.steps * len(layer_ids) * args.stall_ms / 1000.0
+        got = results["p1a"].get("replay_wall_s")
+        base_wall = (results.get("fork") or {}).get("replay_wall_s")
+        v.check(got is not None and got >= want,
+                f"positive control: with every ExternalEvent record held back {args.stall_ms} ms, the "
+                f"clean p1a arm's {args.steps} replays took {got}s (want >= {want:.2f}s = 0.7 x steps x "
+                f"layers x stall; the same arm without the async wait took {base_wall}s). A device that "
+                f"was NOT waiting on that event would finish in the usual time whatever the completion "
+                f"thread does -- this is the only check here that can tell those two apart.")
 
     if "serial" in results and results["serial"].get("all_bit_identical") is not True:
         v.note("🔴 the NEGATIVE control (side stream off) is not bit-identical either ⇒ the harness itself "
@@ -621,10 +861,16 @@ def main() -> int:  # noqa: C901
         s_ok = results["serial"].get("all_bit_identical")
         v.note(f"discriminating pair: serial {'green' if s_ok else 'RED'} / fork {'green' if f_ok else 'RED'} "
                f"-- same schedule, same poison, only the stream the D2H and the host-func sit on differs")
+    if "p1a" in results:
+        p_ok = results["p1a"].get("all_bit_identical")
+        v.note(f"p1a arm {'green' if p_ok else 'RED'}: same buffers, same stream, same poison as 'fork' -- "
+               "the only difference is that the device waits on an ExternalEvent a completion thread "
+               "records instead of on the callback's return")
 
     return v.finish(os.path.join(args.out, "t5r_result.json"),
                     {"arms": results, "layer_ids": layer_ids, "steps": args.steps, "tokens": T,
                      "recycle": args.recycle, "mutant": args.mutant, "probe": args.probe,
+                     "async_wait": want_p1a, "stall_ms": args.stall_ms,
                      "stress": args.stress, "stress_reps": args.stress_reps,
                      "poison": {"id": poison_id, "weight": poison_w},
                      "measures_performance": False})
