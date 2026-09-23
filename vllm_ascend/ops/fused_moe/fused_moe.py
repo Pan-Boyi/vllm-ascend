@@ -344,10 +344,24 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 before_routed_experts = torch.npu.current_stream().record_event()
                 after_routed_experts = None
 
+            # §4.31: with the switch on, the routed half hands back an
+            # UN-merged routed_out and the kt merge happens below, after the
+            # shared-expert MLP. The shared expert reads the layer's input
+            # hidden states and depends on neither routed_out nor the CPU
+            # half, so this only changes *when* the merge is enqueued: into
+            # the window where the main stream is otherwise idle waiting for
+            # the CPU experts (trace reconciliation: 38.25 us/layer).
+            # ``is True`` and the conditional kwarg: with the switch off (or a
+            # routed half that is not AscendRoutedExperts) the call is exactly
+            # the upstream one, byte for byte -- no new keyword, no new attribute
+            # read that could raise.
+            defer_kt_merge = getattr(self.routed_experts, "kt_shared_in_window", False) is True
+            routed_kwargs = {"defer_kt_merge": True} if defer_kt_merge else {}
             routed_out, fused_moe_events = self.routed_experts.forward_impl(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+                **routed_kwargs,
             )
             fused_moe_events.before_routed_experts = before_routed_experts
             fused_moe_events.after_routed_experts = after_routed_experts
@@ -360,4 +374,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 input_is_gathered=shared_input_is_gathered,
                 defer_output_wait=defer_shared_output_wait,
             )
+            if defer_kt_merge:
+                # 🔴 Before the return, and therefore before the runner's
+                # ``shared_out + fused_output``: nothing may read routed_out
+                # without the CPU half in it. The layer counts merge calls per
+                # route and refuses anything but exactly one, so a path that
+                # skipped this line (or ran it twice) goes red at its next
+                # route instead of silently dropping half the experts.
+                routed_out = self.routed_experts.kt_merge(routed_out)
             return shared_out, routed_out

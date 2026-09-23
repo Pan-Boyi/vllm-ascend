@@ -1132,6 +1132,52 @@ P3 的 15.6 µs/层）**预期同样换不来 TPOT**；要再进一步只能动 
 ⚠ **机器级**：2026-09-23 07:43 前后根 overlay **6.0 T 100% 满、只剩 20 K**（非本线造成，本项目整棵树 ~25 G）。
 已清本线 profile 原始 trace（约 1.7 G），现 9.3 G 可用，**余量仍极小**。采 profile 前先 `df -h /`。
 
+## 4.31 共享专家 MLP 挪进「主流等 CPU」的窗口（2026-09-23，**未上卡**；开关默认关）
+
+**动机（离线 trace 对账，已确认；本节没有新的卡上读数）**：侧流臂每层主流顺序是
+`fork → 窗口内 13 个算子(~77 µs) → DAVID_EVENT_WAIT(join，~294 µs 空等) → H2D + fp32 Add(kt merge)
+→ 共享专家 MLP(DynamicMxQuant→QBMM→SwigluGroupQuant→QBMM，**38.25 µs/层**) → Add_BF16(shared+routed) → 下一层`。
+共享专家的输入是 MoE 层输入 hidden_states，**与 routed_out、与 CPU 输出都没有数据依赖**；它排在 join 之后纯粹是调用顺序
+（join 在 `layer.py:merge()`，merge 在 `routed_experts.forward_impl` 里调，共享专家在 `fused_moe._forward_impl`
+里等 `forward_impl` 返回后才调）。挪到 join 前 ⇒ 38.25 µs × 40 ≈ **1.5 ms/token 上限**；窗口 77+38=115 µs ≪ 副流链 ~370 µs，
+不产生新的关键路径。与 §4.30 的区别：P1b 削的是 kt 开跑**之前**的 host 侧链（被 kt 盖住），这里削的是 join **之后**、
+下一层 fork **之前**的主流尾巴 —— 按构造在串行链上。⚠ 这是推理，不是读数；只有整网 A/B 算数。
+
+**设计**：
+- 开关 `VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW`（纯 env，只认 `"1"`，默认 `"0"`）。`KTLayerOffload.shared_in_window`
+  在构造时读；`AscendRoutedExperts.kt_shared_in_window` = kt 开 且 开关开。
+- `fused_moe._forward_impl` **只在有共享专家那一支**：开关开时给 `forward_impl` 传 `defer_kt_merge=True`
+  （用 `**routed_kwargs`，开关关时调用与上游**逐字相同**，上游单测 `assert_called_once_with` 仍过），
+  `ascend_shared_experts.forward(...)` 之后、`return` 之前调 `routed_experts.kt_merge(routed_out)`。
+  `fused_moe_events` 原样交给共享专家（同一个对象），不新增跨流依赖；merge 仍在 `_forward_impl` 返回前完成 ⇒
+  上游 `shared_out + fused_output` 读到的永远是 merge 后的张量。
+- 其它所有调用方不变：`ascend_shared_experts is None` 短路支、SP 自定义 op（它包的还是 `_forward_impl`）、
+  其它模型/DBO/MTP 直接调 `forward_impl` 的都不传 `defer_kt_merge` ⇒ 仍在 routed 内 merge。
+- `kt_offload.merge` 全树只剩一个调用点（`AscendRoutedExperts.kt_merge`）；侧流关时开关照样生效、结果等价（只是没有窗口可藏，
+  config 打 warning）。开关开时每层打一行 `SHARED IN WINDOW for layer N`（整网臂数它：开 40 / 关 0）。
+
+**守卫（漏合并/重复合并必须变红）**：`KTLayerOffload` 数每次 route 之后的 merge **调用次数**（含 no-op 的调用），
+下一次 route 时 ≠1 就 `AssertionError`（点名两个调用方）；dtype 被拒的 route 不计账；唯一豁免是「捕获中、侧流已提交未 join」，
+那一态由 `_claim_side_buffers` 给出更具体的拒绝。判据纯函数在 `kt_offload/shared_window.py`（`merge_balance_ok`、`window_ops_ok`）。
+
+**测试（CPU，本树 `vllm_ascend.__file__` 已核为 staging/moe-offload-shared）**：
+- `tests/ut/kt_offload/test_shared_in_window.py` **44 过**：判据变异 6 条全红；运行时「漏 merge」「merge 两次」「profile run 的 no-op 也要调」红；
+  源码 AST 检查 + 5 个手写变异红；🔴 **直接跑生产的 `AscendMoERunner._forward_impl`**（CPU 上替身 self + 真 `KTLayerOffload`）：
+  开关关 = `route→merge→shared`、开 = `route→shared→merge` 恰一次且与关**逐位相同**、短路支两态都在 routed 内 merge；
+  对**生产源码文本**做 5 个变异（删 merge / 不传 defer / 开关读成常关 / merge 挪到 return 后 / 换掉 events 对象）全红，另「routed 忽略 defer」红；
+  侧流模拟器上 shared 落在 fork..join 之间、输出逐位同、墙钟少 SHARED_COST；侧流关两种顺序等价。
+- **改生产文件的变异**（改完跑、再还原）：删 fused_moe 里的 merge → 5 红；routed 不看 defer → 1 红；merge 不计数 → 12 红；route 不调守卫 → 7 红。
+- 全量 `tests/ut/kt_offload`：**595 passed / 0 failed**（需树里有钉值 `.so`，否则 `test_serve_preflight_gates` 5 条因「树里 0 份 .so」红——环境，不是本改动）。
+  `tests/ut/ops/test_fused_moe.py` 等 4 个文件：失败集合与 ff4ffb920 基线**逐条相同**（11 条 `Ascend config is not initialized`，基线即如此）。
+- 前人代码的一处回归已修：原写法无条件传 `defer_kt_merge=` 并直接读 `routed_experts.kt_shared_in_window`，
+  把 `test_fused_moe.py` 两条（替身 routed_experts / `assert_called_once_with`）打红。
+
+**待上卡**（执行单 `tools/kt_offload/oncard/RUNBOOK_shared_window.md`，判据先写死；卡由用户排）：
+t5r `--shared-mlp both` ×3 发（干净臂 after/before 两顺序互相、对串行参照逐位；`--mutant no-merge` 必须**按位**红且守卫 8/8 看见；
+`--stall-ms 50` 阳性对照、`no-wait`、`drop-join` 仍红）≈20 min；t4p `--shared-mlp`（fork_sb−fork_sa 每层差 + 共享 MLP 自身成本，
+**只作信号**：代理 §4.30 已判 unusable）≈5 min；整网 A/B（run_arm.sh 写死验收树，**未准备**）。
+替身共享 MLP 是 W8A8/bf16 链，不是服务的 MXFP 链 ⇒ 正确性不受影响，计时只是信号。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -1222,3 +1268,4 @@ P3 的 15.6 µs/层）**预期同样换不来 TPOT**；要再进一步只能动 
 - 2026-09-23（phase2）：🟢 P1a 完成——ExternalEvent 等待，**−0.53 ms/token**（地板 0.16，按 §4.27 算收益但小、待复现）、整网 decode 1150/1150 逐位、kt 未改。三条发现：阳性对照 `--stall-ms` 才让「逐位相同」有证据力；本构建 reset 不承重（与文档相反，仍保留）；错码正则需「显式名单 + 非数字边界 + 排除埋点行」三者并用。见 §4.28。
 - 2026-09-23（phase2）：P1b 落地——图里已无 host-func 节点（计数器 D2H 启动 + C 自旋轮询 + ExternalEvent），**未改 kt**；逐位按各臂自身地板校到 skip=13 后六对 100% 相同；perf A−B=0.85 但本发地板 1.13 ⇒ §4.27 判 fail（机器在变空），待安静时段 ≥4 轮重测。三条仪器发现见 §4.29。
 - 2026-09-23（phase2）：🔴 P1b 机制不成立——节点确实归零、35.75 µs 中位代价确实消失，但副流链每层只少 0.25 µs、step 周期只动 0.07 ms（时间从 wait 挪进 idle）⇒ 主流停等由 kt 何时算完决定，削 host 侧换不来 TPOT；推论：P2/P3 预期同样无效。代理层判 unusable（只有 1 个标定点、分辨率 ±1 ms）；perf 口径不许砍半（噪声翻倍）。见 §4.30。
+- 2026-09-23（phase2）：§4.31 共享专家 MLP 挪到 kt join 之前（`VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW`，默认关）——trace 对账 38.25 µs/层在 join 之后且无数据依赖，上限 ≈1.5 ms/token；每次 route 恰一次 merge 的运行时守卫 + 生产 `_forward_impl` 源码变异全红；CPU 595/0；上卡 t5r/t4p 执行单已备、未跑。见 §4.31。

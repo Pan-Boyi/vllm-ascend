@@ -655,6 +655,11 @@ def test_a_stale_join_is_cleared_by_an_eager_route(monkeypatch, sim):
     rt.route(hs, w, ids, in_profile_run=False)
     assert rt._pending_join is not None
     sim.capturing = False
+    # This case deliberately skips the merge, which the merge-balance counter
+    # (shared_window / _assert_merge_balance) would refuse first and with a
+    # different message. Tell it the merge happened, so what speaks here is
+    # the thing under test: the stale join, and _side_inflight surviving.
+    rt._merges_since_route = 1
     rt.route(hs, w, ids, in_profile_run=False)  # eager, no merge in between
     assert rt._pending_join is None
     assert rt._side_inflight is True  # the un-joined submit is NOT forgotten

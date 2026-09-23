@@ -26,6 +26,17 @@ instrument at the *mechanisms* instead of at form C:
              submits, the device waits on an ExternalEvent
     p1b      side stream + ``VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL``: no host-func
              node at all, an 8-byte counter D2H starts a polling thread
+    fork_sa  (``--shared-mlp``, §4.31) the side stream with a served-shape
+             shared-expert MLP enqueued AFTER the merge -- today's order
+    fork_sb  (``--shared-mlp``) the same MLP enqueued BEFORE the merge, i.e.
+             between the fork and the join -- what
+             ``VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=1`` does in production.
+             Mechanism ``shared_window`` = fork_sb - fork_sa. The shared MLP is
+             a stand-in (npu_moe.build_shared_mlp: random weights, the chain the
+             build offers, printed), so this is a signal about the ORDER, not a
+             measurement of the served block; the control ``g_npu_shared``
+             (NPU chain + the MLP, no kt) says what the MLP itself costs per
+             layer, which bounds what hiding it can buy.
 
 Every switch is production's (``vllm_ascend.kt_offload``): this file sets the
 same env vars before the layers are built and flips the same instance
@@ -70,7 +81,8 @@ sys.path.insert(0, HERE)
 import oncard_common as C  # noqa: E402
 import t4_model as M  # noqa: E402
 
-ARM_NAMES = ("serial", "fork", "fork2", "p1a", "p1b")
+ARM_NAMES = ("serial", "fork", "fork2", "p1a", "p1b", "fork_sa", "fork_sb")
+SHARED_ARMS = {"fork_sa": "after", "fork_sb": "before"}
 
 # mechanism -> (arm A, arm B); the prediction is A - B, so a saving is negative
 MECHANISMS = {
@@ -78,6 +90,8 @@ MECHANISMS = {
     "p1a": ("p1a", "fork"),
     "p1b": ("p1b", "fork"),
     "null": ("fork2", "fork"),
+    # §4.31: the shared-expert MLP before vs after the kt merge (both forked)
+    "shared_window": ("fork_sb", "fork_sa"),
 }
 
 PLAN = """T4p plan (a stack of --layers real layers, T=1 decode shape, timing only):
@@ -120,6 +134,13 @@ def main() -> int:  # noqa: C901
     ap.add_argument("--prev", default=None,
                     help="a previous flight's t4p_result.json: report the BETWEEN-FLIGHT spread of the "
                          "predictions as well as this flight's within-flight one")
+    ap.add_argument("--shared-mlp", action="store_true",
+                    help="§4.31: add the fork_sa/fork_sb arms (a served-shape shared-expert MLP after / before "
+                         "the kt merge) and the g_npu_shared control; reports the per-layer difference")
+    ap.add_argument("--shared-inter", type=int, default=None,
+                    help="shared-expert intermediate size (default: oncard_common.INTER, DSV4.1 2304)")
+    ap.add_argument("--shared-chain", choices=("auto", "w8a8", "bf16"), default="auto",
+                    help="stand-in operator chain; 'auto' probes the build and prints what it got")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and exit without touching the device")
     ap.add_argument("--out", default=os.environ.get("ONCARD_RUN_DIR", "."))
     args = ap.parse_args()
@@ -140,12 +161,17 @@ def main() -> int:  # noqa: C901
     for dep in ("p1a", "p1b"):
         if dep in arms and "fork" not in arms:
             ap.error(f"--arms: {dep} is measured against fork; add fork")
+    if args.shared_mlp:
+        arms += [a for a in SHARED_ARMS if a not in arms]
+    elif any(a in SHARED_ARMS for a in arms):
+        ap.error("--arms: fork_sa/fork_sb need --shared-mlp (they have no shared MLP to place otherwise)")
     if args.layers < 2:
         ap.error("--layers must be >= 2: a one-layer stack makes the per-layer figure a single sample")
 
     print(PLAN, flush=True)
     print(f"t4p: arms {arms}, layers {args.layers} (model {args.model_layers}), tokens {args.tokens}, "
-          f"reps {args.reps}, n {args.n}, threads {args.threads}, numa {args.numa}", flush=True)
+          f"reps {args.reps}, n {args.n}, threads {args.threads}, numa {args.numa}, "
+          f"shared-mlp {'on (' + args.shared_chain + ')' if args.shared_mlp else 'off'}", flush=True)
     if args.dry_run or os.environ.get("ONCARD_DRY") == "1":
         print("t4p: --dry-run, nothing was measured and no device was touched", flush=True)
         return 0
@@ -209,6 +235,17 @@ def main() -> int:  # noqa: C901
     sids, sw = C.make_routing(rng, T, pl0.cpu_ids, list(pl0.resident_ids))
     sids, sw = sids.to(dev), sw.to(dev)
     print(f"input: {C.coverage(sids.cpu(), pl0.resident_mask()).line()}", flush=True)
+
+    # §4.31: one shared-MLP stand-in, built outside any capture and used by
+    # every layer of every shared arm (same weights: the arms differ in WHERE
+    # it is enqueued, never in what it computes).
+    shared_fn = shared_kind = None
+    if args.shared_mlp:
+        shared_fn, shared_kind = N.build_shared_mlp(dev, hidden=C.HIDDEN, inter=args.shared_inter,
+                                                    kind=args.shared_chain)
+        v.note(f"shared-expert stand-in: chain {shared_kind!r}, random weights; the served block is "
+               "DynamicMxQuant -> QBMM -> SwigluGroupQuant -> QBMM (38.25 us/layer in the trace). "
+               "shared_window is a SIGNAL about the order, not a measurement of the served block.")
 
     # The NPU half's routing per layer, computed once and OUTSIDE any capture:
     # the control arms must contain the same NPU work the kt arms do, and a
@@ -278,13 +315,29 @@ def main() -> int:  # noqa: C901
 
     capture("g_fat", _fat_body)
 
+    if shared_fn is not None:
+        def _npu_shared_body(_s):
+            h = sx
+            for (off, lay, comm), (ids_n, w_n) in zip(stack, npu_routing):
+                s_out = shared_fn(h)
+                h = h + N.npu_moe(lay, comm, h, w_n, ids_n) + s_out
+            return h
+
+        capture("g_npu_shared", _npu_shared_body)
+
     # ------------------------------------------------------ the kt arms
-    def kt_body(_stream):
+    def kt_body(_stream, shared: str = "off"):
         h = sx
         for off, lay, comm in stack:
             r = off.route(h, sw, sids, in_profile_run=False)
             pre = N.npu_moe(lay, comm, h, r.topk_weights, r.topk_ids)
-            h = h + off.merge(pre)
+            # §4.31: "before" = between the fork and the join (merge() holds
+            # the join); "after" = behind the H2D, today's production order.
+            s_out = shared_fn(h) if shared == "before" else None
+            h_next = h + off.merge(pre)
+            if shared == "after":
+                s_out = shared_fn(h)
+            h = h_next if s_out is None else h_next + s_out
         return h
 
     def set_arm(name: str) -> None:
@@ -302,14 +355,21 @@ def main() -> int:  # noqa: C901
             off._submit_ops = None
         getattr(KL, "_SIDE_BUFFER_OWNER", getattr(KL, "_SIDE_INFLIGHT", {})).clear()
 
+    def base_arm(name: str) -> str:
+        """The production switches an arm runs with (fork2 / fork_sa / fork_sb are all 'fork')."""
+        return "fork" if name in ("fork2", *SHARED_ARMS) else name
+
     arm_flags = {}
     calls_before_capture = dict(KL.HOST_FUNC_CALLS)
     for name in arms:
-        set_arm("fork" if name == "fork2" else name)
+        set_arm(base_arm(name))
         arm_flags[name] = {"overlap": stack[0][0].overlap, "async_wait": stack[0][0].async_wait,
-                           "device_signal": stack[0][0].device_signal}
-        capture(name, kt_body)
-    missing = [a for a in (*arms, "g_npu_only", "g_fat") if a not in graphs]
+                           "device_signal": stack[0][0].device_signal,
+                           "shared_mlp": SHARED_ARMS.get(name, "off")}
+        sh = SHARED_ARMS.get(name, "off")
+        capture(name, lambda s, _sh=sh: kt_body(s, _sh))
+    controls = ("g_npu_only", "g_fat", *(("g_npu_shared",) if shared_fn is not None else ()))
+    missing = [a for a in (*arms, *controls) if a not in graphs]
     v.check(not missing, f"every arm captured (missing: {missing or 'none'}; errors: {build_errors or 'none'})")
     if missing:
         return v.finish(os.path.join(args.out, "t4p_result.json"),
@@ -330,7 +390,7 @@ def main() -> int:  # noqa: C901
         st0 = {lid: DS.STEPS.get(lid, 0) for lid in layer_ids}
         fat0 = calls["fat"]
         if name in arms:
-            set_arm("fork" if name == "fork2" else name)
+            set_arm(base_arm(name))
         graphs[name][0].replay()
         torch.npu.synchronize()
         hf = sum(KL.HOST_FUNC_CALLS.get(lid, 0) - hf0[lid] for lid in layer_ids)
@@ -375,7 +435,7 @@ def main() -> int:  # noqa: C901
 
     def replay_of(name):
         g = graphs[name][0]
-        arm = "fork" if name == "fork2" else name
+        arm = base_arm(name)
 
         def run():
             # The per-arm instance flags decide what the *callback* and the
@@ -387,7 +447,7 @@ def main() -> int:  # noqa: C901
 
         return run
 
-    dev_arms = {name: replay_of(name) for name in (*arms, "g_npu_only", "g_fat")}
+    dev_arms = {name: replay_of(name) for name in (*arms, *controls)}
     dev_arms["eager_npu_only"] = lambda: npu_chain(sx)
 
     # 🔴 How much blocker: enough that the HOST is still enqueueing when the
@@ -477,7 +537,7 @@ def main() -> int:  # noqa: C901
 
     # ---- the predictions --------------------------------------------------
     measured = {"sidestream": args.measured_sidestream, "p1a": args.measured_p1a, "p1b": args.measured_p1b,
-                "null": None}
+                "null": None, "shared_window": None}
     preds: dict = {}
     for mech, (a, b) in MECHANISMS.items():
         if a not in graphs or b not in graphs:
@@ -498,6 +558,20 @@ def main() -> int:  # noqa: C901
                   f"{pl['median']:+8.1f} us/layer (p10 {pl['p10']:+8.1f}, p90 {pl['p90']:+8.1f})  "
                   f"=> {pm['median']:+6.2f} ms/token (p10 {pm['p10']:+6.2f}, p90 {pm['p90']:+6.2f})  "
                   f"{'resolved' if p['resolved'] else '🔴 NOT RESOLVED'}", flush=True)
+
+    # ---- §4.31: what the shared MLP costs, and what moving it bought -------
+    shared_report = None
+    if shared_fn is not None and "shared_window" in preds:
+        cost = M.per_layer_delta(dv["g_npu_shared"], dv["g_npu_only"], args.layers)
+        sw_pl = preds["shared_window"]["per_layer_us"]
+        shared_report = {"chain": shared_kind, "mlp_cost_per_layer_us": cost,
+                         "window_delta_per_layer_us": sw_pl,
+                         "resolved": preds["shared_window"]["resolved"]}
+        print(f"\n  §4.31 shared MLP ({shared_kind}): costs {cost['median']:+.1f} us/layer on its own "
+              f"(g_npu_shared - g_npu_only; p10 {cost['p10']:+.1f}, p90 {cost['p90']:+.1f}); "
+              f"fork_sb - fork_sa = {sw_pl['median']:+.1f} us/layer (p10 {sw_pl['p10']:+.1f}, "
+              f"p90 {sw_pl['p90']:+.1f}), {'resolved' if preds['shared_window']['resolved'] else 'NOT resolved'}. "
+              "Ideal is about -cost. A signal only: 'not seen here' is not 'no gain'.", flush=True)
 
     # ---- the proxy's own floor (the null mechanism) -----------------------
     floor_ms = abs(preds["null"]["pred_ms_per_token"]["median"]) if "null" in preds else None
@@ -590,6 +664,7 @@ def main() -> int:  # noqa: C901
         "criteria": {"file": "tools/kt_offload/oncard/PROXY_CRITERIA.md",
                      "rel_tol": M.PROXY_REL_TOL, "min_calibrated": M.PROXY_MIN_CALIBRATED},
         "graph_build_errors": build_errors,
+        "shared_window": shared_report,
         "args": vars(args),
     }
     return v.finish(os.path.join(args.out, "t4p_result.json"), extra)

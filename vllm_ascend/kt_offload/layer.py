@@ -49,7 +49,7 @@ import torch
 # (vllm/logger.py:204-214). 132 files in this tree use the import below.
 from vllm.logger import logger
 
-from vllm_ascend.kt_offload import async_wait, device_signal, report_affinity, seam_timing, side_stream
+from vllm_ascend.kt_offload import async_wait, device_signal, report_affinity, seam_timing, shared_window, side_stream
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
     NpuRouting,
@@ -216,6 +216,17 @@ class KTLayerOffload:
         # _join_side_stream. route()'s blanket _pending_join reset must not
         # clear it -- see _claim_side_buffers.
         self._side_inflight = False
+        # Merge accounting (shared_window). Every route must be followed by
+        # exactly ONE merge call, whoever makes it: with
+        # VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW on, the caller is
+        # fused_moe._forward_impl instead of routed_experts.forward_impl, and
+        # both halves of that split fail silently (a merge that never happens
+        # drops this layer's CPU experts; a duplicated call site only happens
+        # to be harmless because merge() finds nothing pending the second
+        # time). Counted here, checked at the next route -- see
+        # _assert_merge_balance.
+        self._merge_owed = False
+        self._merges_since_route = 0
         # Host-func count of this layer when its capture recorded the node.
         self._hostfunc_at_capture: int | None = None
         self.overlap = bool(getattr(cfg, "overlap_side_stream", False))
@@ -232,6 +243,14 @@ class KTLayerOffload:
         # they are two ways to start the same work, and an arm must differ in
         # one thing.
         self.device_signal = device_signal.enabled_by_env()
+        # §4.31, env-only (shared_window.ENV_NAME). When on, forward_impl hands
+        # back an un-merged routed_out and fused_moe._forward_impl calls
+        # merge() after the shared-expert MLP, so those 38.25 us/layer land in
+        # the window where the main stream only waits for kt. Nothing in THIS
+        # class changes: merge() does the same work at a later point in program
+        # order, which is why the side stream being off still runs correctly
+        # (it just buys nothing -- there is no idle window to fill).
+        self.shared_in_window = shared_window.enabled_by_env()
         self._packed: dict[int, dict] = {}
         # bs -> (slot index in the pinned signal array, the 1-element view the
         # graph's counter copy writes). P1b only.
@@ -311,6 +330,18 @@ class KTLayerOffload:
         if not p.cpu_ids:
             return  # every expert resident: nothing for kt to do
         self.wrapper = self._build_wrapper()
+        if self.shared_in_window:
+            # One line per layer, like SIDE STREAM ENABLED: a whole-network arm
+            # counts these to prove the switch was on (40) or off (0) -- an
+            # env var that never reached the process reads the same as "no gain".
+            logger.warning(
+                "kt_offload: SHARED IN WINDOW for layer %d (%s=1, overlap_side_stream=%s): the kt merge "
+                "is made by fused_moe._forward_impl after the shared-expert MLP. Criterion: bit-identity "
+                "with the switch off, never TPOT (a dropped merge is silent).",
+                self.layer_idx,
+                shared_window.ENV_NAME,
+                self.overlap,
+            )
         # Seam timing, if the env var asks for it. The CPUInfer probe is what
         # splits kt's submit from its sync without touching kt's C++; where WE
         # make those two calls, no probe is needed (and wrapping there would
@@ -845,6 +876,12 @@ class KTLayerOffload:
                     f"kt_offload route: no {name} table baked for {dtype}; the placement tables were built "
                     f"for {sorted(str(d) for d in baked)} in process_weights_after_loading."
                 )
+        # Before anything is overwritten: the previous route's merge must have
+        # happened exactly once. Placed after the dtype checks above so a route
+        # that refused its arguments never arms the counter.
+        self._assert_merge_balance(hidden_states)
+        self._merge_owed = True
+        self._merges_since_route = 0
         self._pending = None
         self._pending_captured = False
         self._pending_own_out = False
@@ -923,8 +960,59 @@ class KTLayerOffload:
             self._keep_tables[topk_weights.dtype],
         )
 
+    def _assert_merge_balance(self, hidden_states: torch.Tensor) -> None:
+        """Exactly one merge() call per route, whoever makes it.
+
+        🔴 The failure this exists for is silent. ``merge()`` is the only place
+        the CPU half of the experts is added, and with
+        ``VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW`` on it is called from a
+        different file (fused_moe._forward_impl) than the one that routes
+        (routed_experts.forward_impl). A path that forgets it produces a tensor
+        of the right shape and plausible values -- the resident half alone --
+        and nothing raises; a path that calls it twice is wrong even though the
+        second call happens to find nothing pending today.
+
+        Checked at the NEXT route rather than at the second merge, because
+        "merge with nothing pending is a no-op" is an existing contract (the
+        profile-run and all-resident paths rely on it). One layer's step of
+        delay is enough: the assertion fires before any output of the step that
+        forgot it can be read a second time, and in graph mode route/merge run
+        once, at capture.
+
+        The carve-out: with the side stream on, a capture that submitted and
+        was never joined is *also* what ``_claim_side_buffers`` refuses a few
+        lines below, and its message names the buffers and the missing join.
+        Let that one speak; it is strictly more specific and the submit below
+        always reaches it in that state.
+        """
+        if not self._merge_owed:
+            return
+        merges = self._merges_since_route
+        report = shared_window.merge_balance_ok(merges, layer_idx=self.layer_idx)
+        if report["ok"]:
+            return
+        if (
+            merges == 0
+            and self._side_inflight
+            and _capturing()
+            and self.wrapper is not None
+            and hidden_states.shape[0] > 0
+        ):
+            return
+        raise AssertionError(
+            f"kt_offload: layer {self.layer_idx} reached route() with {merges} merge call(s) since its "
+            f"previous route, expected exactly 1 ({report['why']}). With "
+            f"{shared_window.ENV_NAME}=1 the merge is made by fused_moe._forward_impl after the "
+            "shared-expert MLP; with it off by routed_experts.forward_impl. Exactly one of them must run."
+        )
+
     def merge(self, routed_out: torch.Tensor) -> torch.Tensor:
         """Add the CPU half at the routed-output point (already scaled weights)."""
+        # Counted for every call, including the no-op ones (profile run,
+        # all-resident layer, nothing pending): what has to be exactly one is
+        # the number of CALLS, which is the thing a deferred call site can get
+        # wrong. See _assert_merge_balance.
+        self._merges_since_route += 1
         hs, self._pending = self._pending, None
         if hs is None:
             return routed_out

@@ -648,13 +648,54 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
         return topk_weights, topk_ids
 
+    @property
+    def kt_shared_in_window(self) -> bool:
+        """Whether THIS layer's caller owes the kt merge (§4.31, env-gated).
+
+        True only with kt offload on and VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=1.
+        Read by fused_moe._forward_impl, the only caller able to put the
+        shared-expert MLP in front of the merge.
+        """
+        kt_offload = self.kt_offload
+        return kt_offload is not None and kt_offload.shared_in_window
+
+    def kt_merge(self, routed_out: torch.Tensor) -> torch.Tensor:
+        """Add the CPU half of this layer's experts.
+
+        🔴 The ONLY call site of ``kt_offload.merge`` in the tree, so that
+        "exactly once per forward" is a property of who calls this rather than
+        of how many places know about kt. With ``defer_kt_merge`` the caller
+        (fused_moe._forward_impl) calls it after the shared-expert MLP;
+        without it ``forward_impl`` does, at the point it always has. Either
+        way the layer counts the calls and refuses a route that saw anything
+        other than one (kt_offload/layer.py:_assert_merge_balance).
+        """
+        kt_offload = self.kt_offload
+        if kt_offload is not None:
+            # Same point as the NPU experts' output: router weights (incl.
+            # routed_scaling_factor) are already applied on both sides; the
+            # shared expert is added later by the runner.
+            routed_out = kt_offload.merge(routed_out)
+        return routed_out
+
     def forward_impl(
         self,
         *,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        defer_kt_merge: bool = False,
     ):
+        """Run the routed half of the layer.
+
+        ``defer_kt_merge`` (§4.31): do NOT add the CPU half here; the caller
+        must call ``kt_merge()`` on the returned tensor before anything reads
+        it. Only fused_moe._forward_impl's shared-expert branch passes True,
+        and only when ``kt_shared_in_window`` says so; every other call site
+        (the no-shared-expert short circuit, the SP custom op wrapper, other
+        models calling forward_impl directly) leaves it False and keeps the
+        merge here.
+        """
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice
         # (compilation + capture), causing moe_layer_index to overflow.
@@ -747,11 +788,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
-        if kt_offload is not None:
-            # Same point as the NPU experts' output: router weights (incl.
-            # routed_scaling_factor) are already applied on both sides; the
-            # shared expert is added later by the runner.
-            routed_out = kt_offload.merge(routed_out)
+        if not defer_kt_merge:
+            routed_out = self.kt_merge(routed_out)
 
         # Clear per-forward LoRA state from long-lived singletons.
         if lora_context is not None:

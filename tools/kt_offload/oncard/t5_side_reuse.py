@@ -131,11 +131,43 @@ counter and a healthy one look the same in a log.
   ``--stall-ms M``  the same positive control, applied to the polling thread:
                     if the device is really parked on that event, the clean p1b
                     arm's replays cost steps x layers x M.
+
+§4.31: the shared-expert MLP inside the window
+----------------------------------------------
+``--shared-mlp`` inserts a shared-expert MLP at the served shapes (5120 ->
+2x2304 -> 5120) into every layer of the stack, which the plain t5r does not
+have at all (``quant_method.apply`` is called with ``shared_experts=None``), so
+the order the switch changes has something to change:
+
+  ``after``   the un-moved order: route -> ... -> merge -> shared MLP
+  ``before``  the switch on: route -> ... -> shared MLP -> merge, i.e. the MLP
+              runs while the main stream would otherwise only be waiting for
+              the CPU experts
+  ``both``    both, as two arms, compared to each other AND to the eager serial
+              reference. **Bit-identity is the criterion**: the shared expert
+              reads the layer input and depends on neither routed_out nor the
+              CPU half, so moving the merge behind it must change no bit.
+
+  ``--mutant no-merge``  the deferred call site simply not made: the CPU half
+              of every layer is dropped. MUST be RED -- this is the failure the
+              switch risks, and the one that raises nothing (right shape,
+              plausible values). It runs on the SERIAL base (side stream off):
+              with the side stream on, a missing merge is also a missing join
+              and the capture itself dies (loud, and already the drop-join
+              arm's business), whereas serial captures fine and only the BITS
+              can say so -- so this arm must capture AND differ. It additionally
+              asks the production guard (``KTLayerOffload._assert_merge_balance``)
+              whether it sees the violation, the in-process half of the check.
+
+🔴 Which operator chain the stand-in uses is decided by probing the build
+(npu_moe.build_shared_mlp) and printed; its weights are random. Correctness
+does not depend on the chain (both arms run the same one), any timing does.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -165,6 +197,9 @@ PLAN = """t5r plan (the service's shape, not the single-layer one):
             MUST get about steps x layers x M slower (else nothing waits)
   judge   : bit-identity against an EAGER serial reference computed first, per step;
             plus host-func = K per layer, and the K replays pairwise different
+  shared  : --shared-mlp {after,before,both} puts a served-shape shared-expert
+            MLP in every layer and runs the merge after / before it (§4.31);
+            both arms must be bit-identical to the reference and to each other
   scope   : correctness. The ONE timing here is the --stall-ms positive
             control (does the device really wait on the ExternalEvent); it is
             not a performance measurement and must never be quoted as one."""
@@ -211,12 +246,20 @@ def main() -> int:  # noqa: C901
     ap.add_argument("--recycle", choices=("off", "inplace", "realloc"), default="inplace",
                     help="what happens to the routing buffers right after route() returns")
     ap.add_argument("--arms", default="serial,fork", help="comma list of serial,fork,p1a,p1b")
-    ap.add_argument("--mutant", choices=("none", "drop-join", "early-fork", "early-record", "signal-first",
+    ap.add_argument("--mutant", choices=("none", "drop-join", "early-fork", "early-record", "signal-first", "no-merge",
                                          "no-reset", "no-wait"),
                     default="drop-join",
                     help="the arm that MUST be red; --mutant none only to bisect (the verdict then fails "
                          "on 'zero mutation arms', by design). early-record/no-reset are the P1a ones and "
                          "need an arm with the async wait on")
+    ap.add_argument("--shared-mlp", choices=("off", "after", "before", "both"), default="off",
+                    help="§4.31: insert a served-shape shared-expert MLP in every layer and run the kt "
+                         "merge AFTER it (the un-moved order), BEFORE it (the switch on), or both as two "
+                         "arms. Bit-identity between the two is the criterion.")
+    ap.add_argument("--shared-inter", type=int, default=C.INTER,
+                    help="shared-expert intermediate size (DSV4.1: n_shared_experts=1 x 2304)")
+    ap.add_argument("--shared-chain", choices=("auto", "w8a8", "bf16"), default="auto",
+                    help="which operator chain the stand-in uses; 'auto' probes the build and prints it")
     ap.add_argument("--stall-ms", type=float, default=0.0,
                     help="🔴 the discriminator. Hold EVERY ExternalEvent record back by this many ms, in "
                          "every async-wait arm. The clean p1a arm then has to take about "
@@ -294,7 +337,7 @@ def main() -> int:  # noqa: C901
     print(f"t5r: layers {layer_ids[0]}-{layer_ids[-1]} ({len(layer_ids)}), steps {args.steps}, "
           f"tokens {args.tokens}, recycle {args.recycle}, arms {arms}, mutant {args.mutant}, "
           f"stress {args.stress}{'' if args.stress == 'none' else f'x{args.stress_reps}'}, "
-          f"probe {'on' if args.probe else 'off'}, "
+          f"probe {'on' if args.probe else 'off'}, shared-mlp {args.shared_mlp}, "
           f"async wait {'ON for the p1a arm' if want_p1a else 'off'}, "
           f"device signal {'ON for the p1b arm' if want_p1b else 'off'}", flush=True)
     if args.dry_run or os.environ.get("ONCARD_DRY") == "1":
@@ -343,6 +386,18 @@ def main() -> int:  # noqa: C901
     pl0 = stack[0][0].placement
     print(N.hbm_line(), flush=True)
 
+    # ------------------------------------------------- the shared expert (§4.31)
+    # Built outside any capture, once, and shared by every arm: what the two
+    # arms differ in is WHERE it is called, never what it computes.
+    shared_fn, shared_kind = (None, None)
+    if args.shared_mlp != "off":
+        shared_fn, shared_kind = N.build_shared_mlp(dev, hidden=C.HIDDEN, inter=args.shared_inter,
+                                                    kind=args.shared_chain)
+        v.note(f"shared-expert stand-in: chain {shared_kind!r}, {C.HIDDEN} -> 2x{args.shared_inter} -> "
+               f"{C.HIDDEN}, random weights. The served block is DynamicMxQuant -> QBMM -> "
+               f"SwigluGroupQuant -> QBMM; correctness does not depend on the chain (both arms run the "
+               f"same one), TIMING DOES -- do not quote a time from this run.")
+
     # ------------------------------------------------------------- the data
     rng = np.random.default_rng(args.seed + 7000 + 97 * layer_ids[0] + T)
     inputs = []
@@ -364,7 +419,14 @@ def main() -> int:  # noqa: C901
         for off, lay, comm in stack:
             npu_routing = off.route(h, w0, ids0, in_profile_run=False)
             pre = N.npu_moe(lay, comm, h, npu_routing.topk_weights, npu_routing.topk_ids)
+            # The reference is SERIAL and un-moved: shared expert on the layer
+            # input, merge where it has always been. Every arm is judged
+            # against this, so an arm that moves the merge is judged against an
+            # order it does not share -- which is the point.
+            shared = shared_fn(h) if shared_fn is not None else None
             h = h + off.merge(pre)
+            if shared is not None:
+                h = h + shared
         return h
 
     ref = [run_eager(*inp).float().cpu() for inp in inputs]
@@ -703,8 +765,10 @@ def main() -> int:  # noqa: C901
         self._pending_join = (join, side, compute)
 
     # --------------------------------------------------------- the arm runner
-    def arm(name: str, forked: bool, mutant: str, p1a: bool = False, p1b: bool = False) -> dict:  # noqa: C901
-        key = f"{name}{'' if mutant == 'none' else '+' + mutant}"
+    def arm(name: str, forked: bool, mutant: str, p1a: bool = False, p1b: bool = False,
+            shared: str = "off") -> dict:  # noqa: C901
+        key = (f"{name}{'' if mutant == 'none' else '+' + mutant}"
+               f"{'' if shared == 'off' else '#shared-' + shared}")
         # stall-record is a POSITIVE control, not a mutation: its output must
         # be bit-identical and its wall time must not be. So it is judged.
         is_mutant = mutant not in ("none", "stall-record")
@@ -722,8 +786,16 @@ def main() -> int:  # noqa: C901
             off._pending_join = None
             off._side_inflight = False  # harmless on a build without the guard
             off._submit_ops = None
+            # §4.31 merge accounting: the harness re-captures the SAME layer
+            # objects arm after arm, and the no-merge mutant deliberately
+            # leaves a route un-merged. Clear it here so the guard speaks about
+            # the arm it is in, not about the previous one; the no-merge arm
+            # asks it directly after its capture (guard_raised below).
+            if hasattr(off, "_merge_owed"):
+                off._merge_owed, off._merges_since_route = False, 0
         getattr(KL, "_SIDE_BUFFER_OWNER", getattr(KL, "_SIDE_INFLIGHT", {})).clear()
         out: dict = {"forked": forked, "p1a": p1a, "mutant": mutant, "recycle": args.recycle,
+                     "shared_mlp": shared, "shared_chain": shared_kind,
                      "captured": None, "error": None, "where": None, "all_bit_identical": None}
         ghost_hits: list = []
 
@@ -748,7 +820,26 @@ def main() -> int:  # noqa: C901
                 ghost_w.fill_(poison_w)
                 del ghost_ids, ghost_w
             pre = N.npu_moe(lay, comm, h, w2, ids2)
-            return h + off.merge(pre)
+            # §4.31. ``before`` is the switch on: the shared MLP is enqueued
+            # between the fork and the join, i.e. inside the window where the
+            # main stream would otherwise only wait for the CPU experts.
+            # ``after`` is the order production has today. Neither reads the
+            # other's output, which is the claim under test.
+            s_out = shared_fn(h) if (shared == "before" and shared_fn is not None) else None
+            if mutant == "no-merge":
+                # 🔴 MUTANT: the deferred call site not made at all. The CPU
+                # half of every layer is dropped -- nothing raises here, the
+                # tensor has the right shape, and only the comparison against
+                # the reference says so.
+                merged = pre
+            else:
+                merged = off.merge(pre)
+            if shared == "after" and shared_fn is not None:
+                s_out = shared_fn(h)
+            # Same association as the reference ((h + merged) + shared), so a
+            # difference can only come from the merge, never from float order.
+            out_h = h + merged
+            return out_h if s_out is None else out_h + s_out
 
         g = torch.npu.NPUGraph()
         saved_join = KL.KTLayerOffload._join_side_stream
@@ -805,6 +896,33 @@ def main() -> int:  # noqa: C901
             # (step, layer) accounting -- which is the whole point, because the
             # question "was this THIS step's routing?" is the same question.
             out["probe_entries_wrapped"] = _probe_poller_entries()
+        def probe_merge_guard() -> None:
+            """The in-process half of the same question: does the production
+            guard SEE a route that was never merged?
+
+            Asked on the real layer objects, after the capture that skipped
+            them -- and in BOTH exits, because a stack whose side-stream work
+            is never joined usually dies at capture_end with ACL 107025 first
+            (also red, but for the other reason), and the guard would then
+            never be asked at all."""
+            if mutant != "no-merge":
+                return
+            raised = 0
+            for off, _, _ in stack:
+                checker = getattr(off, "_assert_merge_balance", None)
+                if checker is None:
+                    return
+                try:
+                    checker(sx)
+                except AssertionError:
+                    raised += 1
+                off._merge_owed, off._merges_since_route = False, 0
+            out["guard_raised"] = f"{raised}/{len(stack)}"
+            v.check(raised == len(stack),
+                    f"arm {key}: the merge-balance guard refused every un-merged layer "
+                    f"({raised}/{len(stack)}). A guard that stays quiet here is the reason this mutant "
+                    f"exists: a dropped merge raises nothing on its own.")
+
         probe_log.clear()
         calls0 = dict(KL.HOST_FUNC_CALLS)
         try:
@@ -833,6 +951,7 @@ def main() -> int:  # noqa: C901
             DS.Poller._handle = saved_handle
             KL.KTLayerOffload._poll_run = saved_poll_run
             _probe_poller_entries(restore=True)
+            probe_merge_guard()
             return out
         finally:
             KL.KTLayerOffload._join_side_stream = saved_join
@@ -861,6 +980,7 @@ def main() -> int:  # noqa: C901
                   f"arm {key}: every layer's freed weights block was handed straight back "
                   f"({hit_w}/{len(ghost_hits)}); if not, --recycle realloc is not testing what it claims")
 
+        probe_merge_guard()
         ran = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - calls0.get(lid, 0) for lid in layer_ids}
         out["host_func_during_capture"] = ran
         judge(all(n == 0 for n in ran.values()), f"arm {key}: capture ran no host-func node (ran {ran})")
@@ -947,9 +1067,12 @@ def main() -> int:  # noqa: C901
                   f"got {min(grew.values())}..{max(grew.values())}; {eager_passes} eager passes do not "
                   f"count -- eager runs kt's own submit/sync, not a host-func node)")
 
-        results, all_same = [], True
+        results, all_same, hashes = [], True, []
         for k in range(args.steps):
             r = outs[k].float().cpu()
+            # The bytes themselves, so two arms can be compared without keeping
+            # their tensors alive (and so the JSON says which step differed).
+            hashes.append(hashlib.sha256(r.contiguous().numpy().tobytes()).hexdigest()[:16])
             same, how = C.bit_identical(r, ref[k])
             all_same = all_same and same
             judge(same, f"arm {key}: step {k} == eager serial step {k}: {how}"
@@ -967,6 +1090,7 @@ def main() -> int:  # noqa: C901
         judge(not bad_pairs, f"arm {key}: the {len(pairs)} compared step pairs are all different "
                              f"(identical: {bad_pairs[:4]})")
         out["steps"] = results
+        out["step_hashes"] = hashes
         out["all_bit_identical"] = all_same
         out["first_divergent_step"] = next((r["step"] for r in results if not r["bit_identical"]), None)
         print(f"  arm {key}: bit-identical {sum(r['bit_identical'] for r in results)}/{args.steps}"
@@ -1031,23 +1155,53 @@ def main() -> int:  # noqa: C901
 
     # --------------------------------------------------------------- run it
     results: dict[str, dict] = {}
+    shared_variants = {"off": ["off"], "after": ["after"], "before": ["before"],
+                       "both": ["after", "before"]}[args.shared_mlp]
     for name in arms:
         forked = name in ("fork", "p1a", "p1b")
-        print(f"\n===== arm {name} (side stream {'ON' if forked else 'off'}, "
-              f"async wait {'ON' if name == 'p1a' else 'off'}, "
-              f"device signal {'ON' if name == 'p1b' else 'off'}, recycle {args.recycle}) =====", flush=True)
-        results[name] = arm(name, forked=forked, mutant="none", p1a=(name == "p1a"), p1b=(name == "p1b"))
-        v.check(results[name]["captured"] is True,
-                f"arm {name} captured (error: {results[name]['error']})")
-        if results[name].get("replay_wall_s") is not None:
-            print(f"  arm {name}: {args.steps} replays + one synchronize took "
-                  f"{results[name]['replay_wall_s']}s", flush=True)
+        for sh in shared_variants:
+            key = name if sh == "off" else f"{name}#shared-{sh}"
+            print(f"\n===== arm {key} (side stream {'ON' if forked else 'off'}, "
+                  f"async wait {'ON' if name == 'p1a' else 'off'}, "
+                  f"device signal {'ON' if name == 'p1b' else 'off'}, recycle {args.recycle}, "
+                  f"shared MLP {sh}) =====", flush=True)
+            results[key] = arm(name, forked=forked, mutant="none", p1a=(name == "p1a"),
+                               p1b=(name == "p1b"), shared=sh)
+            v.check(results[key]["captured"] is True,
+                    f"arm {key} captured (error: {results[key]['error']})")
+            if results[key].get("replay_wall_s") is not None:
+                print(f"  arm {key}: {args.steps} replays + one synchronize took "
+                      f"{results[key]['replay_wall_s']}s", flush=True)
+    # §4.31: the two orders, byte for byte against each other. Both are already
+    # compared to the eager serial reference; this says it again directly, so a
+    # reference that was somehow wrong for both cannot hide the difference.
+    if args.shared_mlp == "both":
+        for name in arms:
+            a, b = results.get(f"{name}#shared-after"), results.get(f"{name}#shared-before")
+            if not (a and b):
+                continue
+            ha, hb = a.get("step_hashes"), b.get("step_hashes")
+            v.check(bool(ha) and ha == hb,
+                    f"arm {name}: the merge AFTER the shared MLP and BEFORE it produced the same bytes in "
+                    f"all {args.steps} steps (after {ha}, before {hb}). This is what "
+                    f"VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW claims: the shared expert reads the layer "
+                    f"input and depends on neither routed_out nor the CPU half.")
     if args.mutant != "none":
         mut_p1b = "p1b" in arms and args.mutant in (*P1B_MUTANTS, *SHARED_MUTANTS)
         mut_p1a = not mut_p1b and args.mutant in P1A_MUTANTS
         base = "p1b" if mut_p1b else "p1a" if mut_p1a else "fork"
+        # The no-merge mutant belongs to the §4.31 order: run it in the arm the
+        # switch produces (shared MLP before the merge) when there is one.
+        mut_shared = ("before" if args.shared_mlp in ("before", "both")
+                      else shared_variants[0] if args.mutant == "no-merge" else "off")
+        # no-merge on the serial base: see the module docstring -- forked, the
+        # missing join kills the capture first and the arm would be red for a
+        # reason that is not the one under test.
+        mut_forked = True
+        if args.mutant == "no-merge":
+            base, mut_forked, mut_p1a, mut_p1b = "serial", False, False, False
         print(f"\n===== MUTANT arm {base}+{args.mutant} (must be RED) =====", flush=True)
-        m = arm(base, forked=True, mutant=args.mutant, p1a=mut_p1a, p1b=mut_p1b)
+        m = arm(base, forked=mut_forked, mutant=args.mutant, p1a=mut_p1a, p1b=mut_p1b, shared=mut_shared)
         results[f"{base}+{args.mutant}"] = m
         if args.mutant == "signal-first":
             # 🔴 Same rule as no-reset/no-wait: prove the mutation HAPPENED.
@@ -1065,6 +1219,13 @@ def main() -> int:  # noqa: C901
                     f"capture (want {len(layer_ids)}, one per layer). Without this, a mutant that quietly "
                     f"did nothing is indistinguishable from a criterion with no discriminating power.")
         red = (m["captured"] is not True) or (m["all_bit_identical"] is not True)
+        if args.mutant == "no-merge":
+            # Red for the RIGHT reason: it captured, it replayed, and the bytes
+            # differ from the reference because the CPU half is missing.
+            v.check(m["captured"] is True and m["all_bit_identical"] is False,
+                    f"mutant no-merge is red BY ITS BITS (captured={m['captured']}, "
+                    f"bit_identical={m['all_bit_identical']}, error={m['error']}); a capture error "
+                    f"here would be red for a reason other than the dropped CPU half")
         if args.mutant == "no-reset":
             # 🔴 2026-09-23, measured, not assumed. On this build the captured
             # ExternalEvent wait re-arms itself on every replay: with all 8 reset
@@ -1101,12 +1262,21 @@ def main() -> int:  # noqa: C901
             if not red:
                 v.note("🔴 the mutant passed the same criteria as the clean arm ⇒ the criterion has no "
                        "discriminating power in this run; no arm here may be called a pass")
+    def res(base: str) -> dict | None:
+        """This base arm's result, whichever shared-MLP variant it ran as."""
+        if base in results:
+            return results[base]
+        for k, val in results.items():
+            if k.split("#")[0] == base and "+" not in k:
+                return val
+        return None
+
     # ---- the positive control: is the device really parked on the event? ----
-    stall_arm = "p1b" if "p1b" in results else "p1a"
-    if args.stall_ms and stall_arm in results:
+    stall_arm = "p1b" if res("p1b") else "p1a"
+    if args.stall_ms and res(stall_arm) is not None:
         want = 0.7 * args.steps * len(layer_ids) * args.stall_ms / 1000.0
-        got = results[stall_arm].get("replay_wall_s")
-        base_wall = (results.get("fork") or {}).get("replay_wall_s")
+        got = (res(stall_arm) or {}).get("replay_wall_s")
+        base_wall = (res("fork") or {}).get("replay_wall_s")
         v.check(got is not None and got >= want,
                 f"positive control: with every ExternalEvent record held back {args.stall_ms} ms, the "
                 f"clean {stall_arm} arm's {args.steps} replays took {got}s (want >= {want:.2f}s = 0.7 x steps x "
@@ -1114,22 +1284,22 @@ def main() -> int:  # noqa: C901
                 f"was NOT waiting on that event would finish in the usual time whatever the completion "
                 f"thread does -- this is the only check here that can tell those two apart.")
 
-    if "serial" in results and results["serial"].get("all_bit_identical") is not True:
+    if res("serial") is not None and res("serial").get("all_bit_identical") is not True:
         v.note("🔴 the NEGATIVE control (side stream off) is not bit-identical either ⇒ the harness itself "
                "is wrong (or the poison is reaching the compute path); the fork arm's result says nothing "
                "until this is green")
-    if "fork" in results and "serial" in results:
-        f_ok = results["fork"].get("all_bit_identical")
-        s_ok = results["serial"].get("all_bit_identical")
+    if res("fork") is not None and res("serial") is not None:
+        f_ok = res("fork").get("all_bit_identical")
+        s_ok = res("serial").get("all_bit_identical")
         v.note(f"discriminating pair: serial {'green' if s_ok else 'RED'} / fork {'green' if f_ok else 'RED'} "
                f"-- same schedule, same poison, only the stream the D2H and the host-func sit on differs")
-    if "p1b" in results:
-        b_ok = results["p1b"].get("all_bit_identical")
+    if res("p1b") is not None:
+        b_ok = res("p1b").get("all_bit_identical")
         v.note(f"p1b arm {'green' if b_ok else 'RED'}: same buffers, same stream, same poison as 'fork' -- "
                "the only difference is that the graph has NO host task at all: an 8-byte counter copy "
                "behind the input copy starts the CPU experts, and a polling thread records the event")
-    if "p1a" in results:
-        p_ok = results["p1a"].get("all_bit_identical")
+    if res("p1a") is not None:
+        p_ok = res("p1a").get("all_bit_identical")
         v.note(f"p1a arm {'green' if p_ok else 'RED'}: same buffers, same stream, same poison as 'fork' -- "
                "the only difference is that the device waits on an ExternalEvent a completion thread "
                "records instead of on the callback's return")
@@ -1139,6 +1309,8 @@ def main() -> int:  # noqa: C901
                      "recycle": args.recycle, "mutant": args.mutant, "probe": args.probe,
                      "async_wait": want_p1a, "device_signal": want_p1b, "stall_ms": args.stall_ms,
                      "stress": args.stress, "stress_reps": args.stress_reps,
+                     "shared_mlp": args.shared_mlp, "shared_chain": shared_kind,
+                     "shared_inter": args.shared_inter,
                      "poison": {"id": poison_id, "weight": poison_w},
                      "measures_performance": False})
 
