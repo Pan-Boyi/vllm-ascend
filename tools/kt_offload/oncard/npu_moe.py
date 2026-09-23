@@ -267,3 +267,109 @@ def offload_forward(off, layer, comm, x, topk_weights, topk_ids):
 def hbm_line() -> str:
     return (f"HBM allocated {torch.npu.memory_allocated() / 2**30:.2f} GiB, "
             f"peak {torch.npu.max_memory_allocated() / 2**30:.2f} GiB")
+
+
+# ---------------------------------------------------------------------------
+# Shared-expert MLP stand-in (§4.31)
+# ---------------------------------------------------------------------------
+#
+# What it is for: t5r's layers call quant_method.apply with shared_experts=None,
+# so the production order "routed -> kt merge -> shared MLP" has no shared MLP
+# in it at all and the switch that moves the merge behind it cannot be
+# exercised. This builds a block with the SHAPES the served model has (5120 ->
+# 2x2304 -> 5120, n_shared_experts=1) out of the quantized matmul operators the
+# build has, so the two orders can be compared bit for bit.
+#
+# 🔴 What it is NOT: the served shared expert. The weights are random, and
+# which operator chain runs is decided by probing this build (the served path
+# is DynamicMxQuant -> QBMM -> SwigluGroupQuant -> QBMM; the W8A8 chain below is
+# the same family at the same shapes, and the bf16 one is not quantized at all).
+# The correctness question -- "does moving the merge behind this block change
+# any bit?" -- does not depend on which chain runs, because both arms run the
+# same one. Any timing read off it does, so the chain is printed and recorded.
+
+
+def _shared_weights(hidden: int, inter: int, seed: int, device, dtype):
+    g = torch.Generator().manual_seed(seed)
+    if dtype == torch.int8:
+        gu = torch.randint(-8, 8, (hidden, 2 * inter), generator=g, dtype=torch.int8)
+        dn = torch.randint(-8, 8, (inter, hidden), generator=g, dtype=torch.int8)
+    else:
+        gu = (torch.randn((hidden, 2 * inter), generator=g) / 32).to(dtype)
+        dn = (torch.randn((inter, hidden), generator=g) / 32).to(dtype)
+    return gu.to(device), dn.to(device)
+
+
+def _shared_w8a8(hidden: int, inter: int, seed: int, device):
+    """The W8A8 chain of vllm_ascend/ops/fused_moe/shared_experts.py, call for call."""
+    import torch_npu
+
+    gu, dn = _shared_weights(hidden, inter, seed, device, torch.int8)
+    gu_scale = torch.full((2 * inter,), 0.01, dtype=torch.float32, device=device)
+    gu_scale_fp32 = gu_scale.clone()
+    dn_scale = torch.full((hidden,), 0.01, dtype=torch.float32, device=device)
+
+    def run(x: torch.Tensor) -> torch.Tensor:
+        qx, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+        h = torch_npu.npu_quant_matmul(qx, gu, gu_scale, pertoken_scale=None, bias=None,
+                                       output_dtype=torch.int32)
+        q2, swiglu_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
+            x=h, weight_scale=gu_scale_fp32, activation_scale=pertoken_scale, bias=None,
+            quant_scale=None, quant_offset=None, group_index=None, activate_left=True,
+            quant_mode=1, swiglu_mode=1, clamp_limit=0.0,
+        )
+        return torch_npu.npu_quant_matmul(q2, dn, dn_scale, pertoken_scale=swiglu_scale, bias=None,
+                                          output_dtype=x.dtype)
+
+    return run
+
+
+def _shared_bf16(hidden: int, inter: int, seed: int, device):
+    """Fallback: same shapes, no quantization. Timing off it means less."""
+    gu, dn = _shared_weights(hidden, inter, seed, device, torch.bfloat16)
+
+    def run(x: torch.Tensor) -> torch.Tensor:
+        h = x @ gu
+        gate, up = h[:, :inter], h[:, inter:]
+        return (torch.nn.functional.silu(gate.float()) * up.float()).to(x.dtype) @ dn
+
+    return run
+
+
+SHARED_CHAINS = (("w8a8", _shared_w8a8), ("bf16", _shared_bf16))
+
+
+def build_shared_mlp(device, hidden: int = None, inter: int = None, seed: int = 41, kind: str = "auto"):
+    """Probe the build for a shared-MLP chain and return (fn, kind).
+
+    The probe runs each candidate once on a 1-token input OUTSIDE any capture
+    and keeps the first that returns a finite tensor of the right shape. A
+    chain that raises (wrong signature on this build, operator not installed)
+    or produces NaN/Inf is skipped and the reason printed -- silently falling
+    through to bf16 would turn "the quantized chain is missing" into a timing
+    result nobody can read.
+    """
+    hidden = C.HIDDEN if hidden is None else hidden
+    inter = C.INTER if inter is None else inter
+    probe = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
+    tried = []
+    for name, build in SHARED_CHAINS:
+        if kind not in ("auto", name):
+            continue
+        try:
+            fn = build(hidden, inter, seed, device)
+            out = fn(probe)
+            torch.npu.synchronize()
+            if tuple(out.shape) != (1, hidden):
+                raise ValueError(f"shape {tuple(out.shape)}, want (1, {hidden})")
+            if not torch.isfinite(out.float()).all():
+                raise ValueError("non-finite output")
+        except Exception as e:  # noqa: BLE001
+            tried.append(f"{name}: {type(e).__name__}: {str(e)[:160]}")
+            print(f"[shared-mlp] chain {name!r} unusable on this build -- {tried[-1]}", flush=True)
+            continue
+        what = ("quantized matmuls (same family as the served path)" if name != "bf16"
+                else "BF16 MATMULS, NOT the served op mix -- correctness only")
+        print(f"[shared-mlp] chain {name!r}: {hidden} -> 2x{inter} -> {hidden}, {what}", flush=True)
+        return fn, name
+    raise RuntimeError(f"no shared-MLP chain works on this build: {tried}")

@@ -200,6 +200,24 @@ class KTOffloadConfig:
                     "against HOSTFUNC_CALLBACK rows that do not exist. Refusing rather than printing a "
                     "report about nothing (§4.26 cost two nights to a pair of instruments that did)."
                 )
+        # §4.31 (VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW): the shared-expert MLP
+        # moves in front of the kt merge. Not refused without the side stream
+        # -- the order is still correct there, and an A/B with the side stream
+        # off is how "correct, just pointless" gets shown -- but say so, because
+        # a run that expects 1.4 ms/token from it and has no window to fill
+        # would otherwise look like the change not working.
+        from vllm_ascend.kt_offload import shared_window
+
+        if shared_window.enabled_by_env() and not self.overlap_side_stream:
+            from vllm.logger import logger
+
+            logger.warning(
+                "%s=1 without kt_offload_config.overlap_side_stream: the merge still moves behind the "
+                "shared-expert MLP and the result is unchanged, but there is no idle window to hide it in "
+                "(the main stream waits for the CPU experts inside merge() either way), so expect no "
+                "TPOT difference.",
+                shared_window.ENV_NAME,
+            )
         pc = vllm_config.parallel_config
         sizes = {
             "tensor_parallel_size": pc.tensor_parallel_size,

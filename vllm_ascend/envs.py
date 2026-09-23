@@ -313,6 +313,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # not noexec, and this project points TMPDIR at /dev/shm, which often is.
     # Not sensitive.
     "VLLM_ASCEND_DSV41_KT_POLL_CACHE": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_POLL_CACHE", ""),
+    # DeepSeek-V4.1 MoE offload: move the shared-expert MLP in front of the kt
+    # merge, so it runs inside the window where the main stream is only waiting
+    # for the CPU experts. The shared expert reads the MoE layer's input hidden
+    # states and depends on neither routed_out nor the CPU half; it sits behind
+    # the join purely because of call order (merge() is called inside
+    # routed_experts.forward_impl, the shared MLP only after it returns). With
+    # "1" the routed path hands back an UN-merged routed_out and
+    # fused_moe._forward_impl merges after ascend_shared_experts.forward(),
+    # still before it returns, so nothing reads routed_out in between. Anything
+    # else (default "0") keeps the merge where it is. Only useful together with
+    # kt_offload_config.overlap_side_stream (there is no idle window without
+    # it); with the side stream off the order still runs and is equivalent.
+    # 🔴 A dropped merge is SILENT (the CPU half of the experts vanishes and
+    # the tensor still looks fine), so the criterion is bit-identity against
+    # the arm with it off, never TPOT; the layer counts its merge calls per
+    # route (vllm_ascend/kt_offload/shared_window.py). Read at config
+    # validation and at weight-load time. Not sensitive.
+    "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW", "0"),
     # DeepSeek-V4.1 MoE offload: pin the ONE ACL report thread (the thread
     # torch_npu creates on the first _subscribe_report and that delivers every
     # _launch_host_func callback) to a PU kt's spinning workers do not own.
