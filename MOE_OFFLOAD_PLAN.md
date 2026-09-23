@@ -1253,6 +1253,18 @@ harness 建层与之前相同。上卡冒烟（全不设起服务、核三项有
 新增 `tests/ut/kt_offload/conftest.py`：每条用例前清四个 env **并删 `envs` 模块上的同名属性**——旧用例的 `monkeypatch.setattr(envs, …)`
 在撤销时把当时读到的值写成真属性、遮住之后所有 `setenv`（默认开以后这会让后续用例静默测错，整套跑时 20 条红即此因）。
 
+### 4.33.1 上卡冒烟（2026-09-23，卡 2，`oncard_runs/20260923_140639_defaults_on`）
+
+E1 = cfg_D 去掉 `overlap_side_stream` 一项（吃代码默认 true）+ **四个开关一个都不传**（`DEFAULTS=1`，`env -u` 剥掉父 shell 残留）。
+
+| 判据（先声明，`RUNBOOK_defaults_on.md`） | 读数 |
+|---|---|
+| 启动行逐字 = 默认语义 | 2/2 行：`side_stream=on(default) async_wait=on(auto: side stream on) shared_in_window=on(auto: follows the side stream) device_signal=off(default)` |
+| 每层 ENABLED 计数 | SIDE 40 · ASYNC WAIT 40 · SHARED IN WINDOW 40 · DEVICE SIGNAL 0 · ACL 错码 0 |
+| 逐位 D4（第二版显式开）vs E1（默认） | prefill 187/187、decode **1170/1170**、非零 Δlogprob 0、top-k 差 0、token 变化 0、退化步 0/1170（两臂） |
+
+⇒ 🟢 **默认开 ≡ 显式开**。起服务前核过：树 HEAD `865954031`、git status 0 行、指纹 dirty 0。就绪 310 s，未撞 `RunAicpuCommInit/11003`（`dsv41_singlecard_stream2` 09-23 的经验：**离上一个 HCCL 任务留够 5 分钟**；本发间隔约 380 s）。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -1347,3 +1359,4 @@ harness 建层与之前相同。上卡冒烟（全不设起服务、核三项有
 - 2026-09-23（phase2）：合版本（侧流+事件等待）验收——单轮 perf Δ4.22（稳妥 3.3–4.2）、整网 decode 1174/1174 逐位、GSM8K 50/50；1319 暂缓。侧流 3 ms 逐层对账：窗口是 13 个算子 78 µs/层（不是只有 GMM），D2H 与调起空隙挪到副流基本抵消，profiler 开销两臂不对称不能报收益。见 §4.32。
 - 2026-09-23（phase2）：刷新文首现状与 §0 分支起点；§4.18.1 队列更新状态（①②③ 完成、共享专家进窗口完成、频率放置本线不做、三轮补测往后排）。
 - 2026-09-23（phase2）：§4.33 侧流 / 事件等待 P1a / 共享专家进窗口 **改为默认开**（P1b 仍关）——统一由 `kt_offload/switches.py` 解析（未设=默认、`0`=关、`1`=开、其它拒起；P1a 未设时自动、遇 P1b 让位；共享进窗口未设跟随侧流）；eager 全不设与之前逐位相同；启动打一行有效值+来源；`run_arm.sh` A 臂本就显式传 0，新增 `DEFAULTS=1` 与 `smoke_defaults.sh`；CPU 641/0、ops 失败集合与基线同。上卡冒烟待排（`RUNBOOK_defaults_on.md`）。见 §4.33。
+- 2026-09-23（phase2）：§4.33.1 默认开上卡冒烟通过——什么都不设 = 第二版显式开，decode 1170/1170 逐位相同，启动行与每层计数全对。本轮三项（侧流 −3.00 / 事件等待 −0.53 / 共享专家进窗口 −1.71）交付完毕，默认开生效。
