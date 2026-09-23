@@ -517,9 +517,15 @@ class KTLayerOffload:
         _CAPTURED_PAYLOADS.append(payload)
         _launch_host_func(stream, _kt_packed_submit_only, payload)
         self._submit_ops.append(("hostfunc", self.layer_idx))
-        # The device waits here for the completion thread, and then clears the
-        # flag so the NEXT replay waits too. Both are graph nodes; neither is a
-        # host-side record.
+        # The device waits here for the completion thread. The reset behind it
+        # is what torch_npu says an ExternalEvent needs before it is reused
+        # (streams.py:214-217); 🔴 on card it turns out not to be load-bearing
+        # -- with every reset node left out the arm stayed bit-identical and
+        # still waited on all 8 replays (t5r --mutant no-reset --stall-ms 50,
+        # 2026-09-23), so the captured wait re-arms itself on this build. It
+        # stays because 0.144 us is a cheap price for not depending on
+        # undocumented behaviour. Both are graph NODES; neither is a host-side
+        # record (that one belongs to the completion thread, at replay time).
         _ext_wait(event, stream)
         self._submit_ops.append(("ext_wait", event))
         _ext_reset(event, stream)
