@@ -15,6 +15,10 @@ X=${ARM:0:1}; CFG=$RUN/cfg_$X.json
 #    检查项必须判【这一臂实际要的】，否则一个写死 40/0 的必检会把正确的臂判成作废。
 SIDE=${SIDE:-$([ "$X" = B ] && echo 1 || echo 0)}
 P1A=${P1A:-0}
+# P1b（VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL）：图里不再有 host-func 节点。与 P1A 互斥
+# （config 起服务就 raise），所以这里也拦一道：两个都开的那一发不是任何一条路的读数。
+P1B=${P1B:-0}
+[ "$P1A" = 1 ] && [ "$P1B" = 1 ] && { echo "❌ P1A 与 P1B 只能开一个"; exit 2; }
 # 🔴 Read the score from metrics.json, never by grepping the progress log: the
 # runner prints "[n/N] acc=..." every 50 items, so `grep -m1 acc` picks the
 # score after the FIRST 50 and calls it the result. With --limit 50 that is
@@ -28,7 +32,7 @@ print(f'{m["num_correct"]}/{m["num_examples"]} acc={m["aggregate"]["score"]:.4f}
       f'{m["latency_seconds"]:.0f}s')
 PYEOF
 }
-say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A extra=[$*] steps=$STEPS"
+say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A DEVICE_SIGNAL=$P1B extra=[$*] steps=$STEPS"
 python3 worktrees/moe-offload/tools/kt_offload/build_fingerprint.py stamp $D --label sidestream_$ARM > $D/fp.txt 2>&1
 grep -q 85331298bdeffee02b7c42c5658030ac $D/build_fingerprint.json || { say "❌ .so mismatch"; exit 3; }
 npu-smi info > $D/card_before.txt 2>&1
@@ -37,6 +41,7 @@ npu-smi info > $D/card_before.txt 2>&1
     KT_OFFLOAD=1 NPUS=$CARD PORT=$PORT EAGER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
     KT_ADDITIONAL_CONFIG="$(cat $CFG)" MAXLEN=8192 MAXSEQS=8 MAXBATCH=4096 \
     VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$SIDE VLLM_ASCEND_DSV41_KT_ASYNC_WAIT=$P1A \
+    VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL=$P1B \
     VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30 "$@" \
     bash worktrees/moe-offload/tools/kt_offload/serve_v41_singlecard.sh ) > $D/serve.log 2>&1 &
 SP=$!; sleep 2; PGID=$(ps -o pgid= -p $SP | tr -d ' '); echo "pgid=$PGID" > $D/pgid.txt; say "serve pid=$SP pgid=$PGID"
@@ -67,11 +72,14 @@ VA=$(grep -m1 'vllm_ascend = ' $D/serve.log); NSS=$(grep -c 'SIDE STREAM ENABLED
 ERRRE='(^|[^0-9])(107011|107015|107025|107027|107030)([^0-9]|$)'
 NE=$(grep -v 'kt-seam' $D/serve.log | grep -cE "$ERRRE")
 NAW=$(grep -c 'ASYNC WAIT ENABLED' $D/serve.log)
+NDS=$(grep -c 'DEVICE SIGNAL ENABLED' $D/serve.log)
 say "check vllm_ascend: $VA"; say "check SIDE STREAM ENABLED count=$NSS (want $([ $SIDE = 1 ] && echo 40 || echo 0))"
-say "check ASYNC WAIT ENABLED count=$NAW (want $([ $P1A = 1 ] && echo 40 || echo 0))"; say "check ACL errcode lines count=$NE (want 0)"
+say "check ASYNC WAIT ENABLED count=$NAW (want $([ $P1A = 1 ] && echo 40 || echo 0))"
+say "check DEVICE SIGNAL ENABLED count=$NDS (want $([ $P1B = 1 ] && echo 40 || echo 0))"; say "check ACL errcode lines count=$NE (want 0)"
 bad=0; echo "$VA" | grep -q 'worktrees/moe-offload/vllm_ascend/__init__.py' || bad=1
 [ $SIDE = 1 ] && [ $NSS -ne 40 ] && bad=1; [ $SIDE = 0 ] && [ $NSS -ne 0 ] && bad=1; [ $NE -ne 0 ] && bad=1
 [ $P1A = 1 ] && [ $NAW -ne 40 ] && bad=1; [ $P1A = 0 ] && [ $NAW -ne 0 ] && bad=1
+[ $P1B = 1 ] && [ $NDS -ne 40 ] && bad=1; [ $P1B = 0 ] && [ $NDS -ne 0 ] && bad=1
 [ $bad = 1 ] && { say "❌ mandatory check failed -> arm void"; stop; exit 5; }
 for s in ${STEPS//,/ }; do case $s in
   probe) curl -s http://127.0.0.1:$PORT/v1/completions -H 'Content-Type: application/json' \
@@ -93,6 +101,10 @@ for s in ${STEPS//,/ }; do case $s in
       say "gsm8k1319 rc=$? $(score $D/gsm8k1319)";;
   hold) say "hold: sleeping until $D/release exists"; while [ ! -e $D/release ]; do sleep 10; done;;
 esac; done
-grep 'host-func over' $D/serve.log | sed 's/.*kt_offload host-func/host-func/' > $D/hostfunc.txt
-say "hostfunc reports $(wc -l < $D/hostfunc.txt); uniform $(grep -c 'uniform$' $D/hostfunc.txt); uneven $(grep -c uneven $D/hostfunc.txt); never-ran $(grep -c 'never ran' $D/hostfunc.txt)"
+# 🔴 采样器的行名跟着它采的那个计数器走：P1b 开着时 HOST_FUNC_CALLS 永远是 0，行名是
+# 'device-signal over'。只 grep 'host-func over' 会让 P1b 那一臂"一行都没有"——而
+# "每层都跑了"和"一层都没跑"在这个输出里长得一模一样。两个都收，并核对条数。
+grep -E 'kt_offload (host-func|device-signal) over' $D/serve.log | sed 's/.*kt_offload //' > $D/hostfunc.txt
+say "per-layer reports $(wc -l < $D/hostfunc.txt) (counter: $([ $P1B = 1 ] && echo device-signal || echo host-func)); uniform $(grep -c 'uniform$' $D/hostfunc.txt); uneven $(grep -c uneven $D/hostfunc.txt); never-ran $(grep -c 'never ran' $D/hostfunc.txt)"
+[ "$(wc -l < $D/hostfunc.txt)" -eq 0 ] && say '⚠ 采样器一行都没出 —— 这一臂的每层计数没有被看过，不是「都好」' 
 stop; say "done"
