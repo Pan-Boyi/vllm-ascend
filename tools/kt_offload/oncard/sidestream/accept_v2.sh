@@ -62,4 +62,4 @@ if [ $lrc = 1 ]; then
     python3 $T/lp_verdict.py $RUN/$1/lp.jsonl $RUN/$2/lp.jsonl "$1 vs $2 ($3)" --skip-first=13 > $RUN/lp_cmp_$1_$2.txt 2>&1
     log "lp_cmp $1 vs $2 rc=$?"; cat $RUN/lp_cmp_$1_$2.txt >> $ST; done
 fi
-log "ALLDONE (perf rc=$vrc, lp rc=$lrc)"
+log "ALLDONE (lp rc=$lrc)"
