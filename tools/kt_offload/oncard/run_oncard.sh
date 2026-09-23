@@ -396,10 +396,15 @@ if [ -z "$ANOMALY" ] && hit=$(oc_scan_anomaly "$ANOM" "$LOG" "$ASCEND_PROCESS_LO
   ANOMALY="$hit"; say "🛑 anomaly marker (final scan): $hit"
 fi
 # 🔴 107025（跨流捕获失败）不在 10701[0-9] 里 —— 旧口径把它漏成 "0 条"，而它正是
-#    侧流那条路最常见的失败码（2026-09-22 t5 实测，见 PLAN §4.19②）。数 1070[12][0-9]。
-N1070=$(oc_count "1070[12][0-9]" "$LOG" "$ASCEND_PROCESS_LOG_PATH")
+#    侧流那条路最常见的失败码（2026-09-22 t5 实测，见 PLAN §4.19②）。
+#    名单显式枚举、每个码写明理由，别再用范围正则（范围会把将来新出现的码悄悄收进来或漏掉）：
+#      107011 重复订阅（我们按设计吞掉，外抛即异常） · 107015 提交到非捕获流
+#      107025 跨流捕获失败（侧流） · 107027 捕获期走了 eager · 107030 捕获期 H2D 被拒
+#    这五个都应为 0（design 的上卡判据第 2 条：107011/107015/107027/107030 为 0）。
+ONCARD_ERRCODES="107011|107015|107025|107027|107030"
+N1070=$(oc_count "$ONCARD_ERRCODES" "$LOG" "$ASCEND_PROCESS_LOG_PATH")
 VERD=$(command grep -E "^VERDICT:" "$LOG" | tail -n 1)
-say "  test rc=$TRC wall $(( (T_END - T_START) / 1000 ))s; $VERD; 1070[12]x lines (log+plog) $N1070"
+say "  test rc=$TRC wall $(( (T_END - T_START) / 1000 ))s; $VERD; ACL err lines (107011|15|25|27|30, log+plog) $N1070"
 say "  MemAvailable min during run $((min_avail/1048576)) GiB; HBM usage max ${hbm_max}% (sampled); $(cat "$RUN/test_vmhwm.txt" 2>/dev/null)"
 if [ -n "$ANOMALY" ]; then RC=20
 elif [ -n "$RC" ]; then :

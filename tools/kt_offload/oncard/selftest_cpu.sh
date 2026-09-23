@@ -47,11 +47,17 @@ oc_scan_anomaly "$RE" "$W/clean.log" > /dev/null; r=$?; [ $r -eq 1 ]; ok $? "cle
 oc_scan_anomaly "$RE" "$W/does_not_exist" > /dev/null; r=$?; [ $r -eq 2 ]; ok $? "nothing scannable -> rc $r (want 2, not 'clean')"
 mkdir -p "$W/plog/debug"; printf 'x\n[ERROR] EZ9999 from plog\n' > "$W/plog/debug/p.log"
 hit=$(oc_scan_anomaly "$RE" "$W/clean.log" "$W/plog"); ok $? "marker inside a plog directory detected -> $hit"
-c=$(oc_count "1070[12][0-9]" "$W/clean.log" "$W/plog"); [ "$c" = 0 ]; ok $? "1070[12]x count on clean inputs = $c"
+ERRC="107011|107015|107025|107027|107030"
+c=$(oc_count "$ERRC" "$W/clean.log" "$W/plog"); [ "$c" = 0 ]; ok $? "ACL err count on clean inputs = $c"
 printf 'rt error 107011 x\n107027 y\n' > "$W/plog/debug/q.log"
-c=$(oc_count "1070[12][0-9]" "$W/plog"); [ "$c" = 2 ]; ok $? "1070[12]x count sees both 107011 and 107027 (the old 10701[0-9] missed the second): $c"
-# 变异臂：旧口径在同一份输入上只数到 1 ⇒ 它确实会漏掉 1070 2x 这一档（107025 就在这一档）。
+c=$(oc_count "$ERRC" "$W/plog"); [ "$c" = 2 ]; ok $? "the list sees both 107011 and 107027 (design 要求这五个都为 0): $c"
+# 变异臂：旧口径在同一份输入上只数到 1 ⇒ 它会漏掉 10702x 这一档，而 107025（侧流捕获失败）就在这一档。
 c=$(oc_count "10701[0-9]" "$W/plog"); [ "$c" = 1 ]; ok $? "the old pattern misses 107027 (counts $c, not 2) -- that is the bug"
+printf 'capture failed 107025 z
+' > "$W/plog/debug/r.log"
+c=$(oc_count "$ERRC" "$W/plog"); [ "$c" = 3 ]; ok $? "107025 is counted by the list ($c, was 2) -- the whole point of the fix"
+c=$(oc_count "10701[0-9]" "$W/plog"); [ "$c" = 1 ]; ok $? "the old pattern still misses 107025 (counts $c) -- that is what shipped as \"0 lines\""
+rm -f "$W/plog/debug/r.log"
 
 echo "== 4. monitor stops a test that prints a marker (process group, no retry)"
 setsid bash -c "sleep 2; echo 'EZ9999 fake'; sleep 60" > "$W/mon.log" 2>&1 < /dev/null &
