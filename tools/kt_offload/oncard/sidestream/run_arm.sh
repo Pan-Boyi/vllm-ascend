@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_arm.sh <RUN> <ARM: A1|B1|A2|B2|...> <CARD> <STEPS: comma list of probe,lp,lp2,perf,gsm,gsm1319,hold> [extra env assignments...]
+# run_arm.sh <RUN> <ARM: A1|B1|A2|B2|...> <CARD> <STEPS: comma list of probe,lp,lp2,perf,gsm,gsm1319,gsm1319if50,hold>  (env: SIDE P1A P1B SIW REQUIRE_CLEAN_TREE PORT) [extra env assignments...]
 set -u
 ROOT=/workspace/code/dsv4_single_card/vllm_project; cd $ROOT
 RUN=$1; ARM=$2; CARD=$3; STEPS=$4; shift 4
@@ -19,6 +19,14 @@ P1A=${P1A:-0}
 # （config 起服务就 raise），所以这里也拦一道：两个都开的那一发不是任何一条路的读数。
 P1B=${P1B:-0}
 [ "$P1A" = 1 ] && [ "$P1B" = 1 ] && { echo "❌ P1A 与 P1B 只能开一个"; exit 2; }
+# §4.31 共享专家进窗口（VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW）。默认 0 = 旧各发的形态不变。
+# 🔴 显式传 0 而不是「不设」：父 shell 里若残留 =1，「不设」会让 C 臂悄悄变成 D 臂，
+#    而两臂逐位全同 + perf 无差 正是那种错误的样子。必检同样按【这一臂要的值】判 40/0。
+SIW=${SIW:-0}
+case "$SIW" in 0|1) ;; *) echo "❌ SIW 只认 0/1（得到 '$SIW'）"; exit 2;; esac
+# 起服务前核树（第二版验收起加，第一版 A4 的教训：另一 agent 在跑期间改了本树的已跟踪文件）。
+# REQUIRE_CLEAN_TREE=1 ⇒ 本树 git status 必须为空、指纹 dirty_files 必须两棵树都是 0，否则拒飞 rc=3。
+REQUIRE_CLEAN_TREE=${REQUIRE_CLEAN_TREE:-0}
 # 🔴 Read the score from metrics.json, never by grepping the progress log: the
 # runner prints "[n/N] acc=..." every 50 items, so `grep -m1 acc` picks the
 # score after the FIRST 50 and calls it the result. With --limit 50 that is
@@ -32,22 +40,42 @@ print(f'{m["num_correct"]}/{m["num_examples"]} acc={m["aggregate"]["score"]:.4f}
       f'{m["latency_seconds"]:.0f}s')
 PYEOF
 }
-say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A DEVICE_SIGNAL=$P1B extra=[$*] steps=$STEPS"
+say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A DEVICE_SIGNAL=$P1B SHARED_IN_WINDOW=$SIW extra=[$*] steps=$STEPS"
 python3 worktrees/moe-offload/tools/kt_offload/build_fingerprint.py stamp $D --label sidestream_$ARM > $D/fp.txt 2>&1
 grep -q 85331298bdeffee02b7c42c5658030ac $D/build_fingerprint.json || { say "❌ .so mismatch"; exit 3; }
+WTREE=$ROOT/worktrees/moe-offload
+git -C $WTREE status --short > $D/git_status.txt 2>&1
+say "tree HEAD $(git -C $WTREE rev-parse HEAD) git-status-lines $(wc -l < $D/git_status.txt) (全文 $D/git_status.txt)"
+DIRTY=$(python3 -c "import json,sys;t=json.load(open(sys.argv[1]))['trees'];print(' '.join(f'{k}={v[\"dirty_files\"]}' for k,v in sorted(t.items())))" $D/build_fingerprint.json 2>&1)
+say "fingerprint dirty_files: $DIRTY"
+# RUNTIME_BASE=<commit>：本臂 HEAD 相对它在 vllm_ascend/ 下必须 0 个文件差（主会话会往本树提交文档，
+# HEAD 会动；动的只许是文档）。
+if [ -n "${RUNTIME_BASE:-}" ]; then
+  RTD=$(git -C $WTREE diff --name-only "$RUNTIME_BASE" HEAD -- vllm_ascend/ 2>&1)
+  say "runtime diff vs $RUNTIME_BASE (vllm_ascend/): $(echo -n "$RTD" | grep -c . ) files"
+  [ -n "$RTD" ] && { say "❌ HEAD 相对 $RUNTIME_BASE 改了运行时代码 —— 拒飞"; echo "$RTD" | tee -a $SUM; exit 3; }
+fi
+if [ "$REQUIRE_CLEAN_TREE" = 1 ]; then
+  [ -s $D/git_status.txt ] && { say "❌ 验收树不干净（git status 非空）—— 拒飞"; cat $D/git_status.txt | tee -a $SUM; exit 3; }
+  [ "$DIRTY" = "vllm=0 vllm_ascend=0" ] || { say "❌ 指纹 dirty_files 不是两棵树都 0 —— 拒飞"; exit 3; }
+fi
+# DRY_RUN=1：只做到这里（cfg/env 组装、.so 与树的核对），不碰卡、不起服务。干跑用。
+[ "${DRY_RUN:-0}" = 1 ] && { say "DRY_RUN: 起飞前核对全过，未起服务"; exit 0; }
 npu-smi info > $D/card_before.txt 2>&1
 ( cd $ROOT && setsid env \
     WT=moe-offload DSV41_VLLM_TREE=$ROOT/worktrees/moe-offload-vllm LEASE_OWNER=$OWNER \
     KT_OFFLOAD=1 NPUS=$CARD PORT=$PORT EAGER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
     KT_ADDITIONAL_CONFIG="$(cat $CFG)" MAXLEN=8192 MAXSEQS=8 MAXBATCH=4096 \
     VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$SIDE VLLM_ASCEND_DSV41_KT_ASYNC_WAIT=$P1A \
-    VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL=$P1B \
+    VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL=$P1B VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=$SIW \
     VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30 "$@" \
     bash worktrees/moe-offload/tools/kt_offload/serve_v41_singlecard.sh ) > $D/serve.log 2>&1 &
 SP=$!; sleep 2; PGID=$(ps -o pgid= -p $SP | tr -d ' '); echo "pgid=$PGID" > $D/pgid.txt; say "serve pid=$SP pgid=$PGID"
 stop(){ say "stopping"; OWNED_CARDS=$CARD STOP_PGID=$PGID bash build_artifacts/stop_by_port.sh $PORT > $D/stop.log 2>&1; say "stop rc=$? $(tail -1 $D/stop.log)"
   for i in $(seq 1 60); do kill -0 -$PGID 2>/dev/null || break; sleep 2; done; kill -0 -$PGID 2>/dev/null && say "⚠ pgid $PGID still alive"
-  bash build_artifacts/card_lease.sh status > $D/lease_after.txt 2>&1; npu-smi info > $D/card_after.txt 2>&1; }
+  bash build_artifacts/card_lease.sh status > $D/lease_after.txt 2>&1; npu-smi info > $D/card_after.txt 2>&1
+  git -C $ROOT/worktrees/moe-offload status --short > $D/git_status_after.txt 2>&1
+  say "tree HEAD at stop $(git -C $ROOT/worktrees/moe-offload rev-parse HEAD) git-status-lines $(wc -l < $D/git_status_after.txt)"; }
 ready=0; w=0
 while [ $w -lt 900 ]; do
   curl -s -m 5 http://127.0.0.1:$PORT/v1/models -o $D/models.json 2>/dev/null && { ready=1; break; }
@@ -73,13 +101,16 @@ ERRRE='(^|[^0-9])(107011|107015|107025|107027|107030)([^0-9]|$)'
 NE=$(grep -v 'kt-seam' $D/serve.log | grep -cE "$ERRRE")
 NAW=$(grep -c 'ASYNC WAIT ENABLED' $D/serve.log)
 NDS=$(grep -c 'DEVICE SIGNAL ENABLED' $D/serve.log)
+NSW=$(grep -c 'SHARED IN WINDOW for layer' $D/serve.log)
 say "check vllm_ascend: $VA"; say "check SIDE STREAM ENABLED count=$NSS (want $([ $SIDE = 1 ] && echo 40 || echo 0))"
 say "check ASYNC WAIT ENABLED count=$NAW (want $([ $P1A = 1 ] && echo 40 || echo 0))"
 say "check DEVICE SIGNAL ENABLED count=$NDS (want $([ $P1B = 1 ] && echo 40 || echo 0))"; say "check ACL errcode lines count=$NE (want 0)"
+say "check SHARED IN WINDOW for layer count=$NSW (want $([ $SIW = 1 ] && echo 40 || echo 0))"
 bad=0; echo "$VA" | grep -q 'worktrees/moe-offload/vllm_ascend/__init__.py' || bad=1
 [ $SIDE = 1 ] && [ $NSS -ne 40 ] && bad=1; [ $SIDE = 0 ] && [ $NSS -ne 0 ] && bad=1; [ $NE -ne 0 ] && bad=1
 [ $P1A = 1 ] && [ $NAW -ne 40 ] && bad=1; [ $P1A = 0 ] && [ $NAW -ne 0 ] && bad=1
 [ $P1B = 1 ] && [ $NDS -ne 40 ] && bad=1; [ $P1B = 0 ] && [ $NDS -ne 0 ] && bad=1
+[ $SIW = 1 ] && [ $NSW -ne 40 ] && bad=1; [ $SIW = 0 ] && [ $NSW -ne 0 ] && bad=1
 [ $bad = 1 ] && { say "❌ mandatory check failed -> arm void"; stop; exit 5; }
 for s in ${STEPS//,/ }; do case $s in
   probe) curl -s http://127.0.0.1:$PORT/v1/completions -H 'Content-Type: application/json' \
@@ -99,6 +130,12 @@ for s in ${STEPS//,/ }; do case $s in
   gsm1319) EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 \
       --out-dir $D/gsm8k1319 --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --resume > $D/gsm1319.log 2>&1
       say "gsm8k1319 rc=$? $(score $D/gsm8k1319)";;
+  # 第二版：1319 只在同一服务的 GSM8K 50 满分时跑（用户：50 满分后直接跑；<50 停下报告）。
+  gsm1319if50) python3 -c "import json,sys;m=json.load(open(sys.argv[1]+'/metrics.json'));sys.exit(0 if (m['num_correct'],m['num_examples'])==(50,50) else 1)" $D/gsm8k50 2>/dev/null \
+      && { EV_THINKING=0 python3 build_artifacts/eval_runners/gsm8k_eval_effort.py --base-url "http://127.0.0.1:$PORT/v1" --model dsv41 \
+             --out-dir $D/gsm8k1319 --max-tokens 4096 --temperature 0 --top-p 1.0 --num-threads 8 --resume > $D/gsm1319.log 2>&1
+           say "gsm8k1319 rc=$? $(score $D/gsm8k1319)"; } \
+      || { say "🔴 gsm8k50 不是 50/50（$(score $D/gsm8k50)）⇒ 不跑 1319，停下报告"; GSM_STOP=1; };;
   hold) say "hold: sleeping until $D/release exists"; while [ ! -e $D/release ]; do sleep 10; done;;
 esac; done
 # 🔴 采样器的行名跟着它采的那个计数器走：P1b 开着时 HOST_FUNC_CALLS 永远是 0，行名是
@@ -108,3 +145,4 @@ grep -E 'kt_offload (host-func|device-signal) over' $D/serve.log | sed 's/.*kt_o
 say "per-layer reports $(wc -l < $D/hostfunc.txt) (counter: $([ $P1B = 1 ] && echo device-signal || echo host-func)); uniform $(grep -c 'uniform$' $D/hostfunc.txt); uneven $(grep -c uneven $D/hostfunc.txt); never-ran $(grep -c 'never ran' $D/hostfunc.txt)"
 [ "$(wc -l < $D/hostfunc.txt)" -eq 0 ] && say '⚠ 采样器一行都没出 —— 这一臂的每层计数没有被看过，不是「都好」' 
 stop; say "done"
+[ "${GSM_STOP:-0}" = 1 ] && exit 7 || true

@@ -1,6 +1,10 @@
 """Apply the PLAN §4.27 benefit criterion to a RUN directory, mechanically.
 
-usage: perf_verdict.py <RUN dir> [--rounds N]
+usage: perf_verdict.py <RUN dir> [--rounds N] [--arms XY] [--signed]
+
+``--arms CD`` (second merge acceptance, C = baseline, D = candidate): the
+first letter is always the baseline, so Δ = mean(first) − mean(second) keeps
+its sign convention (positive = the candidate is faster). Default ``AB``.
 
 Why a script and not arithmetic in the report: the criterion is
 ``|A-B| >= 3 x floor AND |A-B| >= 0.3 ms/token``, where the floor is THIS run's
@@ -57,28 +61,39 @@ def main() -> None:
     rounds = 3
     if "--rounds" in sys.argv:
         rounds = int(sys.argv[sys.argv.index("--rounds") + 1])
-    arms = {X: [f"{X}{r}" for r in range(1, rounds + 1)] for X in "AB"}
+    pair = "AB"
+    if "--arms" in sys.argv:
+        pair = sys.argv[sys.argv.index("--arms") + 1]
+        if len(pair) != 2 or pair[0] == pair[1]:
+            print(f"❌ --arms 要两个不同字母（基线在前），得到 {pair!r}")
+            raise SystemExit(3)
+    P, Q = pair
+    arms = {X: [f"{X}{r}" for r in range(1, rounds + 1)] for X in pair}
     vals: dict[str, list[float]] = {}
     print(f"== §4.27 判定  run={run}  轮次={rounds}  读数行='{ROW}' 的均值")
-    for X in "AB":
+    for X in pair:
         vals[X] = []
         for arm in arms[X]:
             mean, lo, hi, n = read_arm(run, arm)
             vals[X].append(mean)
             print(f"  {arm}: {mean:7.2f}  (轮内 {lo:.2f}–{hi:.2f}, n={n})")
-    mA, mB = st.mean(vals["A"]), st.mean(vals["B"])
-    fA = max(vals["A"]) - min(vals["A"])
-    fB = max(vals["B"]) - min(vals["B"])
+    mA, mB = st.mean(vals[P]), st.mean(vals[Q])
+    fA = max(vals[P]) - min(vals[P])
+    fB = max(vals[Q]) - min(vals[Q])
     floor = max(fA, fB)
     delta = mA - mB
-    print(f"  A 臂均值 {mA:.3f}  ({' / '.join(f'{v:.2f}' for v in vals['A'])})  同臂摆动 {fA:.3f}")
-    print(f"  B 臂均值 {mB:.3f}  ({' / '.join(f'{v:.2f}' for v in vals['B'])})  同臂摆动 {fB:.3f}")
-    print(f"  Δ = A − B = {delta:+.3f} ms/token   （正 = B 更快）")
+    print(f"  {P} 臂均值 {mA:.3f}  ({' / '.join(f'{v:.2f}' for v in vals[P])})  同臂摆动 {fA:.3f}")
+    print(f"  {Q} 臂均值 {mB:.3f}  ({' / '.join(f'{v:.2f}' for v in vals[Q])})  同臂摆动 {fB:.3f}")
+    print(f"  Δ = {P} − {Q} = {delta:+.3f} ms/token   （正 = {Q} 更快）")
     print(f"  同臂地板 floor = max({fA:.3f}, {fB:.3f}) = {floor:.3f}")
-    c1 = abs(delta) >= 3 * floor
-    c2 = abs(delta) >= 0.3
-    print(f"  判据①  |Δ| {abs(delta):.3f} ≥ 3×floor {3*floor:.3f} ? {'✅' if c1 else '❌'}")
-    print(f"  判据②  |Δ| {abs(delta):.3f} ≥ 0.3      ? {'✅' if c2 else '❌'}")
+    # --signed（第二版验收起用）：收益 = 候选臂【更快】，Δ 按带符号判。|Δ| 的旧写法下
+    # 候选臂慢 3×地板 也会打出「收益成立」—— 前几发 Δ 都为正所以没咬到，第二版不赌这个。
+    signed = "--signed" in sys.argv
+    d, dn = (delta, "Δ") if signed else (abs(delta), "|Δ|")
+    c1 = d >= 3 * floor
+    c2 = d >= 0.3
+    print(f"  判据①  {dn} {d:+.3f} ≥ 3×floor {3*floor:.3f} ? {'✅' if c1 else '❌'}")
+    print(f"  判据②  {dn} {d:+.3f} ≥ 0.3      ? {'✅' if c2 else '❌'}")
     ok = c1 and c2
     print(f"  ⇒ {'🟢 收益成立' if ok else '🔴 判负'}"
           + ("" if ok else "（按 EXPECTED.txt §4：不许调参数重试、不许放宽门槛）"))
