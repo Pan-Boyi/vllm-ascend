@@ -454,21 +454,47 @@ def main() -> int:  # noqa: C901
         return {"layer": int(layer_idx), "slot": -1, "where": "own buffer",
                 "ids": buf["pin_ids"].clone(), "w": buf["pin_weights"].clone()}
 
-    def _probing_poll_run(original):
-        """P1b has no callback; what reads the pinned buffers is the poller.
+    def _probe_poller_entries(restore=False) -> int:
+        """Wrap (or unwrap) what the polling thread actually calls.
 
-        Same snapshot and the same (step, layer) accounting as the callback
-        probe, because it answers the same question: was the buffer this layer
-        read THIS step's routing, the previous step's, or the poison?
+        🔴 Patching ``KTLayerOffload._poll_run`` on the CLASS does nothing: the
+        poller was handed ``self._poll_run``, a **bound** method, at
+        registration time, and keeps calling that object. The first probe run
+        (2026-09-23, `20260923_045324_t5r`) therefore recorded 0 of 64 reads --
+        and ``probe_report`` then said "every pinned input buffer held this
+        step's value (0 callbacks checked)", i.e. an instrument that had been
+        unplugged reported all-clear. Both halves are fixed: this wraps the
+        entries themselves, and the count is judged rather than printed.
         """
-        def probing(self, bs):
-            try:
-                probe_log.append(_snapshot_packed((self.wrapper, self._packed[bs], self.layer_idx)))
-            except BaseException as exc:  # noqa: BLE001
-                probe_log.append({"layer": -1, "error": repr(exc)})
-            return original(self, bs)
+        poller = getattr(KL, "_POLLER", None)
+        if poller is None:
+            return 0
+        n = 0
+        for e in poller.entries:
+            if restore:
+                inner = getattr(e.run, "_t5r_inner", None)
+                if inner is not None:
+                    e.run = inner
+                    n += 1
+                continue
+            if getattr(e.run, "_t5r_inner", None) is not None:
+                continue
+            original = e.run
+            layer = original.__self__
 
-        return probing
+            def probing(bs, _orig=original, _layer=layer):
+                try:
+                    probe_log.append(
+                        _snapshot_packed((_layer.wrapper, _layer._packed[bs], _layer.layer_idx))
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    probe_log.append({"layer": -1, "error": repr(exc)})
+                return _orig(bs)
+
+            probing._t5r_inner = original
+            e.run = probing
+            n += 1
+        return n
 
     def _probing(original, snapshot):
         def probing(payload):
@@ -585,7 +611,6 @@ def main() -> int:  # noqa: C901
 
     # ------------------------------------------------------ the P1b mutants
     original_handle = DS.Poller._handle
-    original_poll_run = KL.KTLayerOffload._poll_run
     signal_first_layers = []
 
     def _handle_early_record(self, e):
@@ -779,7 +804,7 @@ def main() -> int:  # noqa: C901
             # polling thread, so the probe goes there. Same snapshot, same
             # (step, layer) accounting -- which is the whole point, because the
             # question "was this THIS step's routing?" is the same question.
-            KL.KTLayerOffload._poll_run = _probing_poll_run(original_poll_run)
+            out["probe_entries_wrapped"] = _probe_poller_entries()
         probe_log.clear()
         calls0 = dict(KL.HOST_FUNC_CALLS)
         try:
@@ -807,6 +832,7 @@ def main() -> int:  # noqa: C901
             AW.Completer._complete = saved_complete
             DS.Poller._handle = saved_handle
             KL.KTLayerOffload._poll_run = saved_poll_run
+            _probe_poller_entries(restore=True)
             return out
         finally:
             KL.KTLayerOffload._join_side_stream = saved_join
@@ -866,6 +892,7 @@ def main() -> int:  # noqa: C901
             KL._kt_host_forward, KL._kt_packed_forward = original_host_forward, original_packed_forward
             KL._kt_packed_submit_only = original_submit_only
             KL.KTLayerOffload._poll_run = saved_poll_run
+            _probe_poller_entries(restore=True)
             AW.Completer._complete = saved_complete
             DS.Poller._handle = saved_handle
         grew = {lid: KL.HOST_FUNC_CALLS.get(lid, 0) - before.get(lid, 0) for lid in layer_ids}
@@ -946,7 +973,14 @@ def main() -> int:  # noqa: C901
               + ("" if out["first_divergent_step"] is None
                  else f", first divergence at step {out['first_divergent_step']}"), flush=True)
         if args.probe:
-            out["probe"] = probe_report(key, list(probe_log))
+            rep = probe_report(key, list(probe_log))
+            out["probe"] = rep
+            # 🔴 Coverage is part of the verdict. A probe that recorded nothing
+            # has no mismatches either, and "0 reads checked" must never read
+            # as "all clear" (it did, once -- see _probe_poller_entries).
+            judge(rep["entries"] == rep["expected"] and not rep["mismatches"],
+                  f"arm {key}: the probe saw {rep['entries']}/{rep['expected']} reads of the pinned "
+                  f"inputs and every one held this step's value ({rep['mismatch_count']} did not)")
         return out
 
     def probe_report(key: str, log: list[dict]) -> dict:
@@ -987,9 +1021,12 @@ def main() -> int:  # noqa: C901
                           + f") -- the {what} buffer held {verdict}: {item['got']} "
                           f"(this step wants {item['want']})", flush=True)
         rep["mismatch_count"] = len(rep["mismatches"])
-        if not rep["mismatches"]:
+        if not rep["mismatches"] and len(log) == expected_n:
             print(f"  probe[{key}]: every pinned input buffer held this step's value "
-                  f"({len(log)} callbacks checked)", flush=True)
+                  f"({len(log)} reads checked)", flush=True)
+        elif not rep["mismatches"]:
+            print(f"  🔴 probe[{key}]: NOT a pass -- only {len(log)} of {expected_n} reads were seen, so "
+                  f"'no mismatches' says nothing about the {expected_n - len(log)} that were not", flush=True)
         return rep
 
     # --------------------------------------------------------------- run it
