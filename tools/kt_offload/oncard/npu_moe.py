@@ -231,6 +231,14 @@ def make_offload(cfg, layer_idx: int, capture_sizes=None):
     from vllm_ascend.kt_offload.layer import KTLayerOffload
     from vllm_ascend.kt_offload.placement import plan_from_config
 
+    # PLAN §4.33 made P1a and the shared-window move default ON (unset =
+    # automatic). These harnesses predate that: their arms pick a path by
+    # flipping instance attributes after the build and set the env to "1"
+    # before it when an arm needs the machinery (t4p/t5r). Keep "unset = 0"
+    # here so a harness layer is built exactly as before §4.33; an explicit
+    # value from the caller or the shell still wins.
+    for name in ("VLLM_ASCEND_DSV41_KT_ASYNC_WAIT", "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW"):
+        os.environ.setdefault(name, "0")
     plan = plan_from_config(cfg, 40, C.N_EXP, C.TOPK)
     placement = plan.layer(layer_idx)
     return KTLayerOffload(cfg, placement, layer_idx, fake_vllm_config(capture_sizes)), plan

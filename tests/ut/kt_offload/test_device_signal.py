@@ -711,7 +711,9 @@ def test_the_poller_builds_the_same_kt_task_the_host_func_node_does(monkeypatch)
 def _cfg(**kw):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
-    base = {"enabled": True, "cpuinfer_threads": 8, "num_resident_experts": 100}
+    # overlap_side_stream is on by default since PLAN §4.33; the base is the
+    # serial config so each case names the own-buffer path it relies on.
+    base = {"enabled": True, "cpuinfer_threads": 8, "num_resident_experts": 100, "overlap_side_stream": False}
     cfg = KTOffloadConfig(**{**base, **kw})
     vcfg = SimpleNamespace(
         parallel_config=SimpleNamespace(

@@ -167,7 +167,9 @@ class FakeWrapper:
 def _layer_runtime(mods, monkeypatch, packed: bool):
     lm, pl = mods.layer, mods.placement
     plan = pl.build_plan([[0, 3]], NEXP)
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=packed)
+    cfg = KTOffloadConfig(
+        enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=packed, overlap_side_stream=False
+    )
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(hidden_size=H, moe_intermediate_size=4, num_experts_per_tok=TOPK),

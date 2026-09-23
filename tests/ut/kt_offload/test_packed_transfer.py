@@ -99,7 +99,8 @@ def _runtime(monkeypatch, packed: bool, layers: int = 4, sizes=(1, 2)):
     registry: dict[int, torch.Tensor] = {}
     plan = build_plan([[0, 3]] * layers, NEXP)
     cfg = KTOffloadConfig(
-        enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=packed
+        enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=packed,
+        overlap_side_stream=False,  # default on since PLAN §4.33; this file tests the packed serial path
     )
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -197,7 +198,9 @@ def test_values_follow_the_input_every_step(monkeypatch):
 
 def test_refuses_a_kt_build_without_the_entry_points(monkeypatch):
     plan = build_plan([[0, 3]], NEXP)
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=True)
+    cfg = KTOffloadConfig(
+        enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=True, overlap_side_stream=False
+    )
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(hidden_size=H, moe_intermediate_size=4, num_experts_per_tok=TOPK),

@@ -1202,6 +1202,45 @@ t5r `--shared-mlp both` ×3 发（干净臂 after/before 两顺序互相、对�
 
 **用户决定（2026-09-23 10:40）**：第二版 = C（侧流+事件等待）vs D（C + 共享专家进窗口），只差一个开关；perf 判负 ⇒ 停下报告、不跑 GSM8K；D 臂 GSM8K 50 满分 ⇒ 直接 1319；**全部验收通过后，本轮所有优化的环境变量改为默认开**（= 侧流 / 事件等待 / 共享专家进窗口；P1b 保持默认关，用户 10:55 确认）。
 
+## 4.33 默认开：侧流 / 事件等待 P1a / 共享专家进窗口（2026-09-23，**未上卡**；P1b 仍默认关）
+
+**依据**（用户 10:40 定「全部验收通过后本轮优化默认开」，10:55 确认 P1b 不动）：
+第二版合版本验收（`oncard_runs/20260923_105413_merge_v2`，卡 2，HEAD 52c0d1e05，C = 侧流+P1a、D = C+共享进窗口）——
+单轮 perf D 比 C **−1.71 ms/token**（用户 11:47 决定 perf 只跑一轮，放行依据 `ADDENDUM_user_1147.txt`）；
+C4 vs D4 prefill 187/187、decode **1170/1170** 逐位、非零 Δlogprob 0、退化步 0/1170 ×2（`lp_cmp_C4_D4.txt`）；
+D4 GSM8K 50 = **50/50**、1319 = **1283/1319**（97.27%，截断 0；多卡带 1276–1281，同码重启噪声 11 题 ⇒ 带内）。
+侧流单项另见 §4.25/§4.26（1319 = 1275/1319），P1a 单项 §4.28，第一版合版本 §4.32，共享进窗口 §4.31。
+读数来自主会话转述与 run 目录（未跟踪、会消失；【已记录】）。
+
+**语义**（唯一读取点 `vllm_ascend/kt_offload/switches.py:resolve`；config 校验、layer、启动日志同一函数，不许各读各的 env）：
+
+| 开关 | 未设（默认） | `"0"` | `"1"` | 其它值 |
+|---|---|---|---|---|
+| 侧流：cfg `overlap_side_stream`（默认改 **true**）+ `VLLM_ASCEND_DSV41_KT_SIDE_STREAM` | = cfg | 关（压过 cfg） | cfg true 时开（旧放行闸，已多余）；cfg false 不翻盘 | 拒起 |
+| P1a `…_KT_ASYNC_WAIT` | 自动：packed 或侧流 ⇒ 开，否则关不报错；P1b 开 ⇒ 让位关 | 关 | 开；前提不满足 raise | 拒起 |
+| 共享进窗口 `…_KT_SHARED_IN_WINDOW` | 跟随侧流 | 关 | 开（无侧流 warning） | 拒起 |
+| P1b `…_KT_DEVICE_SIGNAL` | 关 | 关 | 开（前提同 P1a） | 拒起 |
+
+- **互斥**：P1a 与 P1b 只有两者都**显式** `"1"` 才拒起（报错写明「取消其一即可，P1a 未设时会自动让位」）；P1b=1 + P1a 未设 ⇒ P1a 自动关。
+  layer 侧用 `resolve(validate=False)`（板上 harness 不经 config 校验、按臂翻实例属性），自动值与 config 侧逐项相同。
+- **「其它值拒起」**：§4.33 之前除 `"1"` 外一律当关；默认翻成开以后，读不懂的值既不能当开也不能当关。
+- **eager**：侧流/P1a/P1b 本就只改捕获路径；另把**自动**得来的 P1a 与共享进窗口在 eager 下关掉，eager 下不建副流、不打 `SIDE STREAM ENABLED`、
+  不再为侧流要求 kt 的 `forward_task`（eager 用不到）⇒ 全不设的 eager 与之前逐调用、逐位相同（单测 + 去门控变异臂 2 红）。
+  显式 `"1"` 在 eager 下的行为与之前相同。`packed_transfer` 默认不变（关）。
+- **启动行**：`kt_offload switches (PLAN §4.33; value(source[: why])): side_stream=on(default) async_wait=on(auto: side stream on) shared_in_window=on(auto: follows the side stream) device_signal=off(default)`；
+  每层 `… ENABLED` / `SHARED IN WINDOW for layer` 行前缀不变（括号内改印有效值与来源）。
+- `init_ascend_config` 无其它拒绝侧流的逻辑（唯一入口 `kt_offload_config._validate_preconditions`，已核）。
+
+**验收脚本**：`run_arm.sh` 一直显式传四个开关 ⇒ A 臂（`SIDE=0 P1A=0 P1B=0 SIW=0`）仍是串行，cfg `overlap_side_stream:false` 照常能起；
+新增 `DEFAULTS=1`（不传、`env -u` 剥残留、核启动行）与 `smoke_defaults.sh`；`npu_moe.make_offload` 对 P1a/共享进窗口 `setdefault "0"`，
+harness 建层与之前相同。上卡冒烟（全不设起服务、核三项有效值、与第二版 D4 lp 逐位比）命令与先写定的判据见
+`tools/kt_offload/oncard/RUNBOOK_defaults_on.md`，由主会话排卡。
+
+**CPU**：`tests/ut/kt_offload` 641 passed / 0 failed（基线 595；+46 为新文件 `test_switches.py`；受默认值影响的旧用例改为显式 `overlap_side_stream=False`
+或改写成新语义，未删断言）；`tests/ut/ops/test_fused_moe.py`+`test_routed_experts.py` 11 failed / 85 passed，失败集合与改动前逐条相同（既有）。
+新增 `tests/ut/kt_offload/conftest.py`：每条用例前清四个 env **并删 `envs` 模块上的同名属性**——旧用例的 `monkeypatch.setattr(envs, …)`
+在撤销时把当时读到的值写成真属性、遮住之后所有 `setenv`（默认开以后这会让后续用例静默测错，整套跑时 20 条红即此因）。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -1295,3 +1334,4 @@ t5r `--shared-mlp both` ×3 发（干净臂 after/before 两顺序互相、对�
 - 2026-09-23（phase2）：§4.31 共享专家 MLP 挪到 kt join 之前（`VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW`，默认关）——trace 对账 38.25 µs/层在 join 之后且无数据依赖，上限 ≈1.5 ms/token；每次 route 恰一次 merge 的运行时守卫 + 生产 `_forward_impl` 源码变异全红；CPU 595/0；上卡 t5r/t4p 执行单已备、未跑。见 §4.31。
 - 2026-09-23（phase2）：合版本（侧流+事件等待）验收——单轮 perf Δ4.22（稳妥 3.3–4.2）、整网 decode 1174/1174 逐位、GSM8K 50/50；1319 暂缓。侧流 3 ms 逐层对账：窗口是 13 个算子 78 µs/层（不是只有 GMM），D2H 与调起空隙挪到副流基本抵消，profiler 开销两臂不对称不能报收益。见 §4.32。
 - 2026-09-23（phase2）：刷新文首现状与 §0 分支起点；§4.18.1 队列更新状态（①②③ 完成、共享专家进窗口完成、频率放置本线不做、三轮补测往后排）。
+- 2026-09-23（phase2）：§4.33 侧流 / 事件等待 P1a / 共享专家进窗口 **改为默认开**（P1b 仍关）——统一由 `kt_offload/switches.py` 解析（未设=默认、`0`=关、`1`=开、其它拒起；P1a 未设时自动、遇 P1b 让位；共享进窗口未设跟随侧流）；eager 全不设与之前逐位相同；启动打一行有效值+来源；`run_arm.sh` A 臂本就显式传 0，新增 `DEFAULTS=1` 与 `smoke_defaults.sh`；CPU 641/0、ops 失败集合与基线同。上卡冒烟待排（`RUNBOOK_defaults_on.md`）。见 §4.33。

@@ -14,9 +14,12 @@ is the one where the side stream's last event record is never joined by the
 compute stream -- which is precisely what production's ``_join_side_stream``
 has always done.
 
-So the switch is opened *conditionally*: the config still refuses unless
-``VLLM_ASCEND_DSV41_KT_SIDE_STREAM=1`` is set explicitly, and the path carries
-the checks below rather than a comment claiming it is safe.
+So the switch was opened *conditionally* (the config refused unless
+``VLLM_ASCEND_DSV41_KT_SIDE_STREAM=1`` was set explicitly), and the path carries
+the checks below rather than a comment claiming it is safe. Since PLAN §4.33
+(after the whole-network acceptances of §4.26, §4.32 and §4.33) it is ON by
+default; ``VLLM_ASCEND_DSV41_KT_SIDE_STREAM=0`` or ``overlap_side_stream: false``
+turns it off, and ``kt_offload.switches.resolve`` is the only reader.
 
 The criteria (k.4's meta-rule: a check that cannot go red is not a check)
 -------------------------------------------------------------------------
@@ -79,15 +82,17 @@ ENV_NAME = "VLLM_ASCEND_DSV41_KT_SIDE_STREAM"
 
 
 def enabled_by_env() -> bool:
-    """Whether the operator explicitly asked for the side stream.
+    """Whether the operator explicitly set ``ENV_NAME=1``.
 
-    Read at config-validation time, not cached: the refusal message names this
-    variable, so the answer has to come from the environment the service was
-    actually started with.
+    NOT whether the side stream is on: since PLAN §4.33 unset means "default", and
+    the effective value (cfg, env and the automatic defaults together) comes
+    only from ``kt_offload.switches.resolve``. Nothing on the production path
+    calls this any more; it is kept for harnesses that ask the narrower
+    question.
     """
-    from vllm_ascend import envs
+    from vllm_ascend.kt_offload import switches
 
-    return getattr(envs, ENV_NAME, "0") == "1"
+    return switches.raw(ENV_NAME) == "1"
 
 
 def slot_of(layer_idx: int, depth: int = KT_BUFFER_DEPTH) -> int:

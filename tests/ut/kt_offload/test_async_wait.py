@@ -315,12 +315,24 @@ def test_the_env_opens_it(monkeypatch):
     assert aw.enabled_by_env() is True
 
 
-@pytest.mark.parametrize("value", ["0", "", "true", "True", "yes", "on", " 1"])
-def test_anything_but_one_keeps_it_shut(monkeypatch, value):
+@pytest.mark.parametrize("value", ["0", ""])
+def test_zero_or_empty_is_not_an_explicit_request(monkeypatch, value):
     from vllm_ascend import envs
 
     monkeypatch.setattr(envs, aw.ENV_NAME, value, raising=False)
     assert aw.enabled_by_env() is False
+
+
+@pytest.mark.parametrize("value", ["true", "True", "yes", "on", " 1"])
+def test_an_unreadable_value_refuses_rather_than_meaning_off(monkeypatch, value):
+    """Before PLAN §4.33 these silently meant off. With the default now ON,
+    'off' is no longer the harmless reading of a typo, and 'on' is not a
+    reading the operator gave -- so neither: refuse."""
+    from vllm_ascend import envs
+
+    monkeypatch.setattr(envs, aw.ENV_NAME, value, raising=False)
+    with pytest.raises(ValueError, match="only '1'"):
+        aw.enabled_by_env()
 
 
 def _vllm_config():
@@ -340,7 +352,9 @@ def test_it_is_refused_without_our_own_buffers(monkeypatch):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
     monkeypatch.setattr(envs, aw.ENV_NAME, "1", raising=False)
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1)
+    # Neither own-buffer path: the side stream is on by default since PLAN
+    # §4.33, so it is switched off here.
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
     with pytest.raises(ValueError, match="packed_transfer or"):
         cfg._validate_preconditions(_vllm_config())
 

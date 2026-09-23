@@ -49,7 +49,15 @@ import torch
 # (vllm/logger.py:204-214). 132 files in this tree use the import below.
 from vllm.logger import logger
 
-from vllm_ascend.kt_offload import async_wait, device_signal, report_affinity, seam_timing, shared_window, side_stream
+from vllm_ascend.kt_offload import (
+    async_wait,
+    device_signal,
+    report_affinity,
+    seam_timing,
+    shared_window,
+    side_stream,
+    switches,
+)
 from vllm_ascend.kt_offload.placement import (
     LayerPlacement,
     NpuRouting,
@@ -229,28 +237,35 @@ class KTLayerOffload:
         self._merges_since_route = 0
         # Host-func count of this layer when its capture recorded the node.
         self._hostfunc_at_capture: int | None = None
-        self.overlap = bool(getattr(cfg, "overlap_side_stream", False))
+        # PLAN §4.33: every optimisation switch comes from switches.resolve --
+        # cfg, env and the automatic defaults in one place, the same function
+        # config validation used (validate=False: that already refused what it
+        # had to; the on-card harnesses build layers without it). Eager is
+        # applied below, once graph_enabled is known.
+        self.switches = switches.resolve(cfg, validate=False)
+        self.overlap = self.switches.side_stream.on
         self.packed = bool(getattr(cfg, "packed_transfer", False))
-        # P1a, env-only (async_wait.ENV_NAME). The captured node submits and
-        # returns; the device waits on this layer's ExternalEvent instead of on
-        # the callback's return. Captured path only -- eager already blocks the
-        # host, so there is nothing there to hand to another thread.
-        self.async_wait = async_wait.enabled_by_env()
-        # P1b, env-only (device_signal.ENV_NAME). No host-func node at all: an
-        # 8-byte copy of a per-step device counter behind the input copy is the
-        # start signal, and a polling thread runs kt and records the same
-        # ExternalEvent P1a uses. Refused together with async_wait in config --
-        # they are two ways to start the same work, and an arm must differ in
-        # one thing.
-        self.device_signal = device_signal.enabled_by_env()
-        # §4.31, env-only (shared_window.ENV_NAME). When on, forward_impl hands
-        # back an un-merged routed_out and fused_moe._forward_impl calls
-        # merge() after the shared-expert MLP, so those 38.25 us/layer land in
-        # the window where the main stream only waits for kt. Nothing in THIS
-        # class changes: merge() does the same work at a later point in program
-        # order, which is why the side stream being off still runs correctly
-        # (it just buys nothing -- there is no idle window to fill).
-        self.shared_in_window = shared_window.enabled_by_env()
+        # P1a (async_wait.ENV_NAME; unset = on when packed or the side stream
+        # is). The captured node submits and returns; the device waits on this
+        # layer's ExternalEvent instead of on the callback's return. Captured
+        # path only -- eager already blocks the host, so there is nothing
+        # there to hand to another thread.
+        self.async_wait = self.switches.async_wait.on
+        # P1b (device_signal.ENV_NAME; explicit "1" only). No host-func node at
+        # all: an 8-byte copy of a per-step device counter behind the input
+        # copy is the start signal, and a polling thread runs kt and records
+        # the same ExternalEvent P1a uses. An automatic P1a steps aside for it;
+        # both explicit is refused in config -- they are two ways to start the
+        # same work.
+        self.device_signal = self.switches.device_signal.on
+        # §4.31 (shared_window.ENV_NAME; unset = follows the side stream). When
+        # on, forward_impl hands back an un-merged routed_out and
+        # fused_moe._forward_impl calls merge() after the shared-expert MLP, so
+        # those 38.25 us/layer land in the window where the main stream only
+        # waits for kt. Nothing in THIS class changes: merge() does the same
+        # work at a later point in program order, which is why the side stream
+        # being off still runs correctly (it just buys nothing).
+        self.shared_in_window = self.switches.shared_in_window.on
         self._packed: dict[int, dict] = {}
         # bs -> (slot index in the pinned signal array, the 1-element view the
         # graph's counter copy writes). P1b only.
@@ -277,6 +292,19 @@ class KTLayerOffload:
         )
         sizes = getattr(cc, "cudagraph_capture_sizes", None) or []
         self.capture_sizes = sorted(set(sizes)) if self.graph_enabled else []
+        if not self.graph_enabled:
+            # Eager with the §4.33 defaults runs what eager ran before them: an
+            # AUTOMATIC P1a has nothing to act on (no graph; the host already
+            # blocks in route()), and an AUTOMATIC shared-window move has no
+            # window to fill (eager never forks). Only an explicit env "1"
+            # keeps either, as before §4.33 (P1a then warns and drops itself
+            # in _enable_async_wait). The side stream keeps its value: eager
+            # never forks whatever it says (route()), and the A/B harnesses
+            # and tests rely on the attribute reflecting the config.
+            if self.switches.async_wait.source != switches.ENV:
+                self.async_wait = False
+            if self.switches.shared_in_window.source != switches.ENV:
+                self.shared_in_window = False
 
     @property
     def num_slots(self) -> int:
@@ -335,12 +363,14 @@ class KTLayerOffload:
             # counts these to prove the switch was on (40) or off (0) -- an
             # env var that never reached the process reads the same as "no gain".
             logger.warning(
-                "kt_offload: SHARED IN WINDOW for layer %d (%s=1, overlap_side_stream=%s): the kt merge "
-                "is made by fused_moe._forward_impl after the shared-expert MLP. Criterion: bit-identity "
-                "with the switch off, never TPOT (a dropped merge is silent).",
+                "kt_offload: SHARED IN WINDOW for layer %d (%s %s, side stream %s): the kt merge "
+                "is made by fused_moe._forward_impl after the shared-expert MLP. Default on since PLAN "
+                "§4.33; criterion for any change here: bit-identity with the switch off, never TPOT "
+                "(a dropped merge is silent).",
                 self.layer_idx,
                 shared_window.ENV_NAME,
-                self.overlap,
+                self.switches.shared_in_window,
+                self.switches.side_stream,
             )
         # Seam timing, if the env var asks for it. The CPUInfer probe is what
         # splits kt's submit from its sync without touching kt's C++; where WE
@@ -357,18 +387,23 @@ class KTLayerOffload:
         # if one instrument were installed.
         own_node = self.packed or self.overlap
         seam_timing.maybe_enable(self.num_layers, None if own_node else self.wrapper, split=own_node)
-        if self.overlap:
+        if self.overlap and self.graph_enabled:
             # Created here, never inside a capture, and subscribed for host-func
-            # reports before any capture can reach it.
+            # reports before any capture can reach it. Graph mode only: eager
+            # never forks (route()), so with the side stream on by default
+            # (PLAN §4.33) an eager service creates no side stream, prints no
+            # SIDE STREAM ENABLED line and needs no kt entry point it does not
+            # use -- it runs exactly what eager ran before.
             side = _side_stream(device)
-            if self.graph_enabled:
-                _subscribe_stream(side)
+            _subscribe_stream(side)
             logger.warning(
-                "kt_offload: SIDE STREAM ENABLED for layer %d (overlap_side_stream=true, %s=1). "
-                "侧流已启用 —— 实验性路径，默认关闭；判据是与串行臂逐位相同，不是 TPOT "
-                "(every known failure of this path is faster and wrong). kt pinned slot %d, "
-                "captured path only (eager never forks).",
+                "kt_offload: SIDE STREAM ENABLED for layer %d (%s %s). "
+                "侧流已启用 —— PLAN §4.33 起默认开（关：%s=0 或 overlap_side_stream=false）；改动它的判据是"
+                "与串行臂逐位相同，不是 TPOT (every known failure of this path is faster and wrong). "
+                "kt pinned slot %d, captured path only (eager never forks).",
                 self.layer_idx,
+                side_stream.ENV_NAME,
+                self.switches.side_stream,
                 side_stream.ENV_NAME,
                 side_stream.slot_of(self.layer_idx),
             )
@@ -376,7 +411,9 @@ class KTLayerOffload:
                 raise RuntimeError(
                     "kt_offload: overlap_side_stream runs the CPU experts on this layer's OWN pinned "
                     "buffers, so it needs kt's moe.forward_task and cpu_infer.submit/sync; this kt build "
-                    f"({type(self.wrapper).__name__}) does not expose them."
+                    f"({type(self.wrapper).__name__}) does not expose them. Turn the side stream off "
+                    f"({side_stream.ENV_NAME}=0 or overlap_side_stream=false; it is on by default since "
+                    "PLAN §4.33)."
                 )
         if self.packed:
             if not self._packed_supported():
@@ -439,11 +476,13 @@ class KTLayerOffload:
             _COMPLETER = _make_completer(device)
             _COMPLETER.start()
         logger.warning(
-            "kt_offload: ASYNC WAIT ENABLED for layer %d (%s=1). 图里的 host-func 节点只 submit 就返回，"
-            "设备改等 ExternalEvent，由完成线程 sync 完再 record。实验性，默认关；"
-            "判据是与关着的那一臂逐位相同，不是 TPOT —— 放行早 = 更快且算错，且不报错 "
+            "kt_offload: ASYNC WAIT ENABLED for layer %d (%s %s). 图里的 host-func 节点只 submit 就返回，"
+            "设备改等 ExternalEvent，由完成线程 sync 完再 record。PLAN §4.33 起默认开（前提 packed 或侧流；"
+            "关：%s=0）；改动它的判据是与关着的那一臂逐位相同，不是 TPOT —— 放行早 = 更快且算错，且不报错 "
             "(every known failure of this path is faster and wrong). %d capture size(s).",
             self.layer_idx,
+            async_wait.ENV_NAME,
+            self.switches.async_wait,
             async_wait.ENV_NAME,
             len(self._ext_events),
         )

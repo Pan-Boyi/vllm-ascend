@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_arm.sh <RUN> <ARM: A1|B1|A2|B2|...> <CARD> <STEPS: comma list of probe,lp,lp2,perf,gsm,gsm1319,gsm1319if50,hold>  (env: SIDE P1A P1B SIW REQUIRE_CLEAN_TREE PORT) [extra env assignments...]
+# run_arm.sh <RUN> <ARM: A1|B1|A2|B2|...> <CARD> <STEPS: comma list of probe,lp,lp2,perf,gsm,gsm1319,gsm1319if50,hold>  (env: SIDE P1A P1B SIW DEFAULTS REQUIRE_CLEAN_TREE PORT) [extra env assignments...]
 set -u
 ROOT=/workspace/code/dsv4_single_card/vllm_project; cd $ROOT
 RUN=$1; ARM=$2; CARD=$3; STEPS=$4; shift 4
@@ -13,6 +13,22 @@ X=${ARM:0:1}; CFG=$RUN/cfg_$X.json
 # 🔴 P1a 的 A/B 是【两臂都开侧流】、只差 async wait 这一个开关，所以两者都可被调用方
 #    显式覆盖（SIDE=1 P1A=0 / SIDE=1 P1A=1）。覆盖之后下面的必检也跟着这两个值走 ——
 #    检查项必须判【这一臂实际要的】，否则一个写死 40/0 的必检会把正确的臂判成作废。
+# 🔴 PLAN §4.33（2026-09-23）起 侧流 / P1a / 共享专家进窗口 在代码里【默认开】，「不设」不再等于 0。
+#    本脚本从来都把四个开关【显式】传进服务（下面的 env 行），A 臂 = SIDE=0 P1A=0 P1B=0 SIW=0，
+#    所以 A 臂仍是串行 —— 与 cfg 的 overlap_side_stream 写 true 还是 false 无关（SIDE=0 是关闸，
+#    §4.33 之后不再 raise）。🔴 不许把这里的默认值改成「不设」：那样 A 臂会悄悄变成合版本。
+# DEFAULTS=1（§4.33 上卡冒烟用）：四个开关【一个都不传】，并用 env -u 把父 shell 的残留也剥掉，
+#    让服务吃代码默认值。此时 SIDE/P1A/P1B/SIW 不许由调用方给（给了 rc=2），必检的期望值取
+#    WANT_SIDE/WANT_P1A/WANT_P1B/WANT_SIW（默认 1/1/0/1 = §4.33 语义表），另核启动行
+#    「kt_offload switches」逐字等于 WANT_SWITCH_LINE。
+DEFAULTS=${DEFAULTS:-0}
+if [ "$DEFAULTS" = 1 ]; then
+  for v in SIDE P1A P1B SIW; do
+    [ -n "${!v+x}" ] && { echo "❌ DEFAULTS=1 时不许显式给 $v（=${!v}）—— 冒烟测的就是「什么都不设」"; exit 2; }
+  done
+  SIDE=${WANT_SIDE:-1}; P1A=${WANT_P1A:-1}; P1B=${WANT_P1B:-0}; SIW=${WANT_SIW:-1}
+  WANT_SWITCH_LINE=${WANT_SWITCH_LINE:-"side_stream=on(default) async_wait=on(auto: side stream on) shared_in_window=on(auto: follows the side stream) device_signal=off(default)"}
+fi
 SIDE=${SIDE:-$([ "$X" = B ] && echo 1 || echo 0)}
 P1A=${P1A:-0}
 # P1b（VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL）：图里不再有 host-func 节点。与 P1A 互斥
@@ -24,6 +40,13 @@ P1B=${P1B:-0}
 #    而两臂逐位全同 + perf 无差 正是那种错误的样子。必检同样按【这一臂要的值】判 40/0。
 SIW=${SIW:-0}
 case "$SIW" in 0|1) ;; *) echo "❌ SIW 只认 0/1（得到 '$SIW'）"; exit 2;; esac
+if [ "$DEFAULTS" = 1 ]; then
+  SWITCH_ENV=(-u VLLM_ASCEND_DSV41_KT_SIDE_STREAM -u VLLM_ASCEND_DSV41_KT_ASYNC_WAIT
+              -u VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL -u VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW)
+else
+  SWITCH_ENV=(VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$SIDE VLLM_ASCEND_DSV41_KT_ASYNC_WAIT=$P1A
+              VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL=$P1B VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=$SIW)
+fi
 # 起服务前核树（第二版验收起加，第一版 A4 的教训：另一 agent 在跑期间改了本树的已跟踪文件）。
 # REQUIRE_CLEAN_TREE=1 ⇒ 本树 git status 必须为空、指纹 dirty_files 必须两棵树都是 0，否则拒飞 rc=3。
 REQUIRE_CLEAN_TREE=${REQUIRE_CLEAN_TREE:-0}
@@ -40,7 +63,11 @@ print(f'{m["num_correct"]}/{m["num_examples"]} acc={m["aggregate"]["score"]:.4f}
       f'{m["latency_seconds"]:.0f}s')
 PYEOF
 }
-say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A DEVICE_SIGNAL=$P1B SHARED_IN_WINDOW=$SIW extra=[$*] steps=$STEPS"
+if [ "$DEFAULTS" = 1 ]; then
+  say "arm $ARM card $CARD cfg $(cat $CFG) DEFAULTS=1（四个开关都不传；期望 SIDE=$SIDE ASYNC_WAIT=$P1A DEVICE_SIGNAL=$P1B SHARED_IN_WINDOW=$SIW） extra=[$*] steps=$STEPS"
+else
+  say "arm $ARM card $CARD cfg $(cat $CFG) SIDE_STREAM=$SIDE ASYNC_WAIT=$P1A DEVICE_SIGNAL=$P1B SHARED_IN_WINDOW=$SIW extra=[$*] steps=$STEPS"
+fi
 python3 worktrees/moe-offload/tools/kt_offload/build_fingerprint.py stamp $D --label sidestream_$ARM > $D/fp.txt 2>&1
 grep -q 85331298bdeffee02b7c42c5658030ac $D/build_fingerprint.json || { say "❌ .so mismatch"; exit 3; }
 WTREE=$ROOT/worktrees/moe-offload
@@ -62,12 +89,10 @@ fi
 # DRY_RUN=1：只做到这里（cfg/env 组装、.so 与树的核对），不碰卡、不起服务。干跑用。
 [ "${DRY_RUN:-0}" = 1 ] && { say "DRY_RUN: 起飞前核对全过，未起服务"; exit 0; }
 npu-smi info > $D/card_before.txt 2>&1
-( cd $ROOT && setsid env \
+( cd $ROOT && setsid env "${SWITCH_ENV[@]}" \
     WT=moe-offload DSV41_VLLM_TREE=$ROOT/worktrees/moe-offload-vllm LEASE_OWNER=$OWNER \
     KT_OFFLOAD=1 NPUS=$CARD PORT=$PORT EAGER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
     KT_ADDITIONAL_CONFIG="$(cat $CFG)" MAXLEN=8192 MAXSEQS=8 MAXBATCH=4096 \
-    VLLM_ASCEND_DSV41_KT_SIDE_STREAM=$SIDE VLLM_ASCEND_DSV41_KT_ASYNC_WAIT=$P1A \
-    VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL=$P1B VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=$SIW \
     VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG=30 "$@" \
     bash worktrees/moe-offload/tools/kt_offload/serve_v41_singlecard.sh ) > $D/serve.log 2>&1 &
 SP=$!; sleep 2; PGID=$(ps -o pgid= -p $SP | tr -d ' '); echo "pgid=$PGID" > $D/pgid.txt; say "serve pid=$SP pgid=$PGID"
@@ -106,11 +131,19 @@ say "check vllm_ascend: $VA"; say "check SIDE STREAM ENABLED count=$NSS (want $(
 say "check ASYNC WAIT ENABLED count=$NAW (want $([ $P1A = 1 ] && echo 40 || echo 0))"
 say "check DEVICE SIGNAL ENABLED count=$NDS (want $([ $P1B = 1 ] && echo 40 || echo 0))"; say "check ACL errcode lines count=$NE (want 0)"
 say "check SHARED IN WINDOW for layer count=$NSW (want $([ $SIW = 1 ] && echo 40 || echo 0))"
+# §4.33 启动行：开关的【有效值与来源】。显式臂只记录；DEFAULTS=1 臂逐字核对（每一条都得是期望值，且至少一条）。
+NSWL=$(grep -c 'kt_offload switches (PLAN §4.33' $D/serve.log)
+say "check kt_offload switches lines=$NSWL: $(grep -m1 -o 'kt_offload switches (PLAN §4.33.*' $D/serve.log)"
 bad=0; echo "$VA" | grep -q 'worktrees/moe-offload/vllm_ascend/__init__.py' || bad=1
 [ $SIDE = 1 ] && [ $NSS -ne 40 ] && bad=1; [ $SIDE = 0 ] && [ $NSS -ne 0 ] && bad=1; [ $NE -ne 0 ] && bad=1
 [ $P1A = 1 ] && [ $NAW -ne 40 ] && bad=1; [ $P1A = 0 ] && [ $NAW -ne 0 ] && bad=1
 [ $P1B = 1 ] && [ $NDS -ne 40 ] && bad=1; [ $P1B = 0 ] && [ $NDS -ne 0 ] && bad=1
 [ $SIW = 1 ] && [ $NSW -ne 40 ] && bad=1; [ $SIW = 0 ] && [ $NSW -ne 0 ] && bad=1
+if [ "$DEFAULTS" = 1 ]; then
+  NSWOK=$(grep 'kt_offload switches (PLAN §4.33' $D/serve.log | grep -cF "$WANT_SWITCH_LINE")
+  say "check DEFAULTS switches line == '$WANT_SWITCH_LINE': $NSWOK/$NSWL (want all, >=1)"
+  { [ "$NSWL" -ge 1 ] && [ "$NSWOK" -eq "$NSWL" ]; } || bad=1
+fi
 [ $bad = 1 ] && { say "❌ mandatory check failed -> arm void"; stop; exit 5; }
 for s in ${STEPS//,/ }; do case $s in
   probe) curl -s http://127.0.0.1:$PORT/v1/completions -H 'Content-Type: application/json' \

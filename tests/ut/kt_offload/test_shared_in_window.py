@@ -43,16 +43,22 @@ H = 8
 # ---------------------------------------------------------------------------
 
 
-def test_env_switch_defaults_off(monkeypatch):
+def test_env_switch_reads_unset_as_default(monkeypatch):
+    """Unset is "" (= the default, which since PLAN §4.33 follows the side
+    stream -- see test_switches.py), never "0"; enabled_by_env answers only
+    "was it explicitly 1"."""
     from vllm_ascend import envs
 
     monkeypatch.delenv(sw.ENV_NAME, raising=False)
-    assert envs.VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW == "0"
+    assert envs.VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW == ""
     assert sw.enabled_by_env() is False
     monkeypatch.setenv(sw.ENV_NAME, "1")
     assert sw.enabled_by_env() is True
-    monkeypatch.setenv(sw.ENV_NAME, "true")  # only "1" counts, like the others
+    monkeypatch.setenv(sw.ENV_NAME, "0")
     assert sw.enabled_by_env() is False
+    monkeypatch.setenv(sw.ENV_NAME, "true")  # unreadable: refused, not silently off
+    with pytest.raises(ValueError, match=sw.ENV_NAME):
+        sw.enabled_by_env()
 
 
 def test_merge_balance_criterion():

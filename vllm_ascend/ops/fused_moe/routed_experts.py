@@ -650,9 +650,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
     @property
     def kt_shared_in_window(self) -> bool:
-        """Whether THIS layer's caller owes the kt merge (§4.31, env-gated).
+        """Whether THIS layer's caller owes the kt merge (§4.31).
 
-        True only with kt offload on and VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=1.
+        True only with kt offload on and the layer's resolved switch on
+        (``kt_offload.switches.resolve``: default since PLAN §4.33 = follow the
+        side stream, off in eager; VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW=0/1
+        overrides). Read from the layer, never from the env here, so this and
+        the layer's merge accounting cannot disagree.
         Read by fused_moe._forward_impl, the only caller able to put the
         shared-expert MLP in front of the merge.
         """

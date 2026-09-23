@@ -155,7 +155,7 @@ def _vcfg(eager=False, sizes=(1, 2, 4, 8)):
 
 def _runtime(monkeypatch, eager=False, sizes=(1, 2, 4, 8), sets=((1, 4, 6),)):
     plan = build_plan([list(s) for s in sets], 16)
-    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1)
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
     rt = kl.KTLayerOffload(cfg, plan.layer(0), 0, _vcfg(eager, sizes))
     fake = FakeKT()
     monkeypatch.setattr(rt, "_build_wrapper", lambda: fake)
@@ -348,9 +348,8 @@ def test_graph_env_for_kt(cap, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "kt_kernel", types.SimpleNamespace(KTMoEWrapper=KTMoEWrapper))
     plan = build_plan([[0, 3]], 16)
-    rt = kl.KTLayerOffload(
-        KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1), plan.layer(0), 0, _vcfg()
-    )
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
+    rt = kl.KTLayerOffload(cfg, plan.layer(0), 0, _vcfg())
     rt.swiglu_limit = 10.0
     rt._build_wrapper()
     assert built["env"] == "1" and built["method"] == "MXFP4" and built["swiglu_limit"] == 10.0
