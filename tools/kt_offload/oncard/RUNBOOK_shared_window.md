@@ -30,7 +30,9 @@ git -C $NT status --porcelain                  # 必须空
 # 2) .so 在树里（gitignore 的，不进提交）；md5 必须是钉值
 md5sum $NT/vllm_ascend/vllm_ascend_C*.so       # 85331298bdeffee02b7c42c5658030ac
 #    缺了就从验收树【读】一份：cp -p $ROOT/worktrees/moe-offload/vllm_ascend/vllm_ascend_C*.so $NT/vllm_ascend/
-ls $NT/vllm_ascend/_cann_ops_custom/vendors    # 算子包也要在（同样 gitignore）
+ls $NT/vllm_ascend/_cann_ops_custom/vendors    # 算子包也要在（同样 gitignore）；🔴 缺了【不报错】，ds41 算子静默退回
+#    缺了同样从验收树【读】一份：cp -a $ROOT/worktrees/moe-offload/vllm_ascend/_cann_ops_custom/vendors $NT/vllm_ascend/_cann_ops_custom/
+#    干跑输出里必须是 `vendors(loaded)=2eae934d033b files=787`（与验收树 2026-09-23 干跑逐字相同）；`files=0` ⇒ 不许飞
 # 3) 指向新树：run_oncard.sh 用 ONCARD_OUT_OF_TREE 把 PYTHONPATH 上的 vllm_ascend 换成新树
 #    （vllm 树 DSV41_VLLM_TREE 仍是 worktrees/moe-offload-vllm，由脚本自己设，不用管）
 export ONCARD_OUT_OF_TREE=$NT
@@ -39,6 +41,10 @@ CARD=0                                          # 由用户排；🔴 卡 3 永�
 # 4) 干跑：走完预检 + 指纹，停在拿租约之前（不碰卡）。确认日志里 tree= 是 $NT
 ONCARD_DRY=1 ONCARD_RUNS_DIR=/tmp/oncard_dry bash $OC/run_oncard.sh $CARD t5r --shared-mlp both
 ```
+
+2026-09-23 已在提交 `105f02459` 上干跑过一次（rc=0，不碰卡）：`tree=.../staging/moe-offload-shared`、
+`.so md5=85331298…` ✅、`vendors(loaded)=2eae934d033b files=787`（第一次干跑是 `files=0` —— 新树建出来时没带算子包，
+已从验收树拷入；这正是上面那条 🔴 要拦的情况）。
 
 🔴 每发开头看 `🔴 OUT-OF-TREE run: vllm_ascend = .../staging/moe-offload-shared @ <提交>`；
 没有这行 ⇒ 跑的是验收树的代码，这一发作废。
