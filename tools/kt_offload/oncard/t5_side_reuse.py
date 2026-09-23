@@ -475,7 +475,7 @@ def main() -> int:  # noqa: C901
             if wrapper is not None:
                 wrapper.cpu_infer.sync(0)
         finally:
-            self.depth -= 1
+            self._completed += 1
 
     def _complete_stalled(self, wrapper, layer_idx, event):
         """POSITIVE CONTROL: hold EVERY record back by --stall-ms.

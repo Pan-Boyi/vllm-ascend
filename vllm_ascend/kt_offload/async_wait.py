@@ -87,7 +87,15 @@ ENV_NAME = "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT"
 RECORDS: dict[int, int] = {}
 # Every failure the completion thread swallowed so the device could proceed,
 # as ``(layer_idx, repr(exc))``. Never silently empty: it is also logged.
+# Capped, because a kt that fails every layer would otherwise grow this list at
+# 40 entries per token for the life of the process; the log keeps them all.
 ERRORS: list[tuple[int, str]] = []
+MAX_ERRORS = 200
+
+
+def _note_error(layer_idx: int, what: str) -> None:
+    if len(ERRORS) < MAX_ERRORS:
+        ERRORS.append((int(layer_idx), what))
 
 
 def enabled_by_env() -> bool:
@@ -124,10 +132,19 @@ class Completer:
         self._thread: threading.Thread | None = None
         self._stream = None
         self._startup_error: BaseException | None = None
-        # Submits handed over but not yet recorded. Only ever inspected; the
-        # ordering it would guard is supplied by the graph (the next host-func
-        # node is behind this layer's event wait).
-        self.depth = 0
+        # Two counters rather than one depth, because they are written by two
+        # threads: ``_submitted`` only by whoever runs the graph node,
+        # ``_completed`` only by the thread below. A single ``depth += 1 / -= 1``
+        # pair would be a read-modify-write race between them. Only ever read as
+        # a diagnostic; the ordering it might look like it guards is supplied by
+        # the graph (the next host-func node sits behind this layer's wait).
+        self._submitted = 0
+        self._completed = 0
+
+    @property
+    def depth(self) -> int:
+        """Submits handed over and not yet recorded."""
+        return self._submitted - self._completed
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -167,7 +184,7 @@ class Completer:
         to wait for -- just let the device through", which is how a callback
         that raised before ``cpu_infer.submit`` avoids wedging the graph.
         """
-        self.depth += 1
+        self._submitted += 1
         self._q.put((wrapper, int(layer_idx), event))
 
     # -- the thread --------------------------------------------------------
@@ -195,7 +212,7 @@ class Completer:
                 # "this layer's task has run".
                 wrapper.cpu_infer.sync(0)
         except BaseException as exc:  # noqa: BLE001
-            ERRORS.append((int(layer_idx), repr(exc)))
+            _note_error(layer_idx, repr(exc))
             logger.error(
                 "kt_offload async wait: layer %d's CPU task raised at sync: %r. The CPU-expert output of "
                 "this step is NOT this step's -- the device reads whatever the pinned buffer held. The "
@@ -204,12 +221,12 @@ class Completer:
                 exc,
             )
         finally:
-            self.depth -= 1
+            self._completed += 1
             try:
                 event.record(self._stream)
                 RECORDS[layer_idx] = RECORDS.get(layer_idx, 0) + 1
             except BaseException as exc:  # noqa: BLE001
-                ERRORS.append((int(layer_idx), f"record failed: {exc!r}"))
+                _note_error(layer_idx, f"record failed: {exc!r}")
                 logger.critical(
                     "kt_offload async wait: recording layer %d's ExternalEvent FAILED (%r). The graph is "
                     "waiting on it and nothing else will ever signal it: this replay will not finish.",
