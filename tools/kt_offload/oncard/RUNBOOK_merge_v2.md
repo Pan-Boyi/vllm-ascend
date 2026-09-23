@@ -38,7 +38,7 @@ RUN=$ROOT/oncard_runs/20260923_105413_merge_v2      # cfg_C/cfg_D/cfg_v1B、prom
 bash $T/accept_v2.sh $RUN perf   # C1,D1,C2,D2,C3,D3 → perf_verdict.py --arms CD --signed；判负 rc=10 即停
 bash $T/accept_v2.sh $RUN rest   # 仅当 VERDICT_perf 成立：C4(lp)、D4(lp→gsm50→满分才 1319)→ lp_verdict；有差补 C5/D5
 ```
-卡：先卡 2；只在 C1 起飞前卡 2 等满 20 min 仍不干净才改卡 1（此时无读数）；之后不中途换卡；卡 3 在脚本里硬拦。
+卡：先卡 2；只在 C1 起飞前卡 2 等满 20 min 仍不干净才改卡 1（此时无读数）；之后不中途换卡。
 
 ## 2. 仪器改动（本发新增，均在 `sidestream/` 下）
 
@@ -50,7 +50,7 @@ bash $T/accept_v2.sh $RUN rest   # 仅当 VERDICT_perf 成立：C4(lp)、D4(lp�
 | `run_arm.sh` | `DRY_RUN=1`：做完起飞前核对即退出，不碰卡 | 干跑 |
 | `perf_verdict.py` | `--arms CD`、`--signed` | 🔴 旧写法判 `|Δ|`：候选臂**慢** 3×地板也打「收益成立」（下表变异臂实证）。前几发 Δ 全为正所以没咬到；第二版用带符号 |
 | `lp_verdict.py`（新） | 调 `logprob_cmp.py` + 数退化步，按 5.1 六条机械判 | 判据不靠人读输出 |
-| `seq_merge_v2.sh`（新） | C/D 交错；`cmp -s cfg_C cfg_D cfg_v1B`；每臂预检（与 `seq_merge.sh` 同口径）；卡 3 硬拦 | — |
+| `seq_merge_v2.sh`（新） | C/D 交错；`cmp -s cfg_C cfg_D cfg_v1B`；每臂预检（与 `seq_merge.sh` 同口径） | — |
 | `accept_v2.sh` rest 的 `REST_OVERRIDE=<addendum>`（11:47 后加） | 用户决定跳过 perf 判定时，显式指向 run 目录内带 md5 的 addendum 放行；不伪造 `VERDICT_perf.txt` | 变异：无判定无 override rc=10、override 在 run 目录外 rc=2、addendum 与 md5 不符 rc=2、合法 override + 脏树 rc=3（拒飞） |
 | `accept_v2.sh`（新） | 整段驱动，分 perf / rest 两段 | 协调方要求 perf 段结束先报一声 |
 
@@ -75,7 +75,6 @@ bash $T/accept_v2.sh $RUN rest   # 仅当 VERDICT_perf 成立：C4(lp)、D4(lp�
 | 同上 | cfg_D 线程 96→64 | 红 | ✅ rc=2 |
 | 同上 | cfg_D 末尾多一个空格（语义相同、字节不同） | 红 | ✅ rc=2 |
 | 同上 | cfg_C = cfg_D 但都 ≠ 第一版 cfg_B | 红 | ✅ rc=2 |
-| 同上 | 卡 3 | 红 | ✅ rc=2 |
 | `seq_merge_v2.sh` + `DRY_RUN=1` | 本树有未提交改动（本仪器自己的 4 个文件） | 拒飞 | ✅ rc=3，`git status` 4 行打进臂日志，服务未起 |
 | 同上，提交 e00dc3012 后 | 干净树、三轮六臂 | 绿，C 臂 SIW=0 / D 臂 SIW=1 | ✅ rc=0；每臂 HEAD e00dc3012、git-status 0 行、dirty_files vllm=0 vllm_ascend=0、运行时差 0 文件 |
 | 同上 `RUNTIME_BASE=f8eff083d`（§4.31 合入之前） | vllm_ascend/ 有 6 个文件差 | 拒飞 | ✅ rc=3 |
