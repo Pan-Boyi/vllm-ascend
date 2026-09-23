@@ -356,17 +356,66 @@ def main() -> int:  # noqa: C901
     # while the device is still busy, and two events bracket the arm itself.
     blk = torch.randn((2048, 2048), device=dev, dtype=torch.bfloat16)
     torch.npu.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(10):
+    # 🔴 The blocker's cost has to be its DEVICE time, not the wall time of a
+    # launch-and-synchronize loop. Wall time includes the host's launch and the
+    # synchronize, so it overstates what the device actually spends: on the
+    # 2026-09-23 07:11 flight the wall figure said 589 us per mm and 14 of them
+    # would be 8.2 ms of cover, while the device got through them fast enough
+    # to reach e0 before the eager arm had finished launching (host-ahead 42%).
+    for _ in range(3):  # warm the kernel before it is timed
         torch.mm(blk, blk)
     torch.npu.synchronize()
-    per_blk_us = (time.perf_counter() - t0) * 1e5
-    # enough blocker to cover the deepest arm's launch: the fat control alone
-    # is layers x fat_us of device time.
-    need_us = max(5000.0, 2.0 * args.layers * args.fat_us)
+    eb0, eb1 = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+    eb0.record()
+    for _ in range(20):
+        torch.mm(blk, blk)
+    eb1.record()
+    torch.npu.synchronize()
+    per_blk_us = eb0.elapsed_time(eb1) * 1000.0 / 20.0
+
+    def replay_of(name):
+        g = graphs[name][0]
+        arm = "fork" if name == "fork2" else name
+
+        def run():
+            # The per-arm instance flags decide what the *callback* and the
+            # completion/polling threads do at replay time, so they are set on
+            # every sample, not once per capture.
+            if name in arms:
+                set_arm(arm)
+            g.replay()
+
+        return run
+
+    dev_arms = {name: replay_of(name) for name in (*arms, "g_npu_only", "g_fat")}
+    dev_arms["eager_npu_only"] = lambda: npu_chain(sx)
+
+    # 🔴 How much blocker: enough that the HOST is still enqueueing when the
+    # device reaches e0, for EVERY arm -- including the eager one. t4's fixed
+    # ~5 ms was sized for a one-layer eager arm; an ``--layers``-deep eager
+    # chain issues layers x ~a hundred small ops and takes far longer to launch
+    # than that, so on the first t4p flight (2026-09-23 07:08) the eager arm's
+    # host-ahead came out at 12% and the whole run was void. The size is
+    # therefore measured, not guessed: four times the slowest arm's own host
+    # launch, and never under 10 ms. Anything smaller makes the control arm
+    # read launch gaps and the negative control compare two instruments.
+    launch_us = {}
+    for name, fn in dev_arms.items():
+        worst = 0.0
+        for _ in range(3):
+            torch.npu.synchronize()
+            t_l = time.perf_counter()
+            fn()
+            worst = max(worst, (time.perf_counter() - t_l) * 1e6)
+            torch.npu.synchronize()
+        launch_us[name] = worst
+    need_us = max(10000.0, 4.0 * max(launch_us.values()), 2.0 * args.layers * args.fat_us)
     blk_reps = max(1, int(round(need_us / max(per_blk_us, 1.0))))
+    print("  host launch (worst of 3): " + ", ".join(f"{k} {v / 1000:.1f} ms" for k, v in launch_us.items()),
+          flush=True)
     print(f"  blocker: {per_blk_us:.1f} us per 2048^3 mm, {blk_reps} of them "
-          f"(~{blk_reps * per_blk_us / 1000:.1f} ms) queued ahead of every device-timed sample", flush=True)
+          f"(~{blk_reps * per_blk_us / 1000:.1f} ms) queued ahead of every device-timed sample "
+          f"(needed >= {need_us / 1000:.1f} ms)", flush=True)
 
     def dev_timed(fns: dict, reps: int) -> tuple[dict, dict]:
         out = {k: [] for k in fns}
@@ -389,22 +438,6 @@ def main() -> int:  # noqa: C901
                     ahead[name].append(host_ran_ahead)
         return out, ahead
 
-    def replay_of(name):
-        g = graphs[name][0]
-        arm = "fork" if name == "fork2" else name
-
-        def run():
-            # The per-arm instance flags decide what the *callback* and the
-            # completion/polling threads do at replay time, so they are set on
-            # every sample, not once per capture.
-            if name in arms:
-                set_arm(arm)
-            g.replay()
-
-        return run
-
-    dev_arms = {name: replay_of(name) for name in (*arms, "g_npu_only", "g_fat")}
-    dev_arms["eager_npu_only"] = lambda: npu_chain(sx)
     dv, ahead = dev_timed(dev_arms, args.reps)
     dev_stats = {k: M.stats(s) for k, s in dv.items()}
     print("", flush=True)
