@@ -358,6 +358,29 @@ def test_a_step_that_never_arrives_is_not_released():
         p.stop()
 
 
+def test_an_idle_service_and_a_stalled_step_are_told_apart():
+    """🔴 The polling thread cannot ask whether work is coming, so the two
+    silences have to be separated from the tables it already has.
+
+    Every layer waiting for the same step, each word one behind = the last step
+    finished and nothing new started (idle, normal, not a warning). Layers
+    waiting for DIFFERENT steps = a replay stopped half way through the model,
+    which is a fault, and the layers still waiting are what a reader needs.
+
+    The first version logged the idle case after 1 s, which put 137 WARNINGs
+    into one on-card logprob arm; a warning that fires in normal operation
+    stops being read.
+    """
+    idle = ds.waiting_state({0: 9, 1: 9, 2: 9}, {0: 8, 1: 8, 2: 8})
+    assert not idle["stalled"] and idle["step"] == 9 and idle["behind"] == []
+    stalled = ds.waiting_state({0: 9, 1: 9, 2: 8, 3: 8}, {0: 8, 1: 8, 2: 7, 3: 7})
+    assert stalled["stalled"] and stalled["behind"] == [2, 3] and stalled["step"] == 9
+    assert stalled["words"] == {2: 7, 3: 7}
+    assert not ds.waiting_state({}, {})["stalled"]
+    # and the thresholds really do separate them in time
+    assert ds.Poller.IDLE_LOG_EVERY > ds.Poller.STALL_LOG_EVERY > ds.Poller.STALL_LOG_AFTER
+
+
 def test_a_record_that_fails_is_critical_and_counted():
     log: list = []
     w = FakeWaiter(log)

@@ -376,6 +376,37 @@ def step_ok(layer_idx: int, got: int, expected: int) -> dict:
     }
 
 
+def waiting_state(expected: dict[int, int], words: dict[int, int]) -> dict:
+    """Tell "the service is idle" apart from "a step never finished".
+
+    🔴 The polling thread cannot ask anyone whether work is coming, so a wait
+    that goes on for ever looks the same from in here whether the service has
+    no requests or a signal was lost. These two tables do tell them apart:
+
+    * every layer waiting for the SAME step, and each one's word holding the
+      step before it -> the last step completed and nothing new has started.
+      That is an idle service, and it is not worth a warning.
+    * layers waiting for DIFFERENT steps -> some consumed step N and others are
+      still waiting for it, i.e. a replay stopped half way through the model.
+      That one is a stalled step, and the layers still waiting are named.
+
+    Returns the classification plus the layers that are behind, so the log line
+    can point at them instead of dumping 40 numbers.
+    """
+    if not expected:
+        return {"stalled": False, "step": None, "behind": [], "layers": 0}
+    steps = sorted(set(expected.values()))
+    ahead = max(steps)
+    behind = sorted(layer for layer, want in expected.items() if want < ahead)
+    return {
+        "stalled": bool(behind),
+        "step": ahead,
+        "behind": behind,
+        "layers": len(expected),
+        "words": {layer: words.get(layer) for layer in behind[:6]},
+    }
+
+
 def records_match_signals(steps_delta: dict[int, int], record_delta: dict[int, int]) -> dict:
     """Signals consumed and events recorded pair up layer by layer."""
     bad = {
@@ -442,9 +473,19 @@ class Poller:
     # Consecutive timeouts before the wait goes cold (no spinning at all).
     # 5 x 200 ms = 1 s of nothing happening.
     COLD_AFTER = 5
-    # ... and how many cold timeouts between two "still waiting" log lines.
-    # 150 x 200 ms = 30 s.
-    LOG_EVERY = 150
+    # How often the waiting state is looked at, and how long a wait has to last
+    # before each kind of it is worth a line. A STALLED step (layers waiting for
+    # different steps) is a fault and is named quickly; an idle service is
+    # normal and gets one line every few minutes, only so that "the thread is
+    # alive" is visible at all.
+    # 🔴 The first version logged the idle case after 5 timeouts = 1 s, which
+    # put 137 WARNINGs into one on-card logprob arm (2026-09-23): every gap
+    # between two requests produced one. A warning that fires in normal
+    # operation stops being read.
+    LOG_CHECK_EVERY = 25  # 5 s
+    STALL_LOG_AFTER = 25  # 5 s
+    STALL_LOG_EVERY = 150  # 30 s
+    IDLE_LOG_EVERY = 1500  # 300 s
 
     def __init__(self, set_device, make_stream, make_waiter, *, name: str = "kt-offload-poller"):
         self._set_device = set_device
@@ -549,8 +590,8 @@ class Poller:
             if i < 0:
                 self.timeouts += 1
                 idle += 1
-                if idle >= self.COLD_AFTER and (idle - self.COLD_AFTER) % self.LOG_EVERY == 0:
-                    self._log_waiting(snapshot)
+                if idle % self.LOG_CHECK_EVERY == 0:
+                    self._log_waiting(snapshot, idle)
                 continue
             idle = 0
             entry = by_slot.get(i)
@@ -567,27 +608,45 @@ class Poller:
                 continue
             self._handle(entry)
 
-    def _log_waiting(self, snapshot: list[Entry]) -> None:
+    def _log_waiting(self, snapshot: list[Entry], idle: int) -> None:
         """🔴 The only thing standing between a lost signal and a silent hang.
 
         Deliberately not an auto-release: recording an event nobody is waiting
         on leaves the NEXT replay's wait pre-signalled, i.e. it converts a hang
-        into wrong output on every step after it. And from in here an idle
-        service and a lost signal look exactly the same.
+        into wrong output on every step after it. What this does instead is say
+        WHICH of the two silences it is (``waiting_state``) and, for the one
+        that is a fault, name the layers that are behind.
         """
         by_layer: dict[int, int] = {}
         for e in snapshot:
             by_layer[e.layer_idx] = max(by_layer.get(e.layer_idx, 0), self._waiter.read(e.slot))
         want = {layer: self.expected_of(layer) for layer in sorted(by_layer)}
-        logger.warning(
-            "kt_offload device signal: no step signal for %.0fs. Waiting for step %s, the pinned words hold "
-            "%s. If the service is idle this is normal; if it is decoding, the counter copy is not reaching "
-            "these words and every replay is parked on an ExternalEvent nobody will record. This thread will "
-            "NOT record one to break the deadlock -- that would release the next replay's wait too.",
-            self.LOG_EVERY * self.TIMEOUT_NS / 1e9,
-            dict(list(want.items())[:6]),
-            {k: by_layer[k] for k in list(want)[:6]},
-        )
+        state = waiting_state(want, by_layer)
+        seconds = idle * self.TIMEOUT_NS / 1e9
+        if state["stalled"]:
+            if idle >= self.STALL_LOG_AFTER and idle % self.STALL_LOG_EVERY < self.LOG_CHECK_EVERY:
+                logger.warning(
+                    "kt_offload device signal: a replay has been stopped half way through the model for "
+                    "%.0fs. %d of %d layers are still waiting for step %d (%s; their words hold %s): the "
+                    "counter copy of those layers is not reaching the host, and every one of them is parked "
+                    "on an ExternalEvent nobody will record. This thread will NOT record one to break the "
+                    "deadlock -- that would release the next replay's wait as well, turning a hang into "
+                    "silently stale output on every step after it.",
+                    seconds,
+                    len(state["behind"]),
+                    state["layers"],
+                    state["step"],
+                    state["behind"][:8],
+                    state["words"],
+                )
+        elif idle % self.IDLE_LOG_EVERY < self.LOG_CHECK_EVERY:
+            logger.info(
+                "kt_offload device signal: idle for %.0fs -- every layer completed step %d and no replay has "
+                "started since. The polling thread is alive and cold (it stops spinning after %.1fs).",
+                seconds,
+                (state["step"] or 1) - 1,
+                self.COLD_AFTER * self.TIMEOUT_NS / 1e9,
+            )
 
     def _handle(self, e: Entry) -> None:
         """One layer's turn: check the step, run kt, release the device."""
