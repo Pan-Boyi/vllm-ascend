@@ -1277,6 +1277,28 @@ E1 = cfg_D 去掉 `overlap_side_stream` 一项（吃代码默认 true）+ **四�
 
 ⇒ 🟢 **默认开 ≡ 显式开**。起服务前核过：树 HEAD `865954031`、git status 0 行、指纹 dirty 0。就绪 310 s，未撞 `RunAicpuCommInit/11003`（`dsv41_singlecard_stream2` 09-23 的经验：**离上一个 HCCL 任务留够 5 分钟**；本发间隔约 380 s）。
 
+## 4.34 Engram 的 host gather（2026-09-24，**本线不做**，记账）
+
+本线的服务一直开着 engram offload，而它的 host gather 与我们 MoE 的 host-func **在同一条主计算流上** ⇒ 读数一直在我们已有的 trace 里（此前一直当成"别人的模块"漏看了）。
+**出处**：`/dev/shm/dsv41_prof_seam/…/task_time.csv`（09-22 15:01，卡 2，bs1 decode，串行臂，191 步，**开 profiler**，stream 244）。识别不靠推断：trace 里有 `_hash_ids_kernel` / `_write_hash_cache_kernel` / `engram_dequant_staging` 三个具名 kernel。
+
+| 项【直测·中位】 | µs | p90 | n |
+|---|---|---|---|
+| `_hash_ids_kernel`（哈希在 **NPU** 上算） | 31.38 | 31.62 | 191 |
+| `_write_hash_cache_kernel` | 4.65 | 4.87 | 191 |
+| D2H 行号 / H2D staging(权重+scale) / `engram_dequant_staging` | 2.0 / 2.8+2.5 / 2.57 | — | 每步各 2 次 |
+| **host gather 的 `NOTIFY_WAIT`（设备干等）** | **143.62** | 227.50 | 382 |
+| — 每步第 1 次 / 第 2 次 | 171.00 / 112.30 | | 各 191 |
+| **每步 engram 暴露合计** | **≈283.3** | | ≈0.74% of TPOT(38.51 profiled) |
+
+- 🔴 **完全没有被掩盖**：两次 gather 的 host-func 发在 `current_stream`（`models/deepseek_v4_1/engram_embedding.py:310,319`），设备停在 `NOTIFY_WAIT` 里干等；且两次都挤在 step 开头（t=107.8 / 632.8 µs，而第一个 MoE 回调在 t=1285.8）⇒ 中间没有并行的设备工作可掩盖。**哪次对应 L1 / L14 未确认**（host-func 无名字），要坐实需加埋点。
+- **代价全在延迟、不在带宽**：每步搬 12.4 KB（权重 6 KB/层 ×2 层，scale 再加 1/32），D2H+H2D 合计 7.3 µs，而干等 283 µs ⇒ **延迟是搬运的 39 倍**。
+- **表**：`/dev/shm/engram_stage/` 四个文件共 **202.76 GB = 188.8 GiB**（L1/L14 各 weight 98.31 GB + scale 3.07 GB；scale/weight = 1/32），生产全量 mmap 只读共享。**不许删、不许重铺**。
+- ⚪ **与 `dsv41_singlecard_stream2` 的「查表 0.019 ms / 0.1%」差一个数量级**，口径不同（我们这个是设备停等全长，含 ACL 回调派发往返），**两个数不得并列**，要用先对口径。
+
+**📒 可优化项，用户 2026-09-24 定：记账，本线不做（收益太小）。**
+机制与 §4.28 的 P1a 同型——同一条流、同一类 ACL 回调往返开销，而 engram 这条**完全没优化过**。把事件等待那套手法搬过去，量级上每 token 约 0.1–0.2 ms（推断，未验）。真要做还需：确认 L1/L14 的对应、确认 gather 能否移出主流、以及它是否属本线职责范围。
+
 ## 5. 边界（不碰）
 
 - 不重编 `vllm_ascend_C*.so`、不改 `vendors/`（起飞闸查全部 worktree，会挡住所有人）；要重编先找 flash_dev 改闸。
@@ -1375,3 +1397,4 @@ E1 = cfg_D 去掉 `overlap_side_stream` 一项（吃代码默认 true）+ **四�
 - 2026-09-24（phase2）：🔴 §4.3 两处更正（由 `dsv4.1-flash-single-card-report` 线对账发现）：① 「N≤113 / 10 ms 硬地板」把闸默认预留当成了唯一情形——实际 N 与 KV 对冲、闸内 CPU 9.6–10.3 ms，「已超闸」为误；真正关死的是「≤5 ms 需 206 GiB HBM」。② E[k_cpu] 不再只有均匀假设：卡上直测 4.54/层（kt-phase `activated` 字段），且 kt 的 TP 按 intermediate 维切、两 NUMA 各持全部专家 ⇒ 字节不翻倍，4.54 与 4.44 同量纲。
 - 2026-09-24（phase2）：🔴 §4.3 二次更正——「66.8 µs/层固定项、k→0 省不掉」是把拟合截距当成了实测地板；台架直测 T(0)=26.0 µs/层 = **1.04 ms/token** 才是不可约地板，且 k=1 因并行度不足落在拟合区间外。关死论证改用不依赖外推的那条：N=250（6.34 ms）已需 175 GiB HBM。另注明台架 T=1 指 1 个 token、配置与生产同（th96/tp2/numa[0,1]）。
 - 2026-09-24（phase2）：§4.3 补一条纪律——实测地板 26.0 与拟合截距 66.8 **不许拼成 `26.0+43.95k`**（会把偏差方向从高估 7.6% 翻成低估 4.6%，翻转是拼接产物）；两个量各自限定用途，问下限答 1.04、预测 k∈[2,6] 用拟合式。
+- 2026-09-24（phase2）：§4.34 记账 engram host gather 的实测（每步暴露 ≈283 µs、全暴露在主流、延迟是搬运的 39 倍），并记为**不做**（用户定：收益太小）。此前误以为本线无 engram 读数，实际一直在我们的 trace 里。
