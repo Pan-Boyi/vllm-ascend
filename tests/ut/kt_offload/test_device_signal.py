@@ -1,23 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P1b (``VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL``): the protocol, the thread, the spin.
-
-The *ordering* model -- what the device does, what happens when the release is
-early or never comes, and what a counter copy in front of the input copy does
-to the output -- lives in ``test_side_stream_overlap.py``, because that is
-where the simulator that can execute a schedule is. This file covers the three
-halves that need no simulator and could not be tested there:
-
-* the **criteria**, driven red once per way the recorded node sequence can be
-  wrong -- above all a host-func node coming back (which would make a reading
-  about P1b a reading about P1a) and the two copies swapping places;
-* the **polling thread**: expected step numbers, a missed step, a step seen
-  twice, and its contract -- run BEFORE record, record on every path including
-  a raise, 🔴 and never a record on a timeout;
-* the **spin loop itself**, which is real C compiled at start-up: its wait
-  semantics, and the measurement that says why it is C at all (a Python
-  spinner costs the main thread several times its own speed; this one costs
-  it nothing measurable).
-"""
+"""``VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL``: the node-sequence criteria, the
+polling thread, the C spin loop and the switch. Each criterion test drives the
+criterion red one way at a time; the spin tests build and run the real C."""
 
 from __future__ import annotations
 
@@ -43,10 +27,6 @@ def _clean_counters():
     ds.ERRORS.clear()
 
 
-# ---------------------------------------------------------------------------
-# 1. the node-sequence criterion
-# ---------------------------------------------------------------------------
-
 EV = object()
 
 
@@ -70,19 +50,15 @@ def test_the_production_sequence_passes():
 
 
 def test_a_host_func_node_coming_back_is_caught():
-    """🔴 The one that makes the whole reading mean something else.
-
-    A host-func node left in the graph IS P1a, and the 35.75 us of idle in
-    front of it comes back with it -- while the arm would still be labelled
-    P1b. Nothing else in the process would notice.
-    """
+    """A host-func node left in the graph is the other mechanism entirely: the
+    arm would still be labelled device-signal and nothing else would notice."""
     rep = ds.signal_ops_ok([*_good_ops(), ("hostfunc", 0)])
     assert not rep["ok"]
     assert any("host-func" in p for p in rep["detail"]), rep["detail"]
 
 
 def test_the_counter_copy_must_be_behind_the_input_copy():
-    """🔴 The failure with no second line of defence: faster, wrong, silent."""
+    """The failure with no second line of defence: faster, wrong, silent."""
     ops = _good_ops()
     ops[1], ops[2] = ops[2], ops[1]
     rep = ds.signal_ops_ok(ops)
@@ -149,11 +125,6 @@ def test_the_step_and_pairing_criteria():
     assert not bad["ok"] and bad["detail"]["wrong"] == {1: 2}
     assert ds.records_match_signals({0: 3}, {0: 3})["ok"]
     assert not ds.records_match_signals({0: 3}, {0: 2})["ok"]
-
-
-# ---------------------------------------------------------------------------
-# 2. the polling thread
-# ---------------------------------------------------------------------------
 
 
 class FakeWaiter:
@@ -231,8 +202,8 @@ def _wait_for(pred, what, timeout=10.0):
 
 
 def test_it_runs_kt_first_and_records_after():
-    """The order IS the correctness property: a record before the run releases
-    the device while the pinned output still holds the previous step's."""
+    """A record before the run would release the device while the pinned output
+    still holds the previous step's."""
     log: list = []
     w = FakeWaiter(log)
     p = _poller(log, w)
@@ -253,9 +224,8 @@ def test_it_runs_kt_first_and_records_after():
 
 def test_the_thread_takes_its_own_acl_context_before_anything_else():
     """The record is an ACL call from a thread that is neither the main one nor
-    ACL's report thread, so it needs a context; and the stream is made IN the
-    thread, before start() returns, because a capture must never be the first
-    thing that needs it."""
+    ACL's report thread, so it needs a context; the stream is made in that
+    thread and before start() returns, never first inside a capture."""
     log: list = []
     p = _poller(log, FakeWaiter(log))
     p.start()
@@ -275,8 +245,8 @@ def test_a_context_failure_is_a_start_up_error_not_a_hang():
 
 
 def test_a_layer_that_raises_still_releases_the_device():
-    """A device left waiting wedges the engine with no message; stale output at
-    least says so in the log, and is the failure the serial node already has."""
+    """A device left waiting wedges the engine with no message; stale output is
+    at least logged."""
     log: list = []
     w = FakeWaiter(log)
     p = _poller(log, w)
@@ -310,13 +280,9 @@ def test_each_replay_advances_the_expected_step():
 
 
 def test_a_missed_step_is_reported_and_resynchronised():
-    """🔴 Mutant ④: the word runs ahead of the step the poller is waiting for.
-
-    It means some replay released its H2D without this thread having run kt for
-    it. The layer still runs (the pinned inputs ARE this step's -- the copy in
-    front of the counter saw to that), but it must not pass silently, and the
-    poller must come back in step rather than trailing for ever.
-    """
+    """The word ran ahead of the step the poller waits for: some replay released
+    its H2D without this thread having run kt for it. It must not pass silently,
+    and the poller must resynchronise rather than trail for ever."""
     log: list = []
     w = FakeWaiter(log)
     p = _poller(log, w)
@@ -336,13 +302,9 @@ def test_a_missed_step_is_reported_and_resynchronised():
 
 
 def test_a_step_that_never_arrives_is_not_released():
-    """🔴 The deliberate non-feature.
-
-    A timeout must NOT record: from in here "the service is idle" and "the
-    signal is lost" look the same, and a spurious record would release a wait
-    nobody armed AND leave the next replay's wait pre-signalled -- turning a
-    visible hang into silent stale output on every step after it.
-    """
+    """A timeout must NOT record: "idle" and "the signal is lost" look the same
+    from here, and a spurious record would release a wait nobody armed and leave
+    the next replay's pre-signalled -- a visible hang becomes silent staleness."""
     log: list = []
     w = FakeWaiter(log)
     p = _poller(log, w)
@@ -359,18 +321,10 @@ def test_a_step_that_never_arrives_is_not_released():
 
 
 def test_an_idle_service_and_a_stalled_step_are_told_apart():
-    """🔴 The polling thread cannot ask whether work is coming, so the two
-    silences have to be separated from the tables it already has.
-
-    Every layer waiting for the same step, each word one behind = the last step
-    finished and nothing new started (idle, normal, not a warning). Layers
-    waiting for DIFFERENT steps = a replay stopped half way through the model,
-    which is a fault, and the layers still waiting are what a reader needs.
-
-    The first version logged the idle case after 1 s, which put 137 WARNINGs
-    into one on-card logprob arm; a warning that fires in normal operation
-    stops being read.
-    """
+    """The thread cannot ask whether work is coming, so the two silences are
+    told apart from the tables it has: all layers on the same step, each word
+    one behind = idle and normal; layers on DIFFERENT steps = a replay stopped
+    half way through the model, which is a fault worth a warning."""
     idle = ds.waiting_state({0: 9, 1: 9, 2: 9}, {0: 8, 1: 8, 2: 8})
     assert not idle["stalled"] and idle["step"] == 9 and idle["behind"] == []
     stalled = ds.waiting_state({0: 9, 1: 9, 2: 8, 3: 8}, {0: 8, 1: 8, 2: 7, 3: 7})
@@ -404,13 +358,9 @@ def test_a_record_that_fails_is_critical_and_counted():
 
 
 def test_the_slot_a_signal_arrives_on_decides_which_layer_runs():
-    """🔴 Slots are not positions in the entry list.
-
-    The self-test takes slot 0, so the first registered entry lives at slot 1.
-    A poller that indexed its entry list with the waiter's return value would
-    run the wrong layer's experts and record the wrong layer's event -- with
-    numbers that look entirely plausible.
-    """
+    """Slots are not positions in the entry list: the self-test takes slot 0, so
+    indexing the entry list with the waiter's return value would run and record
+    the wrong layer, with entirely plausible-looking numbers."""
     log: list = []
     w = FakeWaiter(log)
     p = _poller(log, w)
@@ -470,11 +420,6 @@ def test_one_layer_with_several_capture_sizes_shares_its_expected_step():
     assert ds.STEPS == {0: 2}
 
 
-# ---------------------------------------------------------------------------
-# 3. the spin loop (real C, compiled at start-up)
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(scope="module")
 def native():
     try:
@@ -524,12 +469,9 @@ def test_a_word_that_ran_ahead_still_returns_so_python_can_judge(words):
 def test_the_spin_sees_another_agents_write_within_microseconds(words):
     """How long the device waits between its copy landing and kt starting.
 
-    Both timestamps are taken in C (the write in ``kt_poke_after``, the match
-    in the wait itself): a Python statement after ``wait`` would be measuring
-    the GIL hand-off, not the loop. For scale, the mechanism this replaces
-    costs ~39 us of dispatch plus 35.75 us of device idle in front of the node
-    (PLAN §4.22 F1).
-    """
+    Both timestamps are taken in C (the write in ``kt_poke_after``, the match in
+    the wait itself): a Python statement after ``wait`` would measure the GIL
+    hand-off, not the loop."""
     _buf, w = words
     lat = []
     for k in range(1, 61):
@@ -542,24 +484,15 @@ def test_the_spin_sees_another_agents_write_within_microseconds(words):
         lat.append((w.seen_ns - wrote[0]) / 1000.0)
     lat.sort()
     median = lat[len(lat) // 2]
-    # Loose on purpose: this is a busy shared machine and the number that
-    # matters is the order of magnitude. Measured 2026-09-23: median 0.52 us,
-    # p90 0.60 us over 300 pokes.
+    # Loose on purpose: on a busy shared machine only the order of magnitude
+    # is meaningful.
     assert median < 20.0, f"the spin took {median:.1f} us (median) to see the write: {lat[:5]}...{lat[-3:]}"
 
 
 def test_the_spin_does_not_hold_the_gil():
-    """🔴 The reason this is C and not Python.
-
-    A Python thread polling a word executes bytecode, so it holds the GIL
-    between checks and the main thread waits for it. The comparison is the
-    evidence: the same spin, once through ctypes (GIL released for the whole
-    call) and once in Python.
-
-    Measured 2026-09-23 on an idle-ish 256-PU host, pinned to two different
-    physical cores: main alone 178 ms, C poller 164 ms, python spinner 1024 ms
-    (5.8x), sleeping thread 162 ms.
-    """
+    """Why the spin is C and not Python: a Python thread polling a word executes
+    bytecode, so it holds the GIL between checks. The same spin is run through
+    ctypes (GIL released for the whole call) and in Python, and compared."""
     import ctypes
 
     try:
@@ -605,12 +538,9 @@ def test_the_spin_does_not_hold_the_gil():
     base = measure(asleep)
     with_c = measure(c_spin)
     with_py = measure(py_spin)
-    # The discriminating comparison, not an absolute: on a shared machine the
-    # absolute numbers move, the ratio does not.
-    # 1.4 rather than the 5.8 measured above: the GIL's own floor for two
-    # CPU-bound threads is about 2x (they take turns), the machine is shared,
-    # and what has to hold is the DIRECTION -- one of these two spinners takes
-    # the interpreter away and the other does not.
+    # A ratio, not an absolute: on a shared machine the absolute numbers move.
+    # The bound is well under the observed gap because only the DIRECTION has to
+    # hold -- one spinner takes the interpreter away, the other does not.
     assert with_py > 1.4 * with_c, (
         f"a python spinner cost the main thread {with_py / base:.1f}x and the C one {with_c / base:.1f}x; "
         "if those are the same, this test is not measuring the GIL and the claim in poll_native.c is "
@@ -629,19 +559,10 @@ def test_the_built_library_is_keyed_to_the_source(native):
     assert native.kt_poll_abi() == ds._ABI
 
 
-# ---------------------------------------------------------------------------
-# 4. the pieces that live in layer.py
-# ---------------------------------------------------------------------------
-
-
 def test_the_self_test_drives_the_whole_path_and_refuses_a_word_that_never_moves(monkeypatch):
-    """The start-up check, on CPU tensors.
-
-    On card it is what turns three silent hangs into start-up errors (no int64
-    add, no 8-byte D2H, a DMA write the host cannot see). Here the same code
-    runs with ``_host_copy`` doing a real copy, and then with one that does
-    nothing -- which is what "the word never moves" looks like.
-    """
+    """The start-up check, on CPU tensors: the same code once with ``_host_copy``
+    doing a real copy, then with one that does nothing -- which is what "the
+    word never moves" looks like."""
     monkeypatch.setattr(kl, "_pinned_empty", lambda shape, dtype: torch.empty(shape, dtype=dtype))
     monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)
     signals = kl._SignalWords(2)
@@ -668,14 +589,9 @@ def test_the_signal_words_are_a_cache_line_apart(monkeypatch):
 
 
 def test_the_poller_builds_the_same_kt_task_the_host_func_node_does(monkeypatch):
-    """🔴 Anti-drift.
-
-    ``_poll_run`` repeats ``_kt_packed_forward``'s ``forward_task`` call
-    literally rather than calling a shared helper, so that instrumenting or
-    changing one of them cannot silently change the other's cost. The price of
-    that is this test: the two must pass the same arguments, or the polling
-    thread is running kt on a different description of the same buffers.
-    """
+    """``_poll_run`` repeats ``_kt_packed_forward``'s ``forward_task`` call
+    literally rather than sharing a helper, so one cannot silently change the
+    other's cost; this test is what keeps the two argument lists identical."""
     calls = []
     buf = {
         "bsz": torch.zeros(1, dtype=torch.int32),
@@ -703,16 +619,11 @@ def test_the_poller_builds_the_same_kt_task_the_host_func_node_does(monkeypatch)
     ]
 
 
-# ---------------------------------------------------------------------------
-# 5. the switch: preconditions, refused at start-up rather than at replay time
-# ---------------------------------------------------------------------------
-
-
 def _cfg(**kw):
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
-    # overlap_side_stream is on by default since PLAN §4.33; the base is the
-    # serial config so each case names the own-buffer path it relies on.
+    # overlap_side_stream defaults on; the base is the serial config so each
+    # case names the own-buffer path it relies on.
     base = {"enabled": True, "cpuinfer_threads": 8, "num_resident_experts": 100, "overlap_side_stream": False}
     cfg = KTOffloadConfig(**{**base, **kw})
     vcfg = SimpleNamespace(
@@ -729,14 +640,10 @@ def _cfg(**kw):
 def _env(monkeypatch):
     """Set the switches in the ENVIRONMENT, not as attributes of ``envs``.
 
-    🔴 ``envs`` resolves these through ``__getattr__``, so
-    ``monkeypatch.setattr(envs, NAME, ...)`` reads the current value as the
-    "old" one and, on undo, writes it back as a REAL attribute -- which shadows
-    ``__getattr__`` for the rest of the session and makes every later
-    ``monkeypatch.setenv`` of that variable a no-op. That is how this fixture
-    silently disabled the seam-timing tests the first time it was written (they
-    use ``setenv``). Anything already shadowed is removed here for the duration.
-    """
+    ``envs`` resolves these through ``__getattr__``, so ``monkeypatch.setattr``
+    writes a REAL attribute back on undo, shadowing ``__getattr__`` for the rest
+    of the session and making every later ``setenv`` of that variable a no-op.
+    Anything already shadowed is removed here for the duration."""
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import async_wait as aw
     from vllm_ascend.kt_offload import side_stream as ss
@@ -772,8 +679,8 @@ def test_it_is_refused_together_with_p1a(_env, monkeypatch):
 
 
 def test_it_is_refused_together_with_the_seam_instrument(_env, monkeypatch):
-    """🔴 The instrument measures segments inside a callback that no longer
-    runs. A report about nothing is worse than no report (§4.26)."""
+    """The instrument measures segments inside a callback that no longer runs;
+    a report about nothing is worse than no report."""
     monkeypatch.setenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", "1")
     cfg, vcfg = _cfg(packed_transfer=True)
     with pytest.raises(ValueError, match="seam"):

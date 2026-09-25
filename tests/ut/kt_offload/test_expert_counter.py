@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Routed-expert frequency counter (M0c) -- CPU only.
+"""Routed-expert frequency counter -- CPU only.
 
-Covers: off by default and guarded at every call site, placement before
-log2phy, profile-run exclusion, decode/prefill split, DP padding and the
-ALLGATHER DP-gathered rows, one file per rank, the report's invariant, and the
-graph-mode refusal. Mutation arms show the checks can fail.
+The capture predicate runs on the NPU in production, so a test that stubs
+``_capturing`` away has zero coverage of it: the fixture instead installs a fake
+``torch.npu`` whose ``is_current_stream_capturing`` answers what the test says
+(True / False / raises / a non-bool) or is absent, and the real predicate runs
+against it. Not claimed here: that on the card the predicate is True exactly for
+the stream the counter's ``index_add_`` is enqueued on.
 """
 
 from __future__ import annotations
@@ -12,7 +14,9 @@ from __future__ import annotations
 import ast
 import importlib.util
 import pathlib
+import types
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -21,21 +25,52 @@ from vllm_ascend.kt_offload import expert_counter as ec
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 ROUTED_EXPERTS = ROOT / "vllm_ascend/ops/fused_moe/routed_experts.py"
-REPORT = ROOT / "tools/kt_offload/expert_count_report.py"
+
+
+def _install_npu(monkeypatch, ctx):
+    """Model the NPU side of the predicate: ``torch.npu.is_current_stream_capturing`` answers ``ctx.capturing``
+    (an exception instance is raised). Undone by monkeypatch, whether or not torch_npu is installed here."""
+
+    def is_current_stream_capturing():
+        if isinstance(ctx.capturing, BaseException):
+            raise ctx.capturing
+        return ctx.capturing
+
+    fake = SimpleNamespace(is_current_stream_capturing=is_current_stream_capturing)
+    monkeypatch.setattr(torch, "npu", fake, raising=False)
+
+
+def _arm(mod, monkeypatch, tmp_path, ctx):
+    monkeypatch.setattr(mod, "OUT_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "ENABLED", True)
+    monkeypatch.setattr(mod, "_S", None)
+    monkeypatch.setattr(mod, "_UNKNOWN_WARNED", False)
+    monkeypatch.setattr(mod, "_CONFIG_ENFORCE_EAGER", None)
+    monkeypatch.setattr(mod, "_batch_split", lambda: ctx.split)
+    monkeypatch.setattr(mod, "_dp_info", lambda: (ctx.rank, ctx.dp))
+    monkeypatch.setattr(mod, "_rows_are_dp_gathered", lambda: ctx.gathered)
+    monkeypatch.setattr(mod.atexit, "register", lambda fn: None)
+    return mod
+
+
+def _ctx():
+    return SimpleNamespace(split=(0, 0), rank=0, dp=1, gathered=(False, None), capturing=False)
 
 
 @pytest.fixture
-def counter(monkeypatch, tmp_path):
-    ctx = SimpleNamespace(split=(0, 0), rank=0, dp=1, gathered=(False, None), capturing=False)
-    monkeypatch.setattr(ec, "OUT_DIR", str(tmp_path))
-    monkeypatch.setattr(ec, "ENABLED", True)
-    monkeypatch.setattr(ec, "_S", None)
-    monkeypatch.setattr(ec, "_capturing", lambda: ctx.capturing)
-    monkeypatch.setattr(ec, "_batch_split", lambda: ctx.split)
-    monkeypatch.setattr(ec, "_dp_info", lambda: (ctx.rank, ctx.dp))
-    monkeypatch.setattr(ec, "_rows_are_dp_gathered", lambda: ctx.gathered)
-    monkeypatch.setattr(ec.atexit, "register", lambda fn: None)
+def env(monkeypatch):
+    """The runtime environment of the predicate. ``env.capturing`` is what the fake NPU answers;
+    ``env.no_npu()`` removes torch.npu from the process."""
+    ctx = _ctx()
+    _install_npu(monkeypatch, ctx)
+    ctx.no_npu = lambda: monkeypatch.delattr(torch, "npu", raising=False)
     return ctx
+
+
+@pytest.fixture
+def counter(env, monkeypatch, tmp_path):
+    _arm(ec, monkeypatch, tmp_path, env)
+    return env
 
 
 def _layer(i):
@@ -51,11 +86,7 @@ def _expected(ids):
     return torch.bincount(ids.reshape(-1).long(), minlength=384)
 
 
-# ---------------------------------------------------------------------------
 # off path
-# ---------------------------------------------------------------------------
-
-
 def test_env_default_is_off(monkeypatch):
     from vllm_ascend import envs
 
@@ -124,11 +155,7 @@ def test_record_before_log2phy_mutation_is_red():
     assert not _record_before_log2phy(mutated)
 
 
-# ---------------------------------------------------------------------------
 # counting
-# ---------------------------------------------------------------------------
-
-
 def test_decode_prefill_split_and_padding(counter):
     counter.split = (3, 10)  # 3 decode tokens, 10 real tokens; router saw 16 rows (padding)
     ids = _ids(16, 1)
@@ -168,7 +195,7 @@ def test_allgather_dp_counts_only_own_slice(counter, rank):
 
 
 def test_allgather_slice_mutation_is_red(counter):
-    """Mutant: take the first rows as the M0c original did -> rank 2 would count rank 0's tokens."""
+    """Mutant: take the first rows instead of the rank's own -> rank 2 would count rank 0's tokens."""
     ids = _ids(32, 7)
     own, mutant = ids[16:22], ids[0:6]
     assert not torch.equal(_expected(own), _expected(mutant))
@@ -181,103 +208,342 @@ def test_allgather_shape_mismatch_is_skipped(counter):
     assert int(ec._S["counts"]["decode"].sum()) == 0 and sum(ec._S["skipped"].values()) == 1
 
 
-def test_graph_mode_refused(counter):
-    with pytest.raises(ec.ExpertCounterError):
-        ec.check_config(SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False)))
-    ec.check_config(SimpleNamespace(model_config=SimpleNamespace(enforce_eager=True)))
+# graph mode: count only provably-eager forwards, with a denominator. Each
+# check_* takes the module under test so that the same criterion runs on the
+# real module and on source-level mutants of it (below); a check is red by
+# raising AssertionError.
+
+
+def _all_layers(mod, ctx, split, rows, seed, force=False):
+    """One model forward: the same router call on every main layer."""
+    ctx.split = split
+    ids = {layer: _ids(rows, seed + layer) for layer in range(mod.N_LAYERS)}
+    for layer in range(mod.N_LAYERS):
+        mod.record(_layer(layer), ids[layer], force)
+    return ids
+
+
+def _dumped(mod):
+    return torch.load(mod.dump())
+
+
+def _ledger_closes(fw):
+    return fw["seen"] == fw["counted"] + sum(fw["excluded"].values())
+
+
+def check_captured_not_counted(mod, ctx):
+    """A forward on a capturing stream adds nothing, and is accounted as captured."""
+    ctx.capturing = True
+    _all_layers(mod, ctx, (8, 8), 8, 10)
+    out = _dumped(mod)
+    fw = out["forwards"]
+    assert int(out["counts"]["decode"].sum() + out["counts"]["prefill"].sum()) == 0, "counted under capture"
+    assert int(out["tokens"]["decode"].sum() + out["tokens"]["prefill"].sum()) == 0
+    assert fw["counted"] == 0 and fw["excluded"].get("captured") == 1, fw
+    assert fw["captured_token_sizes"] == [8] and fw["replayed"] is None, fw
+    assert _ledger_closes(fw), fw
+
+
+def check_eager_counted(mod, ctx):
+    """A >=512-token prefill with the predicate saying False is counted, exactly."""
+    ctx.capturing = False
+    ids = _all_layers(mod, ctx, (0, 512), 512, 20)
+    out = _dumped(mod)
+    for layer in (0, 17, 39):
+        assert torch.equal(out["counts"]["prefill"][layer], _expected(ids[layer])), layer
+    fw = out["forwards"]
+    assert fw["seen"] == 1 and fw["counted"] == 1 and fw["excluded"] == {}, fw
+    assert fw["replayed"] == 0 and out["steps"] == 1, fw  # no capture seen -> no graph -> no replay, provably
+
+
+def check_unknown_not_counted(mod, ctx, make_unknown):
+    """Predicate cannot be evaluated -> not counted (fail closed), accounted, replayed unknowable."""
+    make_unknown()
+    _all_layers(mod, ctx, (0, 512), 512, 30)
+    out = _dumped(mod)
+    fw = out["forwards"]
+    assert int(out["counts"]["prefill"].sum()) == 0, "counted although the capture state was unknown"
+    assert fw["counted"] == 0 and fw["excluded"].get("capture_state_unknown") == 1, fw
+    assert fw["replayed"] is None and _ledger_closes(fw), fw
+
+
+def check_ledger(mod, ctx):
+    """Every layer-0 call has exactly one disposition, and each exclusion is under its own key."""
+    ctx.capturing = False
+    _all_layers(mod, ctx, (4, 4), 4, 40, force=True)  # profile run
+    _all_layers(mod, ctx, (8, 8), 8, 50)  # capture warm-up (eager dummy, looks like decode)
+    ctx.capturing = True
+    _all_layers(mod, ctx, (8, 8), 8, 50)  # the capture
+    ctx.capturing = False
+    ctx.split = None  # an eager dummy without attention metadata
+    mod.record(_layer(0), _ids(1), False)
+    ids_p = _all_layers(mod, ctx, (0, 600), 600, 60)  # real prefill
+    ids_d = _all_layers(mod, ctx, (3, 3), 3, 70)  # real (eager) decode
+    ctx.capturing = RuntimeError("driver gone")
+    _all_layers(mod, ctx, (0, 600), 600, 80)
+    fw = _dumped(mod)["forwards"]
+    ex = fw["excluded"]
+    assert fw["seen"] == 7 and fw["counted"] == 2, fw
+    assert ex.get("profile_run") == 1 and ex.get("captured") == 1, ex
+    assert ex.get("discarded_before_capture") == 1 and ex.get("capture_state_unknown") == 1, ex
+    assert ex.get("no attn metadata (dummy run?)") == 1, ex
+    assert _ledger_closes(fw), fw
+    assert fw["replayed"] is None and fw["captured_token_sizes"] == [8], fw
+    return ids_p, ids_d
+
+
+def check_warmup_discarded(mod, ctx):
+    """Capture warm-ups (eager, FULL => with attn metadata) must not survive into the table."""
+    ctx.capturing = False
+    for seed in (100, 200):  # cudagraph_num_of_warmups = 2
+        _all_layers(mod, ctx, (8, 8), 8, seed)
+    ctx.capturing = True
+    _all_layers(mod, ctx, (8, 8), 8, 100)
+    ctx.capturing = False
+    ids = _all_layers(mod, ctx, (0, 600), 600, 300)
+    out = _dumped(mod)
+    assert int(out["counts"]["decode"].sum()) == 0, "capture warm-up decode counted as traffic"
+    for layer in (0, 39):
+        assert torch.equal(out["counts"]["prefill"][layer], _expected(ids[layer])), layer
+    assert int(out["tokens"]["prefill"][0]) == 600 and int(out["tokens"]["decode"][0]) == 0
+    assert out["forwards"]["excluded"].get("discarded_before_capture") == 2, out["forwards"]
+    # the report's sum invariant still holds after the discard
+    assert torch.equal(out["counts"]["prefill"].sum(1), out["tokens"]["prefill"] * 6)
+    assert torch.equal(out["counts"]["decode"].sum(1), out["tokens"]["decode"] * 6)
+
+
+def check_capture_touches_no_device_state(mod, ctx):
+    """The captured path may not write a device tensor: it would be recorded and
+    re-run on every replay. CPU model of that: the counts tensors must be
+    bit-identical before and after a captured call.
+    """
+    ctx.capturing = False
+    _all_layers(mod, ctx, (8, 8), 8, 400)
+    before = {b: t.clone() for b, t in mod._S["counts"].items()}
+    ctx.capturing = True
+    _all_layers(mod, ctx, (8, 8), 8, 400)
+    for b, t in mod._S["counts"].items():
+        assert torch.equal(t, before[b]), f"device counts[{b}] written under capture"
+    ctx.capturing = False
+    ids = _all_layers(mod, ctx, (0, 512), 512, 500)
+    assert int(mod._S["counts"]["decode"].sum()) == 0  # stale counts dropped by the eager call
+    assert torch.equal(mod._S["counts"]["prefill"][0], _expected(ids[0]))
+
+
+def check_first_call_captured_allocates_nothing(mod, ctx):
+    """If the very first call is under capture, no device state may be allocated (graph pool)."""
+    ctx.capturing = True
+    mod.record(_layer(0), _ids(8), False)
+    assert mod._S["counts"] is None, "allocated counts under capture"
+    ctx.capturing = False
+    ctx.split = (0, 512)
+    ids = _ids(512, 9)
+    mod.record(_layer(0), ids, False)
+    assert torch.equal(mod._S["counts"]["prefill"][0], _expected(ids))
+
+
+def _no_npu(monkeypatch, ctx):
+    return lambda: monkeypatch.delattr(torch, "npu", raising=False)
+
+
+def _unknown_envs(monkeypatch, ctx):
+    """Every way the predicate can fail to give an answer."""
+
+    def set_(v):
+        return lambda: setattr(ctx, "capturing", v)
+
+    return {
+        "no_torch_npu": _no_npu(monkeypatch, ctx),
+        "no_predicate": lambda: monkeypatch.setattr(torch, "npu", SimpleNamespace(), raising=False),
+        "raises": set_(RuntimeError("ACL not initialised")),
+        "returns_mock": set_(mock.MagicMock()),
+        "returns_int": set_(1),
+        "returns_none": set_(None),
+    }
+
+
+UNKNOWN_KINDS = ("no_torch_npu", "no_predicate", "raises", "returns_mock", "returns_int", "returns_none")
+
+CHECKS = {
+    "captured_not_counted": check_captured_not_counted,
+    "eager_counted": check_eager_counted,
+    "ledger": check_ledger,
+    "warmup_discarded": check_warmup_discarded,
+    "capture_touches_no_device_state": check_capture_touches_no_device_state,
+    "first_call_captured_allocates_nothing": check_first_call_captured_allocates_nothing,
+}
+
+
+@pytest.mark.parametrize("name", sorted(CHECKS))
+def test_graph_mode_checks_green_on_real_module(counter, name):
+    CHECKS[name](ec, counter)
+
+
+@pytest.mark.parametrize("kind", UNKNOWN_KINDS)
+def test_cannot_evaluate_fails_closed(counter, monkeypatch, kind):
+    check_unknown_not_counted(ec, counter, _unknown_envs(monkeypatch, counter)[kind])
+
+
+def test_predicate_is_the_production_one(env, monkeypatch):
+    """True/False only from a real bool; the capture half matches layer.py's ``_capturing`` (``is True``)."""
+    from vllm_ascend.kt_offload import layer as kt_layer  # not the model package: no platform patches
+
+    for answer, want in ((True, True), (False, False), (1, None), (0, None), (None, None), (mock.MagicMock(), None)):
+        env.capturing = answer
+        assert ec._capturing() is want, answer
+        # "captured" agrees with the production path's own predicate, evaluated on the same fake stream
+        assert (want is True) == (kt_layer._capturing() is True), answer
+    env.capturing = RuntimeError("x")
+    assert ec._capturing() is None
+    env.no_npu()
+    assert ec._capturing() is None
+
+
+def test_plain_cpu_process_counts_nothing(counter, monkeypatch, caplog):
+    """Without an NPU the real predicate cannot say "eager"."""
+    counter.no_npu()
+    counter.split = (0, 512)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            ec.record(_layer(0), _ids(512), False)
+    fw = ec._S["forwards"]
+    assert fw["counted"] == 0 and fw["excluded"] == {"capture_state_unknown": 3}
+    warned = [r for r in caplog.records if "cannot tell whether the current stream is being captured" in r.getMessage()]
+    assert len(warned) <= 1  # logged once, not per call (0 if the vllm logger does not propagate to caplog)
+
+
+def test_check_config_records_instead_of_refusing(counter):
+    ec.check_config(SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False)))
+    assert ec._CONFIG_ENFORCE_EAGER is False
+    counter.split = (1, 1)
+    ec.record(_layer(0), _ids(1), False)
+    out = _dumped(ec)
+    assert out["config_enforce_eager"] is False and out["forwards"]["counted"] == 1
+
+
+def test_non_main_layer_calls_are_not_forwards(counter):
     counter.capturing = True
-    with pytest.raises(ec.ExpertCounterError):
-        ec.record(_layer(0), _ids(1), False)
+    ec.record(SimpleNamespace(layer_name="dspark.stages.0.ffn.experts"), _ids(8), False)
+    ec.record(_layer(3), _ids(8), False)  # captured, but not layer 0: per-call only
+    fw = ec._S["forwards"]
+    assert fw["seen"] == 0 and fw["excluded"] == {}
+    assert ec._S["skipped"].get("captured") == 1
 
 
-# ---------------------------------------------------------------------------
-# files per rank + report invariant
-# ---------------------------------------------------------------------------
+# mutation arms: each mutant is the real source with one edit, and must turn a check red
+
+COUNTER_SRC = pathlib.Path(ec.__file__)
 
 
-def _load_report():
-    spec = importlib.util.spec_from_file_location("expert_count_report", REPORT)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+def _mutant(tag, *subs):
+    src = COUNTER_SRC.read_text()
+    for old, new in subs:
+        assert src.count(old) == 1, f"mutant {tag}: anchor not found exactly once: {old!r}"
+        src = src.replace(old, new)
+    mod = types.ModuleType(f"vllm_ascend.kt_offload.expert_counter__mutant_{tag}")
+    mod.__file__ = str(COUNTER_SRC)
+    exec(compile(src, f"{COUNTER_SRC} [mutant {tag}]", "exec"), mod.__dict__)
     return mod
 
 
-def test_one_file_per_rank_and_report_invariant(counter, tmp_path, monkeypatch):
-    paths = []
-    for rank in range(4):
-        monkeypatch.setattr(ec, "_S", None)
-        monkeypatch.setattr(ec.os, "getpid", lambda r=rank: 1000 + r)  # distinct processes
-        counter.rank, counter.dp = rank, 4
-        for step in range(3):
-            counter.split = (2, 5)
-            for layer in range(ec.N_LAYERS):
-                ec.record(_layer(layer), _ids(5, seed=rank * 100 + step * 10 + layer), False)
-        paths.append(ec.dump())
-    assert len(set(paths)) == 4 and all(f"rank{r}_pid{1000 + r}.pt" in p for r, p in enumerate(paths))
-    tot, tok, bad = _load_report().load(str(tmp_path))
-    assert bad == 0
-    assert torch.equal(tot["all"].sum(1), tok["all"] * 6)
-    assert int(tok["all"][0]) == 4 * 3 * 5
+MUTANTS = {
+    # counts a captured forward: the capture verdict is ignored
+    "count_during_capture": (
+        [("    cap = _capturing()\n", "    cap = _capturing()\n    cap = False if cap is True else cap\n")],
+        ["captured_not_counted"],
+    ),
+    # the runtime condition as a gate, both constants
+    "predicate_const_false": (
+        [("def _capturing() -> bool | None:\n", "def _capturing() -> bool | None:\n    return False\n")],
+        ["captured_not_counted", "unknown:no_torch_npu", "unknown:raises"],
+    ),
+    "predicate_const_true": (
+        [("def _capturing() -> bool | None:\n", "def _capturing() -> bool | None:\n    return True\n")],
+        ["eager_counted", "unknown:no_torch_npu"],
+    ),
+    # layer.py's predicate verbatim: fine for "am I capturing", fails OPEN for "am I provably eager"
+    "fail_open_like_layer_py": (
+        [
+            (
+                "        return None\n    try:\n        result = predicate()",
+                "        return False\n    try:\n        result = predicate()",
+            ),
+            ("    if result is False:\n        return False\n", "    if result is not True:\n        return False\n"),
+        ],
+        ["unknown:no_torch_npu", "unknown:returns_mock", "unknown:returns_none"],
+    ),
+    # the denominator: drop the excluded-count bookkeeping
+    "drop_excluded_bookkeeping": (
+        [("        ex[why] = ex.get(why, 0) + 1\n", "        pass\n")],
+        ["ledger", "captured_not_counted"],
+    ),
+    # capture warm-ups kept in the table
+    "keep_capture_warmups": (
+        [("        dropped = _discard_before_capture(s)\n", "        dropped = 0\n")],
+        ["warmup_discarded", "ledger"],
+    ),
+    # zero the device counts inside the captured call (would be recorded into the graph)
+    "zero_under_capture": (
+        [
+            (
+                '    s["counts_stale"] = True\n',
+                '    s["counts_stale"] = True\n    for t in (s["counts"] or {}).values():\n        t.zero_()\n',
+            )
+        ],
+        ["capture_touches_no_device_state"],
+    ),
+    # allocate the state's device tensors regardless of the capture verdict
+    "allocate_under_capture": (
+        [
+            (
+                "    s = _state(topk_ids.device, allocate=cap is False)\n",
+                "    s = _state(topk_ids.device, allocate=True)\n",
+            )
+        ],
+        ["first_call_captured_allocates_nothing"],
+    ),
+}
 
 
-def test_report_invariant_mutation_is_red(counter, tmp_path):
-    counter.split = (1, 2)
-    ec.record(_layer(0), _ids(2), False)
-    path = ec.dump()
-    d = torch.load(path)
-    d["tokens"]["decode"][0] += 1  # tokens no longer match counts
-    torch.save(d, path)
-    _, _, bad = _load_report().load(str(tmp_path))
-    assert bad == 1
+def _run_check(check, mod, ctx, monkeypatch):
+    if check.startswith("unknown:"):
+        check_unknown_not_counted(mod, ctx, _unknown_envs(monkeypatch, ctx)[check.split(":", 1)[1]])
+    else:
+        CHECKS[check](mod, ctx)
 
 
-def test_report_output_feeds_frequency_placement(counter, tmp_path):
-    from vllm_ascend.kt_offload.placement import load_frequency_table
-
-    counter.split = (1, 3)
-    for layer in range(ec.N_LAYERS):
-        ec.record(_layer(layer), _ids(3, seed=layer), False)
-    ec.dump()
-    rep = _load_report()
-    tot, _, bad = rep.load(str(tmp_path))
-    assert bad == 0
-    import torch as _t
-
-    _t.save({"counts": tot, "tokens": {}}, tmp_path / "expert_counts_total.pt")
-    freq = load_frequency_table(str(tmp_path / "expert_counts_total.pt"))
-    assert tuple(freq.shape) == (40, 384) and _t.equal(freq, tot["all"])
+@pytest.mark.parametrize(
+    "tag,check", [(tag, check) for tag, (_, checks) in MUTANTS.items() for check in checks], ids=lambda x: x
+)
+def test_mutation_arm_is_red(monkeypatch, tmp_path, tag, check):
+    subs, _ = MUTANTS[tag]
+    ctx = _ctx()
+    _install_npu(monkeypatch, ctx)
+    mod = _arm(_mutant(tag, *subs), monkeypatch, tmp_path, ctx)
+    with pytest.raises(AssertionError):
+        _run_check(check, mod, ctx, monkeypatch)
 
 
-def _allgather_run(counter, monkeypatch, tmp_path, old_slicing: bool):
-    """4 DP ranks, one ALLGATHER step per layer: every rank sees the same 4x8 gathered rows."""
-    for rank in range(4):
-        monkeypatch.setattr(ec, "_S", None)
-        monkeypatch.setattr(ec.os, "getpid", lambda r=rank: 2000 + r)
-        counter.rank, counter.dp = rank, 4
-        # old bug: rows treated as local -> slice from row 0 on every rank
-        counter.gathered = (False, None) if old_slicing else (True, 8)
-        counter.split = (4, 6)
-        for layer in range(ec.N_LAYERS):
-            ec.record(_layer(layer), _ids(32, seed=500 + layer), False)  # same gathered rows on all ranks
-        ec.dump()
-    return _load_report()
+@pytest.mark.parametrize("check", sorted({c for _, checks in MUTANTS.values() for c in checks}), ids=lambda x: x)
+def test_same_checks_green_on_unmutated_source(monkeypatch, tmp_path, check):
+    """Positive control: the same harness on the unedited source is green, so a red
+    arm is the mutation and not the exec-loading."""
+    ctx = _ctx()
+    _install_npu(monkeypatch, ctx)
+    mod = _arm(_mutant("none"), monkeypatch, tmp_path, ctx)
+    _run_check(check, mod, ctx, monkeypatch)
 
 
-@pytest.mark.parametrize("old_slicing", [True, False])
-def test_identity_criterion_discriminates_allgather_slicing(counter, monkeypatch, tmp_path, old_slicing):
-    rep = _allgather_run(counter, monkeypatch, tmp_path, old_slicing)
-    # sum criterion alone (identity check disabled): green in both arms -> no discriminating power
-    monkeypatch.setattr(rep, "identity_check", lambda names, ranks: 0)
-    _, _, bad_sum_only = rep.load(str(tmp_path))
-    assert bad_sum_only == 0
-    rep2 = _load_report()
-    _, _, bad = rep2.load(str(tmp_path))
-    assert bad == (1 if old_slicing else 0)
+# files per rank + report invariant
 
 
-def test_identity_criterion_names_the_ranks(counter, monkeypatch, tmp_path, capsys):
-    rep = _allgather_run(counter, monkeypatch, tmp_path, old_slicing=True)
-    rep.load(str(tmp_path))
-    out = capsys.readouterr().out
-    assert "计数完全相同的 rank 对" in out and "rank0_pid2000.pt" in out and "rank3_pid2003.pt" in out
-    assert "比较了 80 个" in out  # 40 layers x 2 buckets, all 4 ranks have tokens
+
+
+
+
+
+
+
+
+
+

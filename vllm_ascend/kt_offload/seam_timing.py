@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Seam timing for the graph-mode host-func path (the 107.5 us/layer target).
+"""Seam timing for the graph-mode host-func path.
 
-§4.18 measured, on one card, bs1 decode, graph mode, serial: the device waits
-a median 353.6 us per layer in NOTIFY_WAIT, while kt's own phase timing
-(``KT_MOE_PHASE_TIMING=1``) accounts for 246.1 us of CPU work on the slower
-NUMA node. The 107.5 us/layer difference (~4.3 ms/token) is *not* kt compute,
-and nothing said where it sits. This module timestamps the seams a host
-thread can see, so that difference stops being one number.
+Per layer, the device waits measurably longer in NOTIFY_WAIT than kt's own
+phase timing (``KT_MOE_PHASE_TIMING=1``) accounts for. This module timestamps
+the seams a host thread can see, so that difference stops being one number.
 
 The segments, in the order they happen inside one host-func callback
 (``layer._kt_host_forward`` / ``layer._kt_packed_forward``):
@@ -26,42 +23,34 @@ The segments, in the order they happen inside one host-func callback
   gap       this callback's entry minus the previous entry *for the same
             layer* -- the host-side view of one device step's period
 
-What is deliberately NOT here: the device-side arrival at the host-func node,
-its dispatch to this thread, and the notify back to the device. No host clock
-can see those. They are obtained by subtraction against a same-run profile:
+Not here, because no host clock can see them: the device-side arrival at the
+host-func node (A), its dispatch to this thread, and the notify back to the
+device (F). They are obtained by subtraction against a profile of the SAME run
+-- same service, same steps:
 
     A + F_device = NOTIFY_WAIT(per layer) - cb(per layer)
-
-which is why the runbook (tools/kt_offload/oncard/RUNBOOK_seam.md) insists the
-profile and these records come from the same service, same steps.
-
-Splitting A from F (§4.22 P0). The subtraction above gives A + F_device as one
-number. A profile's task timestamps are CLOCK_REALTIME microseconds (checked:
-a device task's ``ts`` and this host's ``time.time()*1e6`` share a base), so a
-CLOCK_REALTIME stamp at callback entry and exit can be subtracted from them
-directly, per callback:
-
     A = entry_realtime - HOSTFUNC_CALLBACK.ts
     F = (NOTIFY_WAIT.ts + NOTIFY_WAIT.dur) - exit_realtime
 
-The segments above stay on ``perf_counter_ns`` (monotonic, what they always
-were); the two realtime stamps are extra, taken first thing at entry and last
-thing in ``record()``, and are written out raw -- absolute CLOCK_REALTIME
-nanoseconds per callback, one ``[kt-seam-rt]`` line per layer per sample --
-because the join with the profile is per callback and a median cannot be
-joined. tools/kt_offload/prof/seam.py does the join and refuses the A/F
-columns when A + F does not reconcile with NOTIFY_WAIT - cb.
+The per-callback form works because a profile's task timestamps are
+CLOCK_REALTIME microseconds sharing a base with this host's clock. The segments
+above stay on ``perf_counter_ns`` (monotonic); the two realtime stamps are extra,
+taken first thing at entry and last thing in ``record()``, and written out raw --
+one ``[kt-seam-rt]`` line per layer per sample -- because the join with the
+profile is per callback and a median cannot be joined. The offline tool does the
+join and refuses the A/F columns when A + F does not reconcile with
+NOTIFY_WAIT - cb.
 
-Cost discipline. The callback is inside a graph node: the device is blocked on
-it. So on the hot path there is no I/O, no allocation, no dict insert, no
-locking -- only ``time.perf_counter_ns()`` calls and integer stores into a
-list that was sized at startup. The aggregation and the logging happen on a
-separate sampler thread, the same shape as hostfunc_log.py.
+The callback is inside a graph node, so the device is blocked on it: on the hot
+path there is no I/O, no allocation, no dict insert, no locking -- only
+``time.perf_counter_ns()`` calls and integer stores into a list sized at
+startup. Aggregation and logging happen on a separate sampler thread, the same
+shape as hostfunc_log.py.
 
-Off unless ``VLLM_ASCEND_DSV41_KT_SEAM_TIMING`` is set to a sampling interval
-in seconds. With it off, ``RECORDER`` stays None and the callbacks take the
-same branch they always took: not one extra device operation, not one changed
-byte of output, on or off.
+Off unless ``VLLM_ASCEND_DSV41_KT_SEAM_TIMING`` is set to a sampling interval in
+seconds; with it off ``RECORDER`` stays None and the callbacks take the branch
+they always took -- not one extra device operation, not one changed byte of
+output.
 """
 
 from __future__ import annotations
@@ -110,16 +99,13 @@ ADDITIVE = ("pre", "kt_pre", "submit", "between", "sync", "kt_tail", "post")
 # Without the CPUInfer probe only these are filled.
 ADDITIVE_LUMPED = ("pre", "kt", "post")
 
-# Timestamp scratch, written by the callback and by the CPUInfer probe that
-# runs inside it. One list, reused: allocating a tuple per callback is exactly
-# the kind of cost this module exists to measure.
-#
-# It is safe to share because host-func callbacks are delivered on the one ACL
-# report/subscriber thread, serially -- the same property the whole captured
-# path already relies on (one serial FIFO worker, one callback at a time). If
-# that ever stops being true the records interleave; ``record()`` drops a
-# record whose timestamps are not monotonic, which is what that would look
-# like.
+# Timestamp scratch, written by the callback and by the CPUInfer probe that runs
+# inside it. One list, reused: allocating a tuple per callback is exactly the
+# kind of cost this module exists to measure. Sharing is safe because host-func
+# callbacks are delivered on the one ACL report/subscriber thread, serially --
+# the property the whole captured path already relies on (one serial FIFO
+# worker, one callback at a time). If that stops being true the records
+# interleave, which is what ``record()`` drops as non-monotonic timestamps.
 #
 # ``T_ENTER_RT`` is the one CLOCK_REALTIME stamp in here (ns since the epoch,
 # ``time.clock_gettime_ns(time.CLOCK_REALTIME)``); every other slot is
@@ -144,9 +130,9 @@ _STOP = threading.Event()
 class SeamRecorder:
     """Per-layer ring buffer of segment durations, in nanoseconds.
 
-    Sized once, at startup: ``num_layers * capacity * ROW`` integers in one
-    flat list. A record is twelve integer stores into slots that already
-    exist (ten segments + the two CLOCK_REALTIME stamps).
+    Sized once, at startup: ``num_layers * capacity * ROW`` integers in one flat
+    list, so a record is twelve stores into slots that already exist (ten
+    segments + the two CLOCK_REALTIME stamps).
     """
 
     def __init__(self, num_layers: int, capacity: int = 1024):
@@ -189,10 +175,9 @@ class SeamRecorder:
             buf[base + S_SYNC] = y_out - y_in
             buf[base + S_KT_TAIL] = t_kt - y_out
         else:
-            # No probe (or a callback that did not go through it): the middle
-            # is one number. Zero, not a guess -- a zero segment next to a
-            # filled ``kt`` reads as "not measured here", a guessed split does
-            # not.
+            # No probe (or a callback that did not go through it): the middle is
+            # one number. Zero, not a guess -- a zero segment next to a filled
+            # ``kt`` reads as "not measured here".
             buf[base + S_KT_PRE] = 0
             buf[base + S_SUBMIT] = 0
             buf[base + S_BETWEEN] = 0
@@ -208,8 +193,8 @@ class SeamRecorder:
         """Records added since the given per-layer counts, plus the new counts.
 
         Only whole ring slots are read; if a layer produced more than
-        ``capacity`` records in one interval the oldest are gone and the
-        report says how many were lost.
+        ``capacity`` records in one interval the oldest are gone and the report
+        says how many were lost.
         """
         out: dict[int, list[list[int]]] = {}
         now = list(self.count)
@@ -251,9 +236,7 @@ _MIDDLE_IDX = (S_KT_PRE, S_SUBMIT, S_BETWEEN, S_SYNC, S_KT_TAIL)
 def summarize(rows_by_layer: dict[int, list[list[int]]], split: bool, interval_s: float) -> dict:
     """Median/p90 per segment per layer, in microseconds. Pure, hence testable.
 
-    Two per-callback fields ride along (§4.20.1: medians alone cannot see one
-    bad callback, and tools/kt_offload/prof/seam.py:check_layer judges these
-    exactly when present):
+    Two per-callback fields ride along, since medians hide one bad callback:
 
       n_unsplit      callbacks of a ``split`` run whose five middle segments
                      were not filled (the probe did not run for them); always
@@ -301,9 +284,9 @@ def summarize(rows_by_layer: dict[int, list[list[int]]], split: bool, interval_s
 def reconcile(med_us: dict[str, float], split: bool, tol_us: float = 2.0) -> dict:
     """Do the segments of one layer add up to its callback duration?
 
-    This is the check that catches a timestamp taken in the wrong place: a
-    mis-ordered pair either overlaps or leaves a hole, and both show up here
-    as a residual that is not ~0. It is reported, never silently absorbed.
+    Catches a timestamp taken in the wrong place: a mis-ordered pair either
+    overlaps or leaves a hole, and both show up here as a residual that is not
+    ~0. Reported, never silently absorbed.
     """
     keys = ADDITIVE if split else ADDITIVE_LUMPED
     total = sum(float(med_us.get(k, 0.0)) for k in keys)
@@ -325,11 +308,11 @@ def format_record(summary: dict) -> str:
 def realtime_rows(rows_by_layer: dict[int, list[list[int]]]) -> list[dict]:
     """Per layer: every callback's absolute CLOCK_REALTIME entry/exit, and its cb.
 
-    Units are in the key names: ``*_realtime_ns`` are nanoseconds since the
-    epoch (``time.clock_gettime_ns(time.CLOCK_REALTIME)``), ``cb_ns`` is the
-    perf_counter duration the segments add up to -- the offline tool compares
-    the two spans, which is how a clock mix-up is caught. Callbacks with no
-    realtime stamp (0) are left out, never written as 0.
+    Units are in the key names: ``*_realtime_ns`` are ns since the epoch
+    (``time.clock_gettime_ns(time.CLOCK_REALTIME)``), ``cb_ns`` the perf_counter
+    duration the segments add up to; the offline tool compares the two spans,
+    which is how a clock mix-up is caught. Callbacks with no realtime stamp (0)
+    are left out, never written as 0.
     """
     out = []
     for layer, rows in sorted(rows_by_layer.items()):
@@ -356,15 +339,14 @@ def format_realtime(entry: dict) -> str:
 def install_infer_probe(wrapper) -> bool:
     """Time kt's submit/sync without touching kt's C++ or rebuilding the wheel.
 
-    ``run_pinned_forward_sync`` is Python (experts_base.py:717-772): it builds
-    a task, calls ``self.cpu_infer.submit(task)`` and then
-    ``self.cpu_infer.sync(allow_pending)``. Replacing that attribute with a
-    pass-through that timestamps the two calls is the whole trick -- the task,
-    the pointers, the order and the return values are kt's own.
+    ``run_pinned_forward_sync`` is Python (kt's ``experts_base.py``): it calls
+    ``self.cpu_infer.submit(task)`` then ``self.cpu_infer.sync(allow_pending)``,
+    so replacing that attribute with a pass-through that timestamps the two calls
+    leaves the task, the pointers, the order and the return values kt's own.
 
-    Returns False if this build does not let us (then only ``kt`` is measured
-    and the report says ``split: false``); never raises: a diagnostic that
-    takes the service down is worse than a missing column.
+    Returns False if this build does not let us (only ``kt`` is then measured and
+    the report says ``split: false``); never raises, a diagnostic that takes the
+    service down being worse than a missing column.
     """
     inner = getattr(wrapper, "cpu_infer", None)
     if inner is None or isinstance(inner, _TimedCpuInfer):
@@ -387,9 +369,9 @@ def unwrap_infer(infer):
 class _TimedCpuInfer:
     """Pass-through CPUInfer that timestamps submit/sync into ``TS``.
 
-    Every wrapper shares one CPUInfer (layer._register_wrapper enforces it),
-    so each wrapper gets its own probe over the *same* inner object; that is
-    why the identity check unwraps instead of comparing the probes.
+    Every wrapper shares one CPUInfer (layer._register_wrapper enforces it), so
+    each wrapper gets its own probe over the *same* inner object -- which is why
+    the identity check unwraps instead of comparing the probes.
     """
 
     def __init__(self, inner):
@@ -455,7 +437,7 @@ def start(interval_s: float) -> threading.Thread | None:
     """Start the one sampler of this process (idempotent). Returns the thread.
 
     Daemon, and stops on the process's exit event: a watcher that outlives its
-    process goes on sampling somebody else's service and its output looks
+    process goes on sampling somebody else's service, and its output looks
     completely normal (hostfunc_log.py, same reasoning).
     """
     global _MONITOR

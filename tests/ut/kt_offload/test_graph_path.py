@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """kt offload captured (graph) path -- CPU only, fake kt, fake capture.
 
-What is checked here: which path each forward takes, what the capture run
-records, that nothing on the captured path is gated by a runtime flag, and that
-a replay of the recorded host-func node recomputes the CPU experts from the
-*current* pinned inputs (the "many inputs, one output" fingerprint of a graph
-that did not re-run the node). Whether ACL really replays the node is an
-on-card question (docs/moe_offload_design.md, M2 validation).
+A replay of the recorded host-func node must recompute the CPU experts from the
+*current* pinned inputs; a node that did not re-run shows up as "many inputs,
+one output".
 """
 
 from __future__ import annotations
@@ -28,14 +25,8 @@ H, TOPK = 8, 2
 
 @pytest.fixture
 def our_logs():
-    """Capture what *our* logger emits.
-
-    Not ``caplog``: we log through ``vllm.logger``'s logger, and vLLM's
-    dictConfig sets ``propagate: False`` on the ``vllm`` logger, so no record
-    of ours ever reaches the root handler caplog installs. The failure
-    direction is safe (caplog reads empty and the test goes red), but the test
-    has to attach to the object it is judging.
-    """
+    """Capture what *our* logger emits; not ``caplog``, which never sees it
+    because vLLM sets ``propagate: False`` on the ``vllm`` logger."""
     import logging
 
     records: list[str] = []
@@ -53,7 +44,6 @@ def our_logs():
     finally:
         kl.logger.removeHandler(handler)
         kl.logger.setLevel(previous)
-
 
 
 class FakeKTBuffer:
@@ -271,13 +261,8 @@ def test_eager_built_layer_refuses_capture(cap, monkeypatch):
         rt.route(hs, w, ids, in_profile_run=False)
 
 
-# ---------------------------------------------------------------------------
-# mutation arms
-# ---------------------------------------------------------------------------
-
-
 def test_mutation_profile_flag_gates_capture_is_red(cap, monkeypatch):
-    """Mutant route: checks the profile flag before the capture branch (the M1 order)."""
+    """Mutant route: checks the profile flag before the capture branch."""
     rt, fake = _runtime(monkeypatch)
 
     def mutant_route(hs, w, ids, *, in_profile_run):
@@ -315,11 +300,6 @@ def test_mutation_stale_output_fingerprint_is_red(cap, monkeypatch):
         FakeKTBuffer.capture_buffers[4]["in"].copy_(hs.float())
         outs.append(fake.copy_forward_output_to_device(hs).float())  # node not run
     assert torch.equal(outs[0], outs[1])  # the fingerprint the on-card check looks for
-
-
-# ---------------------------------------------------------------------------
-# kt capture probe
-# ---------------------------------------------------------------------------
 
 
 def test_capture_probe_installed_when_kt_has_hook(monkeypatch, our_logs):

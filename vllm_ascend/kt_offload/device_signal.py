@@ -1,75 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P1b: the graph starts the CPU experts with a memory write, not a callback.
+"""The graph starts the CPU experts with a memory write, not a callback.
 
-What changes against P1a
-------------------------
-P1a (``async_wait.py``) took the *waiting* off the ACL callback path: the
-host-func node only submits and returns, and the device waits on an
-``ExternalEvent`` a completion thread records. Measured on card that is worth
-0.53 ms/token (PLAN §4.27) -- roughly the ``F`` leg, "callback returns, device
-is told". What it cannot touch is what stays in front of the node:
-
-* ``A``  -- the device reaching the node and the callback being *dispatched*
-  (report delivered, GIL taken, argument tuple built);
-* 🔴 the **35.75 us of device idle in front of every ``HOSTFUNC_CALLBACK``**
-  (§4.22 F1), which is specific to that node type -- ``DAVID_EVENT_WAIT``,
-  ``MEM_WAIT_VALUE``, ``MEMCPY_ASYNC`` and ``EVENT_RECORD`` all show a
-  preceding gap of 0.000 us.
-
-So P1b takes the host-func node out of the graph altogether. The layer becomes::
+The alternative (``async_wait.py``) keeps a host-func node in the graph and only
+moves the *waiting* off the ACL callback path; it cannot touch the callback's
+dispatch, nor the tens of microseconds of device idle the profile shows in front
+of every host-func node specifically (``DAVID_EVENT_WAIT``, ``MEM_WAIT_VALUE``,
+``MEMCPY_ASYNC`` and ``EVENT_RECORD`` show no such gap). So the host-func node
+leaves the graph altogether and the layer becomes::
 
     D2H(inputs) -> D2H(8-byte step counter) -> ExternalEvent.wait -> reset -> H2D
 
-and a **resident polling thread** watches the counter word. When it reaches
-this step's number the thread runs kt for that layer and records the event.
-Nothing in the graph is a host task any more: the two copies and the event
-wait are ordinary device nodes, which is exactly the set of node types the
-profile shows with no idle gap in front of them.
+A **resident polling thread** watches the counter word; when it reaches this
+step's number it runs kt for that layer and records the event. Nothing in the
+graph is a host task any more.
 
-The ordering that makes it safe
--------------------------------
-🔴 The counter's D2H is a **separate copy on the same stream, enqueued after**
-the input copy. Same-stream tasks run in order, so "the counter arrived"
-implies "the inputs arrived". It must NOT be appended to the input copy as a
-tail field: the write order *inside* one DMA is not specified, and a counter
-that lands before the payload would start kt on the previous step's routing --
-faster, wrong, and silent, which is the failure mode this whole line of work
-keeps meeting.
+The counter's D2H is a **separate copy on the same stream, enqueued after** the
+input copy: same-stream tasks run in order, so "the counter arrived" implies
+"the inputs arrived". It must NOT be appended to the input copy as a tail field
+-- the write order *inside* one DMA is not specified, and a counter landing
+before the payload would start kt on the previous step's routing: faster, wrong
+and silent. The same rule covers everything else the polling thread reads, today
+only the pinned input buffer; that buffer is per layer, so its only writer is
+the copy in front of the counter.
 
-The same rule applies to everything else the polling thread reads (§4.25): it
-must all be written before the counter write. Today that is only the pinned
-input buffer, and the buffer is per layer, so the only writer is the copy in
-front of the counter.
+The counter is one device scalar, incremented once per replay by the first
+offloaded layer of the capture (``StepCounter``) -- one add per step, not per
+layer, so every layer's word must carry the *same* number. A word off by one is
+a step missed or replayed twice, and the poller says so instead of quietly
+computing the wrong layer's experts.
 
-The counter itself is one device scalar, incremented once per replay by the
-first offloaded layer of the capture (``StepCounter``). One add per step, not
-per layer, and every layer's word must carry the *same* number: a layer whose
-word is off by one is a step that was missed or replayed twice, and the poller
-says so instead of quietly computing the wrong layer's experts.
+The spin is in C (``poll_native.c``) because a Python thread that spins holds
+the GIL between checks; the wait is one ``ctypes`` call, which releases the GIL
+for its whole duration. Only the per-layer work (build kt's task, submit, sync,
+record) happens in Python.
 
-Why a C spin
-------------
-See ``poll_native.c``: a Python thread that spins holds the GIL between checks.
-The wait is a single ``ctypes`` call, which releases the GIL for its whole
-duration; only the per-layer work (build kt's task, submit, sync, record)
-happens in Python, which is exactly what P1a's completion thread already did.
-
-Failure modes and what this module does about them
---------------------------------------------------
-* **The event is never recorded** -> the device waits for ever. Everything
-  below that owns a task records the event on every exit path, including a kt
-  that raised, exactly as ``async_wait.Completer`` does.
-* 🔴 **The signal never arrives** (a capture without the counter bump, say) ->
-  the poller logs, loudly and repeatedly, and **keeps waiting**. It does NOT
-  release the device on a timeout: there is no way to tell "idle service" from
-  "lost signal" from inside this thread, and a spurious record would both
-  release a wait nobody armed and leave the *next* replay's wait pre-signalled,
-  i.e. turn a visible hang into silent stale output on every later step. A hang
-  with a message naming the layer and the step is the better failure.
-* **A step was missed or seen twice** -> the word does not equal the expected
-  step. The poller logs it, counts it, runs this layer anyway (the pinned
-  buffer does hold this step's inputs -- it is the bookkeeping that slipped)
-  and resynchronises. The on-card cases judge the counter.
+Failure modes: **the event is never recorded** -> the device waits for ever, so
+everything below that owns a task records it on every exit path, including a kt
+that raised, exactly as ``async_wait.Completer`` does. **The signal never
+arrives** (a capture without the counter bump, say) -> the poller logs, loudly
+and repeatedly, and **keeps waiting**; it does NOT release the device on a
+timeout, because nothing inside this thread can tell "idle service" from "lost
+signal" and a spurious record would release a wait nobody armed and leave the
+*next* replay's wait pre-signalled -- a visible hang turned into silent stale
+output on every later step. **A step was missed or seen twice** -> the word does
+not equal the expected step; the poller logs it, counts it, runs this layer
+anyway (the pinned buffer does hold this step's inputs -- it is the bookkeeping
+that slipped) and resynchronises.
 """
 
 from __future__ import annotations
@@ -86,16 +62,16 @@ from vllm.logger import logger
 
 ENV_NAME = "VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL"
 
-# Padding between two signal words, in 8-byte units. One 128-byte line each:
-# this thread scans every slot while the device DMAs into one of them, and two
-# layers sharing a line would mean every write invalidating the line the spin
-# is reading for the other.
+# Padding between two signal words, in 8-byte units: one 128-byte line each.
+# This thread scans every slot while the device DMAs into one of them, so two
+# layers sharing a line would have every write invalidate the line the spin is
+# reading for the other.
 STRIDE_WORDS = 16
 
-# layer_idx -> signals consumed (one per replay per layer). The P1b counterpart
-# of layer.HOST_FUNC_CALLS, which stays at 0 with this switch on because there
-# is no host-func node left to count. Kept separate on purpose: a counter that
-# silently changes meaning is how an instrument ends up measuring nothing (§4.26).
+# layer_idx -> signals consumed (one per replay per layer). The counterpart of
+# layer.HOST_FUNC_CALLS, which stays at 0 with this switch on because there is
+# no host-func node left to count. Kept separate on purpose: a counter that
+# silently changes meaning measures nothing.
 STEPS: dict[int, int] = {}
 # layer_idx -> ExternalEvents recorded. Must equal STEPS; a layer whose signals
 # grow while its records do not is a device about to wait for ever.
@@ -114,11 +90,10 @@ def _note_error(layer_idx: int, what: str) -> None:
 def enabled_by_env() -> bool:
     """Whether the operator explicitly set ``ENV_NAME=1``.
 
-    NOT whether the device-signal path is on: since PLAN §4.33 unset means "default", and
-    the effective value (cfg, env and the automatic defaults together) comes
-    only from ``kt_offload.switches.resolve``. Nothing on the production path
-    calls this any more; it is kept for harnesses that ask the narrower
-    question.
+    NOT whether the device-signal path is on: unset means "default", and the
+    effective value (cfg, env and the automatic defaults together) comes only
+    from ``kt_offload.switches.resolve``. Kept for harnesses that ask the
+    narrower question; nothing on the production path calls it.
     """
     from vllm_ascend.kt_offload import switches
 
@@ -136,11 +111,10 @@ _ABI = 3
 def _cache_dirs() -> list[Path]:
     """Where the built .so may go, best first.
 
-    Several candidates because the answer is a property of the *mount*, not of
-    the path: ``/dev/shm`` (which this project exports as ``TMPDIR``) is often
-    ``noexec``, and a .so on a noexec mount fails at ``dlopen``, not at
-    ``write``. Each candidate is tried end to end -- compile, load, call -- so
-    "it is not executable here" is found at start-up.
+    Several candidates because executability is a property of the *mount*, not
+    the path: ``/dev/shm`` (this project's ``TMPDIR``) is often ``noexec``, and
+    a .so there fails at ``dlopen``, not at ``write``. Each candidate is tried
+    end to end -- compile, load, call -- so it is found at start-up.
     """
     from vllm_ascend import envs
 
@@ -175,10 +149,9 @@ def _compile(src: str, out_path: Path, cc: str) -> None:
 def load_native(force: bool = False):
     """Compile (once) and load the spin loop. Returns the ctypes library.
 
-    Built at start-up rather than shipped, because this tree is run from a
-    worktree on PYTHONPATH and has no build step of its own. The file name
-    carries the source hash, so an edit to ``poll_native.c`` can never be
-    served from a stale .so.
+    Built at start-up rather than shipped: this tree runs from a worktree on
+    PYTHONPATH and has no build step. The file name carries the source hash, so
+    an edit to ``poll_native.c`` can never be served from a stale .so.
     """
     global _LIB
     with _LIB_LOCK:
@@ -234,9 +207,9 @@ class Waiter:
     """The GIL-free wait, over a fixed words/expected pair.
 
     ``expected`` is a mutable byte buffer the caller writes step numbers into,
-    so a wait that is already running sees the update on its next scan; the
-    poller only ever changes it between waits, but the property is what makes
-    the buffer, rather than an argument list, the right shape here.
+    so a wait already running sees the update on its next scan. The poller only
+    changes it between waits, but that property is what makes a buffer, rather
+    than an argument list, the right shape here.
     """
 
     def __init__(self, words_ptr: int, n: int, stride_words: int = STRIDE_WORDS, lib=None):
@@ -248,8 +221,8 @@ class Waiter:
         self._out = (ctypes.c_uint64 * 2)()
         self.total_scans = 0
         # CLOCK_MONOTONIC ns at which the last wait saw its word, taken in C.
-        # The Python statement after ``wait`` cannot stand in for it: coming
-        # back from a foreign call means re-acquiring the GIL first.
+        # The Python statement after ``wait`` cannot stand in for it: returning
+        # from a foreign call means re-acquiring the GIL first.
         self.seen_ns = 0
 
     def set_expected(self, slot: int, value: int) -> None:
@@ -284,30 +257,30 @@ class Waiter:
 def signal_ops_ok(ops) -> dict:
     """The shape of one layer's captured CPU-expert section, as a check.
 
-    ``ops`` is ``(kind, what)`` in enqueue order, the same vocabulary
-    ``async_wait.ext_event_ops_ok`` uses plus ``("signal", (layer, bs))`` for
-    the counter's D2H:
+    ``ops`` is ``(kind, what)`` in enqueue order: the
+    ``async_wait.ext_event_ops_ok`` vocabulary plus ``("signal", (layer, bs))``
+    for the counter's D2H.
 
       ``("bump", layer)``      the step counter's increment (the lowest signal
                                layer only; which layer that is, is checked by
-                               the caller, which is the only place that knows)
+                               the caller, the only place that knows)
       ``("d2h", bs)``          the input copy that feeds kt
       ``("signal", key)``      the 8-byte counter copy -- the start signal
       ``("ext_wait", ev)``     ``event.wait(stream)``  -- a graph node
       ``("ext_reset", ev)``    ``event.reset(stream)`` -- a graph node
       ``("h2d", bs)``          the output copy back to the device
-      ``("hostfunc", layer)``  a host-func node -- 🔴 must NOT be here any more
+      ``("hostfunc", layer)``  a host-func node -- must NOT be here any more
 
-    🔴 The order ``d2h`` -> ``signal`` is the whole safety argument: same
-    stream, so the counter cannot land before the inputs. Reversed, the poller
-    starts kt on the previous step's routing and nothing raises.
+    The order ``d2h`` -> ``signal`` is the whole safety argument: same stream,
+    so the counter cannot land before the inputs. Reversed, the poller starts kt
+    on the previous step's routing and nothing raises.
     """
     problems = []
     kinds = [k for k, _ in ops]
     if "hostfunc" in kinds:
         problems.append(
             f"{kinds.count('hostfunc')} host-func node(s) still in the graph; P1b exists to remove them "
-            "(the 35.75 us of device idle in front of one is the target, PLAN §4.22 F1)"
+            "(the 35.75 us of device idle in front of one is the target, F1)"
         )
     if kinds.count("signal") != 1:
         problems.append(f"expected exactly one counter copy (the start signal), found {kinds.count('signal')}")
@@ -365,9 +338,9 @@ def step_ok(layer_idx: int, got: int, expected: int) -> dict:
 
     ``got < expected`` cannot come out of the waiter (it returns on ``>=``), so
     the only mismatch is a word that ran ahead: replays whose signal this thread
-    never consumed. It is reported rather than fixed silently, because "the
-    poller and the graph disagree about which step this is" is precisely the
-    state in which a layer's kt run could belong to another step.
+    never consumed. Reported rather than fixed silently -- "the poller and the
+    graph disagree about which step this is" is exactly the state in which a
+    layer's kt run could belong to another step.
     """
     missed = int(got) - int(expected)
     return {
@@ -381,19 +354,13 @@ def step_ok(layer_idx: int, got: int, expected: int) -> dict:
 def waiting_state(expected: dict[int, int], words: dict[int, int]) -> dict:
     """Tell "the service is idle" apart from "a step never finished".
 
-    🔴 The polling thread cannot ask anyone whether work is coming, so a wait
-    that goes on for ever looks the same from in here whether the service has
-    no requests or a signal was lost. These two tables do tell them apart:
-
-    * every layer waiting for the SAME step, and each one's word holding the
-      step before it -> the last step completed and nothing new has started.
-      That is an idle service, and it is not worth a warning.
-    * layers waiting for DIFFERENT steps -> some consumed step N and others are
-      still waiting for it, i.e. a replay stopped half way through the model.
-      That one is a stalled step, and the layers still waiting are named.
-
-    Returns the classification plus the layers that are behind, so the log line
-    can point at them instead of dumping 40 numbers.
+    An endless wait looks the same from in here whether the service has no
+    requests or a signal was lost. These two tables tell them apart: every layer
+    waiting for the SAME step, each word holding the step before it, is an idle
+    service and not worth a warning; layers waiting for DIFFERENT steps mean a
+    replay stopped half way through the model. Returns the classification plus
+    the layers that are behind, so the log line can name them instead of dumping
+    40 numbers.
     """
     if not expected:
         return {"stalled": False, "step": None, "behind": [], "layers": 0}
@@ -458,32 +425,29 @@ class Entry:
 class Poller:
     """One thread per process: see the step number, run kt, release the device.
 
-    Injected dependencies, like ``async_wait.Completer``, so the CPU tests can
-    drive the whole protocol with no device and no native library:
-    ``set_device`` gives the thread its ACL context, ``make_stream`` the stream
-    the record goes on (created *in* the thread, after the context, before
-    ``start()`` returns), and ``make_waiter`` the object whose ``wait`` blocks.
+    Dependencies are injected, like ``async_wait.Completer``, so CPU tests can
+    drive the protocol with no device and no native library: ``set_device``
+    gives the thread its ACL context, ``make_stream`` the stream the record goes
+    on (created *in* the thread, after the context, before ``start()`` returns),
+    and ``make_waiter`` the object whose ``wait`` blocks.
     """
 
     # Spin without sleeping for this long after entering a wait, then fall back
     # to short sleeps. A decode step is ~30 ms, so a generating service never
-    # leaves the hot window; an idle one drops out of it after the first
-    # timeout and stops burning a core.
+    # leaves the hot window; an idle one drops out after the first timeout and
+    # stops burning a core.
     HOT_NS = 60_000_000
     SLEEP_NS = 200_000
     TIMEOUT_NS = 200_000_000
     # Consecutive timeouts before the wait goes cold (no spinning at all).
     # 5 x 200 ms = 1 s of nothing happening.
     COLD_AFTER = 5
-    # How often the waiting state is looked at, and how long a wait has to last
-    # before each kind of it is worth a line. A STALLED step (layers waiting for
-    # different steps) is a fault and is named quickly; an idle service is
-    # normal and gets one line every few minutes, only so that "the thread is
-    # alive" is visible at all.
-    # 🔴 The first version logged the idle case after 5 timeouts = 1 s, which
-    # put 137 WARNINGs into one on-card logprob arm (2026-09-23): every gap
-    # between two requests produced one. A warning that fires in normal
-    # operation stops being read.
+    # How often the waiting state is looked at, and how long a wait must last
+    # before each kind is worth a line. A STALLED step (layers waiting for
+    # different steps) is a fault, named quickly; an idle service is normal and
+    # gets one line every few minutes, only so "the thread is alive" is visible.
+    # Logging idle after a second of silence would warn once per gap between
+    # requests, and a warning that fires in normal operation stops being read.
     LOG_CHECK_EVERY = 25  # 5 s
     STALL_LOG_AFTER = 25  # 5 s
     STALL_LOG_EVERY = 150  # 30 s
@@ -531,8 +495,8 @@ class Poller:
         """Start the thread and wait until its context, stream and waiter exist.
 
         Synchronous for the same reason ``Completer.start`` is: a thread that
-        cannot take an ACL context has to be a start-up error, not a hang at
-        the first replay.
+        cannot take an ACL context has to be a start-up error, not a hang at the
+        first replay.
         """
         if self._thread is not None:
             return
@@ -574,12 +538,12 @@ class Poller:
             with self._lock:
                 if gen != self._gen:
                     gen, snapshot = self._gen, list(self._entries)
-                    # 🔴 Keyed by SLOT, never by position in this list. The
+                    # Keyed by SLOT, never by position in this list: the
                     # waiter returns an index into the pinned array, and the
-                    # two are not the same number: the self-test takes slot 0,
-                    # so entry 0 lives at slot 1. Reading one as the other runs
+                    # two are not the same number (the self-test takes slot 0,
+                    # so entry 0 lives at slot 1). Reading one as the other runs
                     # the wrong layer's experts and releases the wrong layer's
-                    # H2D -- with entirely plausible-looking numbers.
+                    # H2D, with entirely plausible-looking numbers.
                     by_slot = {e.slot: e for e in snapshot}
                     for e in snapshot:
                         self._waiter.set_expected(e.slot, self._expected[e.layer_idx])
@@ -598,8 +562,8 @@ class Poller:
             idle = 0
             entry = by_slot.get(i)
             if entry is None:
-                # Only reachable if something set an expected step for a slot
-                # that belongs to no entry, i.e. the two tables disagree.
+                # Only reachable if an expected step was set for a slot that
+                # belongs to no entry, i.e. the two tables disagree.
                 _note_error(-1, f"signal on unregistered slot {i}")
                 logger.critical(
                     "kt_offload device signal: slot %d was signalled but belongs to no layer; the slot "
@@ -611,13 +575,13 @@ class Poller:
             self._handle(entry)
 
     def _log_waiting(self, snapshot: list[Entry], idle: int) -> None:
-        """🔴 The only thing standing between a lost signal and a silent hang.
+        """The only thing standing between a lost signal and a silent hang.
 
         Deliberately not an auto-release: recording an event nobody is waiting
-        on leaves the NEXT replay's wait pre-signalled, i.e. it converts a hang
-        into wrong output on every step after it. What this does instead is say
-        WHICH of the two silences it is (``waiting_state``) and, for the one
-        that is a fault, name the layers that are behind.
+        on leaves the NEXT replay's wait pre-signalled, converting a hang into
+        wrong output on every step after it. Instead it says WHICH of the two
+        silences this is (``waiting_state``) and, for the one that is a fault,
+        names the layers that are behind.
         """
         by_layer: dict[int, int] = {}
         for e in snapshot:

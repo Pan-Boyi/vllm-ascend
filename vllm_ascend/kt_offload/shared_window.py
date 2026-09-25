@@ -1,46 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared-expert-in-the-window: the switch, and the criteria that make it checkable.
 
-Why this module exists
-----------------------
-With ``overlap_side_stream`` on, one MoE layer's main stream runs (offline
-trace reconciliation, PLAN §4.30/§4.31):
+With ``overlap_side_stream`` on, a MoE layer's main stream forks the side
+stream, runs the resident experts, then waits at the join for the CPU experts
+before the kt merge and the shared-expert MLP. The shared expert depends on
+neither ``routed_out`` nor the CPU experts -- it sits behind the join only
+because of call order, so moving the merge to *after* the shared MLP puts the
+shared MLP into the idle window. That window stays far shorter than the
+side-stream arm, so nothing new becomes critical path.
 
-  fork -> 13 resident-expert ops inside the window (~77 us) -> DAVID_EVENT_WAIT
-  (the join, ~294 us of *idle* waiting for the CPU experts) -> H2D + fp32 add
-  (kt merge) -> shared-expert MLP (38.25 us/layer) -> Add_BF16(shared + routed).
+Both halves fail silently, hence a runtime assertion rather than a comment:
 
-The shared expert reads the MoE layer's input hidden states. It depends on
-neither ``routed_out`` nor the CPU experts' output: it sits behind the join
-only because of call order -- ``merge()`` is called inside
-``routed_experts.forward_impl`` and the shared MLP only after that function
-returns (``fused_moe._forward_impl``). Moving the merge to *after* the shared
-MLP puts those 38.25 us/layer into the idle window, ~1.5 ms/token at 40 layers,
-and the window (77 + 38 = 115 us) stays far below the side-stream arm (~370 us),
-so nothing new becomes critical path.
+  * a merge that never happens drops the CPU experts' contribution. Nothing
+    raises -- right shape, plausible values, still-fluent text.
+  * a merge that happens twice is a no-op today only because ``_pending`` was
+    consumed; the next change to ``merge()`` turns it into a double-add.
+  * anything reading ``routed_out`` before the merge (the upstream runner adds
+    ``shared_out + fused_output``) sees the resident half only.
 
-🔴 What can go wrong, and why a comment is not enough
------------------------------------------------------
-The merge is the *only* place the CPU half of the experts is added. Deferring
-it splits "who calls it" from "who computed it", and both halves of that split
-fail silently:
-
-  **a merge that never happens** -- the CPU experts' contribution is dropped.
-  Nothing raises: the tensor has the right shape and plausible values, and on
-  this model the resident half alone still produces fluent text. That is the
-  §4.23 failure mode (faster and wrong) with an even weaker signature.
-
-  **a merge that happens twice** -- today the second call is a no-op because
-  ``_pending`` was consumed, so it would not double-add; but the code that
-  produced it is wrong, and the next change to ``merge()`` turns it into one.
-
-  **something reading ``routed_out`` before the merge** -- the upstream runner
-  adds ``shared_out + fused_output`` (vllm moe_runner.py). If the merge landed
-  after that add, the CPU half would be added to a tensor nobody uses.
-
-So the accounting is a runtime assertion (``KTLayerOffload`` counts merge calls
-per route and checks the count at the next route) plus the pure predicates
-below, which the unit tests drive red and the on-card case reuses.
+``KTLayerOffload`` counts merge calls per route and checks at the next route;
+the pure predicates below are what the unit tests drive.
 """
 
 from __future__ import annotations
@@ -51,11 +30,9 @@ ENV_NAME = "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW"
 def enabled_by_env() -> bool:
     """Whether the operator explicitly set ``ENV_NAME=1``.
 
-    NOT whether the shared-MLP move is on: since PLAN §4.33 unset means "default", and
-    the effective value (cfg, env and the automatic defaults together) comes
-    only from ``kt_offload.switches.resolve``. Nothing on the production path
-    calls this any more; it is kept for harnesses that ask the narrower
-    question.
+    NOT whether the shared-MLP move is on: unset means "default", and the
+    effective value comes only from ``kt_offload.switches.resolve``. Nothing on
+    the production path calls this; it is for harnesses asking that question.
     """
     from vllm_ascend.kt_offload import switches
 
@@ -69,9 +46,8 @@ def merge_balance_ok(merges: int, *, layer_idx: int = -1) -> dict:
     """Exactly one merge call per route, whoever makes it.
 
     ``merges`` is how many times ``merge()`` was called since this layer's last
-    ``route()``. Zero means the CPU half of this layer was dropped; more than
-    one means the call site is duplicated (harmless today only because the
-    second call finds nothing pending).
+    ``route()``. Zero means this layer's CPU half was dropped; more than one
+    means the call site is duplicated.
     """
     return {
         "name": "one_merge_per_route",
@@ -97,16 +73,8 @@ def window_ops_ok(ops) -> dict:
       ``("read", what)``    anything else reading ``routed_out``
                             (the runner's ``shared_out + fused_output``)
 
-    What it checks -- each one is a way the change fails:
-
-      * exactly one merge (see ``merge_balance_ok``; repeated here so a
-        recorded sequence alone is enough to judge);
-      * every shared op is before the merge -- that is the whole point, and a
-        sequence where they are not is the un-moved order;
-      * when a fork is present, every shared op is inside ``fork..join``:
-        after the join the window is over and nothing is hidden;
-      * no ``read`` of ``routed_out`` before the merge -- the CPU half must be
-        in the tensor before anyone consumes it.
+    Requires exactly one merge, every shared op inside ``fork..join`` and before
+    the merge, and no read of ``routed_out`` before the merge.
     """
     problems = []
     forked = joined = merged = False

@@ -1,36 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Load-time code must name the device of every tensor it creates.
 
-The dimension under test: a CPU unit test runs with the default factory device
-set to the CPU, while the model loader runs with it set to the NPU (vLLM wraps
-weight loading in ``with torch.device(device)``). A factory call that omits
-``device=`` therefore lands on a *different* device in production than in this
-suite, and no CPU test can see the difference -- the tensor is on the CPU
-either way, for the wrong reason. Two of these tensors are handed straight to
-kt, which requires host memory: ``gpu_experts_mask`` and
-``physical_to_logical_map_cpu``.
-
-Three arms, and the last two are what give the first its meaning:
-
-1. real code, loader's default device -> every load-time tensor is where it
-   was meant to be;
-2. mutant (the explicit ``device="cpu"`` stripped from the source), CPU
-   default -> **green**, which is why this dimension had zero coverage: no
-   existing test could have failed on it;
-3. the same mutant, loader's default device -> **red**.
-
-A fourth check scans the package's source: every ``torch`` factory call must
-name a device, so the next call site someone adds is covered before it is
-written.
-
-``meta`` stands in for the NPU default: it needs no accelerator, so this file
-runs in both test modes, and nothing in the load-time code ever asks for it
-(asserted below).
-
-This is not the ``_pinned_empty()`` hook from the round before. That hook
-removed a test-mode *symptom* -- pinned allocation needs a registered
-accelerator, so one mode was red and the other green -- and said nothing about
-which device a tensor lands on when nobody names one.
+vLLM loads weights inside ``with torch.device(npu)``, so a factory call that
+omits ``device=`` lands elsewhere in production than in this CPU suite. Three
+arms: the real code is green under a loader-like default device; the source
+mutant with ``device="cpu"`` stripped is green under a CPU default -- which is
+why no plain CPU test covers this -- and red under the loader's. ``meta``
+stands in for the NPU default; the load-time code never asks for it.
 """
 
 from __future__ import annotations
@@ -67,12 +43,9 @@ def load_mutant(qualname: str):
     """Re-exec a module with every explicit ``device="cpu"`` removed.
 
     A source-level mutant, not a patched ``torch.zeros``: the default-device
-    machinery dispatches on the *identity* of the factory functions (and caches
-    that set), so a wrapper around ``torch.zeros`` silently stops receiving the
-    default device and would make every arm below read "cpu" for the wrong
-    reason. Registered in ``sys.modules`` under its own mutant name, which
-    ``dataclasses`` needs to resolve the module's annotations and which no
-    import in the suite can reach.
+    machinery dispatches on the *identity* of the factory functions, so a
+    wrapper would stop receiving the default device and make every arm below
+    read "cpu" for the wrong reason.
     """
     real = importlib.import_module(qualname)
     path = real.__file__
@@ -103,22 +76,14 @@ def real():
 
 
 def failure(fn) -> BaseException | None:
-    """Run a check and hand back what made it red, or None if it passed.
-
-    A check is red on the mutant either by asserting, or because the mutant
-    cannot build or use the tensor at all (reading or copying a meta tensor
-    raises). The arm below also requires the reason to *name* the poison
-    device, so a mutant that is red for an unrelated reason does not read as
-    coverage.
-    """
+    """Run a check and hand back what made it red, or None if it passed; the
+    arm below also requires the reason to *name* the poison device, so a mutant
+    red for an unrelated reason does not read as coverage."""
     try:
         fn()
     except BaseException as exc:  # noqa: BLE001 - the reason is the assertion
         return exc
     return None
-
-
-# -- the subjects: one function per load-time surface --------------------
 
 
 def check_placement_tables(mods, _monkeypatch, _tmp) -> None:
@@ -187,13 +152,13 @@ def _layer_runtime(mods, monkeypatch, packed: bool):
 
     monkeypatch.setitem(sys.modules, "kt_kernel", SimpleNamespace(KTMoEWrapper=factory))
     monkeypatch.setattr(lm, "_install_capture_probe", lambda cls: None)
-    # each arm stands in for a fresh process: the wrapper registry (A5) is
-    # process-level by design, and a module-scoped mutant keeps earlier arms'
-    # wrappers alive
+    # each arm stands in for a fresh process: the wrapper registry is
+    # process-level, and a module-scoped mutant keeps earlier arms' wrappers
+    # alive
     lm._reset_wrapper_registry()
     # Pinned allocation needs a registered accelerator, so the CPU suite cannot
-    # call the real one. The stand-in names its device exactly as the subject
-    # does -- and that the subject does is asserted separately, on its source.
+    # call the real one; that the subject names its device is asserted
+    # separately, on its source.
     monkeypatch.setattr(lm, "_pinned_empty", lambda shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"))
     rt = lm.KTLayerOffload(cfg, plan.layer(0), 0, vcfg)
     mod = torch.nn.Module()
@@ -258,17 +223,12 @@ SUBJECTS = {
 }
 
 
-# -- arm 1: the real code, under the loader's default device -------------
-
-
 @pytest.mark.parametrize("name", sorted(SUBJECTS))
 def test_load_time_tensors_are_host_under_the_loader_default(real, monkeypatch, tmp_path, name):
     with default_device(POISON):
         assert torch.zeros(2).device.type == POISON, "the loader-like default device is not in effect"
         SUBJECTS[name](real, monkeypatch, str(tmp_path))
 
-
-# -- arm 2/3: the mutant, under each default device ----------------------
 
 # Which module's explicit ``device=`` each subject depends on: one module is
 # mutated per arm, so a red arm is attributable to that module's source.
@@ -309,9 +269,6 @@ def test_mutant_is_red_under_the_loader_default(mutants, monkeypatch, tmp_path, 
     assert POISON in str(exc), f"{name}: red for a reason that does not name the default device: {exc!r}"
 
 
-# -- controls on the instrument ------------------------------------------
-
-
 def test_the_mutant_removed_something_from_every_module(mutants):
     counts = {m: getattr(mutants, m)._mutations for m in ("placement", "layer", "counter")}
     assert all(n > 0 for n in counts.values()), counts
@@ -323,10 +280,9 @@ def test_the_mutant_removed_something_from_every_module(mutants):
 
 
 def test_the_poison_device_is_one_the_load_time_code_never_asks_for():
-    """Positive control on the instrument: if the load-time code asked for
-    ``meta`` itself, the arms above would compare a device against itself.
-    Matched as a device literal, not as a substring -- "attn metadata" contains
-    the word."""
+    """Positive control: if the load-time code asked for ``meta`` itself, the
+    arms above would compare a device against itself. Matched as a device
+    literal, not a substring -- "attn metadata" contains the word."""
     literal = re.compile(rf"device=[\"']{POISON}[\"']")
     for mod in (real_placement, real_counter):
         assert not literal.search(Path(mod.__file__).read_text()), f"{mod.__name__} asks for {POISON}"
@@ -343,8 +299,6 @@ def test_pinned_allocation_names_its_device():
     src = inspect.getsource(real_layer._pinned_empty)
     assert 'device="cpu"' in src and "pin_memory=True" in src, src
 
-
-# -- the same rule, as a scan over the source ----------------------------
 
 FACTORIES = frozenset(
     {"zeros", "ones", "empty", "full", "tensor", "arange", "rand", "randn", "eye", "linspace", "as_tensor"}
@@ -380,10 +334,7 @@ def test_no_tensor_in_this_package_takes_the_default_device():
         seen, bare = scan_factory_calls(Path(mod.__file__).read_text())
         assert not bare, f"{name}.py lets the default device decide:\n  " + "\n  ".join(bare)
         total += seen
-    # 15 until 2026-09-22, when the forked path dropped its ``torch.empty(...,
-    # device="meta")`` shape reference: it hands kt a buffer dict now, not a
-    # shape. The floor is a "the scan still finds the file" check, so it tracks
-    # the real count rather than being left above it.
+    # a floor, not an exact count: it checks the scan still finds the files
     assert total >= 14, f"the scan only saw {total} factory calls; it is looking in the wrong place"
 
 

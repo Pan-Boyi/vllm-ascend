@@ -838,8 +838,31 @@ class NPUWorker(WorkerBase):
 
             context = nullcontext()  # type: ignore
 
+        # kt_offload zero-copy w13: put the checkpoint's expert
+        # pages on the right NUMA node BEFORE anything reads them. kt's CPU
+        # half is loaded by KTMoEWrapper.load_weights, which runs inside
+        # model_runner.load_model() just below, and a page placed before that
+        # read is placed once -- letting kt read first means migrating every
+        # one of them afterwards. No-op unless kt_offload_config.zerocopy_w13
+        # is on; it raises rather than placing nothing quietly.
+        from vllm_ascend.kt_offload.wiring import setup_placement
+
+        setup_placement(self.vllm_config)
+
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        # kt_offload streaming prefill (STREAM_PREFILL_PLAN.md F2-7). Here
+        # because it is the one point between "every MoE layer has run
+        # process_weights_after_loading" (just above, inside load_model) and the
+        # KV-cache profile run (determine_available_memory, later): the
+        # provider's slot and the fold's ND staging must be allocated before
+        # vLLM promises the rest of HBM to the KV cache. No-op unless
+        # kt_offload_config.stream_prefill is on; it refuses rather than
+        # half-installing.
+        from vllm_ascend.kt_offload.wiring import setup_streaming
+
+        setup_streaming(self.vllm_config)
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (

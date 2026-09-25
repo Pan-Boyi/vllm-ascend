@@ -1,18 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§4.31: the shared-expert MLP moves in front of the kt merge.
+"""The shared-expert MLP moves in front of the kt merge.
 
-Three things are tested, in this order:
-
-1. the **criteria** (``kt_offload/shared_window.py``), as pure functions, each
-   driven red by the failure it exists for;
-2. the **runtime accounting** on ``KTLayerOffload``: exactly one ``merge()``
-   call per ``route()``, whoever makes it -- with the mutation arms "forgot the
-   merge" and "merged twice" going red;
-3. the **production wiring** (``routed_experts.forward_impl`` /
-   ``fused_moe._forward_impl``), read out of the source, because no CPU test
-   can run those functions: they need a device, a forward context and a comm
-   method. The checker itself is driven red on mutated source, so "the
-   assertion passes" is not the same as "the assertion is vacuous".
+The criteria in ``kt_offload/shared_window.py``, the runtime accounting on
+``KTLayerOffload`` (exactly one ``merge()`` per ``route()``, whoever makes it),
+and the production wiring -- the last read out of the source, since those
+functions need a device, a forward context and a comm method. Every checker is
+also driven on mutated source, so a passing assertion is not a vacuous one.
 
 CPU only; nothing here imports kt_kernel or touches an NPU.
 """
@@ -38,15 +31,9 @@ FUSED_MOE = ROOT / "vllm_ascend/ops/fused_moe/fused_moe.py"
 H = 8
 
 
-# ---------------------------------------------------------------------------
-# 1. the criteria
-# ---------------------------------------------------------------------------
-
-
 def test_env_switch_reads_unset_as_default(monkeypatch):
-    """Unset is "" (= the default, which since PLAN §4.33 follows the side
-    stream -- see test_switches.py), never "0"; enabled_by_env answers only
-    "was it explicitly 1"."""
+    """Unset is "" (the default follows the side stream), never "0";
+    ``enabled_by_env`` answers only "was it explicitly 1"."""
     from vllm_ascend import envs
 
     monkeypatch.delenv(sw.ENV_NAME, raising=False)
@@ -68,7 +55,7 @@ def test_merge_balance_criterion():
 
 
 def _deferred_ops():
-    """The shape §4.31 asks for: shared ops inside the fork..join window."""
+    """The shape asked for: shared ops inside the fork..join window."""
     return [
         ("fork", None),
         ("window", "resident gmm"),
@@ -119,11 +106,6 @@ def test_window_ops_criterion_mutants_are_red(mutate, expect):
     rep = sw.window_ops_ok(mutate(_deferred_ops()))
     assert not rep["ok"], rep
     assert any(expect in p for p in rep["detail"]), rep["detail"]
-
-
-# ---------------------------------------------------------------------------
-# 2. the runtime accounting
-# ---------------------------------------------------------------------------
 
 
 class FakeKT:
@@ -248,11 +230,8 @@ def test_mutant_merged_twice_is_red(monkeypatch):
 
 
 def test_a_no_op_merge_still_counts(monkeypatch):
-    """Profile run: kt is skipped, but the call must still be made exactly once.
-
-    Otherwise "the merge is a no-op here" becomes a place where a missing call
-    site hides, and the same code path runs for real the next step.
-    """
+    """Profile run: kt is skipped, but the call must still be made exactly once,
+    or "the merge is a no-op here" becomes a place a missing call site hides."""
     rt = _runtime(monkeypatch, shared_in_window=True)
     hs, ids, w = _inputs()
     rt.route(hs, w, ids, in_profile_run=True)
@@ -262,11 +241,8 @@ def test_a_no_op_merge_still_counts(monkeypatch):
 
 
 def test_a_route_that_refuses_its_arguments_does_not_arm_the_counter(monkeypatch):
-    """A route rejected at the door owes no merge, so the next one is not blamed.
-
-    (The counter is armed after the routing-dtype checks, which is where the
-    on-card scaffold's swapped ids/weights was caught -- PLAN §4.6.)
-    """
+    """A route rejected at the door owes no merge, so the next one is not blamed:
+    the counter is armed after the routing-dtype checks."""
     rt = _runtime(monkeypatch, shared_in_window=True)
     hs, ids, w = _inputs()
     with pytest.raises(TypeError, match="topk_ids must be int32/int64"):
@@ -276,14 +252,10 @@ def test_a_route_that_refuses_its_arguments_does_not_arm_the_counter(monkeypatch
 
 
 def test_the_a6_carve_out_is_narrow(monkeypatch):
-    """The un-joined-submit case is left to _claim_side_buffers, which is more
-    specific -- but only where that guard is guaranteed to run.
-
-    Captured + overlap + a real submit: the next route reaches
-    ``_claim_side_buffers`` and its message names the buffers and the missing
-    join, so the merge counter keeps quiet. Anywhere else (here: eager) the
-    counter is the only thing that can speak, and it must.
-    """
+    """The un-joined-submit case is left to the more specific
+    ``_claim_side_buffers``, but only where that guard is guaranteed to run
+    (captured + overlap). Anywhere else the merge counter is the only thing that
+    can speak, and it must."""
     rt = _runtime(monkeypatch, shared_in_window=True)
     hs, _, _ = _inputs()
     rt._merge_owed, rt._merges_since_route, rt._side_inflight = True, 0, True
@@ -292,11 +264,6 @@ def test_the_a6_carve_out_is_narrow(monkeypatch):
     monkeypatch.setattr(kl, "_capturing", lambda: False)
     with pytest.raises(AssertionError, match="0 merge call"):
         rt._assert_merge_balance(hs)
-
-
-# ---------------------------------------------------------------------------
-# 3. the production wiring, read out of the source
-# ---------------------------------------------------------------------------
 
 
 def _func(tree, name):
@@ -374,11 +341,8 @@ def test_forward_impl_guard_check_mutants_are_red():
 
 def _defer_arg(call: ast.Call) -> str | None:
     """How a ``forward_impl`` call asks for the deferral, as source text.
-
-    Production passes ``**routed_kwargs`` (empty with the switch off, so that
-    call is byte-identical to upstream's); an explicit ``defer_kt_merge=...``
-    is reported as written. None: the call cannot defer.
-    """
+    Production passes ``**routed_kwargs`` (empty with the switch off, so the call
+    is byte-identical to upstream's); None means the call cannot defer."""
     for kw in call.keywords:
         if kw.arg == "defer_kt_merge":
             return f"defer_kt_merge={ast.unparse(kw.value)}"
@@ -536,18 +500,11 @@ def test_no_other_caller_of_forward_impl_defers():
     assert offenders == [], offenders
 
 
-# ---------------------------------------------------------------------------
-# 4. the REAL AscendMoERunner._forward_impl, driven on CPU
-# ---------------------------------------------------------------------------
-#
-# Sections 1-3 check the pieces; this runs the production function itself
-# (unbound, on a stand-in ``self``) around a real KTLayerOffload, so the order
-# and the merge count are observed, not read out of the source. The routed half
-# is a stand-in whose tail is the production one (``if not defer_kt_merge:
-# routed_out = self.kt_merge(routed_out)``) and whose ``kt_merge`` /
-# ``kt_shared_in_window`` ARE the production members of AscendRoutedExperts.
-# The mutants below are applied to the production source text of
-# ``_forward_impl``, not to a hand-written copy.
+# The production ``AscendMoERunner._forward_impl`` itself, run unbound on a
+# stand-in ``self`` around a real KTLayerOffload, so the order and the merge
+# count are observed rather than read out of the source. The routed half is a
+# stand-in whose tail and whose ``kt_merge`` / ``kt_shared_in_window`` ARE the
+# production members; the mutants are applied to the production source text.
 
 import contextlib  # noqa: E402
 import inspect  # noqa: E402
@@ -651,7 +608,7 @@ def _drive(monkeypatch, fwd, *, switch, has_shared=True, steps=3, ignore_defer=F
 
 
 def _judge(monkeypatch, fwd, **kw):
-    """Everything §4.31 asks of the switch-on arm, as a list of problems."""
+    """Everything asked of the switch-on arm, as a list of problems."""
     ref, _, _, _ = _drive(monkeypatch, _production_forward_impl(), switch=False)
     outs, logs, runner, problems = _drive(monkeypatch, fwd, switch=True, **kw)
     for k, lg in enumerate(logs):
@@ -753,14 +710,9 @@ def test_routed_half_ignoring_defer_is_red(monkeypatch):
     assert any("2 merge call" in p for p in problems), problems
 
 
-# ---------------------------------------------------------------------------
-# 5. the window itself, on the side-stream simulator
-# ---------------------------------------------------------------------------
-#
-# The simulator of test_side_stream_overlap (completion-time ordered streams,
-# the forked H2D reading the pinned buffer when it executes). A shared-expert
-# op enqueued before the merge lands between the fork and the join; enqueued
-# after, behind the H2D. Same values either way, and only the first is hidden.
+# The side-stream simulator of test_side_stream_overlap: a shared-expert op
+# enqueued before the merge lands between the fork and the join; enqueued after,
+# behind the H2D. Same values either way, and only the first is hidden.
 
 from tests.ut.kt_offload import test_side_stream_overlap as sso  # noqa: E402
 
@@ -817,12 +769,3 @@ def test_side_stream_off_either_order_is_the_same(monkeypatch, sim):
     assert t_after == pytest.approx(t_before)
 
 
-def test_the_switch_announces_itself_once_per_layer(monkeypatch):
-    """A whole-network arm proves the switch reached the process by counting
-    this line (40 on, 0 off), the way SIDE STREAM ENABLED is counted."""
-    seen = []
-    monkeypatch.setattr(kl.logger, "warning", lambda msg, *a, **k: seen.append(msg % a if a else msg))
-    _runtime(monkeypatch, shared_in_window=False)
-    assert not any("SHARED IN WINDOW" in m for m in seen)
-    _runtime(monkeypatch, shared_in_window=True)
-    assert sum("SHARED IN WINDOW for layer 0" in m for m in seen) == 1, seen

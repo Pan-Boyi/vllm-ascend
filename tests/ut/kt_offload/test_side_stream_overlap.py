@@ -1,38 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Side-stream overlap (cfg.overlap_side_stream) -- CPU only, fake streams.
 
-Two layers of checking, and the second one is the point:
-
-1. The call sequence the real ``KTLayerOffload`` emits (fill this layer's own
-   buffers on the compute stream -> fork -> side wait -> D2H/host-func on the
-   side stream -> join -> H2D on the compute stream), event lifetime, stale-join
-   refusal, and the refusal when a capture does not follow onto the side stream.
-
-2. A tiny stream simulator *executes* that recorded schedule and compares the
-   result with the serial (overlap off) one **bit for bit**. Every mutant below
-   (join dropped, join recorded too early, events not kept alive, capture not
-   propagated, 🔴 fork recorded before the fills) produces a schedule that is
-   FASTER and WRONG -- each test asserts both, so the record shows why the
-   on-card criterion is bit-identity and not TPOT. sglang's F1 failure was
-   exactly this shape: the capture did not propagate to the side stream, the
-   graph got quicker and the CPU experts' contribution froze at the capture
-   run's value.
-
-🔴 2026-09-22: what the forked path reads changed, and so did this file.
-It used to hand ``hs``/``topk_ids``/``topk_weights`` straight to kt's
-``copy_inputs_to_cpu_buffers`` **from the side stream**, with the fork event
-recorded *before* the compute-stream work those reads depend on. Two holes:
-the caller drops its last reference to the routing tensors the moment
-``route()`` returns (routed_experts.py:707-708), so inside a capture the
-allocator may hand that storage to a later allocation; and the int64 id buffer
-was filled by the compute stream *after* the fork, so whichever stream got
-there first won. On card, with the compute stream made late on purpose
-(``t5_side_reuse.py --stress ids-delay``, 40 layers x 30 steps), the side
-stream read the previous step's ids in 1160 of 1200 layer-steps and every step
-diverged, while the serial arm stayed 30/30 bit-identical. The path now fills
-this layer's **own** buffers on the compute stream and records the fork after
-them; ``_early_fork`` below is that edge taken out again.
-"""
+Two layers of checking: the call sequence ``KTLayerOffload`` emits, and a tiny
+stream simulator that *executes* the recorded schedule and compares it with the
+serial one bit for bit. Every mutant here is FASTER and WRONG -- each test
+asserts both, which is why the criterion is bit-identity and not wall time."""
 
 from __future__ import annotations
 
@@ -49,9 +21,7 @@ from vllm_ascend.kt_offload.placement import build_plan
 
 H, TOPK, NEXP = 8, 2, 16
 
-# ---------------------------------------------------------------------------
-# a minimal device: streams of timed ops, events, pinned/device buffers
-# ---------------------------------------------------------------------------
+# A minimal device: streams of timed ops, events, pinned/device buffers.
 
 
 class Box:
@@ -74,16 +44,11 @@ class Sim:
         self.current = None
         # id(destination Box) -> the Box a _device_fill of it reads at the
         # moment it executes. Without it a fill would copy the value the tensor
-        # had when the op was *enqueued*, which is the reordering these tests
-        # exist to see.
+        # had when the op was *enqueued*, hiding the reordering under test.
         self.fill_src: dict[int, Box] = {}
-        # 🔴 P1a. id(ExternalEvent) -> the time it was signalled, and it
-        # PERSISTS ACROSS REPLAYS: that is the whole difference from the
-        # ordinary event table, which is rebuilt per replay. An external event
-        # is a value in device memory; nothing clears it but the ``reset`` node
-        # in the graph. Drop that node and replay 2's wait sails through on
-        # replay 1's signal -- faster, wrong, silent, and invisible to any
-        # model that resets the table between replays.
+        # id(ExternalEvent) -> when it was signalled. It PERSISTS ACROSS
+        # REPLAYS, unlike the ordinary event table: an external event is a value
+        # in device memory that nothing clears but the graph's ``reset`` node.
         self.ext_signaled: dict[int, float] = {}
         # How the modelled completion thread behaves: "clean" (sync, then
         # record), "early-record" (record first) or "no-record" (never).
@@ -104,30 +69,27 @@ class Sim:
 
         Used for a graph replay: fresh indices and a fresh event table. The op
         lists are copied because the modelled completion thread appends to them
-        while the replay runs (it is host work, not a graph node), and
+        while the replay runs (host work, not a graph node), and
         ``ext_signaled`` is NOT reset -- see the comment on it.
         """
         # A signal left over from an earlier replay happened before this one
-        # started, so its timestamp is 0 on this replay's clock. Keeping the
-        # old absolute time would make a stale signal look like a wait that
-        # still delayed -- which is exactly the bug it must NOT hide.
+        # started, so its timestamp is 0 on this replay's clock; keeping the old
+        # absolute time would make a stale signal look like a wait that delayed.
         self.ext_signaled = dict.fromkeys(self.ext_signaled, 0.0)
         return self._run({n: list(ops) for n, ops in programs.items()}, {}, {}, {})
 
     def async_complete(self, work_fn, cost, event) -> None:
         """Model the completion thread, from inside the host-func node.
 
-        What the node does is hand the task over and return; what happens next
-        is another thread waiting ``cost`` for kt and only then writing the
-        value the device is parked on. Modelled as a serial FIFO program of its
-        own (kt's queue is exactly that) gated on the moment of the hand-off.
+        The node hands the task over and returns; another thread then waits
+        ``cost`` for kt and only afterwards writes the value the device is
+        parked on. Modelled as a serial FIFO program gated on the hand-off.
 
         ``sim.async_mode`` picks the arm:
           ``clean``         work, then signal -- production.
-          ``early-record``  signal, then work. 🔴 The main failure: the H2D is
-                            released while the pinned output still holds the
-                            previous step's value, and nothing raises.
-          ``no-record``     never signal. The device waits for ever, which here
+          ``early-record``  signal, then work: the H2D is released while the
+                            pinned output still holds the previous step's value.
+          ``no-record``     never signal; the device waits for ever, which here
                             is the deadlock assertion at the end of ``_run``.
         """
         gate = object()
@@ -147,8 +109,8 @@ class Sim:
         """Host-side device sync: everything enqueued and not yet executed runs.
 
         Indices, clocks and recorded events persist, so a second drain does not
-        re-run what the first one already executed (the host runs ahead between
-        drains -- which is exactly the window this file is about).
+        re-run what the first already executed (the host runs ahead between
+        drains, which is the window this file is about).
         """
         if not hasattr(self, "_idx"):
             self._idx, self._recorded, self._clock = {}, {}, {}
@@ -185,8 +147,8 @@ class Sim:
         """Time-ordered execution; an op's effect lands when it completes.
 
         Completion order across streams is what makes a missing or early join a
-        data hazard here, exactly as on the device: the H2D reads the pinned
-        buffer at the moment it executes, not when it was enqueued.
+        data hazard, as on the device: the H2D reads the pinned buffer when it
+        executes, not when it was enqueued.
         """
         self._active_programs, self._active_recorded = programs, recorded
         while True:
@@ -243,9 +205,9 @@ class FStream:
     def synchronize(self):
         """Host waits for THIS stream only (torch.npu.Stream.synchronize).
 
-        Other streams keep their queued work: that is the whole difference
-        from kt's torch.npu.synchronize(device), and the window in which the
-        host can run ahead of a pending H2D.
+        Other streams keep their queued work -- the difference from kt's
+        torch.npu.synchronize(device), and the window in which the host can run
+        ahead of a pending H2D.
         """
         self.sim.host_syncs = getattr(self.sim, "host_syncs", 0) + 1
         self.sim.drain_stream(self.name)
@@ -254,11 +216,9 @@ class FStream:
 class FakeKT:
     """kt wrapper on the simulator: CPU experts compute out = 3 * input.
 
-    Only the *serial* paths are exercised through it now (eager submit/sync and
-    the captured non-forked node). The forked path stopped calling kt's pinned
-    buffers on 2026-09-22; it runs ``_kt_packed_forward`` on this layer's own
-    buffers, which ``sim`` replaces with ``_fake_packed_forward``.
-    """
+    Only the *serial* paths go through it (eager submit/sync and the captured
+    non-forked node); the forked path runs ``_kt_packed_forward`` on this
+    layer's own buffers, which ``sim`` replaces with ``_fake_packed_forward``."""
 
     _layer_has_pending_deferred: dict = {}
 
@@ -308,9 +268,7 @@ class FakeKT:
         self.pinned_out.value = 3 * self.pinned_in.value
 
 
-# ---------------------------------------------------------------------------
-# the per-layer side buffers the forked path fills and reads
-# ---------------------------------------------------------------------------
+# The per-layer side buffers the forked path fills and reads.
 
 
 class Store:
@@ -352,10 +310,8 @@ def make_side_buffers(sim: Sim, device_in: Box, out_gpu: torch.Tensor, ids_in: B
 def _fake_packed_forward(payload) -> None:
     """The host-func node: this layer's CPU experts on its own pinned buffers.
 
-    ``3 * hidden`` matches FakeKT so the serial and forked arms are comparable
-    bit for bit, and the ``+ ids`` term is what makes a stale id buffer visible
-    in the output rather than only in a probe.
-    """
+    ``3 * hidden`` matches FakeKT so the two arms are comparable bit for bit;
+    the ``+ ids`` term makes a stale id buffer visible in the output."""
     _wrapper, buf, layer_idx = payload
     hidden, ids = buf["pin_hidden"].value, buf["pin_ids"].value
     kl.HOST_FUNC_CALLS[layer_idx] = kl.HOST_FUNC_CALLS.get(layer_idx, 0) + 1
@@ -385,11 +341,10 @@ def sim(monkeypatch):
     def device_fill(dst, src):
         """A compute-stream write into one region of this layer's device buffer.
 
-        Cost 5 each against the 2-unit D2H of the combined buffer: with the
-        fork recorded after these (production) the D2H cannot start before they
-        finish, and with it recorded before them (the mutant) the D2H finishes
-        first and copies whatever the previous replay left. The numbers are a
-        fixture -- the ordering they expose is not.
+        Cost 5 each against the 2-unit D2H of the combined buffer, so that with
+        the fork recorded before them (the mutant) the D2H finishes first and
+        copies whatever the previous replay left. The numbers are a fixture --
+        the ordering they expose is not.
         """
         src_box = s.fill_src.get(id(dst))
 
@@ -406,11 +361,10 @@ def sim(monkeypatch):
 
             s.enqueue(s.current, Op("d2h", d2h, 2.0))
         elif isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor) and dst.dtype == torch.int64:
-            # 🔴 P1b's start signal: 8 bytes, its own copy, behind the D2H
-            # above on the same stream. When it EXECUTES, the word carries this
-            # step's number and the polling thread has its cue -- which is the
-            # whole mechanism, and why its position in this list is the thing
-            # the mutants move.
+            # The start signal: 8 bytes, its own copy, behind the D2H above on
+            # the same stream. When it EXECUTES the word carries this step's
+            # number and the polling thread has its cue, which is why its
+            # position in this list is what the mutants move.
             slot = (dst.data_ptr() - kl._SIGNALS.words.data_ptr()) // (8 * ds.STRIDE_WORDS)
 
             def signal():
@@ -418,12 +372,11 @@ def sim(monkeypatch):
                 entry = s.signal_entries[slot]
                 layer = entry.run.__self__
                 buf = layer._packed[entry.bs]
-                # 🔴 The snapshot is taken HERE, when the counter copy lands,
+                # The snapshot is taken HERE, when the counter copy lands,
                 # because that is when the polling thread starts reading the
-                # pinned buffer. Reading it 35 units later (when the modelled
-                # kt finishes) would quietly repair every ordering mistake this
-                # file exists to catch: the input copy would have overtaken the
-                # signal by then and the arm would look clean.
+                # pinned buffer. Reading it when the modelled kt finishes would
+                # let the input copy overtake the signal and repair every
+                # ordering mistake this file exists to catch.
                 seen_hidden, seen_ids = buf["pin_hidden"].value, buf["pin_ids"].value
 
                 def work():
@@ -497,12 +450,11 @@ def sim(monkeypatch):
     monkeypatch.setattr(kl, "_make_poller", make_poller)
 
     def poll_run(self, bs):
-        """``_poll_run`` must never be reached in this file: what the polling
-        thread does is modelled by the signal op below, because the moment it
-        READS the pinned buffer is the property under test and a function
-        called at completion time cannot express it. The real one is covered in
-        test_device_signal.py (including that it builds the same kt task the
-        host-func node does)."""
+        """``_poll_run`` must never be reached here: the polling thread is
+        modelled by the signal op above, because the moment it READS the pinned
+        buffer is the property under test and a function called at completion
+        time cannot express it. The real one is covered in
+        test_device_signal.py."""
         raise AssertionError("the simulator models the poller through the signal op")
 
     monkeypatch.setattr(kl.KTLayerOffload, "_poll_run", poll_run)
@@ -510,9 +462,9 @@ def sim(monkeypatch):
     def submit_only(payload):
         """``_kt_packed_submit_only``: build the task, hand it over, return.
 
-        The node itself is cheap (5 against the serial node's 40); kt's 35 runs
-        on the modelled completion thread, and the device is parked on the
-        ExternalEvent until that thread signals it.
+        The node is cheap (5 against the serial node's 40); kt's 35 runs on the
+        modelled completion thread and the device is parked on the
+        ExternalEvent until it signals.
         """
         _wrapper, buf, layer_idx, event = payload
         kl.HOST_FUNC_CALLS[layer_idx] = kl.HOST_FUNC_CALLS.get(layer_idx, 0) + 1
@@ -551,15 +503,13 @@ def _runtime(monkeypatch, sim, overlap: bool, graph: bool, boxes, *, packed: boo
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import async_wait as aw
 
-    # 🔴 setenv, not setattr(envs, ...): a setattr here would be written back
-    # as a real module attribute on undo and shadow envs.__getattr__ for the
-    # rest of the session, so any later test that sets this variable in the
-    # environment would be quietly ignored.
+    # setenv, not setattr(envs, ...): a setattr would be written back as a real
+    # module attribute on undo and shadow envs.__getattr__ for the rest of the
+    # session, so later tests setting this variable would be ignored.
     monkeypatch.setenv(ds.ENV_NAME, "1" if device_signal else "0")
 
-    # P1a is an env-only switch (the A/B it exists for must differ in exactly
-    # one thing, and the cfg json is part of an arm's fingerprint), so it is
-    # set here rather than on the config object.
+    # An env-only switch (the cfg json is part of an arm's fingerprint, and the
+    # A/B must differ in exactly one thing), so not set on the config object.
     monkeypatch.setattr(envs, aw.ENV_NAME, "1" if async_wait else "0", raising=False)
     plan = build_plan([[0, 3]], NEXP)
     cfg = KTOffloadConfig(
@@ -616,19 +566,10 @@ def _inputs(seed):
     return hs, ids, w
 
 
-# ---------------------------------------------------------------------------
-# 1. the call sequence
-# ---------------------------------------------------------------------------
-
-
 def test_eager_is_never_forked_even_with_overlap_on(monkeypatch, sim):
-    """Eager keeps kt's own submit/sync, whatever overlap_side_stream says.
-
-    A fork there buys nothing -- the side stream's first op waits on an event
-    recorded on the compute stream after the previous layer's H2D, so waiting
-    for the side stream waits for the compute stream anyway -- and it takes kt's
-    pinned slots out from under the device sync kt's submit_forward does.
-    """
+    """Eager keeps kt's own submit/sync, whatever overlap_side_stream says: a
+    fork buys nothing there and takes kt's pinned slots out from under the
+    device sync its submit_forward does."""
     boxes = _boxes()
     rt, fake = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes)
     hs, ids, w = _inputs(0)
@@ -641,13 +582,8 @@ def test_eager_is_never_forked_even_with_overlap_on(monkeypatch, sim):
 
 def test_a_stale_join_is_cleared_by_an_eager_route(monkeypatch, sim):
     """Capture, then an eager forward: the previous capture's join must not
-    survive into that forward's merge (sglang 18c8b21e3 clears it in
-    pre-dispatch for every path, not only the forked one).
-
-    It is cleared, and the layer still remembers that its side-stream work was
-    never joined -- that is what ``_side_inflight`` is for, and the next
-    captured submit refuses (see ``test_a_second_submit_before_the_join_is_refused``).
-    """
+    survive into that forward's merge. It is cleared, and the layer still
+    remembers its side-stream work was never joined (``_side_inflight``)."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
@@ -674,8 +610,8 @@ def test_captured_overlap_fills_first_then_forks_side_work_and_joins(monkeypatch
     assert rt._pending_join is not None
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
     assert rt._pending_join is None  # consumed
-    # 🔴 the three fills come BEFORE the record: that is the edge that orders
-    # the compute stream's writes against the side stream's reads.
+    # the three fills come BEFORE the record: the edge that orders the compute
+    # stream's writes against the side stream's reads
     assert [o.kind for o in sim.programs["compute"]] == ["fill", "fill", "fill", "record", "wait", "h2d"]
     assert [o.kind for o in sim.programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
     # the event objects the graph's nodes point at are kept for the process
@@ -687,11 +623,8 @@ def test_captured_overlap_fills_first_then_forks_side_work_and_joins(monkeypatch
 
 
 def test_the_side_stream_reads_only_this_layers_own_buffers(monkeypatch, sim):
-    """The criterion for the lifetime half, as a check the code can fail.
-
-    Nothing the side stream reads may be storage the caller owns: the routing
-    tensors' last reference goes when ``route()`` returns.
-    """
+    """Nothing the side stream reads may be storage the caller owns: the routing
+    tensors' last reference goes when ``route()`` returns."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
@@ -719,13 +652,9 @@ def test_capture_that_does_not_reach_the_side_stream_is_refused(monkeypatch, sim
 
 
 def test_a_second_submit_before_the_join_is_refused(monkeypatch, sim):
-    """🔴 The guard that had to change: it must span steps, not one capture.
-
-    ``_claim_side_slot`` counted layers in flight inside one capture and
-    ``route()`` cleared ``_pending_join`` on the way in, so a layer that
-    submitted and was never joined arrived at its next route indistinguishable
-    from one that had been joined. Now the flag is cleared only by the join.
-    """
+    """The guard spans steps, not one capture: a layer that submitted and was
+    never joined must not arrive at its next route looking like one that was.
+    The flag is cleared only by the join."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
@@ -758,13 +687,9 @@ def test_overlap_off_keeps_the_m2_path(monkeypatch, sim):
 
 
 def test_packed_and_overlap_together_fork_rather_than_silently_serialise(monkeypatch, sim):
-    """The combination the config used to refuse.
-
-    The refusal existed because ``route()`` tested ``packed`` first, so "side
-    stream on" quietly meant "packed serial". The branch order is the other way
-    round now and both switches use the same per-layer buffers, so the
-    combination is accepted -- and here is the assertion that it really forks.
-    """
+    """Both switches share the same per-layer buffers and ``route()`` takes the
+    forked branch first, so "side stream on" must not quietly mean "packed
+    serial"."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, packed=True)
     sim.capturing = True
@@ -774,9 +699,7 @@ def test_packed_and_overlap_together_fork_rather_than_silently_serialise(monkeyp
     assert [o.kind for o in sim.programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
 
 
-# ---------------------------------------------------------------------------
-# 2. execute the recorded schedule: bit-identity vs wall time
-# ---------------------------------------------------------------------------
+# Execute the recorded schedule: bit-identity vs wall time.
 
 
 def _capture_schedule(monkeypatch, sim, boxes, *, overlap: bool):
@@ -785,10 +708,7 @@ def _capture_schedule(monkeypatch, sim, boxes, *, overlap: bool):
     hs, ids, w = _inputs(7)
     rt.route(hs, w, ids, in_profile_run=False)
     # the resident experts, between route and merge: the work the side stream is
-    # supposed to hide behind. (The "~0.62 ms/layer" once written here is
-    # retired; the measured per-layer GMM is 44.7 us and the whole-layer window
-    # is what t4 item 2 measures. The simulated 30 us below is a fixture, not a
-    # claim about the card.)
+    # supposed to hide behind. The 30 units are a fixture, not a measurement.
     sim.enqueue(sim.compute, Op("npu_experts", lambda: None, 30.0))
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
     sim.capturing = False
@@ -858,11 +778,9 @@ def _events_not_kept(programs, boxes, rt):
 
 
 def _capture_not_propagated(programs, boxes, rt):
-    """The side stream's work never made it into the graph (sglang's F1).
-
-    In that shape the D2H and the host func ran once, eagerly, while the graph
-    was being captured: the pinned output keeps that run's value for ever.
-    """
+    """The side stream's work never made it into the graph: the D2H and the host
+    func ran once, eagerly, during the capture, and the pinned output keeps that
+    run's value for ever."""
     device_in = boxes[0]
     buf = rt._packed[1]
     buf["pin_hidden"].value = device_in.value
@@ -871,13 +789,9 @@ def _capture_not_propagated(programs, boxes, rt):
 
 
 def _early_fork(programs, boxes, rt):
-    """🔴 The 2026-09-22 fix, taken out again: fork recorded before the fills.
-
-    The compute stream's writes into this layer's own buffers are then ordered
-    against nothing the side stream waits for, so the D2H (5 units) finishes
-    before the first fill (10) and copies whatever the previous replay left.
-    That is the shape measured on card at 1160/1200 layer-steps.
-    """
+    """Fork recorded before the fills: the compute stream's writes into this
+    layer's own buffers are then ordered against nothing the side stream waits
+    for, so the D2H finishes first and copies the previous replay's values."""
     compute = programs["compute"]
     fills = [o for o in compute if o.kind == "fill"]
     rest = [o for o in compute if o.kind != "fill"]
@@ -895,49 +809,33 @@ def _early_fork(programs, boxes, rt):
     ],
 )
 def test_mutants_are_faster_and_wrong(monkeypatch, sim, name, mutate):
-    """Bit-identity catches each mutant; a wall-time criterion passes all of them.
-
-    This is the argument for the on-card criterion: every one of these makes the
-    step FASTER, so "TPOT improved" is evidence of nothing.
-    """
+    """Bit-identity catches each mutant; a wall-time criterion passes all of
+    them, because every one of these makes the step faster."""
     out_s, out_o, t_s, t_o = _arms(monkeypatch, sim, mutate)
     assert not _bits_equal(out_s, out_o), f"{name}: bit-identity did not catch it ({out_s} vs {out_o})"
     assert t_o <= t_s, f"{name}: expected the mutant to be no slower (time is not a criterion)"
 
 
 def test_stale_output_fingerprint_of_the_unpropagated_capture(monkeypatch, sim):
-    """The F1 shape specifically: one CPU output reused for every replay."""
+    """The unpropagated-capture shape: one CPU output reused for every replay."""
     _, out_o, _, _ = _arms(monkeypatch, sim, _capture_not_propagated)
     assert len(set(out_o)) == 1, f"expected one frozen value, got {out_o}"
 
 
 def test_the_early_fork_mutant_reads_the_previous_replays_input(monkeypatch, sim):
-    """Name the failure, not just "different": it is the PREVIOUS step's value.
-
-    That is what the on-card probe reported (kt's pinned id buffer holding the
-    previous step's routing ids in 1160 of 1200 layer-steps), so the CPU model
-    has to produce the same fingerprint or it is modelling something else.
-    """
+    """Name the failure rather than calling it "different": each replay carries
+    the PREVIOUS step's value, which is the fingerprint seen on card."""
     out_s, out_o, _, _ = _arms(monkeypatch, sim, _early_fork)
     # each overlap replay carries the value of the replay before it
     assert out_o[1:] == out_s[:-1], (out_s, out_o)
 
 
-# ---------------------------------------------------------------------------
-# 3. several layers, with the host running ahead
-#
-# kt keeps ONE pair of pinned buffers per batch size and hands layer L the slot
-# ``L % 2``: the pinned output of layer L is read by an ASYNC H2D on the compute
-# stream while the CPU task of layer L+2 writes that same buffer. In the serial
-# path kt's own submit_forward calls torch.npu.synchronize() before submitting,
-# which is what supplies the ordering. The forked path used to inherit that
-# sharing without the sync; since 2026-09-22 it has per-layer buffers instead,
-# and these tests are what says the sharing is really gone.
-#
-# Everything above this line is single-layer, i.e. zero coverage for reuse
-# across layers: with fewer than three layers no two layers share a slot, and
-# with the device drained at every step the host can never run ahead.
-# ---------------------------------------------------------------------------
+# Several layers, with the host running ahead. kt keeps ONE pair of pinned
+# buffers per batch size and hands layer L the slot ``L % 2``, so layer L's
+# pinned output is read by an async H2D while layer L+2's CPU task writes the
+# same buffer; the forked path has per-layer buffers instead, and these tests
+# are what says the sharing is really gone. Three layers and an undrained device
+# are the minimum that can see it at all.
 
 DEPTH = 2  # kt's KExpertsCPUBuffer.buffer_depth
 
@@ -1083,14 +981,14 @@ def _run_model(monkeypatch, sim, *, overlap, graph, layers=4, steps=3, batch_siz
 
 
 def test_multi_layer_serial_is_correct(monkeypatch, sim):
-    """Positive control: overlap off, the same four layers and shared slots."""
+    """Positive control: overlap off, same four layers and shared slots."""
     seen = _run_model(monkeypatch, sim, overlap=False, graph=False)
     assert seen and all(got == want for got, want in seen), seen[:6]
 
 
 def test_multi_layer_overlap_keeps_every_layers_cpu_output(monkeypatch, sim):
-    """The regression: with the host running ahead, layer L+2 must not overwrite
-    layer L's pinned output before its H2D has read it."""
+    """With the host running ahead, layer L+2 must not overwrite layer L's
+    pinned output before its H2D has read it."""
     seen = _run_model(monkeypatch, sim, overlap=True, graph=False)
     wrong = [(got, want) for got, want in seen if got != want]
     assert not wrong, f"{len(wrong)}/{len(seen)} layers read another layer's CPU output: {wrong[:4]}"
@@ -1112,7 +1010,7 @@ def test_multi_layer_overlap_under_changing_batch_size(monkeypatch, sim):
 
 
 def test_no_two_layers_share_a_side_buffer(monkeypatch, sim):
-    """A6 after the change: the forked path's stores belong to one layer each."""
+    """The forked path's stores belong to one layer each."""
     buffers = KtBuffers()
     ins = [Box(1.0) for _ in range(4)]
     rts = [_layer_runtime(monkeypatch, sim, buffers, i, ins[i], overlap=True, graph=True) for i in range(4)]
@@ -1159,22 +1057,10 @@ def test_the_normal_layer_order_never_trips_the_buffer_guard(monkeypatch, sim):
     assert len(set(kl._SIDE_BUFFER_OWNER.values())) == 4
 
 
-# ---------------------------------------------------------------------------
-# 4. the switch: refused unless the operator asks for it explicitly
-#
-# 2026-09-20, in order: (a) the guard read torch.npu.is_current_stream_capturing()
-# as if it meant "this stream's work is in the graph" -- it does not; (b) the
-# replacement was a start-up probe that captured the same fork/join *pattern*
-# with a scalar copy and a trivial host function: it PASSED on the platform
-# where every real-layer capture failed with 107025. A stand-in weaker than its
-# subject passes where the subject fails. So there is still no probe.
-#
-# 2026-09-22: the 107025 verdict itself was withdrawn (it was our own empty
-# capture buffer, and the one arm that really reproduces 107025 is the one
-# whose side-stream record nobody joins -- t5 off_evt vs off_evtw). The switch
-# is therefore conditional, not dead: refused unless
-# VLLM_ASCEND_DSV41_KT_SIDE_STREAM=1, and then loud.
-# ---------------------------------------------------------------------------
+# The switch. There is no start-up probe: a probe that captures the same
+# fork/join pattern with a scalar copy and a trivial host function is weaker
+# than its subject and passes where the subject fails. The env variable decides,
+# and enabling it is logged loudly.
 
 
 def _preconditions_cfg(packed: bool = False):
@@ -1196,7 +1082,7 @@ def _preconditions_cfg(packed: bool = False):
 
 
 def test_env_zero_turns_it_off_in_production_and_eager_alike(monkeypatch):
-    """PLAN §4.33: "0" is the kill switch now (it used to be the refusal)."""
+    """"0" is the kill switch, in captured and eager mode alike."""
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import switches
 
@@ -1218,12 +1104,8 @@ def test_the_env_opens_it(monkeypatch):
 
 
 def test_packed_and_the_side_stream_together_are_accepted(monkeypatch):
-    """Both on is a configuration now, not a refusal (see the test in §1).
-
-    It was refused while ``route()`` took the packed branch first, which made
-    "side stream on" mean "packed serial". The forked path *is* the packed
-    buffers now and is taken first.
-    """
+    """Both on is a configuration, not a refusal: the forked path *is* the
+    packed buffers and is taken first."""
     from vllm_ascend import envs
 
     monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
@@ -1232,9 +1114,8 @@ def test_packed_and_the_side_stream_together_are_accepted(monkeypatch):
 
 
 def test_a_typo_in_the_env_refuses_to_start(monkeypatch):
-    """Before §4.33 a typo read as "not 1" = refused. With the default on, a
-    typo must not read as on (the default) or as off (a would-be "0"): it
-    refuses, naming the variable. "" is unset, i.e. the default."""
+    """With the default on, a typo must read as neither on nor off: it refuses,
+    naming the variable. "" is unset, i.e. the default."""
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import switches
 
@@ -1249,36 +1130,18 @@ def test_a_typo_in_the_env_refuses_to_start(monkeypatch):
     assert switches.resolve(cfg).side_stream.on is True
 
 
-def test_enabling_it_says_so_in_the_log(monkeypatch, sim):
-    """An operator reading serve.log must see which arm is running.
-
-    The vllm logger is captured by hand: it has its own handlers and does not
-    propagate to pytest's caplog (see the note at the top of layer.py).
-    """
-    said = []
-    monkeypatch.setattr(kl.logger, "warning", lambda msg, *a: said.append(msg % a if a else msg))
-    _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=_boxes())
-    assert any("SIDE STREAM ENABLED" in m and "侧流已启用" in m for m in said), said
-    # ...and the serial arm stays quiet, so the line means something
-    said.clear()
-    _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=_boxes())
-    assert not [m for m in said if "SIDE STREAM" in m], said
-
-
 def test_the_object_can_still_be_built_for_bisection(monkeypatch, sim):
-    """The on-card harness constructs the config directly to bisect the limit."""
+    """The config can be constructed directly, with no probe and no refusal."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     assert rt.overlap is True  # no probe, no refusal at this level
 
 
-# ---------------------------------------------------------------------------
-# 5. the runtime gates the side stream carries (each with its mutant)
-# ---------------------------------------------------------------------------
+# The runtime gates the side stream carries, each with its mutant.
 
 
 def test_submit_order_criterion_goes_red_on_a_fill_after_the_fork(monkeypatch):
-    """The pure form of the fix, so it can be read without a simulator."""
+    """The ordering rule in pure form, readable without the simulator."""
     good = [("fill", "ids"), ("fork", None), ("side_wait", None), ("side_read", "ids")]
     assert ss.submit_order_ok(good)["ok"]
     bad = [("fork", None), ("fill", "ids"), ("side_wait", None), ("side_read", "ids")]
@@ -1298,12 +1161,9 @@ def test_buffer_ownership_criterion_spans_steps():
 
 
 def test_a_host_func_that_runs_during_the_capture_is_refused(monkeypatch, sim):
-    """The silent non-replay shape: the node was executed, not recorded.
-
-    Nothing about the output can see this at capture time (it is the capture
-    run's own value), and it makes every replay faster -- so the counter is
-    the only witness.
-    """
+    """The silent non-replay shape: the node was executed, not recorded. The
+    output cannot see it at capture time and every replay gets faster, so the
+    counter is the only witness."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes)
     sim.capturing = True
@@ -1326,22 +1186,11 @@ def test_the_counter_moving_between_replays_is_fine(monkeypatch, sim):
     rt.merge(torch.zeros(1, H, dtype=torch.bfloat16))
 
 
-# ---------------------------------------------------------------------------
-# 6. the diagnostic instrument must not be installed twice on one call
-# ---------------------------------------------------------------------------
-
-
 def test_seam_timing_does_not_also_probe_cpu_infer_on_the_forked_path(monkeypatch, sim):
-    """🔴 Two instruments on one call read like one.
-
-    ``seam_timing``'s CPUInfer probe exists to split submit from sync on the
-    path where *kt* makes those calls. Since the forked path runs
-    ``_kt_packed_forward`` on this layer's own buffers, it stamps submit/sync
-    itself -- and the probe's ``T_SUBMIT_IN``, taken inside its own frame, then
-    overwrote ours, moving time out of ``submit`` and into ``kt_pre``, while the
-    extra frame lengthened the host-func node the side stream exists to hide.
-    So: split is on (the node does it), and ``cpu_infer`` is left alone.
-    """
+    """Two instruments on one call read like one: the forked node stamps
+    submit/sync itself, and the CPUInfer probe on top would overwrite those
+    stamps and lengthen the very node the side stream exists to hide. So split
+    stays on and ``cpu_infer`` is left alone."""
     from vllm_ascend.kt_offload import seam_timing as sm
 
     monkeypatch.setenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", "60")
@@ -1364,24 +1213,12 @@ def test_seam_timing_does_not_also_probe_cpu_infer_on_the_forked_path(monkeypatc
         sm._reset_for_tests()
 
 
-# ---------------------------------------------------------------------------
-# 5. P1a: the device waits for an ExternalEvent, not for the callback's return
-#
-# The arm under test is the one that will be merged: side stream ON in both
-# arms, and only VLLM_ASCEND_DSV41_KT_ASYNC_WAIT differs. The simulator has to
-# model two things the side-stream model did not need:
-#
-#   * the release comes from a thread that runs AFTER the node returned, so
-#     the node no longer contains kt's compute (``Sim.async_complete``);
-#   * an external event is a value in device memory and stays signalled until
-#     the graph's ``reset`` node clears it (``Sim.ext_signaled``, which is the
-#     one piece of state ``run()`` does not rebuild per replay).
-#
-# 🔴 All three mutants below are the same failure the on-card cases look for:
-# a release that happens before this step's output exists. Two of them are
-# faster and wrong; the third is a hang, which is the only one a user would
-# notice on their own.
-# ---------------------------------------------------------------------------
+# ASYNC_WAIT: the device waits for an ExternalEvent, not for the callback's
+# return. Side stream is ON in both arms and only the env variable differs. Two
+# things the side-stream model did not need: the release comes from a thread
+# that runs after the node returned (``Sim.async_complete``), and an external
+# event stays signalled until the graph's reset node clears it
+# (``Sim.ext_signaled``, the one piece of state ``run()`` keeps per replay).
 
 
 def _capture_p1a(monkeypatch, sim, boxes, *, async_wait: bool, overlap: bool = True, packed: bool = False):
@@ -1420,12 +1257,9 @@ def _p1a_arms(monkeypatch, sim, *, mode="clean", mutate=None, values=(2.0, 5.0, 
 
 
 def test_p1a_records_the_wait_and_the_reset_behind_the_node(monkeypatch, sim):
-    """The shape, on the stream the node is on, with the reset present.
-
-    The reset has no second line of defence at run time: without it the graph
-    still works and gets faster. This asserts the node is emitted; the next
-    test asserts that removing it is caught by the output.
-    """
+    """The shape, on the stream the node is on, with the reset present: without
+    the reset the graph still works and gets faster, so nothing else at run time
+    would catch its absence."""
     boxes = _boxes()
     programs, _ = _capture_p1a(monkeypatch, sim, boxes, async_wait=True)
     assert [o.kind for o in programs["side"]] == [
@@ -1457,51 +1291,36 @@ def test_p1a_is_bit_identical_and_not_slower(monkeypatch, sim):
 
 
 def test_p1a_without_the_record_hangs(monkeypatch, sim):
-    """🔴 Mutant ①: the completion thread never records.
-
-    This is the arm that says the device really is waiting. If the graph
-    finished anyway, the ``ext_wait`` node would not be doing anything and
-    every other result here would be meaningless.
-    """
+    """The arm that says the device really is waiting: if the graph finished
+    anyway, the ``ext_wait`` node would be doing nothing and every other result
+    here would be meaningless."""
     with pytest.raises(AssertionError, match="deadlock"):
         _p1a_arms(monkeypatch, sim, mode="no-record")
 
 
 def test_p1a_recording_before_the_work_is_faster_and_wrong(monkeypatch, sim):
-    """🔴 Mutant ②: released before this step's output exists.
-
-    The main failure mode of the whole scheme, and the reason the on-card
-    criterion is bit-identity rather than TPOT.
-    """
+    """Released before this step's output exists: the main failure mode of the
+    scheme, and the reason the criterion is bit-identity rather than wall time."""
     out_r, out_p, t_r, t_p = _p1a_arms(monkeypatch, sim, mode="early-record")
     assert not _bits_equal(out_r, out_p), (out_r, out_p)
     assert t_p <= t_r, (t_p, t_r)
 
 
 def test_p1a_recording_early_reads_the_previous_replays_output(monkeypatch, sim):
-    """Name the failure: it is the PREVIOUS step's CPU output, as on card."""
+    """Name the failure: it is the PREVIOUS step's CPU output."""
     out_r, out_p, _, _ = _p1a_arms(monkeypatch, sim, mode="early-record")
     assert out_p[1:] == out_r[:-1], (out_r, out_p)
 
 
 def _drop_reset(programs, boxes, rt):
-    """🔴 Mutant ③: the reset node never made it into the graph.
+    """The reset node never made it into the graph: the first replay is fine --
+    the event starts clear -- and every replay after it walks through a wait
+    still signalled from the one before, so one replay proves nothing.
 
-    The first replay is fine -- the event starts clear -- and every replay
-    after it walks straight through a wait that is still signalled from the
-    replay before. That is why one replay proves nothing here.
-
-    🔴 The card disagrees with this model, and the disagreement is recorded on
-    purpose (2026-09-23, t5r ``--mutant no-reset --stall-ms 50``): with all 8
-    reset nodes provably left out the on-card arm stayed bit-identical AND
-    still paid the stall on every replay, i.e. the captured ExternalEvent wait
-    re-arms itself on that build. This model follows what torch_npu documents
-    ("Before reusing ExternalEvent, you need to call reset() to clear the
-    flag", streams.py:214-217), which is the more pessimistic of the two, and
-    the production path keeps the reset for the same reason -- 0.144 us
-    against relying on undocumented behaviour. What this file must NOT be read
-    as saying is that a missing reset would show up on card: it does not, and
-    the on-card arm that does go red is ``--mutant no-wait``.
+    The model follows what torch_npu documents ("Before reusing ExternalEvent,
+    you need to call reset() to clear the flag"), which is the pessimistic
+    reading; a device whose captured wait re-arms itself would stay correct
+    without the reset, so this arm is not a claim about any particular build.
     """
     return {n: [o for o in ops if o.kind != "ext_reset"] for n, ops in programs.items()}
 
@@ -1513,20 +1332,17 @@ def test_p1a_without_the_reset_in_the_graph_is_faster_and_wrong(monkeypatch, sim
 
 
 def test_p1a_without_the_reset_is_right_once_and_wrong_after(monkeypatch, sim):
-    """The fingerprint of a missing reset, and the reason a one-replay check
-    cannot see it: replay 0 is correct, replay 1 onwards is the previous one."""
+    """Why a one-replay check cannot see a missing reset: replay 0 is correct,
+    replay 1 onwards carries the previous one."""
     out_r, out_p, _, _ = _p1a_arms(monkeypatch, sim, mutate=_drop_reset)
     assert out_p[0] == out_r[0]
     assert out_p[1:] == out_r[:-1], (out_r, out_p)
 
 
 def test_the_criterion_catches_the_missing_reset_in_the_recorded_ops(monkeypatch, sim):
-    """The same mutant, seen by the check the production path itself runs.
-
-    ``_packed_output`` evaluates ``ext_event_ops_ok`` on the ops it recorded,
-    so a future edit that drops the reset raises at capture instead of serving
-    stale output.
-    """
+    """``_packed_output`` evaluates ``ext_event_ops_ok`` on the ops it recorded,
+    so an edit that drops the reset raises at capture rather than serving stale
+    output."""
     from vllm_ascend.kt_offload import async_wait as aw
 
     boxes = _boxes()
@@ -1545,35 +1361,32 @@ EV_SENTINEL = object()
 
 
 def test_p1a_off_records_no_external_event_nodes(monkeypatch, sim):
-    """With the switch off the schedule is the one that was verified on card."""
+    """With the switch off the schedule is the plain side-stream one."""
     boxes = _boxes()
     programs, rt = _capture_p1a(monkeypatch, sim, boxes, async_wait=False)
     assert [o.kind for o in programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
     assert kl._EXT_EVENTS == [] and rt._ext_events == {}
 
 
-def test_p1a_needs_our_own_buffers(monkeypatch, sim):
+@pytest.mark.parametrize("knob", ["async_wait", "device_signal"])
+def test_the_switch_needs_our_own_buffers(monkeypatch, sim, knob):
     """kt's own captured entry point does submit+sync in one call."""
     boxes = _boxes()
     with pytest.raises(RuntimeError, match="own pinned buffers"):
-        _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes, packed=False, async_wait=True)
+        _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes, packed=False, **{knob: True})
 
 
-def test_p1a_is_a_no_op_in_eager_mode(monkeypatch, sim):
+@pytest.mark.parametrize("knob", ["async_wait", "device_signal"])
+def test_the_switch_is_a_no_op_in_eager_mode(monkeypatch, sim, knob):
     """Eager already blocks the host inside route(); there is nothing to defer."""
-    boxes = _boxes()
-    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes, async_wait=True)
-    assert rt.async_wait is False
+    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=_boxes(), **{knob: True})
+    assert getattr(rt, knob) is False
 
 
 def test_every_replay_records_once_per_layer(monkeypatch, sim):
-    """The submit counter and the release counter have to agree.
-
-    ``HOST_FUNC_CALLS`` counts submits and ``async_wait.RECORDS`` counts
-    releases; a run where the first grows and the second does not is a device
-    about to wait for ever, which is a different symptom from a wrong answer
-    and worth naming separately.
-    """
+    """``HOST_FUNC_CALLS`` counts submits and ``async_wait.RECORDS`` releases: a
+    run where the first grows and the second does not is a device about to wait
+    for ever, a different symptom from a wrong answer."""
     from vllm_ascend.kt_offload import async_wait as aw
 
     boxes = _boxes()
@@ -1589,26 +1402,12 @@ def test_every_replay_records_once_per_layer(monkeypatch, sim):
     assert aw.submits_match_records(dict(kl.HOST_FUNC_CALLS), records)["ok"]
 
 
-# ---------------------------------------------------------------------------
-# 6. P1b: no host-func node at all -- an 8-byte counter copy is the start signal
-#
-# The device side loses its last host task: D2H(inputs) -> D2H(counter) ->
-# ExternalEvent wait -> reset -> H2D. What the simulator has to model that
-# section 5 did not:
-#
-#   * the hand-off happens when a COPY executes, not when a node calls into
-#     Python. So the position of that copy in the stream's op list IS the
-#     protocol: behind the input copy it means "the inputs are there", in front
-#     of it it means nothing at all;
-#   * there is no callback left to count, so what the harness watches per
-#     replay is device_signal.STEPS, not HOST_FUNC_CALLS.
-#
-# The release mutants (never record / record before the work) are unchanged --
-# they live in Sim.async_mode and apply to whatever hands work over, which is
-# now the counter copy. The mutant that is new here is the ORDER of the two
-# copies, and it is the one with no second line of defence on card: it is
-# faster, wrong, and raises nothing.
-# ---------------------------------------------------------------------------
+# DEVICE_SIGNAL: no host-func node at all -- an 8-byte counter copy is the start
+# signal, so the device side is D2H(inputs) -> D2H(counter) -> ExternalEvent
+# wait -> reset -> H2D. The hand-off happens when a COPY executes, so the
+# position of that copy in the op list IS the protocol: behind the input copy it
+# means "the inputs are there", in front of it it means nothing. With no
+# callback left to count, the per-replay counter is device_signal.STEPS.
 
 
 def _capture_p1b(monkeypatch, sim, boxes, *, device_signal: bool, overlap: bool = True, packed: bool = False):
@@ -1647,7 +1446,7 @@ def _p1b_arms(monkeypatch, sim, *, mode="clean", mutate=None, values=(2.0, 5.0, 
 
 
 def test_p1b_has_no_host_func_node_and_signals_behind_the_input_copy(monkeypatch, sim):
-    """The shape. Two claims, and the whole point of P1b is the first one."""
+    """The shape: no host-func node, and the signal behind the input copy."""
     boxes = _boxes()
     programs, rt = _capture_p1b(monkeypatch, sim, boxes, device_signal=True)
     assert [o.kind for o in programs["side"]] == [
@@ -1662,8 +1461,8 @@ def test_p1b_has_no_host_func_node_and_signals_behind_the_input_copy(monkeypatch
 
 
 def test_p1b_on_the_packed_path_without_the_side_stream(monkeypatch, sim):
-    """Both switches stand alone, and they combine -- the combination is the
-    form that gets merged, so neither may depend on the other."""
+    """Both switches stand alone as well as combining, so neither may depend on
+    the other."""
     boxes = _boxes()
     programs, _ = _capture_p1b(monkeypatch, sim, boxes, device_signal=True, overlap=False, packed=True)
     assert "side" not in programs
@@ -1679,19 +1478,14 @@ def test_p1b_is_bit_identical_and_not_slower(monkeypatch, sim):
 
 
 def test_p1b_without_the_record_hangs(monkeypatch, sim):
-    """🔴 Mutant ①: nothing ever records the event.
-
-    The arm that says the device really is parked on it. It is a CPU test and
-    not an on-card one on purpose: on card it would leave a device waiting for
-    ever and the next arm would have no card (the bounded version there is
-    --stall-ms).
-    """
+    """Nothing ever records the event: the arm that says the device really is
+    parked on it. CPU-only on purpose -- on card it would wedge the device."""
     with pytest.raises(AssertionError, match="deadlock"):
         _p1b_arms(monkeypatch, sim, mode="no-record")
 
 
 def test_p1b_recording_before_the_work_is_faster_and_wrong(monkeypatch, sim):
-    """🔴 Mutant ②: released before this step's CPU output exists."""
+    """Released before this step's CPU output exists."""
     out_r, out_p, t_r, t_p = _p1b_arms(monkeypatch, sim, mode="early-record")
     assert not _bits_equal(out_r, out_p), (out_r, out_p)
     assert t_p <= t_r, (t_p, t_r)
@@ -1699,16 +1493,13 @@ def test_p1b_recording_before_the_work_is_faster_and_wrong(monkeypatch, sim):
 
 
 def _signal_before_the_inputs(programs, boxes, rt):
-    """🔴 Mutant ③: the counter copy moved in FRONT of the input copy.
+    """The counter copy moved in FRONT of the input copy: "the counter arrived"
+    stops meaning "the inputs arrived", so the polling thread starts kt on the
+    previous step's routing. Nothing raises and the step gets faster.
 
-    This is the one the whole design rests on. Same stream, one place earlier,
-    and "the counter arrived" stops meaning "the inputs arrived": the polling
-    thread starts kt on whatever the pinned buffer still held, which is the
-    previous step's routing. Nothing raises, and the step gets faster.
-
-    It is also why the counter is a copy of its own rather than a field
-    appended to the input copy: inside one DMA this order is not something the
-    platform promises, so the mutant would be the *default*.
+    It is also why the counter is a copy of its own rather than a field appended
+    to the input copy: inside one DMA the platform promises no order between the
+    two, so this mutant would be the default.
     """
     out = {}
     for name, ops in programs.items():
@@ -1729,18 +1520,14 @@ def test_p1b_signalling_before_the_inputs_are_copied_is_faster_and_wrong(monkeyp
 
 def test_p1b_signalling_early_reads_the_previous_replays_input(monkeypatch, sim):
     """Name the failure rather than calling it "different": the fingerprint is
-    the same one the side stream's early fork produced on card."""
+    the side stream's early fork again."""
     out_r, out_p, _, _ = _p1b_arms(monkeypatch, sim, mutate=_signal_before_the_inputs)
     assert out_p[1:] == out_r[:-1], (out_r, out_p)
 
 
 def test_p1b_without_the_wait_node_is_faster_and_wrong(monkeypatch, sim):
-    """The load-bearing half of the pair, reached from the graph side.
-
-    (Its twin, the missing reset, is modelled in section 5 and does NOT go red
-    on this build -- see _drop_reset. Keeping the wait's arm here is what makes
-    "the device waits" a checked property of P1b too.)
-    """
+    """The load-bearing half of the wait/reset pair, reached from the graph
+    side: "the device waits" has to be a checked property here too."""
     def drop_wait(programs, boxes, rt):
         return {n: [o for o in ops if o.kind != "ext_wait"] for n, ops in programs.items()}
 
@@ -1750,12 +1537,9 @@ def test_p1b_without_the_wait_node_is_faster_and_wrong(monkeypatch, sim):
 
 
 def test_the_criterion_catches_a_host_func_node_coming_back(monkeypatch, sim):
-    """The check the production path runs on its own recorded ops.
-
-    Two edits it has to catch: a host-func node creeping back in (P1b would
-    then be P1a with extra steps, and the readings would be attributed to the
-    wrong change), and the two copies swapping places.
-    """
+    """The check the production path runs on its own recorded ops: a host-func
+    node creeping back in (which would make this the other mechanism entirely)
+    and the two copies swapping places."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, device_signal=True)
     sim.capturing = True
@@ -1774,12 +1558,9 @@ def test_the_criterion_catches_a_host_func_node_coming_back(monkeypatch, sim):
 
 
 def test_only_the_lowest_layer_increments_the_counter(monkeypatch, sim):
-    """One add per replay, in one layer, or every word means something else.
-
-    Two increments and every layer's word runs a step ahead of what the poller
-    expects; none and the words never move. Both are caught here at capture
-    rather than at the first replay.
-    """
+    """One add per replay, in one layer: two and every word runs a step ahead of
+    what the poller expects, none and the words never move. Both are caught at
+    capture rather than at the first replay."""
     boxes = _boxes()
     rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=True, boxes=boxes, device_signal=True)
     kl._SIGNAL_LAYERS.add(rt.layer_idx + 1)  # a second, higher layer on this path
@@ -1800,32 +1581,17 @@ def test_only_the_lowest_layer_increments_the_counter(monkeypatch, sim):
 
 
 def test_p1b_off_records_no_signal_nodes(monkeypatch, sim):
-    """With the switch off the schedule is the one that was verified on card."""
+    """With the switch off the schedule is the plain side-stream one."""
     boxes = _boxes()
     programs, rt = _capture_p1b(monkeypatch, sim, boxes, device_signal=False)
     assert [o.kind for o in programs["side"]] == ["wait", "d2h", "hostfunc", "record"]
     assert rt._signal_words == {} and kl._SIGNALS is None
 
 
-def test_p1b_needs_our_own_buffers(monkeypatch, sim):
-    boxes = _boxes()
-    with pytest.raises(RuntimeError, match="own pinned buffers"):
-        _runtime(monkeypatch, sim, overlap=False, graph=True, boxes=boxes, packed=False, device_signal=True)
-
-
-def test_p1b_is_a_no_op_in_eager_mode(monkeypatch, sim):
-    boxes = _boxes()
-    rt, _ = _runtime(monkeypatch, sim, overlap=True, graph=False, boxes=boxes, device_signal=True)
-    assert rt.device_signal is False
-
-
 def test_every_replay_signals_and_records_once_per_layer(monkeypatch, sim):
-    """STEPS and RECORDS are what HOST_FUNC_CALLS was, and they must agree.
-
-    🔴 With P1b on, HOST_FUNC_CALLS stays 0 for ever. Anything still reading it
-    -- the sampler, the on-card cases -- is reading an instrument that has been
-    unplugged, and a flat counter and a healthy one look the same in a log.
-    """
+    """STEPS and RECORDS replace HOST_FUNC_CALLS and must agree. With the switch
+    on HOST_FUNC_CALLS stays 0 for ever, so anything still reading it is reading
+    an unplugged instrument -- and flat looks exactly like healthy in a log."""
     boxes = _boxes()
     sim.async_mode = "clean"
     programs, _ = _capture_p1b(monkeypatch, sim, boxes, device_signal=True)

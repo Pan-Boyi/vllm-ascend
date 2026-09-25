@@ -1,24 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Nothing may cross a layer boundary, checked on kt's own bookkeeping.
 
-kt keeps one process-level dict, ``BaseMoEWrapper._layer_has_pending_deferred``,
-keyed by the bare layer index (experts_base.py:411 in our branch's kt at
-033ea76). Reading it through kt's public ``has_pending_deferred`` is the only
-check that says what kt *actually saw*; the configuration knob
-(``max_deferred_experts_per_token``) only says what kt could produce, and the
-two fail in different places:
-
-  A1  knob == 0            deferral cannot be produced          (build time)
-  A3  not pending(L-1)     nothing was read as incremental      (every submit)
-  A4  not pending(L)       this layer left nothing behind       (every drain)
-  A5  one wrapper per L    nobody else writes our flags         (build time)
-  A9  one CPUInfer         the queue really is one serial FIFO  (build time)
-
-A4 matters most where it is least visible: a stale True makes kt's own drain
-allowance 1 (experts_base.py:771/:942), so the sync waits for one task fewer
-and returns early -- no exception, just an output that is half written. A
-stale True is exactly what an exception on kt's pre-submit checks leaves
-behind (the False is written only after a successful submit, :697/:755/:844).
+kt keeps one process-level dict of pending-deferred flags keyed by the bare
+layer index; reading it through kt's public ``has_pending_deferred`` is the
+only check that says what kt *actually saw*. A stale True makes kt's own drain
+allowance 1, so the sync waits for one task fewer and returns early -- no
+exception, just an output that is half written.
 """
 
 from __future__ import annotations
@@ -57,9 +44,6 @@ def fresh_registry():
     kl._reset_wrapper_registry()
 
 
-# -- A3 / A4 -------------------------------------------------------------
-
-
 def test_a3_refuses_when_the_previous_layer_left_something():
     w = Flagged(5, {4: True})
     with pytest.raises(RuntimeError, match="incremental=True"):
@@ -67,8 +51,7 @@ def test_a3_refuses_when_the_previous_layer_left_something():
 
 
 def test_a4_names_the_early_return_not_just_the_flag():
-    """The own-layer case has a different consequence and must say so: the
-    drain waits for one task fewer, which looks like success."""
+    """The own-layer case must name its consequence: the drain waits for one task fewer."""
     w = Flagged(5, {5: True})
     with pytest.raises(RuntimeError) as exc:
         kl._assert_no_pending(w, 5, 5, "after this layer drained")
@@ -95,9 +78,6 @@ def test_a_build_without_the_accessor_reports_zero_coverage(monkeypatch):
     assert any("Coverage of" in m and "zero" in m for m in said), said
 
 
-# -- the checks are on the paths that submit and drain -------------------
-
-
 def test_a3_and_a4_sit_on_the_eager_path():
     import ast
     import inspect
@@ -106,7 +86,7 @@ def test_a3_and_a4_sit_on_the_eager_path():
         src = inspect.getsource(fn)
         assert "_assert_no_pending(" in src, f"{fn.__name__} does not check kt's flags"
         assert want in src, f"{fn.__name__} checks the wrong layer index"
-    # and on the two graph-node callbacks, which are the only per-replay place
+    # and on the two graph-node callbacks: the only per-replay place
     for node in (kl._kt_packed_forward, kl._kt_host_forward):
         calls = [
             n
@@ -117,8 +97,7 @@ def test_a3_and_a4_sit_on_the_eager_path():
 
 
 def test_the_graph_node_logs_the_refusal_instead_of_raising_into_acl(monkeypatch):
-    """A raise inside a host-func node has nowhere to go; it must be logged,
-    and the node must not pretend the step happened."""
+    """A raise inside a host-func node has nowhere to go; it must be logged instead."""
     logged = []
     monkeypatch.setattr(kl.logger, "error", lambda *a, **k: logged.append(a[0] % a[1:] if len(a) > 1 else a[0]))
     before = dict(kl.HOST_FUNC_CALLS)
@@ -133,9 +112,6 @@ def test_the_graph_node_logs_the_refusal_instead_of_raising_into_acl(monkeypatch
     kl._kt_packed_forward((w, buf, 3))
     assert any("raised" in m for m in logged), logged
     assert kl.HOST_FUNC_CALLS.get(3, 0) == before.get(3, 0), "a refused step was counted as having run"
-
-
-# -- A5 / A9 -------------------------------------------------------------
 
 
 def test_a5_refuses_two_live_wrappers_on_one_layer_index():

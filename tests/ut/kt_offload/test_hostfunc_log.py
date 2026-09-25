@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-layer host-func sampling (the measurement that settles 2026-09-20).
+"""Per-layer host-func sampling.
 
 Only a host-func node inside the graph increments the counters, so a layer
 whose count does not grow while the service decodes has no CPU-expert work in
-the graph. The analysis is a pure function so it can be tested here; the
-sampler itself is checked for the two properties a background watcher must
-have: it is a daemon and it stops with its process.
+the graph.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ def test_uniform_growth_is_the_healthy_reading():
 
 
 def test_layers_that_never_ran_are_named():
-    """The 2026-09-20 shape: some layers grow, others never do."""
     before = {i: 0 for i in range(40)}
     after = {i: (5 if i < 10 else 0) for i in range(40)}
     r = hf.host_func_report(before, after, 40)

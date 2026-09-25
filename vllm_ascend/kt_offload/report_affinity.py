@@ -12,10 +12,8 @@ not a poll interval, and no env tunes it). Meanwhile kt's workers spin for
 few hundred µs -- so in steady state every kt worker is a runnable spinner
 hard-bound to a single PU (``kt_bind_worker``, ``hwloc_bitmap_singlify`` +
 ``HWLOC_CPUBIND_STRICT``). The unbound report thread has to find a CPU among
-those. §4.20's whole-net A+F is 78.0 µs/layer against 56.8 µs in a
-micro-benchmark whose kt threads were asleep; this switch tests whether that
-gap is preemption, without taking any core away from kt (kt leaves PUs free:
-96 workers on a 256-PU machine).
+those; this switch moves it onto one kt does not own, without taking any core
+away from kt (kt normally leaves PUs free).
 
 Everything here is off unless ``VLLM_ASCEND_DSV41_KT_REPORT_CPU`` is set.
 
@@ -42,7 +40,7 @@ from dataclasses import dataclass, field
 from vllm.logger import logger
 
 # kt names its threads "numa_<n>_t_<i>" (InNumaPool) and "numa_<n>_m_<i>"
-# (NumaJobDistributor); worker_pool.cpp pthread_setname_np calls.
+# (NumaJobDistributor), in worker_pool.cpp.
 KT_THREAD_NAME = re.compile(r"^numa_(\d+)_[tm]_(\d+)$")
 
 
@@ -154,14 +152,12 @@ def kt_threads_per_numa(cpuinfer_threads: int, threadpool_count: int, numa_nodes
     """How many kt threads each NUMA node gets, and hence which indices it binds.
 
     kt splits ``cpuinfer_threads`` over ``threadpool_count`` subpools with the
-    remainder on the first subpools (``kt-kernel/python/experts_base.py:358-371``),
-    and ``WorkerPool::init`` gives subpool *j* the start index
-    ``sum(threads of earlier subpools on the SAME numa node)``
-    (``worker_pool.cpp:517-531``). Inside a subpool, worker 0 is the
-    NumaJobDistributor thread (bound with the start index,
-    ``worker_pool.cpp:395-400``) and workers 1..t-1 are the InNumaPool threads
-    (bound with ``i + start``, ``:196-200``), so a node with T threads in total
-    occupies exactly the indices 0..T-1 of its own order.
+    remainder on the first subpools (``kt-kernel/python/experts_base.py``), and
+    ``WorkerPool::init`` gives subpool *j* the start index ``sum(threads of
+    earlier subpools on the SAME numa node)``. Inside a subpool, worker 0 is the
+    NumaJobDistributor thread (bound with the start index) and workers 1..t-1
+    are the InNumaPool threads (bound with ``i + start``), so a node with T
+    threads in total occupies exactly the indices 0..T-1 of its own order.
     """
     if cpuinfer_threads <= 0 or threadpool_count <= 0:
         raise ReportAffinityError(
@@ -183,12 +179,12 @@ def kt_threads_per_numa(cpuinfer_threads: int, threadpool_count: int, numa_nodes
 def kt_core_order(topo: Topology, numa: int, striped: bool = True) -> list[int]:
     """The core order ``kt_bind_worker`` indexes into, for one NUMA node.
 
-    Striped (kt's default, ``KT_CPU_BIND`` unset; ``worker_pool.cpp:58-105``):
-    the node's L3 domains are walked slot by slot, so worker *i* lands on
-    domain ``i % ndomains``, slot ``i / ndomains`` -- one CCD per consecutive
-    worker, because a single Zen5 CCD saturates at ~76 GB/s. With one domain
-    or none, kt falls back to the dense order. Pack mode (``KT_CPU_BIND=pack``,
-    ``worker_pool.cpp:118-124``) is the dense order: core *i* of the node.
+    Striped (kt's default, ``KT_CPU_BIND`` unset): the node's L3 domains are
+    walked slot by slot, so worker *i* lands on domain ``i % ndomains``, slot
+    ``i / ndomains`` -- one CCD per consecutive worker, because a single CCD
+    saturates well below the node's memory bandwidth. With one domain or none,
+    kt falls back to the dense order. Pack mode (``KT_CPU_BIND=pack``) is the
+    dense order: core *i* of the node.
     """
     cores = topo.cores_of_numa(numa)
     if not striped:
@@ -442,7 +438,7 @@ def build_plan(
 
 
 def kt_striped() -> bool:
-    """kt's own reading of ``KT_CPU_BIND`` (``worker_pool.cpp:45-54``)."""
+    """kt's own reading of ``KT_CPU_BIND`` (``worker_pool.cpp``)."""
     value = os.environ.get("KT_CPU_BIND")
     if value is None:
         return True
@@ -639,7 +635,7 @@ def _set_fifo(prio: int, plan: Plan) -> bool:
 
 
 def status() -> dict:
-    """What actually happened, for the on-card run's artifacts."""
+    """What actually happened, for logging and diagnostics."""
     if _PLAN is None:
         return {"enabled": False}
     return {

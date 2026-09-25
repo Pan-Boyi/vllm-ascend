@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """packed_transfer: one host-device input copy per layer instead of three.
 
-The target is the transport + callback cost on card (once recorded as 7.5 ms
-per token). 🔴 The "~62.5 us x 120 operations" reading of it is retired: the
-2026-09-20 profile measures 1.168 us of device time per memcpy, so that figure
-was an aggregate divided by a count. What packed actually buys is the A/B's
-TPOT delta; what this file asserts is the operation count and bit-identity,
-both of which stand on their own. kt fills three separate pinned
-allocations, so a layer pays three host-device copies for the inputs; one
-combined buffer with the same three regions pays one. The switch also gives
-each layer its own buffers, which removes kt's ``layer_idx % 2`` slot sharing.
-
-Criterion here is the same as on card: **the output is bit-identical with the
-switch flipped**, and the host-device operation count drops. Speed is measured
-on card, never asserted here.
+kt fills three separate pinned allocations, so a layer pays three host-device
+copies for the inputs; one combined buffer with the same three regions pays one,
+and each layer gets its own buffers (no ``layer_idx % 2`` slot sharing). The
+criterion is bit-identity with the switch flipped plus the operation count;
+speed is measured on card, never asserted here.
 """
 
 from __future__ import annotations
@@ -100,7 +92,7 @@ def _runtime(monkeypatch, packed: bool, layers: int = 4, sizes=(1, 2)):
     plan = build_plan([[0, 3]] * layers, NEXP)
     cfg = KTOffloadConfig(
         enabled=True, cpuinfer_threads=4, num_resident_experts=1, packed_transfer=packed,
-        overlap_side_stream=False,  # default on since PLAN §4.33; this file tests the packed serial path
+        overlap_side_stream=False,  # on by default; this file tests the packed serial path
     )
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -227,16 +219,10 @@ def test_capture_of_an_unprepared_size_is_refused(monkeypatch):
         rts[0].route(hs, torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32), in_profile_run=False)
 
 
-# ---------------------------------------------------------------------------
-# the four properties of kt's raw task we now depend on (kt, 2026-09-20)
-# ---------------------------------------------------------------------------
-
-
+# the properties of kt's raw task the packed path depends on
 def test_refuses_more_tokens_than_kt_sized_its_output_for(monkeypatch):
-    """kt's own wrappers check qlen; calling the C++ task directly makes it ours.
-
-    Past chunked_prefill_size the C++ output pointer runs outside the
-    allocation and the heap damage shows up somewhere else entirely.
+    """kt's own wrappers check qlen; calling the C++ task directly makes it ours --
+    past chunked_prefill_size the output pointer runs outside the allocation.
     """
     rts, _ = _runtime(monkeypatch, packed=True, layers=1, sizes=(1,))
     rts[0].chunked_prefill_size = 4
@@ -291,15 +277,10 @@ def test_buffers_are_dtype_and_contiguity_checked(monkeypatch):
         rt._packed_buffers(1, torch.device("cpu"))
 
 
-# ---------------------------------------------------------------------------
 # hard constraint: nothing crosses a layer boundary
-# ---------------------------------------------------------------------------
-
-
 def test_a_kt_build_that_defers_experts_is_refused(monkeypatch):
-    """Deferring part of a token's CPU experts to a later layer/step is
-    forbidden for this deployment. kt's default is 0, but a default is a
-    policy: the guard reads the built wrapper and refuses."""
+    """Deferring a token's CPU experts to a later layer is forbidden here; kt's
+    default is 0, but the guard reads the built wrapper rather than trusting it."""
     w = FakeWrapper({})
     w.max_deferred_experts_per_token = 2
     with pytest.raises(RuntimeError, match="forbidden"):
@@ -317,8 +298,7 @@ def test_a_build_without_the_attribute_is_flagged_not_waved_through(monkeypatch)
 
 
 def test_the_guard_runs_when_the_wrapper_is_built(monkeypatch):
-    """The check has to sit on the path that actually builds kt, or it is a
-    function nobody calls."""
+    """The check has to sit on the path that builds kt, or nobody calls it."""
     import inspect
 
     src = inspect.getsource(kl.KTLayerOffload._build_wrapper)
@@ -326,12 +306,9 @@ def test_the_guard_runs_when_the_wrapper_is_built(monkeypatch):
 
 
 def test_every_forward_task_call_overwrites_rather_than_accumulates():
-    """The other half of the same constraint: incremental=True would read the
-    output back and accumulate, which is how a deferred expert's contribution
-    would arrive a layer late."""
-    # AST, not a text search: the prose around these checks legitimately says
-    # "incremental=True" when it explains what must never be passed, and a
-    # substring criterion cannot tell an argument from a sentence.
+    """incremental=True would accumulate the previous layer's experts into this one."""
+    # AST, not a text search: nearby comments legitimately mention
+    # "incremental=True", and a substring cannot tell an argument from a sentence.
     import ast
     import inspect
 

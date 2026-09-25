@@ -261,6 +261,16 @@ class NPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
+        # kt_offload dynamic_resident: same two lines as NPUModelRunner.execute_model
+        # (model_runner_v1.py). Both runners need it because the worker picks
+        # between them at runtime and vLLM defaults to V2 -- without this the
+        # first chunked prefill would raise "nothing has published a prefill
+        # window", which is fail-closed but would make the switch unusable on
+        # the default path. Reads scheduler_output only; one bool test unless
+        # kt_offload_config.dynamic_resident is on.
+        from vllm_ascend.kt_offload import prefill_window
+        prefill_window.observe(scheduler_output)
+
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(

@@ -1,29 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The four kt offload optimisation switches, resolved in ONE place (PLAN §4.33).
+"""The four kt offload optimisation switches, resolved in ONE place.
 
-Since §4.33 three of them are ON by default -- the side stream (§4.25/§4.26),
-the event wait P1a (§4.28) and the shared expert in the window (§4.31); the
-second merged-version acceptance (§4.32/§4.33: perf -1.71 ms single round,
-whole-network decode 1170/1170 bit-identical, GSM8K 50/50, 1319 = 1283/1319)
-was run with exactly that set on. P1b (device signal, §4.29/§4.30) stays off.
+Three are ON by default -- the side stream, the event wait (P1a) and the shared
+expert in the window. The device signal (P1b) stays off.
 
-"Unset" used to mean "0" for every one of these variables. It now means
-"default", and the default of P1a and of the shared window depends on other
-switches. That makes it easy for two readers to disagree about what "unset"
-means, so nobody reads these variables except :func:`resolve` -- config
-validation, the layer runtime and the start-up log all call it and get the
-same answer, with where the answer came from.
+"Unset" means "default", not "0", and the default of P1a and of the shared
+window depends on the other switches. That makes it easy for two readers to
+disagree about what "unset" means, so nobody reads these variables except
+:func:`resolve` -- config validation, the layer runtime and the start-up log
+all call it and get the same answer, plus where the answer came from.
 
 Values accepted in the environment: unset or "" (= default), "1", "0".
-Anything else raises: before §4.33 a stray "true" silently meant off, and with
-defaults now on, a value we cannot read must not quietly mean either.
+Anything else raises: a value we cannot read must not quietly mean "off" when
+the default is "on".
 
 Semantics (on/off, and the ``source`` the start-up log prints)::
 
   side stream    (VLLM_ASCEND_DSV41_KT_SIDE_STREAM, cfg overlap_side_stream)
       env "0"                       -> off  (env)   the kill switch
       cfg overlap_side_stream=false -> off  (cfg)
-      env "1"                       -> on   (env)   (the pre-§4.33 permit; now redundant)
+      env "1"                       -> on   (env)
       otherwise                     -> on   (default; cfg default is true)
   device signal  P1b (VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL)
       env "1"                       -> on   (env)   precondition: packed_transfer or side stream
@@ -41,8 +37,7 @@ Semantics (on/off, and the ``source`` the start-up log prints)::
 Eager (enforce_eager / cudagraph_mode NONE): the side stream, P1a and P1b are
 captured-path changes -- eager never forks, never splits submit from sync and
 keeps its host-func-free submit+sync. The layer runtime additionally turns an
-*auto* P1a and an *auto* shared-window move off in eager, so eager with every
-variable unset runs exactly what it ran before §4.33 (see KTLayerOffload).
+*auto* P1a and an *auto* shared-window move off in eager (see KTLayerOffload).
 """
 
 from __future__ import annotations
@@ -67,7 +62,7 @@ def raw(env_name: str) -> str | None:
 
     Read through ``vllm_ascend.envs`` (not os.environ) so a test that
     monkeypatches the ``envs`` attribute is seen the same way as a real
-    environment variable.
+    environment variable. Raises ValueError on any other value.
     """
     from vllm_ascend import envs
 
@@ -78,8 +73,8 @@ def raw(env_name: str) -> str | None:
     if value in ("0", "1"):
         return value
     raise ValueError(
-        f"{env_name}={value!r}: only '1' (on), '0' (off) or unset (the default, PLAN §4.33) are "
-        "accepted. Before §4.33 any value other than '1' silently meant off; with the default now "
+        f"{env_name}={value!r}: only '1' (on), '0' (off) or unset (the default) are "
+        "accepted. An earlier version read any value other than '1' as off; with the default now "
         "on, a value that cannot be read must not quietly mean either."
     )
 
@@ -115,10 +110,10 @@ def resolve(cfg: Any, *, validate: bool = True) -> Switches:
     ``validate=True`` (config validation) raises on the combinations an
     operator asked for explicitly and cannot have: P1a or P1b "1" without
     their precondition, and P1a and P1b both "1". ``validate=False`` (the
-    layer runtime, and the on-card harnesses that build a layer without going
-    through config validation) never raises on those: it honours explicit
-    values as they are, and the layer's own start-up checks still refuse what
-    it cannot run. The *auto* results are identical in both modes.
+    layer runtime, and harnesses that build a layer without going through
+    config validation) never raises on those: it honours explicit values as
+    they are, and the layer's own start-up checks still refuse what it cannot
+    run. The *auto* results are identical in both modes.
     """
     packed = bool(getattr(cfg, "packed_transfer", False))
     cfg_overlap = bool(getattr(cfg, "overlap_side_stream", False))
@@ -174,7 +169,7 @@ def resolve(cfg: Any, *, validate: bool = True) -> Switches:
             raise ValueError(
                 f"{DEVICE_SIGNAL_ENV}=1 and {ASYNC_WAIT_ENV}=1 are both set explicitly, and they are two "
                 "ways to start the same work (P1b replaces the host-func node; P1a keeps it and only moves "
-                f"the waiting). Since PLAN §4.33 P1a is on by default and steps aside by itself when P1b "
+                f"the waiting). P1a is on by default and steps aside by itself when P1b "
                 f"is on: to run P1b, unset {ASYNC_WAIT_ENV} (or set it to 0); to run P1a, unset "
                 f"{DEVICE_SIGNAL_ENV} (or set it to 0)."
             )

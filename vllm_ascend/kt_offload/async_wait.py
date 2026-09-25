@@ -1,73 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P1a: the device waits for an ExternalEvent instead of for the callback's return.
+"""The device waits for an ExternalEvent instead of for the callback's return.
 
-What changes
-------------
-Today the graph node that runs this layer's CPU experts does the whole job
-inside the callback::
+With the switch off, the graph node does the whole job inside the callback::
 
     D2H -> host-func [ kt_pre | submit | kt compute | sync ] -> H2D
 
-and the device's ``NOTIFY_WAIT`` covers all of it, plus the ACL round trip on
-both sides of the callback (``A`` = report delivered + GIL + argument tuple,
-``F`` = the callback returning and the device being told). Measured on card
-(PLAN §4.20/§4.22): ``A+F`` 78.0 us/layer = 3.83 ms/token, of which ``F`` is
-the half this removes, and event waits themselves are almost free
-(``DAVID_EVENT_WAIT`` 0.027 us, ``MEM_WAIT_VALUE`` 0.144 us, no idle gap).
-
-With this switch on the graph is::
+so the device's ``NOTIFY_WAIT`` also covers the ACL round trip on both sides of
+the callback. With it on the graph is::
 
     D2H -> host-func [ kt_pre | submit ] (returns at once)
         -> ExternalEvent.wait -> ExternalEvent.reset -> H2D
 
-and a **completion thread** calls ``cpu_infer.sync(0)`` and then
-``event.record(<its own stream>)``. The device stops waiting the moment kt's
-task is done, rather than one more ACL round trip later.
+and a **completion thread** calls ``cpu_infer.sync(0)`` then
+``event.record(<its own stream>)``, releasing the device the moment kt's task is
+done rather than one ACL round trip later.
 
-kt is NOT modified
-------------------
-The split is already ours: ``layer._kt_packed_forward`` builds the task with
-``moe.forward_task(...)`` and calls ``cpu_infer.submit`` / ``cpu_infer.sync``
-itself, so "submit here, sync there" needs no new kt entry point. Two facts
-about kt's queue make the hand-off safe (``kt-kernel/cpu_backend/task_queue.cpp``):
+kt is NOT modified: ``layer._kt_packed_forward`` already calls
+``cpu_infer.submit`` / ``cpu_infer.sync`` itself, and two facts about kt's queue
+(``kt-kernel/cpu_backend/task_queue.cpp``) make the hand-off safe.
+``TaskQueue::sync(allow_n_pending)`` is ``cv.wait(lock, pred)`` on
+``pending <= allow_n``: several threads may wait at once and the predicate is a
+count, not an identity -- but the queue is one serial FIFO worker and the graph
+keeps only one of our tasks outstanding (the next layer's host-func node sits
+behind this layer's event wait on the same stream), so ``sync(0)`` from the
+completion thread means "this layer's task is done". And a task's exception is
+stored and rethrown by *the next* ``sync``, so whoever syncs first gets it --
+usually the completion thread, which logs it and **records the event anyway**.
 
-* ``TaskQueue::sync(allow_n_pending)`` is ``cv.wait(lock, pred)`` on
-  ``pending <= allow_n``: several threads may wait on it at once, and the
-  predicate is a count, not an identity. The queue is one serial FIFO worker,
-  and the graph only ever has one of our tasks outstanding (the next layer's
-  host-func node sits behind this layer's event wait on the same stream), so
-  ``sync(0)`` from the completion thread means "this layer's task is done".
-* a task's exception is stored and rethrown by *the next* ``sync``
-  (``task_queue.cpp:112-124``), so whoever syncs first gets it. With this
-  switch on that is usually the completion thread; it logs it with the same
-  wording the callback used, and **records the event anyway** -- see below.
-
-🔴 The failure mode this file is fenced against
------------------------------------------------
 Releasing the device early is *faster and wrong, and nothing raises*: the H2D
-copies whatever the pinned output held, which is the previous step's CPU
-experts. So:
+copies whatever the pinned output held, i.e. the previous step's CPU experts.
+So:
 
 * the event is **reset inside the graph**, right behind the wait, because
-  torch_npu says an ExternalEvent has to be (streams.py:214-217: "Before
-  reusing ExternalEvent, you need to call reset() to clear the flag") and
-  because it costs 0.144 us. 🔴 On card it turns out not to be load-bearing:
-  with every reset node provably left out (t5r ``--mutant no-reset
-  --stall-ms 50``, 2026-09-23) the arm stayed bit-identical and still waited on
-  every replay, so the captured wait re-arms itself on this build. The reset
-  stays anyway -- undocumented behaviour is not something to build on -- but
-  nobody should expect a missing one to show up on card. The mutant that does
-  go red there is ``--mutant no-wait``; the reset's red arm is the CPU model.
+  torch_npu requires reset() before an ExternalEvent is reused.
 * the record must happen **after** ``sync`` returns, never around it.
 * the completion thread must have an ACL context of its own
-  (``torch.npu.set_device``). This is the one part with no precedent in this
-  tree: ``ExternalEvent`` wait/reset inside a capture and a host-side record
-  during replay is what ``mla_v1.py:947-970`` + ``:1744-1747`` already do, but
-  there the record comes from the **main** thread between replays.
-* if anything at all goes wrong, the event is recorded regardless. A device
-  that waits for ever wedges the service with no message; stale output at
-  least logs "the CPU-expert output of this step is NOT this step's", which is
-  the same wording (and the same severity) the callback already uses.
+  (``torch.npu.set_device``). ``mla_v1.py`` already captures an ExternalEvent
+  wait/reset and records host-side during replay, but from the **main** thread
+  between replays; recording from another thread has no precedent in this tree.
+* if anything at all goes wrong the event is recorded regardless: a device that
+  waits for ever wedges the service with no message, while stale output at least
+  logs that this step's CPU-expert output is not this step's.
 """
 
 from __future__ import annotations
@@ -80,15 +53,13 @@ from vllm.logger import logger
 ENV_NAME = "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT"
 
 # layer_idx -> how many times the completion thread has recorded that layer's
-# ExternalEvent. The counterpart of layer.HOST_FUNC_CALLS (which counts
-# submits): one per replay per layer, and the two must agree. Read by the
-# on-card cases; a layer whose submits grow while its records do not is a
-# device that is about to wait for ever.
+# ExternalEvent. Counterpart of layer.HOST_FUNC_CALLS (which counts submits):
+# one per replay per layer, and the two must agree. Submits growing while
+# records do not is a device about to wait for ever.
 RECORDS: dict[int, int] = {}
-# Every failure the completion thread swallowed so the device could proceed,
-# as ``(layer_idx, repr(exc))``. Never silently empty: it is also logged.
-# Capped, because a kt that fails every layer would otherwise grow this list at
-# 40 entries per token for the life of the process; the log keeps them all.
+# Every failure the completion thread swallowed so the device could proceed, as
+# ``(layer_idx, repr(exc))``; also logged. Capped, because a kt that fails every
+# layer would otherwise add 40 entries per token for the life of the process.
 ERRORS: list[tuple[int, str]] = []
 MAX_ERRORS = 200
 
@@ -101,11 +72,9 @@ def _note_error(layer_idx: int, what: str) -> None:
 def enabled_by_env() -> bool:
     """Whether the operator explicitly set ``ENV_NAME=1``.
 
-    NOT whether the async wait is on: since PLAN §4.33 unset means "default", and
-    the effective value (cfg, env and the automatic defaults together) comes
-    only from ``kt_offload.switches.resolve``. Nothing on the production path
-    calls this any more; it is kept for harnesses that ask the narrower
-    question.
+    NOT whether the async wait is on: unset means "default", and the effective
+    value comes only from ``kt_offload.switches.resolve``. Nothing on the
+    production path calls this; it is for harnesses asking the narrower question.
     """
     from vllm_ascend.kt_offload import switches
 
@@ -133,12 +102,11 @@ class Completer:
         self._thread: threading.Thread | None = None
         self._stream = None
         self._startup_error: BaseException | None = None
-        # Two counters rather than one depth, because they are written by two
-        # threads: ``_submitted`` only by whoever runs the graph node,
-        # ``_completed`` only by the thread below. A single ``depth += 1 / -= 1``
-        # pair would be a read-modify-write race between them. Only ever read as
-        # a diagnostic; the ordering it might look like it guards is supplied by
-        # the graph (the next host-func node sits behind this layer's wait).
+        # Two counters rather than one depth: they are written by two threads
+        # (``_submitted`` by whoever runs the graph node, ``_completed`` by the
+        # thread below), and a single ``depth += 1 / -= 1`` pair would race.
+        # Diagnostic only; the ordering is supplied by the graph (the next
+        # host-func node sits behind this layer's wait).
         self._submitted = 0
         self._completed = 0
 
@@ -152,9 +120,9 @@ class Completer:
     def start(self) -> None:
         """Start the thread and wait until its context and stream exist.
 
-        Synchronous on purpose: a capture must never be the first thing that
-        needs this stream, and a thread that failed to get a context has to be
-        a start-up error rather than a hang at the first decode step.
+        Synchronous on purpose: a capture must never be the first thing needing
+        this stream, and a thread that failed to get a context has to be a
+        start-up error rather than a hang at the first decode step.
         """
         if self._thread is not None:
             return
@@ -181,9 +149,9 @@ class Completer:
     def submit(self, wrapper, layer_idx: int, event) -> None:
         """Hand this layer's outstanding kt task over. Never blocks.
 
-        ``wrapper is None`` means "the submit itself failed, there is nothing
-        to wait for -- just let the device through", which is how a callback
-        that raised before ``cpu_infer.submit`` avoids wedging the graph.
+        ``wrapper is None`` means "the submit itself failed, nothing to wait for
+        -- just let the device through": how a callback that raised before
+        ``cpu_infer.submit`` avoids wedging the graph.
         """
         self._submitted += 1
         self._q.put((wrapper, int(layer_idx), event))
@@ -251,10 +219,9 @@ def ext_event_ops_ok(ops) -> dict:
       ``("h2d", buf)``        the output copy back to the device
       ``("host_record", ev)`` a host-side ``event.record`` (must NOT be here)
 
-    🔴 The reset is the one that has no second line of defence. Without it the
-    event stays signalled after the first replay, every later replay's wait is
-    a no-op, and the H2D copies the pinned output before this step's task has
-    written it: faster, wrong, and silent.
+    The reset has no second line of defence: without it the event stays
+    signalled, every replay after the first sails through the wait, and the H2D
+    copies the pinned output before this step's task wrote it.
     """
     problems = []
     kinds = [k for k, _ in ops]
@@ -302,11 +269,9 @@ def ext_event_ops_ok(ops) -> dict:
 def record_counts_ok(before: dict[int, int], after: dict[int, int], replays: int, layers) -> dict:
     """Every layer's event was recorded exactly once per replay.
 
-    The counterpart of ``side_stream.replay_hostfunc_ok``: that one counts
-    submits, this one counts releases. They have to agree, and a run where the
-    submits grow and the records do not is a device that is about to wait for
-    ever -- which looks like a hang, not like a wrong answer, so it is worth
-    naming separately.
+    Counterpart of ``side_stream.replay_hostfunc_ok``, which counts submits;
+    the two must agree. Submits growing while records do not is a device about
+    to wait for ever -- a hang, not a wrong answer, hence a check of its own.
     """
     bad = {}
     for i in layers:

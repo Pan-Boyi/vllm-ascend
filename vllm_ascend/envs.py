@@ -252,9 +252,32 @@ env_variables: dict[str, Callable[[], Any]] = {
         "VLLM_ASCEND_DSV41_ALLOW_UNVALIDATED_GRAPH_MODE", "0"),
     # DeepSeek-V4.1 MoE offload (M0c): output directory for the per-layer
     # routed-expert frequency counter (vllm_ascend/kt_offload/expert_counter.py).
-    # Empty (default) = off. Diagnostic only; requires --enforce-eager. Read
-    # once at import. Not sensitive.
+    # Empty (default) = off. Diagnostic only. Does NOT require --enforce-eager
+    # (T3.8/O4): whether a forward may be counted is decided per call from the
+    # capture predicate, not from the config -- a captured or undecidable call
+    # counts nothing, and replays, which run no Python, are reported as
+    # unobservable rather than guessed. Read once at import. Not sensitive.
     "VLLM_ASCEND_DSV41_EXPERT_COUNT": lambda: os.getenv("VLLM_ASCEND_DSV41_EXPERT_COUNT", ""),
+    # DeepSeek-V4.1 MoE offload: how many counted forwards between the expert
+    # counter's periodic dumps ("200" = the default it always had; the exit dump
+    # happens regardless). Only read when VLLM_ASCEND_DSV41_EXPERT_COUNT is set.
+    #
+    # Why it is settable: the counts are cumulative and one process writes one
+    # file, so the ONLY way to attribute counts to a single request is to diff
+    # two dumps taken at that request's boundaries -- and a dump only ever
+    # happens inside a counted forward. At "1" every forward dumps, so the last
+    # dump before a request ends IS its last forward, and consecutive
+    # boundary snapshots slice per request exactly (bar the one-forward skew
+    # noted in expert_counter.dump). Larger values leak up to that many forwards
+    # of the previous request into the next slice.
+    #
+    # Cost at "1": one D2H of 2 x [40, 384] int64 (245 KiB) plus a torch.save
+    # per forward. Diagnostic only, and the value is recorded in every dump
+    # ("dump_every") so a reading can never be wrong about which granularity
+    # produced it. Not a number below 1; anything unparsable keeps 200 and logs
+    # a WARNING (this is a statistics hook inside the serving forward -- it must
+    # not raise). Read once at import. Not sensitive.
+    "VLLM_ASCEND_DSV41_EXPERT_COUNT_EVERY": lambda: os.getenv("VLLM_ASCEND_DSV41_EXPERT_COUNT_EVERY", "200"),
     # DeepSeek-V4.1 MoE offload: sampling interval in seconds for the per-layer
     # host-func counters (vllm_ascend/kt_offload/hostfunc_log.py). Only a
     # host-func node inside the graph increments them, so a layer whose count

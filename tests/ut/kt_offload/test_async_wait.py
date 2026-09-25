@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P1a (``VLLM_ASCEND_DSV41_KT_ASYNC_WAIT``): the criteria and the thread.
-
-The ordering model -- what the device waits on, and what happens when the
-release comes too early or not at all -- lives in
-``test_side_stream_overlap.py``, because that is where the stream simulator
-that can *execute* a schedule is. This file covers the two halves that need no
-simulator:
-
-* the criterion ``ext_event_ops_ok``, driven red once per way the node
-  sequence can be wrong -- above all the 🔴 missing ``reset``, which is the
-  only failure with no second line of defence: the graph keeps working, gets
-  faster, and every replay after the first reads the previous step's CPU
-  output;
-* ``Completer``, the thread that syncs kt and records the event. Its contract
-  is short and every clause of it is a way to wedge or corrupt a service:
-  sync BEFORE record, record on EVERY path including a raise, and a context
-  failure at start-up rather than a hang at the first replay.
-"""
+"""``VLLM_ASCEND_DSV41_KT_ASYNC_WAIT``: the node-sequence criterion
+(``ext_event_ops_ok``) and the completion thread (``Completer``), plus the
+switch. Each criterion test drives the criterion red one way at a time."""
 
 from __future__ import annotations
 
@@ -37,10 +22,6 @@ def _clean_counters():
     aw.ERRORS.clear()
 
 
-# ---------------------------------------------------------------------------
-# 1. the node-sequence criterion
-# ---------------------------------------------------------------------------
-
 EV = object()
 
 
@@ -55,7 +36,8 @@ def test_the_production_sequence_passes():
 
 
 def test_a_missing_reset_is_caught():
-    """🔴 The one that is faster, wrong and silent on card."""
+    """Without the reset the graph keeps running, faster, reading the previous
+    replay's CPU output."""
     ops = [o for o in _good_ops() if o[0] != "ext_reset"]
     rep = aw.ext_event_ops_ok(ops)
     assert not rep["ok"]
@@ -90,7 +72,7 @@ def test_the_output_copy_must_be_behind_the_wait():
 
 
 def test_a_host_record_inside_the_graph_is_caught():
-    """The record belongs to the completion thread at replay time, not to the graph."""
+    """The record belongs to the completion thread at replay time, not the graph."""
     ops = [("d2h", 1), ("hostfunc", 3), ("host_record", EV), ("ext_wait", EV), ("ext_reset", EV), ("h2d", 1)]
     rep = aw.ext_event_ops_ok(ops)
     assert not rep["ok"]
@@ -117,11 +99,6 @@ def test_record_counts_and_submit_pairing():
     assert aw.submits_match_records({0: 3}, {0: 3})["ok"]
     bad = aw.submits_match_records({0: 3}, {0: 2})
     assert not bad["ok"] and bad["detail"] == {0: (3, 2)}
-
-
-# ---------------------------------------------------------------------------
-# 2. the completion thread
-# ---------------------------------------------------------------------------
 
 
 class FakeEvent:
@@ -172,8 +149,8 @@ def _drain(c, timeout=10.0):
 
 
 def test_it_syncs_first_and_records_after():
-    """The order IS the correctness property: a record before the sync releases
-    the device while kt is still writing the pinned output."""
+    """A record before the sync would release the device while kt is still
+    writing the pinned output."""
     log: list = []
     c = _completer(log)
     c.start()
@@ -191,10 +168,9 @@ def test_it_syncs_first_and_records_after():
 
 
 def test_the_thread_takes_its_own_acl_context_before_making_a_stream():
-    """🔴 The unprecedented part: the record comes from a thread that is neither
-    the main thread nor ACL's report thread, so it needs a context of its own.
-    The stream is created IN the thread, after that, and before start() returns
-    -- a capture must never be the first thing that needs it."""
+    """The record comes from a thread that is neither the main thread nor ACL's
+    report thread, so it needs a context of its own; the stream is created in
+    that thread and before start() returns, never first inside a capture."""
     log: list = []
     c = _completer(log)
     c.start()
@@ -214,8 +190,8 @@ def test_a_context_failure_is_a_start_up_error_not_a_hang():
 
 
 def test_a_task_that_raises_still_releases_the_device():
-    """A device left waiting wedges the engine with no message; stale output at
-    least says so in the log, and is the failure the serial node already has."""
+    """A device left waiting wedges the engine with no message; stale output is
+    at least logged."""
     log: list = []
     c = _completer(log)
     c.start()
@@ -264,9 +240,7 @@ def test_a_record_that_fails_is_logged_as_critical_and_counted():
 
 
 def test_submits_are_completed_in_order():
-    """kt's queue is one serial FIFO worker and the graph keeps one task of ours
-    outstanding, so ``sync(0)`` means "this layer's task". Out-of-order
-    completion would make that reasoning false."""
+    """``sync(0)`` means "this layer's task" only because completion is FIFO."""
     log: list = []
     c = _completer(log)
     c.start()
@@ -283,7 +257,7 @@ def test_submits_are_completed_in_order():
 
 
 def test_submit_never_blocks_the_callback():
-    """The whole point: the graph node returns without waiting for kt."""
+    """The graph node returns without waiting for kt."""
     log: list = []
     c = _completer(log)
     c.start()
@@ -303,11 +277,6 @@ def test_submit_never_blocks_the_callback():
         c.stop()
 
 
-# ---------------------------------------------------------------------------
-# 3. the switch
-# ---------------------------------------------------------------------------
-
-
 def test_the_env_opens_it(monkeypatch):
     from vllm_ascend import envs
 
@@ -325,9 +294,8 @@ def test_zero_or_empty_is_not_an_explicit_request(monkeypatch, value):
 
 @pytest.mark.parametrize("value", ["true", "True", "yes", "on", " 1"])
 def test_an_unreadable_value_refuses_rather_than_meaning_off(monkeypatch, value):
-    """Before PLAN §4.33 these silently meant off. With the default now ON,
-    'off' is no longer the harmless reading of a typo, and 'on' is not a
-    reading the operator gave -- so neither: refuse."""
+    """With the default ON, reading a typo as 'off' is not harmless, and 'on'
+    is not what the operator wrote -- so refuse rather than guess."""
     from vllm_ascend import envs
 
     monkeypatch.setattr(envs, aw.ENV_NAME, value, raising=False)
@@ -345,15 +313,13 @@ def _vllm_config():
 
 
 def test_it_is_refused_without_our_own_buffers(monkeypatch):
-    """kt's own captured entry point does submit+sync in one call, and its
-    pinned buffers are shared by ``layer_idx % 2`` -- the very sharing a
-    device-side wait would stop ordering."""
+    """kt's own captured entry point does submit+sync in one call and shares its
+    pinned buffers by ``layer_idx % 2``, which a device-side wait cannot order."""
     from vllm_ascend import envs
     from vllm_ascend.kt_offload.config import KTOffloadConfig
 
     monkeypatch.setattr(envs, aw.ENV_NAME, "1", raising=False)
-    # Neither own-buffer path: the side stream is on by default since PLAN
-    # §4.33, so it is switched off here.
+    # Neither own-buffer path: the side stream defaults on, so switch it off.
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
     with pytest.raises(ValueError, match="packed_transfer or"):
         cfg._validate_preconditions(_vllm_config())

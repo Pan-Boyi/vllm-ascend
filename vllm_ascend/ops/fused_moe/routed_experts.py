@@ -674,6 +674,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         way the layer counts the calls and refuses a route that saw anything
         other than one (kt_offload/layer.py:_assert_merge_balance).
         """
+        if getattr(self, "_kt_streamed_forward", False):
+            # Streaming prefill forked before route(): nothing was submitted for
+            # this forward, so there is nothing to merge. Set by forward_impl on
+            # EVERY forward, so it can never be stale. Without this the deferred
+            # site would merge a streamed layer and _assert_merge_balance would
+            # fire on the next route() -- loud, but only after the fact.
+            return routed_out
         kt_offload = self.kt_offload
         if kt_offload is not None:
             # Same point as the NPU experts' output: router weights (incl.
@@ -735,7 +742,22 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             input_ids=input_ids,
         )
         kt_offload = self.kt_offload
+        streamed_out = None
         if kt_offload is not None:
+            # Streaming prefill forks BEFORE route(): a streamed layer computes
+            # every expert on the NPU from weights pulled up for this forward,
+            # so it must not submit CPU work and must not merge. Doing either
+            # would add the CPU half's experts on top of the ones the stream
+            # already computed -- twice in the output, no error anywhere.
+            # None = this forward is not streamed; carry on unchanged.
+            streamed_out = kt_offload.maybe_stream_prefill(
+                self,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                in_profile_run=enable_force_load_balance,
+            )
+        if kt_offload is not None and streamed_out is None:
             # Logical ids, after the profile-run randomisation above: the CPU
             # half gets the original routing, the NPU half resident slots with
             # CPU routes turned into a zero-weight resident slot.
@@ -752,18 +774,24 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             topk_ids = npu_routing.topk_ids
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
-        try:
-            fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
-            )
-        finally:
-            self.ascend_pertoken_scale = None
-            self.ascend_mc2_mask = None
+        if streamed_out is not None:
+            # The streamed layer has already done dispatch+experts+combine, so
+            # the quant method must not run again. Its result object is built
+            # here only so the code below (eplb heat, finalize) keeps one shape.
+            fused_experts_results = FusedExpertsResult(routed_out=streamed_out)
+        else:
+            try:
+                fused_experts_results = self.quant_method.apply(
+                    layer=self,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
+            finally:
+                self.ascend_pertoken_scale = None
+                self.ascend_mc2_mask = None
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens
@@ -792,8 +820,24 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
-        if not defer_kt_merge:
-            routed_out = self.kt_merge(routed_out)
+        # 🔴 A streamed layer must not merge at EITHER site: nothing was
+        # submitted, so merging would add a stale CPU buffer on top of the
+        # experts the stream already computed -- twice in the output, no error
+        # anywhere. This site sees ``streamed_out``; the deferred site
+        # (fused_moe._forward_impl, kt_shared_in_window) does not, so it
+        # reads the flag below instead.
+        self._kt_streamed_forward = streamed_out is not None
+        if streamed_out is None:
+            # Nested rather than one ``and``: the two reasons to skip are
+            # different things, and the bit-identity criterion reads this ``if`` as
+            # source text -- it requires the deferral guard to be literally
+            # ``not defer_kt_merge`` (test_shared_in_window._merge_is_guarded_by_defer,
+            # which carries its own mutation arms for "unguarded" and
+            # "inverted"). Folding them into one BoolOp would make that check
+            # stop matching, and relaxing the check to fit this code is the one
+            # move that is not allowed.
+            if not defer_kt_merge:
+                routed_out = self.kt_merge(routed_out)
 
         # Clear per-forward LoRA state from long-lived singletons.
         if lora_context is not None:

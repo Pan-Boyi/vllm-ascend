@@ -59,11 +59,6 @@ def _plans():
 PLANS = _plans()
 
 
-# ---------------------------------------------------------------------------
-# resident-set construction
-# ---------------------------------------------------------------------------
-
-
 def test_prefix_is_identity_slots():
     p = PLANS["prefix"].layer(7)
     assert p.resident_ids == tuple(range(100))
@@ -169,11 +164,6 @@ def test_plan_from_config_files(tmp_path):
     assert plan2.num_slots == 3 and plan2.layer(1).resident_ids == (0, 15)
 
 
-# ---------------------------------------------------------------------------
-# logical <-> slot round trip
-# ---------------------------------------------------------------------------
-
-
 def _roundtrip_errors(p: LayerPlacement) -> list[str]:
     errs = []
     l2s, s2l = p.logical_to_slot(), p.slot_to_logical()
@@ -217,11 +207,6 @@ def test_roundtrip_mutation_is_red():
         l2s[lid] = slot
     object.__setattr__(bad, "_l2s", tuple(l2s))
     assert _roundtrip_errors(bad) != []
-
-
-# ---------------------------------------------------------------------------
-# routing split
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("name", list(PLANS))
@@ -293,17 +278,12 @@ def test_split_mutation_arms_are_red(mutant):
 
 
 def test_identity_slot_mutant_is_invisible_on_prefix():
-    # Why frequency placement must be in the suite: on prefix the identity
-    # mapping is correct, so a prefix-only test would pass the bug.
+    # Why frequency placement is in the suite: on prefix the identity mapping
+    # is correct, so a prefix-only test would pass the bug.
     p = PLANS["prefix"].layer(0)
     ids, w = _random_topk(257)
     nid, nw = _mut_identity_slots(ids, w, p)
     assert check_split(p, ids, w, nid, nw) == []
-
-
-# ---------------------------------------------------------------------------
-# numerical semantics: resident (slot-packed) + CPU == all experts
-# ---------------------------------------------------------------------------
 
 
 def _moe_ref(x, ids, w, experts_w):
@@ -344,11 +324,6 @@ def test_split_recombines_to_full_moe(name):
 
 def test_resident_bytes_per_slot_dsv41():
     assert resident_bytes_per_slot(5120, 2304) == 18_800_640
-
-
-# ---------------------------------------------------------------------------
-# the (weights, ids) contract at the call sites
-# ---------------------------------------------------------------------------
 
 
 def test_split_routing_returns_a_named_pair_weights_first():

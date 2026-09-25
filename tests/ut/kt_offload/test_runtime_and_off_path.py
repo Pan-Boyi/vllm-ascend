@@ -22,11 +22,6 @@ from vllm_ascend.kt_offload.placement import build_plan, check_split, frequency_
 ROUTED_EXPERTS = pathlib.Path(__file__).resolve().parents[3] / "vllm_ascend/ops/fused_moe/routed_experts.py"
 
 
-# ---------------------------------------------------------------------------
-# config
-# ---------------------------------------------------------------------------
-
-
 def test_config_defaults_off():
     cfg = KTOffloadConfig()
     assert cfg.enabled is False
@@ -80,11 +75,40 @@ def _vllm_config(tp=1, dp=1, pp=1, eager=True, eplb=False, spec=None):
 def test_preconditions():
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100)
     cfg._validate_preconditions(_vllm_config())
-    cfg._validate_preconditions(_vllm_config(eager=False))  # graph mode allowed since M2
+    cfg._validate_preconditions(_vllm_config(eager=False))  # graph mode is allowed
     for bad in (dict(dp=4), dict(tp=2), dict(eplb=True), dict(spec=object())):
         with pytest.raises(ValueError):
             cfg._validate_preconditions(_vllm_config(**bad))
     KTOffloadConfig()._validate_preconditions(_vllm_config(dp=4, eager=False))  # off: no checks
+
+
+def test_streaming_switches_are_declared_and_off_by_default():
+    """The fields exist, default to False, and a default config validates without
+    a word about either switch.
+    """
+    for field in ("stream_prefill", "dynamic_resident"):
+        assert field in KTOffloadConfig.__dataclass_fields__
+        assert getattr(KTOffloadConfig(), field) is False
+    # off is off: a default config validates without a word about either switch
+    KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
+                    overlap_side_stream=False)._validate_preconditions(_vllm_config())
+    # dynamic_resident alone is still refused, and names the switch it needs
+    with pytest.raises(ValueError, match="needs stream_prefill"):
+        KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
+                        overlap_side_stream=False,
+                        dynamic_resident=True)._validate_preconditions(_vllm_config())
+
+
+def test_chunk_size_is_tunable_and_validated():
+    """Chunk size is configuration, but not any value."""
+    cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100,
+                          stream_prefill_chunk_experts=64, stream_prefill_min_tokens=4096)
+    assert cfg.stream_prefill_chunk_experts == 64 and cfg.stream_prefill_min_tokens == 4096
+    cfg._validate_preconditions(_vllm_config())          # the switch itself is still off
+    for bad in (dict(stream_prefill_chunk_experts=0), dict(stream_prefill_chunk_experts=-8),
+                dict(stream_prefill_min_tokens=0)):
+        with pytest.raises(ValueError):
+            KTOffloadConfig(enabled=True, cpuinfer_threads=8, num_resident_experts=100, **bad)
 
 
 def test_ascend_config_accepts_section():
@@ -93,11 +117,7 @@ def test_ascend_config_accepts_section():
     assert "kt_offload_config" in AscendConfig.__dataclass_fields__
 
 
-# ---------------------------------------------------------------------------
 # feature off: nothing is created, nothing is mutated
-# ---------------------------------------------------------------------------
-
-
 def _fake_init(self, layer_name, params_dtype, moe_config, quant_config, expert_map_manager, **kw):
     pass
 
@@ -137,6 +157,11 @@ def _guarded_offload_calls(tree: ast.AST) -> tuple[list[int], list[int]]:
     guarded, unguarded = [], []
 
     def is_guard(test):
+        # ``<guard> and <extra>`` still guards: an ``and`` can only NARROW the
+        # set of forwards that reach the call. An ``or`` would widen it and is
+        # deliberately not accepted.
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            return any(is_guard(v) for v in test.values)
         return (
             isinstance(test, ast.Compare)
             and len(test.ops) == 1
@@ -167,8 +192,9 @@ def _guarded_offload_calls(tree: ast.AST) -> tuple[list[int], list[int]]:
 def test_every_hook_in_routed_experts_is_guarded():
     guarded, unguarded = _guarded_offload_calls(ast.parse(ROUTED_EXPERTS.read_text()))
     assert unguarded == [], f"unguarded kt_offload calls at lines {unguarded}"
-    # coverage: attach_after_init, slot_of, route, merge (+ num_slots is an attribute)
-    assert len(guarded) == 4, guarded
+    # coverage: attach_after_init, slot_of, route, merge, maybe_stream_prefill
+    # (+ num_slots is an attribute)
+    assert len(guarded) == 5, guarded
     src = ROUTED_EXPERTS.read_text()
     assert src.count("create_layer_offload(") == 1
     assert "kt_offload = None" in src  # class default for __new__-built instances
@@ -180,11 +206,15 @@ def test_guard_check_mutation_is_red():
     assert unguarded == [3] and guarded == []
 
 
-# ---------------------------------------------------------------------------
+def test_guard_check_rejects_a_widening_or():
+    """``A or B`` must NOT read as guarded: it lets through forwards A excludes."""
+    src = ("def f(self):\n    kt_offload = self.kt_offload\n"
+           "    if kt_offload is not None or x:\n        kt_offload.merge(1)\n")
+    guarded, unguarded = _guarded_offload_calls(ast.parse(src))
+    assert unguarded == [4] and guarded == []
+
+
 # layer runtime with a fake kt wrapper
-# ---------------------------------------------------------------------------
-
-
 class FakeKT:
     def __init__(self, cpu_value=0.25):
         self.submits = []
@@ -202,8 +232,8 @@ class FakeKT:
 def _runtime(monkeypatch, resident_sets, num_experts=16, fake=None):
     monkeypatch.setattr(kl, "_stream_handle", lambda device: 0)
     plan = build_plan(resident_sets, num_experts)
-    # Serial (kt's own) path under test: the side stream is on by default
-    # since PLAN §4.33, so it is switched off explicitly.
+    # serial (kt's own) path under test: the side stream is on by default, so
+    # it is switched off explicitly
     cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
     vcfg = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -335,7 +365,7 @@ def test_route_rejects_swapped_ids_and_weights(monkeypatch):
     ids = torch.tensor([[0, 9], [4, 1]], dtype=torch.int32)
     w = torch.rand(2, 2)
     with pytest.raises(TypeError, match="topk_ids must be int32/int64"):
-        rt.route(hs, ids, w, in_profile_run=False)  # swapped, as the on-card scaffold did
+        rt.route(hs, ids, w, in_profile_run=False)  # ids and weights swapped
     with pytest.raises(TypeError, match="no topk_weights table baked"):
         rt.route(hs, w.to(torch.float64), ids, in_profile_run=False)  # no table baked for f64
 

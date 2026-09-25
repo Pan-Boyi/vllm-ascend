@@ -3,11 +3,7 @@
 
 Only a host-func node *in the graph* increments ``layer.HOST_FUNC_CALLS``: a
 graph replay runs no Python, so if a layer's counter does not grow while the
-service decodes, that layer's CPU-expert work is not in the graph at all. That
-is the measurement that settles what the 2026-09-20 arms could not -- the
-profile arithmetic there was consistent with both "~25-30 of 44 exposure
-points lost their work" and "the captured steps lost all 40 and the survivors
-are breakable's eager attention".
+service decodes, that layer's CPU-expert work is not in the graph at all.
 
 Off unless ``VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG`` is set to an interval in
 seconds. The sampler is a daemon thread that also stops on the stop event at
@@ -20,14 +16,11 @@ from __future__ import annotations
 import atexit
 import threading
 
-# The ``vllm`` logger, not ``logging.getLogger(__name__)``: in the worker
-# process only ``configure_ascend_file_logging()`` runs (worker.py), which adds
-# a file handler to the ``vllm_ascend`` logger but never sets its level, so that
-# logger's effective level is the root's WARNING. A ``vllm_ascend.*`` name
-# therefore loses INFO at the level gate, and its WARNING/ERROR reach only
-# ~/ascend/log/vllm_ascend/*.log, never serve.log. ``init_logger(__name__)``
-# would not change that: it is ``getLogger`` plus patched methods
-# (vllm/logger.py:204-214). 132 files in this tree use the import below.
+# The ``vllm`` logger, not a ``vllm_ascend.*`` one: in the worker process the
+# ``vllm_ascend`` logger gets a file handler but never a level, so its effective
+# level is the root's WARNING -- INFO is dropped at the gate and WARNING/ERROR
+# land only in the Ascend log file, never in serve.log. ``init_logger(__name__)``
+# would not change that.
 from vllm.logger import logger
 
 _MONITOR: threading.Thread | None = None
@@ -37,9 +30,8 @@ _STOP = threading.Event()
 def host_func_report(before: dict[int, int], after: dict[int, int], expected_layers: int) -> dict:
     """What changed between two samples of the counters. Pure, hence testable.
 
-    ``per_layer`` is the delta for every layer the offload knows about, so a
-    layer that never ran appears as 0 rather than going missing (an absent key
-    and a zero read the same in a log, and only one of them is the finding).
+    ``per_layer`` holds a delta for every layer the offload knows about, so a
+    layer that never ran appears as 0 rather than going missing.
     """
     per_layer = {layer: after.get(layer, 0) - before.get(layer, 0) for layer in range(expected_layers)}
     deltas = sorted(per_layer.values())
@@ -59,10 +51,8 @@ def host_func_report(before: dict[int, int], after: dict[int, int], expected_lay
 
 
 def format_report(report: dict, interval_s: float, what: str = "host-func") -> str:
-    """``what`` names the counter that was sampled, because since P1b there are
-    two of them and a reader cannot otherwise tell which path the line is about
-    (``host-func`` = a node in the graph, ``device-signal`` = the polling
-    thread that replaced it)."""
+    """``what`` names the counter that was sampled: ``host-func`` (a node in the
+    graph) or ``device-signal`` (the polling thread that replaces it)."""
     z = report["zero_layers"]
     head = (
         f"kt_offload {what} over {interval_s:.1f}s: {report['total']} calls across {report['layers']} layers, "

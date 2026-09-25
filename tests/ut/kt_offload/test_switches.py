@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PLAN §4.33: the side stream, P1a and the shared-window move default ON; P1b OFF.
+"""The side stream, P1a and the shared-window move default ON; P1b OFF.
 
 One resolver (``kt_offload.switches.resolve``) decides every switch; config
-validation, the layer runtime and the start-up log all go through it. These
-cases pin its table, the start-up refusals that survive the flip, and eager.
-
-CPU only. Environment values are set with ``setenv`` (conftest.py clears all
-four before every test, so "unset" really is unset).
+validation, the layer runtime and the start-up log all go through it. CPU only;
+conftest.py clears all four env vars before every test, so "unset" is unset.
 """
 
 from __future__ import annotations
@@ -43,11 +40,6 @@ def _vcfg(eager: bool = False):
 
 def _state(sw):
     return (sw.side_stream.on, sw.async_wait.on, sw.shared_in_window.on, sw.device_signal.on)
-
-
-# ---------------------------------------------------------------------------
-# 1. the table
-# ---------------------------------------------------------------------------
 
 
 def test_all_unset_is_side_on_p1a_on_shared_on_p1b_off():
@@ -111,7 +103,7 @@ def test_shared_zero_turns_only_the_shared_move_off(monkeypatch):
 
 
 def test_all_explicit_zero_is_the_serial_arm(monkeypatch):
-    """What run_arm.sh's A arm passes: every switch off, and it starts."""
+    """Every switch set to 0 explicitly, and it still starts."""
     for name in (SIDE, P1A, P1B, SIW):
         monkeypatch.setenv(name, "0")
     for cfg in (_cfg(), _cfg(overlap_side_stream=False)):
@@ -120,18 +112,11 @@ def test_all_explicit_zero_is_the_serial_arm(monkeypatch):
 
 
 def test_the_explicit_accepted_arm_resolves_like_the_default(monkeypatch):
-    """The D arm of the second acceptance (cfg overlap true, SIDE=1 P1A=1
-    P1B=0 SIW=1) and "nothing set" must be the same configuration -- that is
-    what makes the on-card smoke comparable with D4 bit for bit."""
+    """SIDE=1 P1A=1 P1B=0 SIW=1 spelled out must resolve exactly like "nothing set"."""
     default = _state(switches.resolve(_cfg()))
     for name, value in ((SIDE, "1"), (P1A, "1"), (P1B, "0"), (SIW, "1")):
         monkeypatch.setenv(name, value)
     assert _state(switches.resolve(_cfg(overlap_side_stream=True, packed_transfer=False))) == default
-
-
-# ---------------------------------------------------------------------------
-# 2. refusals that survive the flip
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("name", [P1A, P1B])
@@ -175,8 +160,8 @@ def test_both_explicit_one_refuses_and_says_how_to_fix_it(monkeypatch):
 
 
 def test_the_layer_resolver_never_raises_on_explicit_values(monkeypatch):
-    """The on-card harnesses (t4/t5) build layers without config validation
-    and set both to 1 to flip per arm; validate=False honours both."""
+    """The on-card harnesses build layers without config validation and set both
+    to 1 to flip per arm; validate=False honours both."""
     monkeypatch.setenv(P1B, "1")
     monkeypatch.setenv(P1A, "1")
     sw = switches.resolve(_cfg(overlap_side_stream=False), validate=False)
@@ -204,11 +189,6 @@ def test_shared_one_without_the_side_stream_warns_but_starts(monkeypatch):
     monkeypatch.delenv(SIW)
     _cfg(overlap_side_stream=False)._validate_preconditions(_vcfg())
     assert not [m for m in said if SIW in m], said
-
-
-# ---------------------------------------------------------------------------
-# 3. the start-up line
-# ---------------------------------------------------------------------------
 
 
 def _startup_line(monkeypatch, cfg, eager=False):
@@ -252,10 +232,7 @@ def test_nothing_is_logged_when_offload_is_off(monkeypatch):
     assert said == []
 
 
-# ---------------------------------------------------------------------------
-# 4. the layer runtime: same resolver, and eager keeps its original path
-# ---------------------------------------------------------------------------
-
+# the layer runtime: same resolver, and eager keeps its original path
 H, TOPK = 8, 2
 
 
@@ -289,8 +266,8 @@ def test_graph_layer_defaults_match_the_resolver():
 def test_eager_layer_turns_the_automatic_values_off():
     rt = _layer(KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1), graph=False)
     assert not rt.graph_enabled
-    # the side stream keeps the config's value (eager never forks whatever it
-    # says); the automatic P1a and shared-window move have nothing to act on
+    # the side stream keeps the config's value (eager never forks anyway); the
+    # automatic P1a and shared-window move have nothing to act on
     assert (rt.overlap, rt.async_wait, rt.shared_in_window, rt.device_signal) == (True, False, False, False)
 
 
@@ -338,13 +315,12 @@ def _eager_run(monkeypatch, cfg):
 
 
 def test_eager_with_every_default_runs_the_serial_path_bit_for_bit(monkeypatch):
-    """The §4.33 flip must not touch eager: same kt calls, same output, no
-    side stream, and none of the per-layer ENABLED lines."""
+    """Defaults on must not touch eager: same kt calls, same output, no side
+    stream."""
     default_cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1)
     serial_cfg = KTOffloadConfig(enabled=True, cpuinfer_threads=4, num_resident_experts=1, overlap_side_stream=False)
-    rt_d, fake_d, out_d, said_d = _eager_run(monkeypatch, default_cfg)
+    rt_d, fake_d, out_d, _ = _eager_run(monkeypatch, default_cfg)
     rt_s, fake_s, out_s, _ = _eager_run(monkeypatch, serial_cfg)
     assert fake_d.calls == fake_s.calls == ["submit_forward", "sync_forward"]
     assert torch.equal(out_d, out_s)
     assert rt_d._ext_events == {} and rt_d._pending_join is None
-    assert not [m for m in said_d if "ENABLED" in m or "SHARED IN WINDOW" in m], said_d

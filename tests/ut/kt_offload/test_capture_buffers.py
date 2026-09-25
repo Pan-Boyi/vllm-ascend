@@ -1,27 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capture-buffer ownership per layer instance, and the side-stream gate.
 
-The production bug this file was written for (2026-09-22): the "capture
-buffers are ready" flag was process-wide (``layer._CAPTURE_BUFFERS_READY``)
-while the int64 id buffers it guards are filled per *layer instance*
-(``self._ids_i64``). In a real model every layer after the first one therefore
-returned early with an empty dict, and the first captured forward on the side
-stream raised ``no preallocated int64 id buffer``. On card that surfaced as
-ACL 107025 and was written up as a platform limit (§4.19 ②/③).
-
-🔴 Later the same day the forked path stopped handing kt its own buffers
-altogether (it fills this layer's own packed buffers on the compute stream
-before the fork instead), so ``_ids_i64`` is no longer on that path. What is
-tested here is still live: ``_prepare_capture_buffers`` is what registers kt's
-capture sizes for the *serial* captured path, the per-instance/per-process
-split is what that bug was about, and ``slot_ownership_ok`` is still the
-criterion for anything that does use kt's ``layer_idx % 2`` pair. The forked
-path's own ownership criterion is ``side_stream.buffer_ownership_ok``
-(tests/ut/kt_offload/test_side_stream_overlap.py).
-
-Note what has zero coverage here and is on-card only: whether an ACL capture
-follows the event wait onto the side stream, and 107025 itself. Those are in
-tools/kt_offload/oncard/RUNBOOK_sidestream.md.
+``_prepare_capture_buffers`` registers kt's capture sizes once per process but
+fills ``self._ids_i64`` per layer instance; ``slot_ownership_ok`` is the
+criterion for anything sharing kt's ``layer_idx % 2`` pinned slot pair.
 """
 
 from __future__ import annotations
@@ -96,17 +78,8 @@ def _layer(layer_idx: int, *, overlap: bool = True):
     return rt
 
 
-# -- 1. the bug: every layer instance must get its own buffers --------------
-
-
 def test_every_layer_instance_gets_its_own_id_buffers():
-    """RED before the fix: only the first instance had buffers.
-
-    The guard was ``if key == _CAPTURE_BUFFERS_READY: return`` with the key
-    built from capture sizes / hidden / top_k / device -- identical for every
-    layer of one model, so layer 1..N-1 returned before ``self._ids_i64`` was
-    filled and their captured side-stream forward raised.
-    """
+    """The process-wide "ready" key must not make layers 1..N-1 return early."""
     layers = [_layer(i) for i in range(LAYERS)]
     for rt in layers:
         rt._prepare_capture_buffers(torch.device("cpu"))
@@ -115,7 +88,7 @@ def test_every_layer_instance_gets_its_own_id_buffers():
 
 
 def test_id_buffers_are_not_shared_between_layers():
-    """A6: two layers pointing at one buffer is the mutant, and it must be caught."""
+    """Two layers pointing at one buffer is the mutant, and must be caught."""
     layers = [_layer(i) for i in range(LAYERS)]
     for rt in layers:
         rt._prepare_capture_buffers(torch.device("cpu"))
@@ -146,21 +119,14 @@ def test_a_second_model_with_other_capture_sizes_is_still_refused():
 
 
 def test_empty_id_buffers_are_reported_by_the_criterion():
-    """The exact shape of the bug, as the gate sees it."""
     rep = ss.slot_ownership_ok([(0, {1}, False), (1, set(), False)])
     assert not rep["ok"] and "layer 1 has no preallocated int64 id buffer" in rep["detail"]
-
-
-# -- 2. A6 in flight: two layers sharing kt's pinned slot -------------------
 
 
 def test_slot_sharing_layers_in_flight_are_refused():
     assert ss.slot_ownership_ok([(0, {1}, True), (1, {2}, True)])["ok"]  # slots 0 and 1: fine
     bad = ss.slot_ownership_ok([(0, {1}, True), (2, {2}, True)])  # both slot 0
     assert not bad["ok"] and "pinned slot 0" in bad["detail"][0]
-
-
-# -- 3. the other gate criteria, each with a red arm ------------------------
 
 
 def test_capture_hostfunc_zero():
@@ -182,7 +148,7 @@ def test_join_record_and_wait_paired():
     side = [("wait", "fork"), ("d2h", None), ("hostfunc", None), ("record", "join")]
     compute = [("record", "fork"), ("wait", "join"), ("h2d", None)]
     assert ss.join_ops_ok(side, compute)["ok"]
-    # the on-card 107025 arm (t5 off_evt): recorded, nobody joins
+    # recorded, nobody joins
     bad = ss.join_ops_ok(side, [("record", "fork"), ("h2d", None)])
     assert not bad["ok"] and "107025" in bad["detail"][0]
     # no record at all: the H2D may read the pinned output before the callback
@@ -202,13 +168,9 @@ def test_gate_report_is_red_if_any_check_is():
     assert "replay_one_per_layer" in ss.format_gate(rep)
 
 
-# -- 4. the switch itself ---------------------------------------------------
-
-
 def test_the_env_is_a_kill_switch_not_a_permit_since_4_33(monkeypatch):
-    """Before PLAN §4.33 the config refused overlap_side_stream unless the env
-    said "1". Now the side stream is on by default: unset and "1" leave it on,
-    "0" turns it off, and nothing here raises."""
+    """The env is a kill switch, not a permit: unset and "1" leave the side
+    stream on, "0" turns it off, and none of these raise."""
     from vllm_ascend import envs
     from vllm_ascend.kt_offload import switches
 
@@ -231,12 +193,7 @@ def test_the_env_is_a_kill_switch_not_a_permit_since_4_33(monkeypatch):
 
 
 def test_the_switch_is_on_by_default():
-    """PLAN §4.33 (user decision 2026-09-23 10:40/10:55, after the second
-    merged-version acceptance)."""
     assert KTOffloadConfig().overlap_side_stream is True
-
-
-# -- 5. packed + side stream is a switch that would look on and be off --------
 
 
 def _preconditions(**kw):
@@ -251,19 +208,8 @@ def _preconditions(**kw):
 
 
 def test_packed_and_side_stream_together_are_accepted(monkeypatch):
-    """The refusal is gone, and this records why it existed and what replaced it.
-
-    It existed because ``route()`` tested ``packed`` first, so with both on the
-    packed branch ran and nothing forked: the service would log "SIDE STREAM
-    ENABLED", dump a config saying so, and serve the serial packed path -- a
-    reading attributed to the side stream that the side stream never produced.
-    The forked path now *is* the packed per-layer buffers (it was moved onto
-    them so it would stop reading kt's shared pinned slots and the caller's
-    short-lived routing tensors), and ``route()`` tests ``overlap`` first, so
-    "on" means on. The test below pins that branch order, and
-    test_side_stream_overlap.test_packed_and_overlap_together_fork_rather_than_
-    silently_serialise asserts that the side stream really carries the work.
-    """
+    """Both switches on is accepted; the branch order that makes "on" mean on
+    is pinned by the next test."""
     from vllm_ascend import envs
 
     monkeypatch.setattr(envs, ss.ENV_NAME, "1", raising=False)
@@ -273,8 +219,7 @@ def test_packed_and_side_stream_together_are_accepted(monkeypatch):
 
 
 def test_route_takes_the_overlap_branch_before_the_packed_one():
-    """🔴 The order the refusal above was traded for. Reverse it and "side
-    stream on" silently becomes "packed serial" again."""
+    """Reverse this order and "side stream on" silently serves packed serial."""
     import inspect
 
     from vllm_ascend.kt_offload.layer import KTLayerOffload

@@ -1,19 +1,13 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Start every kt_offload test from "all four switches unset".
-
-Since PLAN §4.33 "unset" is a state of its own (the default: side stream,
-P1a and the shared-window move on, P1b off), not a synonym for "0". A value
-left in the parent shell -- the on-card runbooks export these -- would
-otherwise change what a test that never mentions them is testing.
-
-Also drops any *module attribute* of that name from ``vllm_ascend.envs``:
-``monkeypatch.setattr(envs, NAME, ...)`` (used by older tests here) restores
-the value ``envs.__getattr__`` returned at the time as a real attribute on
-undo, which then shadows the environment for every later test -- with
-defaults on, that turns a later ``setenv`` into a silent no-op.
+"""Per-test isolation for the two pieces of process-global state in kt_offload:
+the four switch env vars ("unset" is a state of its own, not a synonym for "0")
+and the prefill window's module state.
 """
 
+from __future__ import annotations
+
 import pytest
+
+from vllm_ascend.kt_offload import prefill_window
 
 _SWITCH_ENVS = (
     "VLLM_ASCEND_DSV41_KT_SIDE_STREAM",
@@ -24,6 +18,8 @@ _SWITCH_ENVS = (
 
 
 def _drop_shadows():
+    # monkeypatch.setattr(envs, NAME, ...) restores the value as a real module
+    # attribute on undo, which then shadows the environment for later tests.
     from vllm_ascend import envs
 
     for name in _SWITCH_ENVS:
@@ -37,3 +33,10 @@ def _kt_switches_unset(monkeypatch):
     _drop_shadows()
     yield
     _drop_shadows()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_prefill_window():
+    prefill_window.reset()
+    yield
+    prefill_window.reset()

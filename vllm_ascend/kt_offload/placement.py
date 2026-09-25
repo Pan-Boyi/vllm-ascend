@@ -148,9 +148,8 @@ def assert_routing_dtypes(topk_ids: torch.Tensor, topk_weights: torch.Tensor, wh
     The kernel's own complaint arrives far away and names neither the caller
     nor the argument that is wrong: a float ``topk_ids`` surfaces inside
     ``npu_moe_init_routing_v2`` as ``aclnnMoeInitRoutingV3 ... EZ1001: Tensor
-    expertIdx not implemented for DT_FLOAT`` (seen on card 2026-09-20, from a
-    caller that had swapped weights and ids). Never coerce with ``.to()``: the
-    swap would then run and produce silently wrong routing.
+    expertIdx not implemented for DT_FLOAT``. Never coerce with ``.to()``: a
+    weights/ids swap would then run and produce silently wrong routing.
     """
     if topk_ids.dtype not in ID_DTYPES:
         raise TypeError(
@@ -307,7 +306,7 @@ def load_frequency_table(path: str) -> torch.Tensor:
                 if key in data:
                     data = data[key]
                     break
-            # tools/kt_offload/expert_count_report.py writes counts={decode, prefill, all}
+            # the expert counter's report writes counts={decode, prefill, all}
             if isinstance(data, Mapping) and "all" in data:
                 data = data["all"]
     elif ext == ".npy":
@@ -448,12 +447,8 @@ def host_ops_per_layer(packed: bool) -> dict[str, int]:
     (the three device-side fills that precede it are ordinary device work, not
     host-device operations).
 
-    This function counts operations and nothing else. The per-operation price
-    once quoted here (7.5 ms / 120 operations = 62.5 us) is retired: the
-    2026-09-20 profile measured 1.168 us of device time per memcpy, so that
-    figure was an aggregate divided by a count, not a price. What an operation
-    costs is only visible as its effect on step time (the packed A/B) or on a
-    graph replay (t4).
+    This function counts operations and nothing else; what an operation costs is
+    only visible as its effect on step time.
     """
     d2h = 1 if packed else 3
     return {"d2h": d2h, "host_func": 1, "h2d": 1, "total": d2h + 2}

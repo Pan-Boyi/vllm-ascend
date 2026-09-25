@@ -2210,6 +2210,14 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # kt_offload dynamic_resident: publish which request is prefilling and
+        # whether this step finishes its prompt, for the MoE layers' folded
+        # swap-in (vllm_ascend/kt_offload/prefill_window.py explains why that
+        # cannot be worked out from the forward context). Reads scheduler_output
+        # only, so it does not matter that it runs before _update_states; one
+        # bool test unless kt_offload_config.dynamic_resident is on.
+        from vllm_ascend.kt_offload import prefill_window
+        prefill_window.observe(scheduler_output)
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
