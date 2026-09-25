@@ -222,7 +222,29 @@ merge: sync_forward → [KT_FORCE_SYNC_SUBMIT=1: cpu_infer.sync()] → H2D(outpu
   dispatcher 行数仍是 T×6 ⇒ NPU 峰值显存与真实 decode/prefill 同形，**profile 不失真**。
 - 不算进 profile 的：kt 的 `output_gpu` 设备缓冲（2×T×5120×bf16，T=4096 时 80 MiB）——建议 `--gpu-memory-utilization` 留出这点。
 - 统计：路由计数钩子（`vllm_ascend/kt_offload/expert_counter.py`，开关 `VLLM_ASCEND_DSV41_EXPERT_COUNT`，用法见 `tools/kt_offload/README.md`）
-  只在 `enable_force_load_balance=False` 时累加，被排除的步数单独计；图模式下拒绝启用。
+  只在 `enable_force_load_balance=False` 时累加（`expert_counter.py:326-327`，排除原因 `profile_run`），被排除的步数单独计。
+- **图模式不再拒绝启用**（T3.8/O4 改；旧文写的"图模式下拒绝启用"已作废）。为什么能开：动态热专家的**决策点在 prefill**，
+  而 prefill 在图外——≥512 token 的 prefill 不在任何捕获 bs 列表里，永远 eager、永远被计；为了它把整个计数器锁在
+  `--enforce-eager` 上，等于逼着用"和生产不同的形态"去测生产要用的表。`check_config` 只记录 `enforce_eager` 供参考，
+  不再拒绝（`expert_counter.py:108-120`）；是不是图由**每次调用**的捕获判据说了算，不由配置说了算。
+- 图模式下的三条规矩（都是"宁可不数"，因为数错的方向会把图里的工作写进表）：
+  1. **捕获中的调用一格不数**（`expert_counter.py:304-315`）：判据是当前流是否在捕获（`_capturing()`，抄 `layer.py` 的
+     `is_current_stream_capturing() is True`，`expert_counter.py:220-246`，抄不导入——导入模型包会带上 V4.1 平台补丁）。
+     读的是**当前流**，也就是这次 `index_add_` 会入队的那条流。若在捕获里数，那句 `index_add_` 会被录进图，
+     每次 replay 在设备上重跑一遍，而 Python 侧的 token 计数不动 ⇒ 和判据 `counts.sum()==tokens×topk` 必然崩。
+     另外捕获前 vLLM 跑的 `cudagraph_num_of_warmups` 次 eager dummy 前向长得和真实 decode 一样，所以一见捕获就把
+     此前数到的全部丢弃、记成 `discarded_before_capture`（`expert_counter.py:172-189`）——只会少数，不会多数。
+  2. **replay 数不到，只能如实报告**：replay 不跑 Python，`record()` 根本看不见它。能看见的是 replay 的前置——捕获。
+     所以只有"本进程没见过任何捕获、也没有不可判定的调用"时才能证明 `replayed == 0`；否则 `replayed = None`（不可观测）
+     并给出 `captured_token_sizes`，即"可能整批走了图、没人数过"的 bs（`expert_counter.py:203-211`）。
+  3. **判不出捕获状态的调用被排除，而不是计入**（`expert_counter.py:316-325`，排除原因 `capture_state_unknown`）：
+     没有 `torch.npu`、没有该谓词、谓词抛异常、返回的不是真 bool（例如 Mock），都算"说不清"。不数是唯一不会把
+     图里的工作塞进表的方向；也不抛——这是服务前向里的统计钩子。失败仍然是响的：`counted` 不涨而 `seen` 涨、
+     `replayed` 变 None。
+- 分母跟着结论一起落盘（`expert_counter.py:396-403`）：`forwards.seen == forwards.counted + Σforwards.excluded`，
+  外加 `replayed` / `replay_note` / `captured_token_sizes`。逐 rank 校验这条等式
+  （不成立 ⇒ rc=1，不给排名、不写产物：分母对不上的频率表不能拿去放专家），`counted == 0` 视为零覆盖同样 rc=1
+  （"全零表"和"没数据"长得一模一样），`replayed` 为 None 或 dump 早于分母字段时给醒目警告并 rc=2（覆盖未确立，不是通过）。
 
 ## i. 显存与主机内存账（integration 写起飞闸用）
 
