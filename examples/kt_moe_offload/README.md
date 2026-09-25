@@ -452,6 +452,40 @@ not fit".
 until [ "$(npu-smi info -t usages -i 0 | awk -F: '/HBM Usage Rate/{gsub(/ /,"",$2);print $2}')" -le 6 ]; do sleep 5; done
 ```
 
+### Releasing the engram tables
+
+Stopping the server does **not** release them. They live in `/dev/shm`, which is
+RAM, and they stay there holding **188.8 GiB** until something removes them —
+which is deliberate, so that restarting the server does not pay the staging cost
+again. Check and remove:
+
+```bash
+du -sb /dev/shm/engram_stage          # 202,758,032,400 B when complete
+rm -rf /dev/shm/engram_stage          # frees 188.8 GiB immediately
+```
+
+🔴 **Remove them only when you are finished with the model on this host.** The
+next start refuses to run without them, so removing costs a re-stage (3-5
+minutes of copying, and the checkpoint has to be readable again).
+
+🔴 **Re-staging does not reproduce the same memory layout.** tmpfs pages are
+allocated on whichever NUMA node the writing thread happened to run on, so the
+split across nodes is whatever first-touch gave you that time, and it is not
+under your control unless you bind the staging yourself. That matters here
+because kt binds its worker threads to one node with `MPOL_BIND | STRICT`: if a
+re-stage leaves one node fuller than before, the expert weights can fail to
+allocate on that node while the machine as a whole has plenty free. If you hit
+that after a re-stage, it is the layout, not the budget.
+
+⚠️ We did not re-stage under an explicit binding, so there is no measured
+recipe here for making the split deterministic — only the warning that it
+varies.
+
+⚠️ `free -g` will not show the space coming back as "free" in the way you might
+expect; tmpfs pages are released immediately on `rm`, but page cache for the
+checkpoint will expand to use what was freed. Read `MemAvailable` in
+`/proc/meminfo` rather than the free column.
+
 ## Failure modes worth knowing
 
 | Symptom | Cause |
