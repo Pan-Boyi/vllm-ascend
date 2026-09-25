@@ -171,18 +171,29 @@ model.
 
 ## 4. ds41 operator package — required
 
-Three wheels, obtained from your Ascend vendor with the model -- they are not
-on PyPI and are not part of CANN:
+Three wheels, obtained from your Ascend vendor alongside the model -- they are
+not on PyPI and are not part of CANN. The versions this was validated with:
 
 ```
-cannbotdsl-*.whl   cann_ops_transformer-*.whl   cannbot_arena_net_ops-*.whl
+cannbotdsl-0.5.0-cp312-cp312-manylinux_2_28_x86_64.whl
+cann_ops_transformer-1.0.0-py3-none-any.whl
+cannbot_arena_net_ops-0.1.0-cp312-cp312-linux_x86_64.whl
 ```
 
 ```bash
-DS41_SITE=$PWD/ds41_site        # 🔴 on disk, not /dev/shm
+WHEELS=/path/to/the/three/wheels
+DS41_SITE=$PWD/ds41_site        # 🔴 on disk, not /dev/shm -- tmpfs is gone
+                                #    after a host reboot
 python3 -m pip install --no-deps --no-index --target "$DS41_SITE" \
-  cannbotdsl-*.whl cann_ops_transformer-*.whl cannbot_arena_net_ops-*.whl
+  "$WHEELS"/cannbotdsl-*.whl \
+  "$WHEELS"/cann_ops_transformer-*.whl \
+  "$WHEELS"/cannbot_arena_net_ops-*.whl
 ```
+
+`--no-deps --no-index` keeps pip from reaching out and, more importantly, from
+"upgrading" `torch` or `torch_npu`: the validated `torch_npu` is a dev snapshot
+that is no longer downloadable, and a resolver that replaces it leaves the
+environment unrecoverable.
 
 🔴 **`--target` is required, not tidiness.** CANN ships its own package named
 `cann_ops_transformer`, and `set_env.sh` puts it at the head of `PYTHONPATH`. A
