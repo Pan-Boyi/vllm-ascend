@@ -10,6 +10,25 @@ On 2026-11-02, all 4,025 tracked files in the later remote runtime snapshot
 matched the pre-documentation PR head. Diagnostic instrumentation and benchmark
 controllers are separate from the runtime changes.
 
+## Adapter scope and current verification
+
+The Ascend drafter inherits upstream's forward and checkpoint loader. Its
+constructor binds only three hardware entry points; loading the target model
+alone does not bind the drafter. The mHC collapse and context-KV insert use the
+target's existing helpers. Context insertion rotates and writes KV directly,
+without allocating or rotating a discarded dummy query. Expert placement is
+enforced at the existing offload boundary rather than scanned again after
+model construction.
+
+The 2026-11-02 simplification passed 59 isolated CPU tests with real PyTorch
+on macOS, including context-insert equivalence, padding, logical/physical KV
+indices, persistent buffers, proposer input preparation, drafter-only binding,
+and draft/target offload boundaries. Six checkpoint-dependent tests were
+skipped because the model index is absent. These checks stub vLLM/hardware
+imports; they do not replace full vLLM integration or native NPU validation.
+The historical results below predate this simplification. A fresh NPU run of
+the simplified adapter is still pending.
+
 ## CPU expert weight reuse
 
 The companion change is

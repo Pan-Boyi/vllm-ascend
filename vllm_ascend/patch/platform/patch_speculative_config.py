@@ -60,14 +60,6 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config, architecture: str = 
     ):
         return
 
-    # ``model_type`` stays "deepseek_v4" for V4.1 too. That is what
-    # upstream already wrote here before this function took an
-    # architecture, and it is what keeps ``is_deepseek_v4_family`` true
-    # and stops the multimodal architecture conversion re-running. The
-    # drafter reads its own hyper-parameters from ``hf_config``, whose
-    # V4.1 fields (dspark_n_routed_experts, dspark_target_layer_ids,
-    # num_nextn_predict_layers) this does not touch. So the one thing
-    # that differs for V4.1 is which class gets built.
     hf_config.update({"architectures": [architecture]})
     draft_model_config.model_arch_config = replace(
         draft_model_config.model_arch_config,
@@ -83,14 +75,8 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config, architecture: str = 
     draft_model_config._architecture = architecture
 
 
-#: Architecture string for the V4.1 DSpark drafter. Distinct from V4.0's
-#: ``DSparkDraftModel`` because the two networks differ -- see
-#: ``_refuse_v40_drafter_for_v41_target`` for what goes wrong if a V4.1
-#: target reaches the V4.0 drafter.
 V41_DSPARK_ARCHITECTURE = "DSparkDeepseekV41DraftModel"
 
-#: Modules that implement a DeepSeek-V4.1 DSpark drafter on Ascend. A V4.1
-#: target whose drafter resolves outside this set is refused.
 V41_DSPARK_DRAFTER_MODULES: frozenset[str] = frozenset({"vllm_ascend.models.deepseek_v4_1.dspark"})
 
 
@@ -99,15 +85,7 @@ def _is_v41_model_type(model_type) -> bool:
 
 
 def _is_v41_dspark_pair(spec_config) -> bool:
-    """Whether this target/draft pair is V4.1's.
-
-    Upstream rewrites the draft config's *instance* ``model_type`` to
-    ``"deepseek_v4"``, so V4.1 is recognised by the target's
-    ``model_type`` or by the draft config's *class* attribute, which that
-    rewrite leaves alone. Used by both the routing below and the refusal
-    above, so the architecture that gets written and the one that gets
-    checked cannot disagree.
-    """
+    """The draft instance's model_type may already have been rewritten to V4."""
     target_hf = getattr(getattr(spec_config, "target_model_config", None), "hf_config", None)
     draft_hf = getattr(getattr(spec_config, "draft_model_config", None), "hf_config", None)
     return _is_v41_model_type(getattr(target_hf, "model_type", None)) or _is_v41_model_type(

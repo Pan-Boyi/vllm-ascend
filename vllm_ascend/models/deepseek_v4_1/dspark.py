@@ -1,94 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Registry entry point for the DeepSeek-V4.1-Flash DSpark drafter on Ascend.
+"""Reuse the upstream V4.1 drafter with Ascend mHC and context-KV operations."""
 
-Subclasses upstream's drafter instead of forking it, the same way
-:mod:`.model` does for the target. Everything in upstream's
-``vllm/models/deepseek_v4_1/nvidia/dspark.py`` is platform-neutral except
-three module-level names, which :mod:`.platform_patches` rebinds (see
-:mod:`.dspark_ops`); in particular
+import torch
+from vllm.models.deepseek_v4_1.nvidia import dspark as upstream
 
-* the draft decoder blocks are upstream's ``DeepseekV4DecoderLayer``, whose
-  attention class this package already rebinds (:mod:`.attn_selector`), so the
-  draft layers get :class:`.attention.AscendDeepseekV41Attention` for free;
-* the weight loader is plain Python over the target checkpoint's ``mtp.*``
-  tensors and needs no adaptation at all.
-
-**The draft weights are not a separate download.** They ship inside the
-target checkpoint under ``mtp.{0,1,2}.*`` -- 2401 tensors, 7.39 GiB of the
-475.24 GiB total -- which the target's own weight mapper drops
-(``"mtp.": None`` in upstream's ``_make_deepseek_v4_weights_mapper``). So
-enabling DSpark reads weights that are already on disk and already being
-skipped, rather than adding any.
-
-Why this is a separate architecture string from V4.0's ``DSparkDraftModel``:
-the two drafters are not interchangeable. V4.1 sizes its draft MoE by
-``dspark_n_routed_experts`` (128, against the backbone's 384), has no learned
-``hc_head_*`` (it collapses the hyper-connection copies with the last layer's
-pre-mix instead), and ships the Markov factors as ``markov_head.embed`` /
-``markov_head.head``. Pointing V4.1 at V4.0's drafter is a wrong-weights
-failure, which is why ``patch_speculative_config`` refuses it by name.
-"""
-
-from __future__ import annotations
-
-from vllm.logger import logger
-from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4ForCausalLM
-
-from vllm_ascend.models.deepseek_v4_1.platform_patches import DSPARK_REBINDS, dspark_rebinds_in_force
-from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+from vllm_ascend.models.deepseek_v4_1.mhc import _collapse_with, mhc_post_ascend
+from vllm_ascend.models.deepseek_v4_1.qkv_prolog import _rope_tail_impl, scatter_rows
+from vllm_ascend.models.deepseek_v4_1.rope_widen import cos_sin_for_slice
 
 
-class AscendDSparkDeepseekV41ForCausalLM(DSparkDeepseekV4ForCausalLM):
-    """DeepSeek-V4.1-Flash's DSpark drafter on Ascend.
+def hc_collapse_ascend(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    # Upstream takes (x, pre_mix); the shared target helper reverses the order.
+    if x.ndim != 3 or pre_mix.ndim != 2:
+        raise ValueError("expected (tokens, hc, hidden) and (tokens, hc)")
+    if pre_mix.shape != x.shape[:2]:
+        raise ValueError("x and pre_mix first two axes must agree")
+    return _collapse_with(pre_mix, x)
 
-    The constructor checks that this package's DSpark rebinds are in force.
-    Without them the drafter builds and loads correctly and then fails in its
-    first forward -- ``mhc_post_tilelang`` on an import that is not installed,
-    or ``torch.ops._C.fused_deepseek_v4_*`` on a symbol that does not exist --
-    which is after the 7.39 GiB of draft weights have loaded and every earlier
-    stage has reported success.
 
-    Only the three DSpark names are checked here. The target-side rebinds are
-    asserted by :class:`.model.AscendDeepseekV41ForCausalLM`, which is always
-    built in the same process: a drafter exists only alongside its target.
-    """
+def insert_context_kv_ascend(
+    attn: torch.nn.Module,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    cache_layer = attn.swa_cache_layer
+    cache = cache_layer.kv_cache
+    if cache.dtype is not torch.bfloat16:
+        raise NotImplementedError("DSpark requires a bf16 SWA cache; use --kv-cache-dtype bfloat16")
+    declared = getattr(cache_layer, "block_size", None)
+    if declared is not None and declared != cache.shape[1]:
+        raise ValueError(f"SWA cache has block size {cache.shape[1]}, but the layer declares {declared}")
+    if cache.shape[2] != attn.head_dim or kv.shape[0] != positions.shape[0]:
+        raise ValueError("context KV dimensions must match the cache head and position count")
 
+    cos, sin = cos_sin_for_slice(attn.rotary_emb.cos_sin_cache, positions, attn.rope_head_dim)
+    # Reuse the target's rotation and paged write without allocating a dummy Q.
+    rotated = _rope_tail_impl(kv)(kv, cos, sin, attn.rope_head_dim)
+    scatter_rows(cache, rotated, slot_mapping, cache.shape[1])
+
+
+class AscendDSparkDeepseekV41ForCausalLM(upstream.DSparkDeepseekV4ForCausalLM):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
-        _assert_dspark_patches_applied()
+        # The package has already applied target adaptations. Bind the three
+        # drafter-only hardware calls before constructing the upstream model.
+        upstream.mhc_post_tilelang = mhc_post_ascend
+        upstream.hc_collapse_triton = hc_collapse_ascend
+        upstream._insert_context_kv = insert_context_kv_ascend
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        checked = 0
-        for layer in self.model.layers:
-            for experts in layer.ffn.modules():
-                if not isinstance(experts, AscendRoutedExperts):
-                    continue
-                expected = self.config.dspark_n_routed_experts
-                if experts.kt_offload is not None or experts.moe_config.num_local_experts != expected:
-                    raise RuntimeError("DSpark requires every draft expert to remain in HBM")
-                checked += 1
-                logger.info(
-                    "DSpark draft expert placement: local=%d logical=%d kt_offload=None weight_device=%s",
-                    experts.moe_config.num_local_experts,
-                    experts.moe_config.num_logical_experts,
-                    experts.w13_weight.device,
-                )
-        if checked != len(self.model.layers):
-            raise RuntimeError("Could not verify every DSpark layer's expert placement")
-
-
-def _assert_dspark_patches_applied() -> None:
-    """Refuse to build a drafter whose hardware entry points are CUDA's.
-
-    Reads the live bindings rather than whatever ``apply_all`` reported: an
-    upstream module re-imported after the rebinds would restore its original
-    names while that list still says success.
-    """
-    wrong = dspark_rebinds_in_force()
-    if wrong:
-        raise RuntimeError(
-            "DeepSeek-V4.1 DSpark rebinds are not in force:\n  "
-            + "\n  ".join(wrong)
-            + "\nImporting vllm_ascend.models.deepseek_v4_1 applies them "
-            f"({len(DSPARK_REBINDS)} names), so this means something "
-            "re-imported upstream's dspark module afterwards and restored its "
-            "original names."
-        )

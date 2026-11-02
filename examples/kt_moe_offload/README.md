@@ -417,8 +417,8 @@ Keep at most four capture sizes: adding a fifth entry to `[1,2,3,4,6]` can
 remove size three and prevent K=2 from starting. Multi-card DSpark remains
 unverified.
 
-Check for three startup messages containing
-`DSpark draft expert placement: local=128 logical=128 kt_offload=None` and
+With target offload enabled, check for three startup messages containing
+`kt_offload: ... keeps all 128 draft experts in HBM` and
 inspect actual request counters after generation:
 
 ```bash

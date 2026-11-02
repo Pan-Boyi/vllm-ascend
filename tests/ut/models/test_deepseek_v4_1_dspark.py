@@ -1,23 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The V4.1 DSpark drafter: the three rebinds, the routing, and the weights.
-
-Three separate things can make "DSpark is enabled" false while every log line
-still looks healthy, and there is one group of tests here for each:
-
-1. **The rebinds became no-ops.** Upstream renames or inlines one of the three
-   hardware entry points and the drafter quietly calls CUDA's version. That
-   surfaces in the first draft forward, after 7.39 GiB of draft weights have
-   loaded. ``test_upstream_dspark_contract`` pins what is being replaced.
-2. **The routing picked the wrong network.** V4.0's drafter is a different
-   model that happens to answer to a similar name; pointing V4.1 at it is a
-   wrong-weights failure. ``test_v41_routes_*`` pins which class gets built.
-3. **The weights are not where the loader looks.** The draft weights ship
-   inside the *target* checkpoint under ``mtp.*``, so there is no separate
-   download whose absence would be obvious. ``test_checkpoint_*`` runs the
-   real mapping function over the real checkpoint's real tensor names.
-
-None of this needs an NPU, a card, or a loaded model.
-"""
+"""V4.1 drafter bindings, context-KV numerics, routing and checkpoint mapping."""
 
 import inspect
 import json
@@ -28,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import regex as re
 
-from vllm_ascend.models.deepseek_v4_1 import dspark_ops, platform_patches
+from vllm_ascend.models.deepseek_v4_1 import dspark, platform_patches
 
 # Importing the package applies the patches, which is what the production path
 # relies on; done here so the assertions below describe that path.
@@ -46,7 +28,8 @@ def upstream_dspark():
     """Upstream's drafter module, with all three names restored afterwards."""
     import vllm.models.deepseek_v4_1.nvidia.dspark as module
 
-    saved = {name: getattr(module, name, None) for name, _, _ in platform_patches.DSPARK_REBINDS}
+    names = ("mhc_post_tilelang", "hc_collapse_triton", "_insert_context_kv")
+    saved = {name: getattr(module, name) for name in names}
     yield module
     for name, value in saved.items():
         if value is not None:
@@ -64,7 +47,7 @@ def test_upstream_dspark_contract(upstream_dspark):
     alias would make the rebind a silent no-op -- the drafter would build,
     load and then fail in its first forward.
     """
-    for name, _, _ in platform_patches.DSPARK_REBINDS:
+    for name in ("mhc_post_tilelang", "hc_collapse_triton", "_insert_context_kv"):
         assert hasattr(upstream_dspark, name), f"{name} is gone from upstream"
 
     model_forward = inspect.getsource(upstream_dspark.DSparkDeepseekV4Model.forward)
@@ -75,38 +58,29 @@ def test_upstream_dspark_contract(upstream_dspark):
     assert "_insert_context_kv(" in precompute
 
 
-def test_package_import_puts_every_rebind_in_force():
-    """The production path: import the package, get all three."""
-    assert platform_patches.dspark_rebinds_in_force() == []
+def test_drafter_binds_hardware_calls_before_upstream_construction(upstream_dspark, monkeypatch):
+    from vllm_ascend.models.deepseek_v4_1.mhc import mhc_post_ascend
+
+    observed = []
+
+    def construct(self, **kwargs):
+        observed.append(
+            (upstream_dspark.mhc_post_tilelang, upstream_dspark.hc_collapse_triton, upstream_dspark._insert_context_kv)
+        )
+
+    monkeypatch.setattr(upstream_dspark.DSparkDeepseekV4ForCausalLM, "__init__", construct)
+    for _ in range(2):
+        dspark.AscendDSparkDeepseekV41ForCausalLM(vllm_config=None)
+    assert observed == [(mhc_post_ascend, dspark.hc_collapse_ascend, dspark.insert_context_kv_ascend)] * 2
 
 
-def test_rebind_is_idempotent(upstream_dspark):
-    platform_patches.rebind_dspark_functions()
-    assert platform_patches.rebind_dspark_functions() == []
-    assert platform_patches.dspark_rebinds_in_force() == []
-
-
-def test_rebind_raises_when_a_name_is_gone(upstream_dspark, monkeypatch):
-    monkeypatch.delattr(upstream_dspark, "hc_collapse_triton")
-    with pytest.raises(AttributeError, match="no longer defines"):
-        platform_patches.rebind_dspark_functions()
-
-
-def test_apply_all_reports_the_dspark_rebinds():
-    applied = platform_patches.apply_all()
-    assert isinstance(applied, list)
-    # apply_all is idempotent, so a second call reports nothing newly rebound;
-    # what must hold either way is that the names are in force.
-    assert platform_patches.dspark_rebinds_in_force() == []
-
-
-def test_drafter_refuses_to_build_without_the_rebinds(upstream_dspark, monkeypatch):
-    """The assert in the constructor, which is the last line of defence."""
-    from vllm_ascend.models.deepseek_v4_1.dspark import AscendDSparkDeepseekV41ForCausalLM
-
-    monkeypatch.setattr(upstream_dspark, "hc_collapse_triton", lambda *a: None)
-    with pytest.raises(RuntimeError, match="rebinds are not in force"):
-        AscendDSparkDeepseekV41ForCausalLM(vllm_config=None)
+def test_target_platform_patches_do_not_modify_the_drafter(upstream_dspark, monkeypatch):
+    names = ("mhc_post_tilelang", "hc_collapse_triton", "_insert_context_kv")
+    sentinels = {name: object() for name in names}
+    for name, value in sentinels.items():
+        monkeypatch.setattr(upstream_dspark, name, value)
+    platform_patches.apply_all()
+    assert all(getattr(upstream_dspark, name) is value for name, value in sentinels.items())
 
 
 # --- 2. the collapse, numerically -------------------------------------------
@@ -120,7 +94,7 @@ def test_hc_collapse_matches_the_reference_sum():
     x = torch.randn(tokens, hc, hidden, dtype=torch.bfloat16)
     pre_mix = torch.randn(tokens, hc, dtype=torch.float32)
 
-    got = dspark_ops.hc_collapse_ascend(x, pre_mix)
+    got = dspark.hc_collapse_ascend(x, pre_mix)
     want = (pre_mix.unsqueeze(-1) * x.float()).sum(dim=1).to(x.dtype)
 
     assert got.shape == (tokens, hidden)
@@ -140,7 +114,7 @@ def test_hc_collapse_refuses_swapped_arguments():
     x = torch.randn(5, 4, 16, dtype=torch.bfloat16)
     pre_mix = torch.randn(5, 4, dtype=torch.float32)
     with pytest.raises(ValueError, match="expected \\(tokens, hc, hidden\\)"):
-        dspark_ops.hc_collapse_ascend(pre_mix, x)
+        dspark.hc_collapse_ascend(pre_mix, x)
 
 
 def test_hc_collapse_refuses_mismatched_token_counts():
@@ -149,7 +123,7 @@ def test_hc_collapse_refuses_mismatched_token_counts():
     x = torch.randn(5, 4, 16, dtype=torch.bfloat16)
     pre_mix = torch.randn(6, 4, dtype=torch.float32)
     with pytest.raises(ValueError, match="first two axes must agree"):
-        dspark_ops.hc_collapse_ascend(x, pre_mix)
+        dspark.hc_collapse_ascend(x, pre_mix)
 
 
 # --- 3. the routing ---------------------------------------------------------
@@ -389,7 +363,7 @@ def test_context_insert_rotates_tail_and_leaves_invalid_slots_untouched():
     rotated[-4:] = torch.tensor([-3, 2, -5, 4], dtype=torch.bfloat16)
     expected[1, 2] = rotated
     expected[2, 3] = rotated
-    dspark_ops.insert_context_kv_ascend(
+    dspark.insert_context_kv_ascend(
         _context_attention(cache),
         kv,
         torch.tensor([0, 1, 2]),
@@ -403,7 +377,7 @@ def test_context_insert_refuses_an_unimplemented_cache_dtype():
 
     cache = torch.zeros(3, 8, 512, dtype=torch.uint8)
     with pytest.raises(NotImplementedError, match="bf16 SWA cache"):
-        dspark_ops.insert_context_kv_ascend(_context_attention(cache), None, None, None)
+        dspark.insert_context_kv_ascend(_context_attention(cache), None, None, None)
 
 
 def test_context_insert_refuses_a_mismatched_page_size():
@@ -411,4 +385,36 @@ def test_context_insert_refuses_a_mismatched_page_size():
 
     cache = torch.zeros(3, 8, 512, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="layer declares"):
-        dspark_ops.insert_context_kv_ascend(_context_attention(cache, block_size=16), None, None, None)
+        dspark.insert_context_kv_ascend(_context_attention(cache, block_size=16), None, None, None)
+
+
+@pytest.mark.parametrize("paired_slots", [False, True])
+@pytest.mark.parametrize("tokens", [0, 1, 5])
+def test_context_only_insert_matches_the_target_prolog_without_a_dummy_query(paired_slots, tokens):
+    import torch
+
+    from vllm_ascend.models.deepseek_v4_1.qkv_prolog import qnorm_rope_kv_insert
+
+    torch.manual_seed(918)
+    cache = torch.randn(3, 8, 512, dtype=torch.bfloat16)
+    expected = cache.clone()
+    attn = _context_attention(cache)
+    kv = torch.randn(tokens, 512, dtype=torch.bfloat16)
+    original_kv = kv.clone()
+    positions = torch.arange(tokens)
+    slots = torch.tensor([10, -1, 19, 12, 23], dtype=torch.int32)[:tokens]
+    if paired_slots:
+        slots = torch.stack((slots // 8, slots % 8), dim=-1)
+    qnorm_rope_kv_insert(
+        q=torch.zeros(tokens, attn.n_local_heads, attn.head_dim, dtype=kv.dtype),
+        kv=kv,
+        positions=positions,
+        cos_sin_cache=attn.rotary_emb.cos_sin_cache,
+        swa_kv_cache=expected,
+        slot_mapping=slots,
+        eps=attn.eps,
+        rope_head_dim=attn.rope_head_dim,
+    )
+    dspark.insert_context_kv_ascend(attn, kv, positions, slots)
+    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+    torch.testing.assert_close(kv, original_kv, rtol=0, atol=0)
