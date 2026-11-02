@@ -7,7 +7,7 @@ serves a model that otherwise needs four.
 
 Follow the steps in order; each one depends on the previous. At a glance:
 
-```
+```text
 1  container image        check yours against the versions listed
 2  source trees           vllm (fork, pinned) + this repo
 3  build artifacts        vllm_ascend_C*.so, custom vendor, _version.py
@@ -126,7 +126,7 @@ an editable `vllm`/`vllm-ascend`, these shadow it.
 
 `vllm_ascend/` needs three gitignored products that a fresh clone does not have:
 
-```
+```text
 vllm_ascend/vllm_ascend_C*.so
 vllm_ascend/_cann_ops_custom/vendors/custom_transformer/
 vllm_ascend/_version.py
@@ -174,7 +174,7 @@ model.
 Three wheels, obtained from your Ascend vendor alongside the model -- they are
 not on PyPI and are not part of CANN. The versions this was validated with:
 
-```
+```text
 cannbotdsl-0.5.0-cp312-cp312-manylinux_2_28_x86_64.whl
 cann_ops_transformer-1.0.0-py3-none-any.whl
 cannbot_arena_net_ops-0.1.0-cp312-cp312-linux_x86_64.whl
@@ -241,7 +241,7 @@ against the byte counts in the checkpoint header.
 
 Four files must be present:
 
-```
+```text
 layers.1.engram.embed.weight.bin    98,305,579,008 B
 layers.1.engram.embed.scale.bin      3,072,049,344 B
 layers.14.engram.embed.weight.bin   98,308,270,592 B
@@ -404,13 +404,18 @@ low-latency profile with these additional arguments:
 export CARD=4  # choose an idle physical device on your host
 npu-smi info -t proc-mem -i "$CARD"
 
-export EXTRA_ARGS='--language-model-only --no-async-scheduling --compilation-config {"cudagraph_capture_sizes":[6],"max_cudagraph_capture_size":6} --speculative-config {"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}'
+export K=5  # K=2 is also validated; keep a target graph of size K+1
+export EXTRA_ARGS="--language-model-only --seed 0 --compilation-config {\"cudagraph_capture_sizes\":[1,2,3,6],\"max_cudagraph_capture_size\":6} --speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$K,\"enforce_eager\":true}"
 bash examples/kt_moe_offload/serve_lowlatency.sh
 ```
 
 This configuration uses one request at a time, a maximum model length of 8192,
-bf16 KV, eager draft execution, and a six-token target verification graph.
-Async scheduling and multi-card DSpark have not been validated for this path.
+bf16 KV, eager draft execution, and target verification graphs of size three
+(K=2) and six (K=5). Default asynchronous scheduling was validated on
+2026-10-29; the original 2026-10-21 smoke run used synchronous scheduling.
+Keep at most four capture sizes: adding a fifth entry to `[1,2,3,4,6]` can
+remove size three and prevent K=2 from starting. Multi-card DSpark remains
+unverified.
 
 Check for three startup messages containing
 `DSpark draft expert placement: local=128 logical=128 kt_offload=None` and
@@ -450,6 +455,22 @@ workload. The non-DSpark latency and accuracy results elsewhere in this document
 do not apply to this configuration. Multimodal end-to-end generation remains
 unverified despite coverage of the shared vision index builder.
 
+#### CPU expert weight reuse and later validation
+
+The optional CPU optimization is carried in the separate kt-kernel repository;
+see [the validation and dependency notes](dspark_validation.md). Within each
+expert, it shares weight loading and dequantization across M=2..6 routed tokens.
+M=1 and M>6 retain their existing paths. M counts tokens routed to that expert,
+so it does not necessarily equal K+1. Rebuild kt-kernel and point `KT_SITE` at
+the new installation; updating vllm-ascend alone does not install this kernel.
+
+The original kernel passed 483 bitwise regression cases, and a same-K service
+comparison returned identical token IDs at all 1,536 tested positions. The
+measured whole-model throughput varied between the before and after baselines,
+so these results do not establish a stable model speedup. Later K2/K5 LongBench
+samples exercised asynchronous scheduling, but their generated token sequences
+were different and do not establish a complete benchmark quality score.
+
 On a shared host, release only the Engram staging files and mounts owned by
 your run. The smoke check reused existing Engram tables through a read-only
 mount; after stopping its service and container, the device and port were free
@@ -480,7 +501,7 @@ PORT=8000 CONCURRENCY=1 REQUESTS=5 PROMPT_TOKENS=4096 GEN_TOKENS=128 \
 
 On the low-latency profile, one card, 4096 in / 128 out at concurrency 1:
 
-```
+```text
 TTFT  mean 21.40 s    TPOT  mean 22.57 ms   (5 requests, TPOT spread 0.22 ms)
 ```
 
