@@ -393,9 +393,9 @@ usually still doing that.
 
 DeepSeek-V4.1-Flash includes three DSpark draft layers in the target checkpoint's
 `mtp.*` tensors. Each draft layer keeps all 128 routed experts in HBM; its
-`kt_offload` is `None`. The target's 40 layers continue to use the configured
-100 resident expert slots and CPU offload. The draft tensors total about
-7.39 GiB, including about 6.72 GiB of expert weights.
+`kt_offload` is `None`. The target's 40 layers retain 100 resident expert slots
+and CPU offload. The draft weights add about 7.39 GiB of HBM; no separate
+checkpoint is required.
 
 After completing the setup above, select an idle physical card and use the
 low-latency profile with these additional arguments:
@@ -404,18 +404,17 @@ low-latency profile with these additional arguments:
 export CARD=4  # choose an idle physical device on your host
 npu-smi info -t proc-mem -i "$CARD"
 
-export K=5  # K=2 is also validated; keep a target graph of size K+1
+export K=5  # use 2 for K2; keep a target graph of size K+1
 export EXTRA_ARGS="--language-model-only --seed 0 --compilation-config {\"cudagraph_capture_sizes\":[1,2,3,6],\"max_cudagraph_capture_size\":6} --speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$K,\"enforce_eager\":true}"
 bash examples/kt_moe_offload/serve_lowlatency.sh
 ```
 
 This configuration uses one request at a time, a maximum model length of 8192,
 bf16 KV, eager draft execution, and target verification graphs of size three
-(K=2) and six (K=5). Default asynchronous scheduling was validated on
-2026-10-29; the original 2026-10-21 smoke run used synchronous scheduling.
-Keep at most four capture sizes: adding a fifth entry to `[1,2,3,4,6]` can
-remove size three and prevent K=2 from starting. Multi-card DSpark remains
-unverified.
+(K=2) and six (K=5). It leaves asynchronous scheduling at its default,
+historically enabled in the pinned runtime. Keep at most four capture sizes: `[1,2,3,4,6]` can
+lose size three during normalization and prevent K2 from starting.
+The stream-prefill threshold defaults to 512 tokens.
 
 With target offload enabled, check for three startup messages containing
 `kt_offload: ... keeps all 128 draft experts in HBM` and
@@ -426,55 +425,20 @@ curl --noproxy '*' -s "http://127.0.0.1:$PORT/metrics" \
   | sed -n '/^vllm:spec_decode_.*_total/p'
 ```
 
-The initial 2026-10-21 run accepted only 2 of 1270 proposed tokens (0.1575%).
-The cause was the original-KV index space: SparseFlashMla expects logical token
-positions within each request and applies `ori_block_table` itself. Passing
-physical KV slots applied the page mapping twice and read unrelated cache pages.
-The DSpark and vision index builders now select logical indices for this
-backend; the legacy shared-KV backend retains physical slots.
+SparseFlashMla requires logical token positions and applies the KV page table
+itself; the legacy shared-KV backend requires physical slots. The index fix
+and its shuffled-page negative control are described in the
+[validation notes](dspark_validation.md), alongside exact tested versions.
+The current simplified adapter has isolated CPU coverage; a fresh native NPU
+validation is pending. Earlier generation and attention results do not validate
+this adapter revision or establish model-quality or acceleration claims.
+Multi-card and multimodal end-to-end generation remain unverified.
 
-A controlled comparison using the same prompt and no tracing accepted 0/290
-tokens before the fix and 35/120 afterward, with identical generated text.
-Captured attention outputs from all three draft layers then matched the CPU
-reference with cosine similarity at least 0.999994 and maximum absolute error
-0.010446. A native NPU regression checks two nonidentity page permutations
-against a dense reference and confirms that the old physical indices fail.
-
-A fresh service using the final source on physical device 4 passed all five
-generation smoke checks: arithmetic (`391`), Chinese text, streamed primes
-(`2, 3, 5, 7, 11`), a 2101-token prefill returning `7391`, and 192-token
-generation. **120 drafts proposed 600 tokens and accepted 142 (23.67%)**;
-per-position accepted counts were `[74, 40, 19, 7, 2]`. All three draft layers
-reported 128 experts in HBM and no kt offload. The targeted suite passed 280
-unit tests plus the native NPU regression. The final service used no attention
-tracing, worker extension, or development RPC endpoint.
-
-These are functional and attention-correctness checks, not a representative
-quality evaluation or acceleration benchmark. Acceptance depends on the
-workload. The non-DSpark latency and accuracy results elsewhere in this document
-do not apply to this configuration. Multimodal end-to-end generation remains
-unverified despite coverage of the shared vision index builder.
-
-#### CPU expert weight reuse and later validation
-
-The optional CPU optimization is carried in the separate kt-kernel repository;
-see [the validation and dependency notes](dspark_validation.md). Within each
-expert, it shares weight loading and dequantization across M=2..6 routed tokens.
-M=1 and M>6 retain their existing paths. M counts tokens routed to that expert,
-so it does not necessarily equal K+1. Rebuild kt-kernel and point `KT_SITE` at
-the new installation; updating vllm-ascend alone does not install this kernel.
-
-The original kernel passed 483 bitwise regression cases, and a same-K service
-comparison returned identical token IDs at all 1,536 tested positions. The
-measured whole-model throughput varied between the before and after baselines,
-so these results do not establish a stable model speedup. Later K2/K5 LongBench
-samples exercised asynchronous scheduling, but their generated token sequences
-were different and do not establish a complete benchmark quality score.
-
-On a shared host, release only the Engram staging files and mounts owned by
-your run. The smoke check reused existing Engram tables through a read-only
-mount; after stopping its service and container, the device and port were free
-and the original shared files were unchanged.
+CPU expert weight reuse is an optional, separate
+[kt-kernel change](https://github.com/wenxuewuhd/ktransformers-AK/pull/1).
+Build that branch and set `KT_SITE` to its installation to use it; the existing
+kernel is sufficient for functional DSpark execution. On a shared host, release
+only Engram staging files and mounts owned by your run.
 
 ## 8. Check it is actually serving
 
