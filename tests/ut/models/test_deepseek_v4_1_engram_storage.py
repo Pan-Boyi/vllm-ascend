@@ -108,15 +108,18 @@ def test_partial_reads_and_writes_are_completed():
     assert destination.getvalue() == b"0123456789"
     assert digest == hashlib.sha256(b"0123456789").hexdigest()
     assert storage._hash_exact(SmallReads(b"0123456789"), 10, 7) == digest
+    assert storage._read_exact(SmallReads(b"0123456789"), 10) == b"0123456789"
 
 
-@pytest.mark.parametrize("operation", ["copy", "hash"])
+@pytest.mark.parametrize("operation", ["copy", "hash", "metadata"])
 def test_short_source_never_silently_zero_fills(operation):
     with pytest.raises(ValueError, match="short read"):
         if operation == "copy":
             storage._copy_exact(io.BytesIO(b"abc"), io.BytesIO(), 4, 3)
-        else:
+        elif operation == "hash":
             storage._hash_exact(io.BytesIO(b"abc"), 4, 3)
+        else:
+            storage._read_exact(io.BytesIO(b"abc"), 4)
 
 
 def test_zero_write_is_a_failure():

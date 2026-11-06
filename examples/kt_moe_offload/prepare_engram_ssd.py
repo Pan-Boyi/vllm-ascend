@@ -34,14 +34,9 @@ def main():
                 "status": "verified" if args.verify else "prepared",
                 "manifest": str(Path(args.output).resolve() / "manifest.json"),
                 "total_bytes": sum(t["nbytes"] for t in manifest["tables"].values()),
-                "tables": {
-                    name: {"nbytes": entry["nbytes"], "sha256": entry["sha256"]}
-                    for name, entry in manifest["tables"].items()
-                },
                 "warning": "Full hashing warms the page cache; establish cold state "
                 "separately before SSD cold measurements.",
             },
-            sort_keys=True,
         ),
         flush=True,
     )

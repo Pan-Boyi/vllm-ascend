@@ -16,6 +16,7 @@ import stat
 import struct
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA = "vllm-ascend-engram-ssd"
@@ -39,23 +40,39 @@ def _stat_identity(value) -> dict:
     return {key: getattr(value, f"st_{key}") for key in STAT_FIELDS}
 
 
+@contextmanager
 def _open_readonly(path):
-    return os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path}: not a regular file")
+        # Metadata reads must not prefetch bytes beyond a safetensors header.
+        with os.fdopen(fd, "rb", buffering=0, closefd=False) as handle:
+            yield handle
+    finally:
+        os.close(fd)
+
+
+def _read_exact(handle, nbytes):
+    chunks = []
+    while nbytes:
+        chunk = handle.read(nbytes)
+        if not chunk:
+            raise ValueError("short read: incomplete metadata")
+        chunks.append(chunk)
+        nbytes -= len(chunk)
+    return b"".join(chunks)
 
 
 def _read_json(path):
-    fd = _open_readonly(path)
-    try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_METADATA_BYTES:
+    with _open_readonly(path) as handle:
+        before = os.fstat(handle.fileno())
+        if before.st_size > MAX_METADATA_BYTES:
             raise ValueError(f"invalid or oversized metadata file: {path}")
-        with os.fdopen(os.dup(fd), "rb") as handle:
-            raw = handle.read(MAX_METADATA_BYTES + 1)
-        if _stat_identity(before) != _stat_identity(os.fstat(fd)):
+        raw = _read_exact(handle, before.st_size)
+        if _stat_identity(before) != _stat_identity(os.fstat(handle.fileno())):
             raise ValueError(f"metadata changed while reading: {path}")
         return json.loads(raw), raw, _stat_identity(before)
-    finally:
-        os.close(fd)
 
 
 def _integer(value):
@@ -71,11 +88,9 @@ def _check_stat(value):
         raise ValueError("invalid file stat identity in Engram manifest")
 
 
-def _validate_entry(name, entry):
-    if not isinstance(entry, dict):
-        raise ValueError(f"{name}: invalid manifest table")
+def _table_shape(name, entry, origin="manifest"):
     dtype, width = TABLE_TYPES[name.rsplit(".", 1)[-1]]
-    shape = entry.get("shape")
+    shape = entry.get("shape") if isinstance(entry, dict) else None
     if (
         not isinstance(shape, list)
         or len(shape) != 2
@@ -83,7 +98,12 @@ def _validate_entry(name, entry):
         or shape[1] != width
         or entry.get("dtype") != dtype
     ):
-        raise ValueError(f"{name}: invalid shape or dtype")
+        raise ValueError(f"{name}: {origin} shape or dtype mismatch")
+    return shape
+
+
+def _validate_entry(name, entry):
+    shape = _table_shape(name, entry)
     if entry.get("file") != staged_file_name(name):
         raise ValueError(f"{name}: invalid table filename")
     if entry.get("nbytes") != shape[0] * shape[1]:
@@ -120,47 +140,24 @@ def _checkpoint_specs(checkpoint_dir):
         if not isinstance(shard, str) or Path(shard).name != shard:
             raise ValueError(f"{name}: missing or unsafe checkpoint shard")
         if shard not in shards:
-            fd = _open_readonly(directory / shard)
-            try:
-                before = os.fstat(fd)
-                if not stat.S_ISREG(before.st_mode):
-                    raise ValueError(f"{shard}: checkpoint shard is not a regular file")
-                prefix = os.read(fd, 8)
-                if len(prefix) != 8:
-                    raise ValueError(f"{shard}: truncated safetensors header")
+            with _open_readonly(directory / shard) as handle:
+                before = os.fstat(handle.fileno())
+                prefix = _read_exact(handle, 8)
                 length = struct.unpack("<Q", prefix)[0]
                 if length > MAX_METADATA_BYTES or length > before.st_size - 8:
                     raise ValueError(f"{shard}: invalid safetensors header size")
-                chunks = []
-                remaining = length
-                while remaining:
-                    chunk = os.read(fd, remaining)
-                    if not chunk:
-                        raise ValueError(f"{shard}: short safetensors header")
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                header_raw = b"".join(chunks)
+                header_raw = _read_exact(handle, length)
                 header = json.loads(header_raw)
-                if _stat_identity(before) != _stat_identity(os.fstat(fd)):
+                if _stat_identity(before) != _stat_identity(os.fstat(handle.fileno())):
                     raise ValueError(f"{shard}: checkpoint changed while reading")
                 shards[shard] = (header, 8 + length, before, hashlib.sha256(header_raw).hexdigest())
-            finally:
-                os.close(fd)
         header, base, source_stat, header_sha = shards[shard]
         tensor = header.get(name)
         if not isinstance(tensor, dict):
             raise ValueError(f"{name}: missing safetensors tensor")
         dtype, width = TABLE_TYPES[name.rsplit(".", 1)[-1]]
-        shape = tensor.get("shape")
+        shape = _table_shape(name, tensor, "checkpoint")
         offsets = tensor.get("data_offsets")
-        if (
-            not isinstance(shape, list)
-            or len(shape) != 2
-            or not all(_integer(dim) and dim > 0 for dim in shape)
-            or shape[1] != width
-            or tensor.get("dtype") != dtype
-        ):
-            raise ValueError(f"{name}: checkpoint shape or dtype mismatch")
         if (
             not isinstance(offsets, list)
             or len(offsets) != 2
@@ -320,19 +317,10 @@ def _fsync_directory(directory):
 
 
 def _publish(source, destination):
-    # renameat2(RENAME_NOREPLACE) provides an atomic rename without silently
-    # overwriting even if a non-cooperating process creates the destination.
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise RuntimeError("atomic publication requires Linux renameat2")
-    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    renameat2.restype = ctypes.c_int
-    at_fdcwd = -100
-    rename_noreplace = 1
-    if renameat2(at_fdcwd, os.fsencode(source), at_fdcwd, os.fsencode(destination), rename_noreplace) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), str(destination))
+    # Both paths share a directory. link publishes a verified file atomically
+    # without replacing an existing name; a crash leaves an incomplete set.
+    os.link(source, destination, follow_symlinks=False)
+    source.unlink()
 
 
 def _write_json_atomic(path, payload):
@@ -396,37 +384,29 @@ def prepare_tables(checkpoint_dir, output_dir, chunk_bytes=DEFAULT_CHUNK_BYTES, 
             destination = output / spec["file"]
             partial = output / (spec["file"] + ".partial")
             source_path = Path(checkpoint_dir) / spec["source"]["shard"]
-            source_fd = _open_readonly(source_path)
-            try:
-                if _stat_identity(os.fstat(source_fd)) != spec["source"]["stat"]:
+            with _open_readonly(source_path) as source:
+                if _stat_identity(os.fstat(source.fileno())) != spec["source"]["stat"]:
                     raise ValueError(f"{name}: checkpoint changed before copy")
-                with os.fdopen(os.dup(source_fd), "rb") as source:
-                    source.seek(spec["source"]["data_offset"])
-                    dest_fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(dest_fd, "wb") as dest:
-                        digest = _copy_exact(source, dest, spec["nbytes"], chunk_bytes)
-                        dest.flush()
-                        os.fsync(dest.fileno())
-                if _stat_identity(os.fstat(source_fd)) != spec["source"]["stat"]:
+                source.seek(spec["source"]["data_offset"])
+                dest_fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(dest_fd, "wb") as dest:
+                    digest = _copy_exact(source, dest, spec["nbytes"], chunk_bytes)
+                    dest.flush()
+                    os.fsync(dest.fileno())
+                if _stat_identity(os.fstat(source.fileno())) != spec["source"]["stat"]:
                     raise ValueError(f"{name}: checkpoint changed during copy")
-            finally:
-                os.close(source_fd)
             _report_progress(progress, "copy_complete", name, spec["nbytes"], started)
-            read_fd = _open_readonly(partial)
-            try:
-                readback_stat = _stat_identity(os.fstat(read_fd))
-                with os.fdopen(os.dup(read_fd), "rb") as handle:
-                    if _hash_exact(handle, spec["nbytes"], chunk_bytes) != digest or handle.read(1):
-                        raise ValueError(f"{name}: independent readback SHA256 differs")
-                if os.fstat(read_fd).st_size != spec["nbytes"]:
+            with _open_readonly(partial) as handle:
+                readback_stat = _stat_identity(os.fstat(handle.fileno()))
+                if _hash_exact(handle, spec["nbytes"], chunk_bytes) != digest or handle.read(1):
+                    raise ValueError(f"{name}: independent readback SHA256 differs")
+                if os.fstat(handle.fileno()).st_size != spec["nbytes"]:
                     raise ValueError(f"{name}: destination size differs")
-                if _stat_identity(os.fstat(read_fd)) != readback_stat:
+                if _stat_identity(os.fstat(handle.fileno())) != readback_stat:
                     raise ValueError(f"{name}: destination changed during readback")
                 _report_progress(progress, "readback_complete", name, spec["nbytes"], started)
-                os.fchmod(read_fd, 0o444)
-                os.fsync(read_fd)
-            finally:
-                os.close(read_fd)
+                os.fchmod(handle.fileno(), 0o444)
+                os.fsync(handle.fileno())
             _publish(partial, destination)
             _fsync_directory(output)
             entries[name] = dict(spec, sha256=digest, stat=_stat_identity(destination.stat()))
@@ -474,31 +454,23 @@ def verify_tables(checkpoint_dir, output_dir, chunk_bytes=DEFAULT_CHUNK_BYTES, p
     for name, entry in manifest["tables"].items():
         started = time.monotonic()
         _report_progress(progress, "verify_started", name, entry["nbytes"], started)
-        table_fd = _open_readonly(output / entry["file"])
-        try:
-            before = os.fstat(table_fd)
+        with _open_readonly(output / entry["file"]) as table:
+            before = os.fstat(table.fileno())
             validate_table(manifest, name, before, *entry["shape"])
-            with os.fdopen(os.dup(table_fd), "rb") as table:
-                digest = _hash_exact(table, entry["nbytes"], chunk_bytes)
+            digest = _hash_exact(table, entry["nbytes"], chunk_bytes)
             if digest != entry["sha256"]:
                 raise ValueError(f"{name}: staged SHA256 differs from manifest")
-            if _stat_identity(before) != _stat_identity(os.fstat(table_fd)):
+            if _stat_identity(before) != _stat_identity(os.fstat(table.fileno())):
                 raise ValueError(f"{name}: staged file changed during verification")
-        finally:
-            os.close(table_fd)
-        source_fd = _open_readonly(Path(checkpoint_dir) / entry["source"]["shard"])
-        try:
-            if _stat_identity(os.fstat(source_fd)) != entry["source"]["stat"]:
+        with _open_readonly(Path(checkpoint_dir) / entry["source"]["shard"]) as source:
+            if _stat_identity(os.fstat(source.fileno())) != entry["source"]["stat"]:
                 raise ValueError(f"{name}: checkpoint file changed")
-            with os.fdopen(os.dup(source_fd), "rb") as source:
-                source.seek(entry["source"]["data_offset"])
-                digest = _hash_exact(source, entry["nbytes"], chunk_bytes)
+            source.seek(entry["source"]["data_offset"])
+            digest = _hash_exact(source, entry["nbytes"], chunk_bytes)
             if digest != entry["sha256"]:
                 raise ValueError(f"{name}: checkpoint SHA256 differs from manifest")
-            if _stat_identity(os.fstat(source_fd)) != entry["source"]["stat"]:
+            if _stat_identity(os.fstat(source.fileno())) != entry["source"]["stat"]:
                 raise ValueError(f"{name}: checkpoint changed during verification")
-        finally:
-            os.close(source_fd)
         _report_progress(progress, "verified", name, entry["nbytes"], started)
     _assert_checkpoint_stable(checkpoint_dir, checkpoint, specs)
     return manifest
