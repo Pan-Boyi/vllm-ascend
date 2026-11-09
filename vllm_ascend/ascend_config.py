@@ -34,6 +34,7 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.kt_offload.config import KTOffloadConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -640,6 +641,8 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    # Optional single-card CPU/NPU expert execution; disabled by default.
+    kt_offload_config: KTOffloadConfig = dataclasses.field(default_factory=KTOffloadConfig)
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1926,6 +1929,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    new_config.kt_offload_config._validate_preconditions(vllm_config)
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config

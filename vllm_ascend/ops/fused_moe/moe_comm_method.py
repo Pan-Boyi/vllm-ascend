@@ -228,10 +228,20 @@ class AllGatherCommImpl(MoECommMethod):
     """
 
     def _get_token_dispatcher(self):
+        try:
+            offload_config = getattr(get_ascend_config(), "kt_offload_config", None)
+        except RuntimeError:
+            offload_config = None
+        dispatcher_kwargs = {}
+        if getattr(offload_config, "enabled", False) is True:
+            # Match the CPU and streamed expert paths without changing the
+            # default precision policy used by existing all-gather models.
+            dispatcher_kwargs["preserve_router_weights_fp32"] = True
         return TokenDispatcherWithAllGather(
             top_k=self.moe_config.experts_per_token,
             num_experts=self.moe_config.num_experts,
             num_local_experts=self.moe_config.num_local_experts,
+            **dispatcher_kwargs,
         )
 
     def _get_prepare_finalize(self):

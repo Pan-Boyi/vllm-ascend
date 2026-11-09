@@ -54,6 +54,7 @@ from vllm_ascend.ascend_config import (
 )
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.kt_offload.config import KTOffloadConfig
 from vllm_ascend.utils import clear_enable_sp, enable_sp, shared_expert_dp_enabled
 
 
@@ -379,6 +380,64 @@ class TestAscendConfig(TestBase):
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertFalse(ascend_config.rl_config.enabled)
+        self.assertIsInstance(ascend_config.kt_offload_config, KTOffloadConfig)
+        self.assertFalse(ascend_config.kt_offload_config.enabled)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_kt_offload_nested_config_coerces_values_and_runs_preconditions(self, mock_fix):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "kt_offload_config": {
+                "enabled": "true",
+                "num_resident_experts": "2",
+                "cpuinfer_threads": "8",
+                "stream_prefill": "false",
+                "zerocopy_w13": "false",
+            }
+        }
+        # Isolate factory wiring from runtime dependency probes. The config's
+        # scalar validators still run while constructing the nested dataclass.
+        with patch.object(KTOffloadConfig, "_validate_preconditions", autospec=True) as validate:
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        cfg = ascend_config.kt_offload_config
+        self.assertIsInstance(cfg, KTOffloadConfig)
+        self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.num_resident_experts, 2)
+        self.assertEqual(cfg.cpuinfer_threads, 8)
+        self.assertFalse(cfg.stream_prefill)
+        self.assertFalse(cfg.zerocopy_w13)
+        validate.assert_called_once_with(cfg, test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_disabled_kt_offload_does_not_probe_optional_runtime(self, mock_fix):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"kt_offload_config": {"enabled": "false"}}
+        with (
+            patch.object(KTOffloadConfig, "_refuse_without_full_set_load") as fullset_probe,
+            patch.object(KTOffloadConfig, "_refuse_without_zerocopy_support") as zerocopy_probe,
+        ):
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertFalse(ascend_config.kt_offload_config.enabled)
+        fullset_probe.assert_not_called()
+        zerocopy_probe.assert_not_called()
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_kt_offload_factory_rejects_invalid_nested_input(self, mock_fix):
+        for nested, message in (
+            ({"enable": True}, "enable"),
+            ({"enabled": True, "num_resident_experts": 2}, "cpuinfer_threads"),
+            ({"enabled": True, "cpuinfer_threads": 8, "num_resident_experts": 0}, "num_resident_experts"),
+        ):
+            with self.subTest(config=nested):
+                test_vllm_config = VllmConfig()
+                test_vllm_config.additional_config = {"kt_offload_config": nested}
+                with self.assertRaisesRegex(ValueError, message):
+                    init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")

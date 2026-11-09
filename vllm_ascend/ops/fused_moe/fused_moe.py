@@ -430,10 +430,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     router_logits,
                 )
             )
+            # The shared MLP depends on the layer input, so it can run while
+            # CPU experts complete. Keep the ordinary call unchanged when the
+            # layer has not explicitly enabled the deferred merge.
+            defer_kt_merge = getattr(self.routed_experts, "kt_shared_in_window", False) is True
+            routed_kwargs = {"defer_kt_merge": True} if defer_kt_merge else {}
             routed_out, milestones = self.routed_experts.forward_impl(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+                **routed_kwargs,
             )
             assert isinstance(milestones, RoutedMoEMilestones)
             milestones.shared_input_ready = shared_input_ready
@@ -454,4 +460,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     defer_output_wait=defer_shared_output_wait,
                     submitted_gate_up=submitted_gate_up,
                 )
+            if defer_kt_merge:
+                routed_out = self.routed_experts.kt_merge(routed_out)
             return shared_out, routed_out

@@ -351,8 +351,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
 
 class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadata]):
-    def __init__(self, **kwargs):
+    def __init__(self, *, preserve_router_weights_fp32: bool = False, **kwargs):
         super().__init__(**kwargs)
+        # Hybrid CPU/NPU experts and streaming prefill use FP32 router weights.
+        # Resolve this policy once, rather than changing shared state per call.
+        self.preserve_router_weights_fp32 = preserve_router_weights_fp32
         self.max_num_tokens = kwargs.get("max_num_tokens")
         num_experts_local = kwargs.get("num_local_experts", 0)
         self.num_experts_local = (
@@ -454,10 +457,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         )
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
+        router_weights = combine_metadata.topk_weights
+        probs = router_weights.float() if self.preserve_router_weights_fp32 else router_weights.to(hidden_states.dtype)
         final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=combine_metadata.expanded_row_idx,
-            probs=combine_metadata.topk_weights.to(hidden_states.dtype),
+            probs=probs,
         )
         if len(combine_metadata.restore_shape) == 3:
             final_hidden_states = final_hidden_states.view(combine_metadata.restore_shape)

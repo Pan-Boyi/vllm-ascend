@@ -34,6 +34,8 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.kt_offload import expert_counter as _expert_counter
+from vllm_ascend.kt_offload.layer import create_layer_offload
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
@@ -393,6 +395,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     """
 
     moe_counter = -1
+    # Also covers instances constructed through __new__ in CPU unit tests.
+    kt_offload = None
 
     def __init__(
         self,
@@ -400,6 +404,15 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         n_shared_experts: int = 0,
         **kwargs,
     ):
+        # Shrink resident expert weights before the upstream weight owner
+        # allocates them. The helper returns immediately when offload is off.
+        try:
+            ascend_config = get_ascend_config()
+        except RuntimeError:
+            ascend_config = None
+        object.__setattr__(
+            self, "kt_offload", create_layer_offload(ascend_config, RoutedExperts.__init__, args, kwargs)
+        )
         super().__init__(*args, **kwargs)
         if self.quant_config is None:
             # Preserve the pre-refactor BF16 lifecycle: let upstream create
@@ -408,6 +421,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.router: FusedMoERouter | None = None
         ascend_config = get_ascend_config()
         vllm_config = get_current_vllm_config()
+        if _expert_counter.ENABLED:
+            _expert_counter.check_config(vllm_config)
         self.n_shared_experts = n_shared_experts
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.enable_npugraph_ex_static_kernel = ascend_config.ascend_compilation_config.enable_static_kernel
@@ -425,6 +440,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if not self._use_v2_model_runner:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
+        if self.kt_offload is not None:
+            self.kt_offload.attach_after_init(self)
 
         runner_type = getattr(vllm_config.model_config, "runner_type", None)
         if runner_type is None:
@@ -511,6 +528,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         expected_local_num_experts = (
             placement_moe_config.num_experts + self.global_redundant_expert_num
         ) // self.moe_config.ep_size
+        if self.kt_offload is not None:
+            expected_local_num_experts = self.kt_offload.num_slots
         if local_num_experts != expected_local_num_experts:
             raise ValueError(
                 "EPLB local expert capacity mismatch: "
@@ -590,6 +609,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     def get_log2phy_map(self) -> torch.Tensor | None:
         return self.log2phy
 
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        # The upstream loader skips -1. CPU experts must never allocate NPU
+        # weights, and resident experts load directly into their compact slots.
+        if self.kt_offload is not None:
+            return self.kt_offload.placement.slot_of(expert_id)
+        return super()._map_global_expert_id_to_local_expert_id(expert_id)
+
     @property
     def ep_rank(self) -> int:
         return self.moe_config.ep_rank
@@ -623,6 +649,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             router_logits=router_logits,
             input_ids=input_ids,
         )
+        if _expert_counter.ENABLED:
+            # Count logical routes, before placement remapping or the profile
+            # run's synthetic load-balancing routes.
+            _expert_counter.record(self, topk_ids, enable_force_load_balance)
         if self.log2phy is not None:
             topk_ids = self.log2phy[topk_ids]
 
@@ -664,12 +694,30 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
         return topk_weights, topk_ids
 
+    @property
+    def kt_shared_in_window(self) -> bool:
+        """Whether the runner should merge CPU experts after the shared MLP."""
+        kt_offload = self.kt_offload
+        return kt_offload is not None and kt_offload.shared_in_window
+
+    def kt_merge(self, routed_out: torch.Tensor) -> torch.Tensor:
+        """Merge the CPU contribution exactly once for a hybrid forward."""
+        if getattr(self, "_kt_streamed_forward", False):
+            # Streaming computes every expert on the NPU and submits no CPU
+            # work, including when the runner has deferred this merge.
+            return routed_out
+        kt_offload = self.kt_offload
+        if kt_offload is not None:
+            routed_out = kt_offload.merge(routed_out)
+        return routed_out
+
     def forward_impl(
         self,
         *,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        defer_kt_merge: bool = False,
     ):
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice
@@ -709,17 +757,41 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             enable_force_load_balance=enable_force_load_balance,
             input_ids=input_ids,
         )
+        kt_offload = self.kt_offload
+        streamed_out = None
+        if kt_offload is not None:
+            # Streaming owns every expert for this forward. It must fork
+            # before route(), which otherwise submits the same CPU experts.
+            streamed_out = kt_offload.maybe_stream_prefill(
+                self,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                in_profile_run=enable_force_load_balance,
+            )
+        if kt_offload is not None and streamed_out is None:
+            npu_routing = kt_offload.route(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                in_profile_run=enable_force_load_balance,
+            )
+            topk_weights = npu_routing.topk_weights
+            topk_ids = npu_routing.topk_ids
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         try:
-            fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
-            )
+            if streamed_out is not None:
+                fused_experts_results = FusedExpertsResult(routed_out=streamed_out)
+            else:
+                fused_experts_results = self.quant_method.apply(
+                    layer=self,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
         finally:
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None
@@ -773,6 +845,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
+        if kt_offload is not None:
+            self._kt_streamed_forward = streamed_out is not None
+            if streamed_out is None:
+                if not defer_kt_merge:
+                    routed_out = self.kt_merge(routed_out)
 
         # Clear per-forward LoRA state from long-lived singletons.
         if lora_context is not None:

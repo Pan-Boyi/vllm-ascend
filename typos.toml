@@ -42,6 +42,7 @@ DepthWiseSeperableConv1d = "DepthWiseSeperableConv1d"
 depthwise_seperable_CNN = "depthwise_seperable_CNN"
 
 [default.extend-words]
+FULLSET = "FULLSET" # External kt-kernel KT_FULLSET_LOAD interface.
 mata = "mata"
 iy = "iy"
 tendencias = "tendencias"

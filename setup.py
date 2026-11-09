@@ -496,6 +496,7 @@ setup(
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
     package_data={
+        "vllm_ascend.kt_offload": ["poll_native.c"],
         "vllm_ascend.observability.ms_metrics": ["config/*.yaml"],
     },
     python_requires=">=3.10",

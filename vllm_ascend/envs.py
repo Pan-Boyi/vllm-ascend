@@ -29,6 +29,26 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Single-card MoE diagnostics and graph controls. These values are not sensitive.
+    # Expert-count output path (empty disables); dump interval defaults to 200 steps.
+    "VLLM_ASCEND_DSV41_EXPERT_COUNT": lambda: os.getenv("VLLM_ASCEND_DSV41_EXPERT_COUNT", ""),
+    "VLLM_ASCEND_DSV41_EXPERT_COUNT_EVERY": lambda: os.getenv("VLLM_ASCEND_DSV41_EXPERT_COUNT_EVERY", "200"),
+    # Optional logging intervals in seconds; empty disables diagnostics.
+    "VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_HOSTFUNC_LOG", ""),
+    "VLLM_ASCEND_DSV41_KT_SEAM_TIMING": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SEAM_TIMING", ""),
+    # Graph switches accept empty (automatic), 0, or 1. Automatic side-stream,
+    # async-wait, and shared-expert overlap follow the enabled offload runtime;
+    # device signaling stays off unless explicitly requested.
+    "VLLM_ASCEND_DSV41_KT_SIDE_STREAM": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SIDE_STREAM", ""),
+    "VLLM_ASCEND_DSV41_KT_ASYNC_WAIT": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_ASYNC_WAIT", ""),
+    "VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_SHARED_IN_WINDOW", ""),
+    "VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_DEVICE_SIGNAL", ""),
+    # Polling-helper build directory; empty chooses a writable executable cache.
+    "VLLM_ASCEND_DSV41_KT_POLL_CACHE": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_POLL_CACHE", ""),
+    # Optional ACL report-thread CPU: empty disables, auto selects, or use a PU ID.
+    "VLLM_ASCEND_DSV41_KT_REPORT_CPU": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_REPORT_CPU", ""),
+    # Optional SCHED_FIFO priority, 1..99; empty or 0 disables.
+    "VLLM_ASCEND_DSV41_KT_REPORT_FIFO": lambda: os.getenv("VLLM_ASCEND_DSV41_KT_REPORT_FIFO", ""),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

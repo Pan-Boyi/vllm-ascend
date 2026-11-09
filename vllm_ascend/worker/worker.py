@@ -915,6 +915,12 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        # The common worker entry covers both runners without reaching into
+        # their input buffers. Only an armed dynamic-resident runtime reads
+        # scheduler state; other deployments return immediately.
+        from vllm_ascend.kt_offload import prefill_window
+
+        prefill_window.observe(scheduler_output)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if self.use_v2_model_runner and self.model_runner.is_pooling_model and output is None:
             output = self.model_runner.pool()  # type: ignore
@@ -962,6 +968,8 @@ class NPUWorker(WorkerBase):
         return output
 
     def load_model(self) -> None:
+        from vllm_ascend.kt_offload.wiring import setup_placement, setup_streaming
+
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -980,8 +988,13 @@ class NPUWorker(WorkerBase):
         else:
             empty_cache_context = nullcontext()
 
+        # Place mmap-backed CPU expert pages before the loader faults them in.
+        setup_placement(self.vllm_config)
         with context, empty_cache_context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        # Account for the streaming slot before profiling available KV memory.
+        setup_streaming(self.vllm_config)
 
         if getattr(self, "use_v2_model_runner", False) and has_ec_transfer():
             get_ec_transfer().start_worker_services()
