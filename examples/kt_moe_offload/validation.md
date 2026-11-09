@@ -19,9 +19,9 @@ for tests that construct a default `VllmConfig`.
 
 | Coverage | Result |
 | --- | --- |
-| `tests/ut/kt_offload` | 1034 passed, 20 skipped |
+| `tests/ut/kt_offload` | 1037 passed, 20 skipped |
 | Complete configuration, MoE and dispatcher regression tests | 402 passed, 11 skipped |
-| Total executed CPU tests | 1436 passed, 31 skipped |
+| Total executed CPU tests | 1439 passed, 31 skipped |
 
 The skipped tests require NUMA syscalls unavailable under the container's
 seccomp policy, optional real-checkpoint fixtures or other hardware paths.
@@ -35,6 +35,11 @@ cover nested coercion, factory validation, defaults and unsupported settings.
 Streaming tests verify raw E8M0 scale bytes while preserving mainline parameter
 dtypes. Worker tests verify current scheduler metadata reaches both runner
 selections before model dispatch.
+
+Zero-copy startup tests use the real NUMA fraction helper and derive its memory
+requirement from the exact checkpoint tensors selected for placement, including
+resident experts. That placement budget does not cover later Engram or CPU
+kernel allocations; a separate per-node host-memory check is still required.
 
 `bash format.sh ci` passed, including Ruff, spelling, Markdown, shell,
 workflow, secret and repository policy checks. A separate CPU-only wheel

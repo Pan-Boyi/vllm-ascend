@@ -9,6 +9,7 @@ nothing is the failure mode that survives every green test.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -196,6 +197,96 @@ def test_setup_placement_raises_when_the_plan_covers_nothing(monkeypatch):
 
     with pytest.raises(RuntimeError, match="planned 0 pages"):
         wiring.setup_placement(_FakeVllmConfig(), ascend_config=_Ascend())
+
+
+@pytest.mark.parametrize("layers, experts", [(None, None), ([1], [3, 17, 383])])
+def test_setup_placement_derives_from_the_exact_checkpoint_set(monkeypatch, layers, experts):
+    """Exercise the real derivation signature, including the per-NUMA need.
+
+    The default placement covers all 384 experts, including the 100 residents;
+    a caller-supplied subset must size the same set that place_weights receives.
+    Fractions are independent local shares, not a distribution summing to one.
+    """
+    from vllm_ascend.kt_offload import numa_placement, wiring
+
+    layer_ids = list(range(2)) if layers is None else layers
+    expert_ids = list(range(384)) if experts is None else experts
+    projection_bytes = 2304 * 5120 // 2
+    need_per_part = len(layer_ids) * len(expert_ids) * 2 * projection_bytes // 2
+    source = _SizedFakeSource(projection_bytes)
+    seen = {}
+
+    monkeypatch.setattr(wiring, "WeightSource", lambda *a, **k: source)
+    # Leave wiring.derive_fraction real: a permissive mock hid the missing
+    # need_bytes_per_part argument that prevented the default path from starting.
+    monkeypatch.setattr(
+        numa_placement,
+        "read_node_memory",
+        lambda nodes: {
+            2: numa_placement.NodeMemory(2, need_per_part // 4, 1024, 1024),
+            5: numa_placement.NodeMemory(5, 2 * need_per_part, 1024, 1024),
+        },
+    )
+
+    def fake_place(src, placed_layers, placed_experts, **kw):
+        assert src is source
+        seen.update(kw)
+        assert list(placed_layers) == layer_ids
+        assert list(placed_experts) == expert_ids
+        return _FakePlan(), _FakeReport()
+
+    monkeypatch.setattr(wiring, "place_weights", fake_place)
+    cfg = _cfg(
+        zerocopy_w13=True,
+        numa_nodes=[2, 5],
+        zerocopy_reserve_gib=0,
+        zerocopy_streaming_node=5,
+    )
+    cfg._refuse_without_zerocopy_support = lambda: None
+    wiring.setup_placement(
+        _FakeVllmConfig(), ascend_config=SimpleNamespace(kt_offload_config=cfg), layers=layers, experts=experts
+    )
+    assert seen["fraction"] == [0.25, 1.0]
+    assert seen["fraction_source"] == "derived"
+    assert seen["tp"] == 2 and seen["part_nodes"] == [2, 5]
+    assert source.located == {
+        (layer, expert, proj, "weight") for layer in layer_ids for expert in expert_ids for proj in ("w1", "w3")
+    }
+    assert source.closed
+
+
+def test_setup_placement_closes_checkpoint_if_derivation_refuses(monkeypatch):
+    from vllm_ascend.kt_offload import numa_placement, wiring
+
+    source = _SizedFakeSource(2304 * 5120 // 2)
+    monkeypatch.setattr(wiring, "WeightSource", lambda *a, **k: source)
+    monkeypatch.setattr(
+        numa_placement,
+        "read_node_memory",
+        lambda nodes: {n: numa_placement.NodeMemory(n, 0, 0, 0) for n in nodes},
+    )
+    monkeypatch.setattr(wiring, "place_weights", lambda *a, **k: pytest.fail("no memory was granted"))
+    cfg = _cfg(zerocopy_w13=True, zerocopy_streaming_node=0)
+    cfg._refuse_without_zerocopy_support = lambda: None
+    with pytest.raises(numa_placement.PlacementError, match="no node has memory"):
+        wiring.setup_placement(_FakeVllmConfig(), ascend_config=SimpleNamespace(kt_offload_config=cfg))
+    assert source.closed
+
+
+class _SizedFakeSource:
+    num_experts = 384
+
+    def __init__(self, projection_bytes):
+        self.projection_bytes = projection_bytes
+        self.located = set()
+        self.closed = False
+
+    def locate(self, layer, expert, proj, kind):
+        self.located.add((layer, expert, proj, kind))
+        return SimpleNamespace(nbytes=self.projection_bytes)
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeSource:

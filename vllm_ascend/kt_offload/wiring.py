@@ -57,6 +57,7 @@ from vllm_ascend.kt_offload.layer import (
     refuse_after_kv_profile,
 )
 from vllm_ascend.kt_offload.numa_placement import (
+    SPLIT_TENSORS,
     derive_fraction,
     place_weights,
     read_node_memory,
@@ -274,26 +275,6 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
 
     tp = int(cfg.threadpool_count)
     part_nodes = list(cfg.numa_nodes) if cfg.numa_nodes else list(range(tp))
-    if cfg.zerocopy_node_fraction is not None:
-        fraction = list(cfg.zerocopy_node_fraction)
-        source_kind = "configured"
-    else:
-        fraction = derive_fraction(float(cfg.zerocopy_reserve_gib), tp, nodes=part_nodes)
-        source_kind = "derived"
-
-    streaming_node = cfg.zerocopy_streaming_node
-    if streaming_node is None:
-        # w2 and the scales have one consumer (streaming prefill) and are not
-        # split, so they go wherever there is room -- measured, not assumed.
-        mem = read_node_memory(part_nodes)
-        streaming_node = max(
-            part_nodes, key=lambda n: mem[n].available(int(float(cfg.zerocopy_reserve_gib) * (1 << 30)))
-        )
-        streaming_source = "derived"
-    else:
-        streaming_node = int(streaming_node)
-        streaming_source = "configured"
-
     weight_path = cfg.weight_path or vllm_config.model_config.model
     # WeightSource's own default expert count: KTOffloadConfig has no such field
     # (num_resident_experts is a different number).
@@ -305,18 +286,51 @@ def setup_placement(vllm_config, *, ascend_config=None, layers=None, experts=Non
     )
     expert_ids = list(experts) if experts is not None else list(range(source.num_experts))
 
-    logger.info(
-        "kt_offload: placing %d layer(s) x %d experts of %s -- fraction=%s (%s), part_nodes=%s, streaming_node=%d (%s)",
-        len(layer_ids),
-        len(expert_ids),
-        weight_path,
-        [round(f, 4) for f in fraction],
-        source_kind,
-        part_nodes,
-        streaming_node,
-        streaming_source,
-    )
     try:
+        if cfg.zerocopy_node_fraction is not None:
+            fraction = list(cfg.zerocopy_node_fraction)
+            source_kind = "configured"
+        else:
+            # Budget the exact Cartesian set passed to place_weights below.
+            # It includes resident experts too: streaming and a later dynamic
+            # promotion read these same checkpoint pages. Counting only today's
+            # CPU subset would understate the placement's actual fault-in demand.
+            w13_bytes = sum(
+                source.locate(layer, expert, proj, kind).nbytes
+                for layer in layer_ids
+                for expert in expert_ids
+                for proj, kind in SPLIT_TENSORS
+            )
+            fraction = derive_fraction(
+                float(cfg.zerocopy_reserve_gib), tp, nodes=part_nodes, need_bytes_per_part=w13_bytes // tp
+            )
+            source_kind = "derived"
+
+        streaming_node = cfg.zerocopy_streaming_node
+        if streaming_node is None:
+            # w2 and the scales have one consumer (streaming prefill) and are not
+            # split, so they go wherever there is room -- measured, not assumed.
+            mem = read_node_memory(part_nodes)
+            streaming_node = max(
+                part_nodes, key=lambda n: mem[n].available(int(float(cfg.zerocopy_reserve_gib) * (1 << 30)))
+            )
+            streaming_source = "derived"
+        else:
+            streaming_node = int(streaming_node)
+            streaming_source = "configured"
+
+        logger.info(
+            "kt_offload: placing %d layer(s) x %d experts of %s -- fraction=%s (%s), "
+            "part_nodes=%s, streaming_node=%d (%s)",
+            len(layer_ids),
+            len(expert_ids),
+            weight_path,
+            [round(f, 4) for f in fraction],
+            source_kind,
+            part_nodes,
+            streaming_node,
+            streaming_source,
+        )
         plan, report = place_weights(
             source,
             layer_ids,
