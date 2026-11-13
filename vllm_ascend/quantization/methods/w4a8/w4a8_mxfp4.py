@@ -28,7 +28,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
+from vllm_ascend.ops.fused_moe.moe_utils import maybe_normalize_mxfp_scale_layout
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, FP8_METHOD, dispose_tensor
 
@@ -43,6 +43,24 @@ from ..registry import register_scheme
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
+# SwigluGroupQuant reduces complete 256-byte vectors of int64 group counts.
+_SWIGLU_GROUP_INDEX_VECTOR_SIZE = 32
+
+
+def _swiglu_group_index(group_list: torch.Tensor, group_list_type: int) -> torch.Tensor:
+    """Keep the live-row total without exposing a partial native reduction vector."""
+    if group_list.ndim != 1 or group_list.dtype not in (torch.int32, torch.int64):
+        raise ValueError("SwigluGroupQuant needs a one-dimensional integer group list")
+    if group_list_type == 1 or (group_list_type == 0 and group_list.numel() == 0):
+        total = group_list.sum(dim=0, keepdim=True, dtype=torch.int64)
+    elif group_list_type == 0:
+        total = group_list[-1:].to(dtype=torch.int64)
+    else:
+        raise ValueError("SwigluGroupQuant needs count or cumulative group-list encoding")
+    # The native op uses only the sum. Its unrolled reduction reads whole
+    # vectors, so a short final vector can otherwise add uninitialized lanes.
+    # Retain a zero total for empty/dead routing; None would enable dead rows.
+    return torch.cat((total, total.new_zeros(_SWIGLU_GROUP_INDEX_VECTOR_SIZE - 1)))
 
 
 @register_scheme("W4A8_MXFP", "linear")
@@ -476,15 +494,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             )
             return hidden_states, maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
 
-        # The `group_index` input for the `npu_swiglu_group_quant` operator
-        # currently only supports the `count` type. In the current version, the
-        # `npu_swiglu_group_quant` operator performs a summation calculation on
-        # `group_index`. Therefore, under the cumsum type, the last value is directly taken
-        # and Avoid executing two small operators.
-        if mlp_compute_input.group_list_type == 0:
-            group_index = mlp_compute_input.group_list[-1:]
-        else:
-            group_index = cumsum_group_list(mlp_compute_input.group_list, mlp_compute_input.group_list_type, 1)
+        group_index = _swiglu_group_index(mlp_compute_input.group_list, mlp_compute_input.group_list_type)
         hidden_states, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
             hidden_states,
             topk_weight=None,

@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch_npu  # noqa: F401 - registers the NPU backend
 
+from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import _swiglu_group_index
 from vllm_ascend.utils import bootstrap_custom_op_env
 
 
@@ -37,6 +38,36 @@ def check_reference(x, quantized, scale, valid_rows):
     assert torch.isfinite(reconstructed).all()
     # E4M3 quantization and the BF16 activation intermediate both round values.
     assert torch.linalg.vector_norm(reconstructed - reference) / torch.linalg.vector_norm(reference) < 0.05
+
+
+@pytest.mark.parametrize("experts", [100, 384])
+@pytest.mark.parametrize("group_list_type", [0, 1])
+@torch.inference_mode()
+def test_mxfp_total_group_index_uses_product_helper(experts, group_list_type):
+    rows, width = 768, 2304
+    counts = torch.zeros(experts, dtype=torch.int64)
+    counts[0], counts[experts // 2], counts[-1] = 555, 100, 113
+    groups = (counts if group_list_type == 1 else counts.cumsum(0)).to("npu")
+    original_groups = groups.clone()
+    group_index = _swiglu_group_index(groups, group_list_type)
+    torch.testing.assert_close(groups, original_groups, rtol=0, atol=0)
+    assert group_index.dtype == torch.int64 and group_index.device == groups.device
+    assert group_index.shape == (32,)
+    torch.testing.assert_close(group_index.cpu(), torch.tensor([rows] + [0] * 31), rtol=0, atol=0)
+
+    # Fixed BF16 input at the exact failing profile geometry. All rows are live,
+    # so the no-index control is valid here; product routing keeps its total.
+    x = ((torch.arange(rows * 2 * width).reshape(rows, 2 * width) % 97 - 48) / 16).to(
+        device="npu", dtype=torch.bfloat16
+    )
+    expected, expected_scale = quantize(x, None)
+    actual, actual_scale = quantize(x, group_index)
+    torch.npu.synchronize()
+    torch.testing.assert_close(actual.view(torch.uint8).cpu(), expected.view(torch.uint8).cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_scale.view(torch.uint8).cpu(), expected_scale.view(torch.uint8).cpu(), rtol=0, atol=0
+    )
+    check_reference(x, actual, actual_scale, rows)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

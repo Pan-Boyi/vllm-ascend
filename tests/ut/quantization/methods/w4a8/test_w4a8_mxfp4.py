@@ -9,7 +9,60 @@ from tests.ut.quantization.conftest_quantization import create_mock_ascend_confi
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicFusedMoEMethod,
     AscendW4A8MXFPDynamicLinearMethod,
+    _swiglu_group_index,
 )
+
+
+class TestSwigluGroupIndex(TestBase):
+    def test_resident_sizes_have_one_defined_native_vector(self):
+        for experts in (100, 96, 1, 384):
+            for dtype in (torch.int32, torch.int64):
+                counts = torch.arange(experts, dtype=dtype) % 7
+                original = counts.clone()
+                with self.subTest(experts=experts, dtype=dtype):
+                    result = _swiglu_group_index(counts, 1)
+                    self.assertEqual(result.dtype, torch.int64)
+                    self.assertEqual(result.device, counts.device)
+                    self.assertEqual(tuple(result.shape), (32,))
+                    self.assertEqual(result[0], counts.sum())
+                    self.assertEqual(result[1:].count_nonzero(), 0)
+                    torch.testing.assert_close(counts, original)
+
+    def test_count_and_cumulative_encodings_have_same_total(self):
+        counts = torch.tensor([0, 3, 0, 2, 7, 0], dtype=torch.int64)
+        cumulative = counts.cumsum(0)
+        original = cumulative.clone()
+        torch.testing.assert_close(_swiglu_group_index(counts, 1), _swiglu_group_index(cumulative, 0))
+        torch.testing.assert_close(cumulative, original)
+
+    def test_empty_and_zero_routing_remain_zero_not_none(self):
+        for list_type in (0, 1):
+            for experts in (0, 1, 100):
+                with self.subTest(list_type=list_type, experts=experts):
+                    result = _swiglu_group_index(torch.zeros(experts, dtype=torch.int64), list_type)
+                    self.assertEqual(tuple(result.shape), (32,))
+                    self.assertEqual(result.count_nonzero(), 0)
+
+    def test_count_total_does_not_overflow_int32(self):
+        result = _swiglu_group_index(torch.tensor([2**31 - 1, 2**31 - 1], dtype=torch.int32), 1)
+        self.assertEqual(result[0], 2**32 - 2)
+
+    def test_output_keeps_source_device_without_host_scalar_read(self):
+        counts = torch.empty(100, dtype=torch.int64, device="meta")
+        for list_type in (0, 1):
+            self.assertEqual(_swiglu_group_index(counts, list_type).device, counts.device)
+
+    def test_invalid_group_list_contract_is_rejected(self):
+        for groups, list_type in (
+            (torch.ones(3), 1),
+            (torch.ones((2, 2), dtype=torch.int64), 1),
+            (torch.ones(3, dtype=torch.int64), 2),
+        ):
+            with (
+                self.subTest(list_type=list_type, shape=groups.shape, dtype=groups.dtype),
+                self.assertRaises(ValueError),
+            ):
+                _swiglu_group_index(groups, list_type)
 
 
 class TestAscendW4A8MXFP4LinearMethod(TestBase):
@@ -399,6 +452,40 @@ class TestAscendW4A8MXFP4MoEMethod(TestBase):
         for k, shape in inference_shapes.items():
             self.assertEqual(tuple(getattr(layer, k).shape), shape)
         self.assertTrue(layer._mxfp4_transformed)
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.dispose_tensor")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.torch.ops._C_ascend.npu_swiglu_group_quant", create=True)
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.torch_npu")
+    def test_swiglu_total_does_not_replace_gmm_expert_counts(self, mock_npu, mock_swiglu, mock_dispose):
+        counts = torch.zeros(100, dtype=torch.int64)
+        counts[0], counts[-1] = 3, 3
+        mlp_input = Mock(
+            hidden_states=torch.zeros((6, 128), dtype=torch.bfloat16),
+            dynamic_scale=None,
+            layer=nn.Module(),
+            group_list=counts,
+            group_list_type=1,
+            activation=None,
+            swiglu_limit=10.0,
+        )
+        gmm_output = torch.zeros((6, 64), dtype=torch.bfloat16)
+        quantized_output = torch.zeros((6, 32), dtype=torch.uint8)
+        mock_npu.npu_grouped_matmul.return_value = [gmm_output]
+        mock_swiglu.return_value = (quantized_output, None, None)
+        with (
+            patch.object(self.scheme, "_quant_hidden_states", return_value=(mlp_input.hidden_states, None)),
+            patch.object(self.scheme, "_get_mlp_weights", return_value=([Mock()], [Mock()], [Mock()], [Mock()])),
+        ):
+            result, _ = self.scheme.apply_gmm1_act_quant(mlp_input)
+        self.assertIs(result, quantized_output)
+        self.assertIs(mock_npu.npu_grouped_matmul.call_args.kwargs["group_list"], counts)
+        self.assertEqual(mock_npu.npu_grouped_matmul.call_args.kwargs["group_list_type"], 1)
+        self.assertIs(mock_swiglu.call_args.args[0], gmm_output)
+        group_index = mock_swiglu.call_args.kwargs["group_index"]
+        self.assertEqual(group_index[0], 6)
+        self.assertEqual(tuple(group_index.shape), (32,))
+        self.assertEqual(group_index[1:].count_nonzero(), 0)
+        self.assertEqual(mock_swiglu.call_args.kwargs["clamp_value"], 10.0)
 
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.torch_npu")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4._EXTRA_CTX")
