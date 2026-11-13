@@ -143,71 +143,103 @@ def _host_library() -> ctypes.CDLL:
 
 
 class HostUvaBuffer:
-    """Host memory the device gathers from directly."""
+    """Contiguous host storage registered in independently addressed row chunks."""
 
     def __init__(self, shape, dtype, device):
         self.lib = _host_library()
+        self._allocation_pointer = ctypes.c_void_p()
+        self.pointer = ctypes.c_void_p()
+        self.buffer = None
+        self.tensor = None
+        self.ptrs = None
+        self._registered_chunks: list[ctypes.c_void_p] = []
+        self._close_synchronized = False
+        self._closing = False
         rows = int(shape[0])
         row_elements = int(torch.Size(shape[1:]).numel())
         self.row_bytes = row_elements * torch.empty((), dtype=dtype).element_size()
         size = rows * self.row_bytes
+        if rows <= 0 or self.row_bytes <= 0:
+            raise ValueError("HostUvaBuffer needs a nonempty row table")
         # Align the payload to avoid incorrect device reads observed on A3/CANN 9.2;
-        # retain the original allocation for free.
+        # retain the original allocation for free. CHUNK_ROWS also makes every
+        # subsequent chunk start a multiple of this alignment for any row width.
         alignment = 64 * 1024
-        self._allocation_pointer = ctypes.c_void_p()
         rc = self.lib.aclrtMallocHost(ctypes.byref(self._allocation_pointer), size + alignment - 1, 0)
         if rc:
             raise RuntimeError(f"aclrtMallocHost failed: rc={rc} size={size}")
         allocation_address = self._allocation_pointer.value
         if allocation_address is None:
             raise RuntimeError("aclrtMallocHost returned a NULL pointer")
-        self.pointer = ctypes.c_void_p((allocation_address + alignment - 1) // alignment * alignment)
-        self.buffer = (ctypes.c_char * size).from_address(self.pointer.value)
-        self.tensor = torch.frombuffer(self.buffer, dtype=dtype).reshape(shape)
         try:
-            rc = self.lib.aclrtHostRegisterV2(self.pointer, size, DeviceOperator.host_register_flags())
-            if rc:
-                raise RuntimeError(f"aclrtHostRegisterV2 failed: rc={rc} size={size}")
-            address = ctypes.c_void_p()
-            rc = self.lib.aclrtHostGetDevicePointer(self.pointer, ctypes.byref(address), 0)
-            if rc:
-                raise RuntimeError(f"aclrtHostGetDevicePointer failed: rc={rc}")
-            self.ptrs = torch.tensor(
-                [address.value + start * self.row_bytes for start in range(0, rows, CHUNK_ROWS)],
-                dtype=torch.int64,
-                device=device,
-            )
-        except Exception:
-            # A half-built buffer must not leave the host range registered: the
-            # caller only sees the exception, so nothing else can release it.
-            self.lib.aclrtHostUnregister(self.pointer)
-            self.lib.aclrtFreeHost(self._allocation_pointer)
-            self.tensor = None
-            self.buffer = None
-            self.pointer = ctypes.c_void_p()
+            self.pointer = ctypes.c_void_p((allocation_address + alignment - 1) // alignment * alignment)
+            self.buffer = (ctypes.c_char * size).from_address(self.pointer.value)
+            self.tensor = torch.frombuffer(self.buffer, dtype=dtype).reshape(shape)
+            addresses = []
+            flags = DeviceOperator.host_register_flags()
+            for start in range(0, rows, CHUNK_ROWS):
+                pointer = ctypes.c_void_p(self.pointer.value + start * self.row_bytes)
+                chunk_size = min(CHUNK_ROWS, rows - start) * self.row_bytes
+                rc = self.lib.aclrtHostRegisterV2(pointer, chunk_size, flags)
+                if rc:
+                    raise RuntimeError(f"aclrtHostRegisterV2 failed: rc={rc} size={chunk_size} row={start}")
+                # Record ownership before the following alias lookup can fail.
+                self._registered_chunks.append(pointer)
+                address = ctypes.c_void_p()
+                rc = self.lib.aclrtHostGetDevicePointer(pointer, ctypes.byref(address), 0)
+                if rc:
+                    raise RuntimeError(f"aclrtHostGetDevicePointer failed: rc={rc} row={start}")
+                if address.value is None:
+                    raise RuntimeError(f"aclrtHostGetDevicePointer returned a NULL pointer: row={start}")
+                # CANN may publish unrelated device aliases for adjacent host
+                # chunks. The gather kernel already indexes this pointer table.
+                addresses.append(address.value)
+            self.ptrs = torch.tensor(addresses, dtype=torch.int64, device=device)
+        except Exception as error:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                # Keep the allocation owner reachable when rollback cannot
+                # unregister or free it. The caller may retry error.buffer.close().
+                error.buffer = self
+                raise error from cleanup_error
             raise
 
     def close(self):
-        """Unregister and release the host range; safe to call more than once.
+        """Synchronize once, unregister remaining chunks, then free the allocation.
 
-        The NPU gathers out of this range through the device address the
-        registration published, so the mapping must not go away while work that
-        reads it is still in flight.
+        A failed close retains the host allocation and only the registrations
+        still owed to CANN. Retrying close never unregisters a successful chunk
+        twice, and no new gathers may use a buffer once closing has begun.
         """
-        if self.pointer is None or not self.pointer.value:
+        if not self._allocation_pointer.value:
             return
-        if self.ptrs is not None and self.ptrs.device.type == "npu":
-            torch.npu.synchronize()
-        rc = self.lib.aclrtHostUnregister(self.pointer)
-        if rc:
-            raise RuntimeError(f"aclrtHostUnregister failed: rc={rc}")
-        self.tensor = None
-        self.buffer = None
+        self._closing = True
+        if not self._close_synchronized:
+            if self.ptrs is not None and self.ptrs.device.type == "npu":
+                torch.npu.synchronize()
+            self._close_synchronized = True
         self.ptrs = None
+        first_error = None
+        for index in range(len(self._registered_chunks) - 1, -1, -1):
+            try:
+                rc = self.lib.aclrtHostUnregister(self._registered_chunks[index])
+                if rc:
+                    raise RuntimeError(f"aclrtHostUnregister failed: rc={rc}")
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                del self._registered_chunks[index]
+        if first_error is not None:
+            raise first_error
         rc = self.lib.aclrtFreeHost(self._allocation_pointer)
         if rc:
             raise RuntimeError(f"aclrtFreeHost failed: rc={rc}")
+        self.tensor = None
+        self.buffer = None
         self.pointer = ctypes.c_void_p()
+        self._allocation_pointer = ctypes.c_void_p()
 
 
 def gather_dequantize_host_uva(
@@ -227,6 +259,13 @@ def gather_dequantize_host_uva(
     Returns ``[tokens * pad_heads, width]``; the head path views it as
     ``[tokens, pad_heads, width]``.
     """
+
+    if (
+        getattr(codes, "_closing", False)
+        or codes.ptrs is None
+        or (scales is not None and (getattr(scales, "_closing", False) or scales.ptrs is None))
+    ):
+        raise RuntimeError("HostUvaBuffer is closing or closed")
 
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 

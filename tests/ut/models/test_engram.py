@@ -137,6 +137,10 @@ def test_host_uva_aligns_registration_and_frees_original_allocation(monkeypatch,
     if failure in ("malloc", "null"):
         assert lib.registered is lib.unregistered is lib.freed is None
         assert lib.free_count == lib.unregister_count == 0
+    elif failure == "register":
+        # A rejected registration does not create an unregister obligation.
+        assert lib.unregistered is None and lib.unregister_count == 0
+        assert lib.freed == lib.original and lib.free_count == 1
     else:
         assert lib.unregistered == lib.registered
         assert lib.freed == lib.original
