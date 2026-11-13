@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -102,6 +102,20 @@ from .indexer import DeepseekV41Indexer
 def _engram_enabled_for_runtime(config, vllm_config) -> bool:
     """Use the current vLLM Engram opt-in for both runtime paths."""
     return engram_enabled(config) and vllm_config.engram_config is not None
+
+
+def _engram_host_backend_for_runtime(vllm_config, *, has_engram: bool) -> Literal["uva", "ram"]:
+    """Validate RAM staging before model or host-table allocation begins."""
+    if not has_engram or not engram_cpu_offload(vllm_config):
+        return "uva"
+    ascend_config = get_ascend_config()
+    backend = ascend_config.engram_host_backend
+    if backend == "ram":
+        if not vllm_config.model_config.enforce_eager:
+            raise ValueError("engram_host_backend='ram' requires --enforce-eager; graph capture is not supported")
+        if ascend_config.multistream_engram_overlap:
+            raise ValueError("engram_host_backend='ram' requires multistream_engram_overlap=false")
+    return backend
 
 
 class DeepseekV41MLP(nn.Module):
@@ -952,6 +966,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.has_engram = _engram_enabled_for_runtime(config, vllm_config)
+        self.engram_host_backend = _engram_host_backend_for_runtime(vllm_config, has_engram=self.has_engram)
         self.device = current_platform.device_type
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
 
@@ -1081,6 +1096,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     storage_dtype=storage_dtype,
                     cpu_offload=cpu_offload,
                     dp_shared_memory=self.engram_dp_shared_memory,
+                    host_backend=self.engram_host_backend,
+                    max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
                 )
                 embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
                 self.layers[layer_id].engram.embed_tokens = embed

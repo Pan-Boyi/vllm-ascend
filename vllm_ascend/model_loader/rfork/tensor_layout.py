@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from vllm.logger import logger
 
-from vllm_ascend.model_loader.rfork.local_weights import get_local_tensor_ids
+from vllm_ascend.model_loader.rfork.local_weights import get_local_tensor_ids, get_unready_meta_tensor_ids
 from vllm_ascend.model_loader.rfork.manifest import (
     normalize_dtype_name,
     numel_from_shape,
@@ -447,12 +447,16 @@ def find_non_npu_state_tensors(model: Any) -> list[str]:
     if not isinstance(model, nn.Module):
         return []
     local_tensor_ids = get_local_tensor_ids(model)
+    unready_meta_tensor_ids = get_unready_meta_tensor_ids(model)
     return [
         name
         for iterator in (model.named_parameters(), model.named_buffers())
         for name, tensor in iterator
-        if not tensor.is_meta
-        and tensor.numel() > 0
-        and not is_tensor_on_transfer_device(tensor)
-        and id(tensor) not in local_tensor_ids
+        if id(tensor) in unready_meta_tensor_ids
+        or (
+            not tensor.is_meta
+            and tensor.numel() > 0
+            and not is_tensor_on_transfer_device(tensor)
+            and id(tensor) not in local_tensor_ids
+        )
     ]

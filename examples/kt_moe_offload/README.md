@@ -9,7 +9,10 @@ The implementation is based on upstream vLLM Ascend, with the expert-offload
 runtime adapted from `wenxuewuhd/vllm-ascend` at
 `59ce1e18a4f93c20a872e4450bd14e891c556cb7`. It uses the mainline V4.1 model,
 attention, cache and Engram implementations. Engram stays in host RAM through
-the existing `--engram-config '{"cpu_offload":true}'` option. This port adds
+the existing `--engram-config '{"cpu_offload":true}'` option. The default
+`engram_host_backend: "uva"` uses CANN-registered host tables. Explicit
+`engram_host_backend: "ram"` uses CPU RAM tables and bounded raw-row staging.
+This port adds
 neither DSpark execution nor an Engram SSD store. Speculative decoding is
 rejected while expert offload is enabled.
 
@@ -36,6 +39,40 @@ Build its `kt-kernel` package following that revision's instructions, and
 install the resulting wheel with `--no-deps` in the selected serving
 environment. Optional CPU weight-reuse changes from later DSpark work are not
 required by this adapter.
+
+## Engram RAM staging
+
+Select `engram_host_backend: "ram"` in `--additional-config` together with
+`--engram-config '{"cpu_offload":true}'`. The complete codes and scales stay
+in ordinary CPU RAM. Each lookup gathers only the queried encoded rows on
+the CPU, copies those rows through bounded temporary NPU buffers, and uses
+the mainline gather/dequantization kernel. The complete table is neither
+copied to HBM nor registered with CANN. Checkpoint loading still uses the
+original table format and weight loader.
+
+RAM staging currently requires TP=DP=PCP=1, unshared host tables,
+`--enforce-eager` and explicit
+`multistream_engram_overlap: false`. Startup rejects graph execution or
+Engram side-stream overlap with this backend, including the A5 default of
+enabling overlap. The temporary buffers are sized from
+`--max-num-batched-tokens`; use 128 or 256 for the initial single-card run
+and increase only after checking host and HBM peaks. Longer prompts use
+chunked prefill within this token capacity.
+
+For example, merge these entries into the expert-offload additional config:
+
+```json
+{
+  "engram_host_backend": "ram",
+  "multistream_engram_overlap": false
+}
+```
+
+Pass `--enforce-eager` and
+`--compilation-config '{"cudagraph_mode":"NONE"}'` instead of the decode-graph
+configuration in the example launcher below. The RAM backend is optional;
+`"uva"` remains the default. This path introduces no DSpark execution or SSD
+storage and does not establish multi-card performance support.
 
 ## Start the service
 

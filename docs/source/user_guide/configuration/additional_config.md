@@ -73,6 +73,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
+| `engram_host_backend`              | str | `"uva"` | DeepSeek V4.1 Engram host storage, used only with `--engram-config '{"cpu_offload":true}'`. `"uva"` uses CANN-registered host memory. `"ram"` keeps the full table in CPU RAM and transfers only queried raw rows to temporary NPU buffers for mainline gather/dequantization. RAM requires TP=DP=PCP=1, unshared host storage, `--enforce-eager` and explicit `multistream_engram_overlap=false`; graph capture and Engram side-stream execution are unsupported. |
 | `rl_config`                        | dict | `{}`    | One-click RL mode configuration. See <a href="#rl_config">rl_config</a> for all fields, the two deployment modes, usage examples, and the migration guide. |
 | `combine_quant_mode`                | int  | `0`     | Fused MC2 configuration. This configuration will be passed as the `comm_quant_mode` argument for the `torch_npu.npu_moe_distribute_combine_v2` operator. Please refer to the operator documentation for the valid value range. |
 
