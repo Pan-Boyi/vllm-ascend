@@ -581,9 +581,9 @@ class AscendConfig:
             get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
         )
     )
-    # Only used with EngramConfig.cpu_offload. RAM stages queried raw rows
-    # through bounded device buffers instead of registering the whole table.
-    engram_host_backend: Literal["uva", "ram"] = "uva"
+    # Only used with EngramConfig.cpu_offload. RAM and checkpoint mmap stage
+    # queried raw rows through bounded device buffers, without whole-table UVA.
+    engram_host_backend: Literal["uva", "ram", "mmap"] = "uva"
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False

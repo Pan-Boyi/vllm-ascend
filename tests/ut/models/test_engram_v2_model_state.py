@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -294,6 +294,125 @@ def make_state(model, monkeypatch):
     state.lookback_token_ids = torch.full((4, 2), -1, dtype=torch.int32)
     state._cg_mode = CUDAGraphMode.FULL
     return state
+
+
+@pytest.mark.parametrize("updatable", [False, True])
+@pytest.mark.parametrize("backend", ["ram", "mmap"])
+def test_ram_full_replay_refreshes_fixed_buffers_outside_capture(runtime, monkeypatch, updatable, backend):
+    from vllm_ascend.worker.v2 import aclgraph_utils as graph_mod
+
+    calls, context, _, context_available = runtime
+    model = make_model()
+    model.engram_host_backend = backend
+    model._engram_overlap_enabled = False
+    model.prepare_engram = Mock()
+    state = make_state(model, monkeypatch)
+    assert state._engram_graph_inputs is None
+    captured = state.prepare_engram_dummy_inputs(1, 4)
+    fixed = captured["engram_lookups"]
+    mask = captured["engram_mask"]
+    pointers = [value.data_ptr() for value in (*fixed.values(), mask)]
+    assert not any(key.startswith("engram_query") for key in captured)
+    assert "engram_pending" not in captured
+    model.prepare_engram.assert_not_called()
+
+    def produce(input_ids, positions, lookback, query, slots, blocks, **kwargs):
+        assert context_available[0] and context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        assert kwargs["output_buffers"] is fixed
+        assert kwargs["mask_output_buffer"] is mask
+        assert kwargs["ready_events"] is None
+        count = len(input_ids)
+        for value in fixed.values():
+            value[:count].copy_(input_ids[:, None].expand(count, value.shape[1]))
+            value[count:4].zero_()
+        mask[:count].fill_(True)
+        mask[count:4].zero_()
+        calls.append(("prepare", input_ids.tolist()))
+
+    model.prepare_engram.side_effect = produce
+    manager = graph_mod.ModelAclGraphManager.__new__(graph_mod.ModelAclGraphManager)
+    manager.update_stream = Mock()
+    manager.vllm_config = SimpleNamespace()
+    metadata = Mock()
+    manager.model_runner = SimpleNamespace(dp_size=1, attn_groups=[], model_state=state)
+    state.attn_metadata = {}
+    state.device_metadata = metadata
+    monkeypatch.setattr(graph_mod, "set_current_vllm_config", lambda *args: nullcontext())
+    monkeypatch.setattr(graph_mod, "_get_graph_update_backend", lambda *args: object())
+    monkeypatch.setattr(graph_mod, "use_updatable_graph", lambda *args: updatable)
+
+    @contextmanager
+    def forward_context(*args, **kwargs):
+        assert kwargs["cudagraph_runtime_mode"] == CUDAGraphMode.FULL
+        context_available[0] = True
+        context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+        try:
+            yield
+        finally:
+            context_available[0] = False
+
+    monkeypatch.setattr(graph_mod, "set_forward_context", forward_context)
+    seen = []
+
+    def replay(*args):
+        assert state._engram_inputs is None
+        assert [value.data_ptr() for value in (*fixed.values(), mask)] == pointers
+        seen.append((fixed[1][:4, 0].tolist(), mask[:4].tolist()))
+        calls.append(("replay",))
+
+    manager._graph_relay = manager._updatable_graph_replay = replay
+    req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.zeros(4, 8)), num_computed_tokens=SimpleNamespace(gpu=torch.zeros(4))
+    )
+    for ids in ([3, 4, 5], [8]):
+        batch = SimpleNamespace(
+            input_ids=torch.tensor(ids),
+            positions=torch.arange(len(ids)),
+            idx_mapping=torch.tensor([0]),
+            num_tokens=len(ids),
+            num_reqs=1,
+            num_tokens_after_padding=4,
+            is_dummy=False,
+            query_start_loc=torch.tensor([0, len(ids)]),
+        )
+        inputs = state.prepare_engram_inputs(batch, req_states)
+        assert inputs["engram_lookups"] is fixed
+        assert "engram_query_start_loc" not in inputs
+        before = model.prepare_engram.call_count
+        manager.run_fullgraph(SimpleNamespace(num_tokens=4, cg_mode=CUDAGraphMode.FULL))
+        assert model.prepare_engram.call_count == before + 1
+        assert state.prepare_engram() == {}  # A pre-hook cannot stage the same step twice.
+    assert seen == [([3, 4, 5, 0], [True, True, True, False]), ([8, 0, 0, 0], [True, False, False, False])]
+    assert [call[0] for call in calls if call[0] in ("prepare", "replay")] == ["prepare", "replay"] * 2
+    assert model._engram_prepare_stream is None and model._engram_capture_stream is None
+    assert metadata.finish_replay.call_count == 2
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY, None, "FULL"])
+@pytest.mark.parametrize("backend", ["ram", "mmap"])
+def test_ram_runtime_refuses_nonconcrete_or_unsupported_mode_before_lookup(runtime, mode, backend):
+    model = make_model()
+    model.engram_host_backend = backend
+    model._engram_overlap_enabled = False
+    model.prepare_engram = Mock(side_effect=AssertionError("unsafe lookup"))
+    with pytest.raises(RuntimeError, match="NONE or FULL execution"):
+        model.prepare_engram_inputs(torch.arange(2), torch.arange(2), 4, cg_mode=mode)
+    assert model._engram_input_buffers is None
+    model.prepare_engram.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["ram", "mmap"])
+def test_ram_cannot_capture_a_producer_even_if_overlap_is_accidentally_enabled(runtime, backend):
+    model = make_model()
+    model.engram_host_backend = backend
+    # Deliberately retain overlap=True: the storage backend itself forbids capture.
+    assert not model.can_capture_engram_producer()
+    with (
+        pytest.raises(RuntimeError, match="graph-external preparation"),
+        model.captured_engram_inputs(torch.arange(2), torch.arange(2), None, None, None),
+    ):
+        pytest.fail("captured RAM producer was entered")
+    assert model._engram_input_buffers is None
 
 
 def test_state_gathers_lookback_and_overlaps_engram(runtime, monkeypatch):

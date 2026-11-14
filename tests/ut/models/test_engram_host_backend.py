@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from vllm.config import CUDAGraphMode
 
 from vllm_ascend.ascend_config import AscendConfig
 from vllm_ascend.device.hardware import AscendDeviceType
@@ -16,10 +17,11 @@ def make_ascend_config(**kwargs):
     return AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **kwargs)
 
 
-def make_vllm_config(*, cpu_offload=True, eager=True):
+def make_vllm_config(*, cpu_offload=True, eager=True, graph_mode=CUDAGraphMode.NONE):
     return SimpleNamespace(
         engram_config=SimpleNamespace(cpu_offload=cpu_offload),
         model_config=SimpleNamespace(enforce_eager=eager),
+        compilation_config=SimpleNamespace(cudagraph_mode=graph_mode),
     )
 
 
@@ -27,7 +29,7 @@ def test_host_backend_defaults_to_uva():
     assert make_ascend_config().engram_host_backend == "uva"
 
 
-@pytest.mark.parametrize("backend", ["uva", "ram"])
+@pytest.mark.parametrize("backend", ["uva", "ram", "mmap"])
 def test_host_backend_accepts_explicit_storage_choice(backend):
     assert make_ascend_config(engram_host_backend=backend).engram_host_backend == backend
 
@@ -38,10 +40,14 @@ def test_host_backend_rejects_unknown_storage_choice(backend):
         make_ascend_config(engram_host_backend=backend)
 
 
-def test_ram_backend_requires_eager_without_overlap(monkeypatch):
-    config = make_ascend_config(engram_host_backend="ram", multistream_engram_overlap=False)
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY])
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("backend", ["ram", "mmap"])
+def test_ram_backend_accepts_eager_or_graph_external_full(monkeypatch, mode, eager, backend):
+    config = make_ascend_config(engram_host_backend=backend, multistream_engram_overlap=False)
     monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
-    assert model_mod._engram_host_backend_for_runtime(make_vllm_config(), has_engram=True) == "ram"
+    vllm = make_vllm_config(eager=eager, graph_mode=mode)
+    assert model_mod._engram_host_backend_for_runtime(vllm, has_engram=True) == backend
 
 
 def test_ram_backend_rejects_a5_default_overlap_until_explicitly_disabled(monkeypatch):
@@ -55,19 +61,30 @@ def test_ram_backend_rejects_a5_default_overlap_until_explicitly_disabled(monkey
         model_mod._engram_host_backend_for_runtime(make_vllm_config(), has_engram=True)
 
 
-@pytest.mark.parametrize(
-    "eager,overlap,message",
-    [
-        (False, False, "requires --enforce-eager"),
-        (True, True, "requires multistream_engram_overlap=false"),
-        (False, True, "requires --enforce-eager"),
-    ],
-)
-def test_ram_backend_rejects_unsupported_execution_before_allocation(monkeypatch, eager, overlap, message):
-    config = make_ascend_config(engram_host_backend="ram", multistream_engram_overlap=overlap)
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY])
+def test_ram_backend_rejects_overlap_before_allocation(monkeypatch, mode):
+    config = make_ascend_config(engram_host_backend="ram", multistream_engram_overlap=True)
     monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
-    with pytest.raises(ValueError, match=message):
-        model_mod._engram_host_backend_for_runtime(make_vllm_config(eager=eager), has_engram=True)
+    with pytest.raises(ValueError, match="requires multistream_engram_overlap=false"):
+        model_mod._engram_host_backend_for_runtime(make_vllm_config(eager=False, graph_mode=mode), has_engram=True)
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE, None, "FULL", object()])
+@pytest.mark.parametrize("backend", ["ram", "mmap"])
+def test_ram_backend_rejects_piecewise_and_unknown_graph_modes(monkeypatch, mode, backend):
+    config = make_ascend_config(engram_host_backend=backend, multistream_engram_overlap=False)
+    monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
+    with pytest.raises(ValueError, match="supports only NONE, FULL or FULL_DECODE_ONLY"):
+        model_mod._engram_host_backend_for_runtime(make_vllm_config(eager=False, graph_mode=mode), has_engram=True)
+
+
+def test_ram_backend_rejects_missing_compilation_config(monkeypatch):
+    config = make_ascend_config(engram_host_backend="ram", multistream_engram_overlap=False)
+    monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
+    vllm = make_vllm_config(eager=False)
+    del vllm.compilation_config
+    with pytest.raises(ValueError, match="supports only NONE, FULL or FULL_DECODE_ONLY"):
+        model_mod._engram_host_backend_for_runtime(vllm, has_engram=True)
 
 
 def test_uva_backend_preserves_graph_and_overlap_settings(monkeypatch):

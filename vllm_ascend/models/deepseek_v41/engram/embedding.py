@@ -12,6 +12,7 @@ storage and lookup; upstream rank selection and hash gathering are reused:
   requested raw rows staged to the device for mainline dequantization.
 """
 
+import hashlib
 import json
 from pathlib import Path
 from typing import cast
@@ -32,6 +33,7 @@ from vllm.model_executor.utils import set_weight_attrs
 # Upstream #56741 normalized the V4.1 model package name.
 from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
 
+from .checkpoint_mmap import MmapEngramBuffer
 from .host_staging import RamEngramBuffer, RamEngramStaging
 from .npu import (
     HostUvaBuffer,
@@ -65,9 +67,9 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         host_backend: str = "uva",
         max_tokens: int = 256,
     ) -> None:
-        if host_backend not in ("uva", "ram"):
+        if host_backend not in ("uva", "ram", "mmap"):
             raise ValueError(f"Unknown Engram host backend: {host_backend}")
-        if host_backend == "ram" and (not cpu_offload or dp_shared_memory or max_tokens <= 0):
+        if host_backend in ("ram", "mmap") and (not cpu_offload or dp_shared_memory or max_tokens <= 0):
             raise ValueError(
                 "RAM Engram requires host offload, a positive token capacity and unshared single-card storage"
             )
@@ -76,6 +78,8 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         self.storage_dtype = storage_dtype
         if storage_dtype not in (torch.bfloat16, torch.int8, torch.float8_e4m3fn):
             raise ValueError(f"Unsupported Engram storage dtype: {storage_dtype}")
+        if host_backend == "mmap" and storage_dtype == torch.int8:
+            raise ValueError("Engram mmap requires native BF16 or MXFP8 checkpoints; INT8 conversion is unsupported")
         self.scale_dtype = torch.uint8 if storage_dtype == torch.float8_e4m3fn else torch.float32
         self.cpu_offload = cpu_offload
         self.layer_hash_index = layer_hash_index
@@ -109,7 +113,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         self.block_size = block_size
         self.n_hash_cols = len(head_sizes)
         self.tp_size = get_tensor_model_parallel_world_size()
-        if host_backend == "ram" and (self.tp_size != 1 or self.dp_size != 1):
+        if host_backend in ("ram", "mmap") and (self.tp_size != 1 or self.dp_size != 1):
             raise ValueError("RAM Engram staging currently requires TP=DP=1")
         num_shards, head_rank = self._get_shard_info()
         if self.n_hash_cols % num_shards:
@@ -166,15 +170,18 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 torch.zeros(codes_shape, dtype=self.storage_dtype, device=device),
                 torch.zeros(scales_shape, dtype=self.scale_dtype, device=device) if quantized else None,
             )
-        if self.host_backend == "ram":
+        if self.host_backend in ("ram", "mmap"):
             try:
                 # These are ordinary, unpinned CPU allocations. The full table
                 # is neither registered with CANN nor allocated on the NPU.
-                self._codes_uva = RamEngramBuffer(codes_shape, self.storage_dtype)
+                buffer_cls = MmapEngramBuffer if self.host_backend == "mmap" else RamEngramBuffer
+                self._codes_uva = buffer_cls(codes_shape, self.storage_dtype)
                 if quantized:
-                    self._scales_uva = RamEngramBuffer(scales_shape, self.scale_dtype)
-                    self._scales_uva.zero_()
-                self._codes_uva.zero_()
+                    self._scales_uva = buffer_cls(scales_shape, self.scale_dtype)
+                if self.host_backend == "ram":
+                    if quantized:
+                        self._scales_uva.zero_()
+                    self._codes_uva.zero_()
                 self._ram_staging = RamEngramStaging(
                     self.max_tokens,
                     self.part_n_hash_cols,
@@ -325,6 +332,9 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 target.copy_(source)
 
     def _load_into_storage(self, model_path, key, chunk_rows) -> None:
+        if getattr(self, "host_backend", "uva") == "mmap":
+            self._bind_mmap_storage(model_path, key)
+            return
         root = Path(model_path)
         scale_key = key.removesuffix(".weight") + ".scale"
         index = self._checkpoint_index(root, key)
@@ -394,6 +404,51 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             raise RuntimeError("Engram checkpoint did not populate every RAM table row")
         logger.info("Engram rows [%d, %d) loaded from %s", start, end, index[key])
 
+    def _bind_mmap_storage(self, model_path, key):
+        """Bind the indexed native checkpoint pair without writing or copying it."""
+        root = Path(model_path).resolve(strict=True)
+        buffers = [buffer for buffer in (self._codes_uva, self._scales_uva) if buffer is not None]
+        for buffer in buffers:
+            buffer.begin_load()
+        try:
+            for name in self._INDEX_FILES:
+                index_path = root / name
+                if not index_path.is_file():
+                    continue
+                raw_index = index_path.read_bytes()
+                index = json.loads(raw_index)["weight_map"]
+                if key in index:
+                    break
+            else:
+                raise ValueError(f"Engram mmap needs an indexed checkpoint containing {key!r}")
+            index_reference = (index_path, hashlib.sha256(raw_index).hexdigest())
+            scale_key = key.removesuffix(".weight") + ".scale"
+            for buffer, tensor_key in ((self._codes_uva, key), (self._scales_uva, scale_key)):
+                if buffer is None:
+                    continue
+                if not isinstance(buffer, MmapEngramBuffer):
+                    raise RuntimeError("Engram mmap checkpoint has no matching mapped storage")
+                relative = Path(index[tensor_key])
+                shard = (root / relative).resolve(strict=True)
+                if relative.is_absolute() or not shard.is_relative_to(root):
+                    raise ValueError("Engram mmap index shard must stay within the original checkpoint")
+                buffer.bind_checkpoint(
+                    shard,
+                    tensor_key,
+                    source_shape=(self.num_embeddings, buffer.shape[1]),
+                    row_start=self.vocab_start_idx,
+                    index_reference=index_reference,
+                )
+            if not all(buffer.loaded for buffer in buffers):
+                raise RuntimeError("Engram mmap checkpoint pair is not fully bound")
+        except Exception:
+            for buffer in buffers:
+                buffer.begin_load()
+            raise
+        logger.info(
+            "Engram mmap native rows [%d, %d) bound without a table copy", self.vocab_start_idx, self.vocab_end_idx
+        )
+
     def embed_gathered(self, gathered: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """Embed ids already gathered across the EDP group.
 
@@ -456,7 +511,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             vocab_end=self.vocab_end_idx,
             output=out.view(-1, self.dim),
         )
-        if getattr(self, "host_backend", "uva") == "ram":
+        if getattr(self, "host_backend", "uva") in ("ram", "mmap"):
             staging = getattr(self, "_ram_staging", None)
             if staging is None or self._codes_uva is None:
                 raise RuntimeError("RAM Engram storage is closed or missing")

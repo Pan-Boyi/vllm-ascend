@@ -50,11 +50,36 @@ the mainline gather/dequantization kernel. The complete table is neither
 copied to HBM nor registered with CANN. Checkpoint loading still uses the
 original table format and weight loader.
 
-RAM staging currently requires TP=DP=PCP=1, unshared host tables,
-`--enforce-eager` and explicit
-`multistream_engram_overlap: false`. Startup rejects graph execution or
-Engram side-stream overlap with this backend, including the A5 default of
-enabling overlap. The temporary buffers are sized from
+For a native BF16 or MXFP8/E8M0 indexed safetensors checkpoint, select
+`engram_host_backend: "mmap"` to use its existing CPU file mapping instead
+of allocating and copying the complete tables into anonymous RAM. Only
+queried rows are gathered into the same bounded staging buffers. The loader
+opens the original files read-only, verifies the header, dtype, shape, byte
+range and actual private file mapping, and retains the mapping with its
+chunk views. E8M0 scale bytes are reinterpreted rather than converted.
+Legacy INT8 conversion is unsupported with this backend.
+
+The `mmap` backend requires Linux and unchanged checkpoint/index files for
+the entire model lifetime. Keep the checkpoint mount read-only. PyTorch's
+private file mapping can have writable COW permissions; the Engram loader
+forbids writes and checks file identity before and after gathering rows.
+Replacement, truncation or modification invalidates readiness. This avoids
+a second full-table anonymous allocation, but mapped pages still consume
+file cache and may fault from storage. Recalculate global, per-NUMA and
+cgroup loading/runtime budgets for this mode; neither zero memory usage
+nor the ordinary RAM backend's loading budget follows from the mapping.
+Concurrent mutation of the source checkpoint is unsupported.
+
+RAM staging requires TP=DP=PCP=1, unshared host tables and explicit
+`multistream_engram_overlap: false`, including on A5 where overlap otherwise
+defaults to enabled. Eager execution and FULL graphs are supported. With
+Model Runner V2, capture binds fixed-address output buffers without running
+RAM lookup; each FULL replay refreshes those buffers from the current
+request's token history before the graph runs. Hashing, CPU row gathering
+and row transfers stay outside capture. PIECEWISE and FULL_AND_PIECEWISE
+execution, captured Engram producers and Engram side-stream overlap are
+rejected. These execution restrictions also apply to `"mmap"`.
+The temporary buffers are sized from
 `--max-num-batched-tokens`; use 128 or 256 for the initial single-card run
 and increase only after checking host and HBM peaks. Longer prompts use
 chunked prefill within this token capacity.
@@ -68,9 +93,14 @@ For example, merge these entries into the expert-offload additional config:
 }
 ```
 
-Pass `--enforce-eager` and
-`--compilation-config '{"cudagraph_mode":"NONE"}'` instead of the decode-graph
-configuration in the example launcher below. The RAM backend is optional;
+For eager execution, pass `--enforce-eager` and
+`--compilation-config '{"cudagraph_mode":"NONE"}'`. For FULL decode graphs,
+omit `--enforce-eager` and use
+`--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'`
+with Model Runner V2. Prefill then remains eager. `"FULL"` is also accepted;
+its runtime mode must still be NONE or FULL. Compare generated token IDs
+against eager under the same workload before measuring TPOT; CPU tests
+alone do not establish NPU graph correctness or performance. The RAM backend is optional;
 `"uva"` remains the default. This path introduces no DSpark execution or SSD
 storage and does not establish multi-card performance support.
 

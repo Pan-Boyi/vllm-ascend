@@ -104,17 +104,22 @@ def _engram_enabled_for_runtime(config, vllm_config) -> bool:
     return engram_enabled(config) and vllm_config.engram_config is not None
 
 
-def _engram_host_backend_for_runtime(vllm_config, *, has_engram: bool) -> Literal["uva", "ram"]:
+def _engram_host_backend_for_runtime(vllm_config, *, has_engram: bool) -> Literal["uva", "ram", "mmap"]:
     """Validate RAM staging before model or host-table allocation begins."""
     if not has_engram or not engram_cpu_offload(vllm_config):
         return "uva"
     ascend_config = get_ascend_config()
     backend = ascend_config.engram_host_backend
-    if backend == "ram":
-        if not vllm_config.model_config.enforce_eager:
-            raise ValueError("engram_host_backend='ram' requires --enforce-eager; graph capture is not supported")
+    if backend in ("ram", "mmap"):
         if ascend_config.multistream_engram_overlap:
-            raise ValueError("engram_host_backend='ram' requires multistream_engram_overlap=false")
+            raise ValueError(f"engram_host_backend={backend!r} requires multistream_engram_overlap=false")
+        if not vllm_config.model_config.enforce_eager:
+            mode = getattr(getattr(vllm_config, "compilation_config", None), "cudagraph_mode", None)
+            if mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY):
+                raise ValueError(
+                    f"engram_host_backend={backend!r} supports only NONE, FULL or FULL_DECODE_ONLY; "
+                    "RAM lookups must run outside graph capture and before each FULL replay"
+                )
     return backend
 
 
@@ -1313,6 +1318,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         """MRV2 slotless, local/shared tables need no graph-side collectives."""
         return (
             self.has_engram
+            and getattr(self, "engram_host_backend", "uva") not in ("ram", "mmap")
             and self._engram_overlap_enabled
             and self.engram_hash is not None
             and not self.engram_hash.use_slot_cache
@@ -1334,6 +1340,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         main graph. Eager and unsupported parallel layouts keep their existing
         preparation path. Both streams are joined before any buffer reuse.
         """
+        if getattr(self, "engram_host_backend", "uva") in ("ram", "mmap"):
+            raise RuntimeError(
+                "RAM Engram lookup requires graph-external preparation; captured producers are unsupported"
+            )
         buffers, mask_buffer = self._get_engram_input_buffers()
         num_tokens = positions.shape[0]
         if not num_tokens <= self._engram_max_tokens:
@@ -1473,6 +1483,12 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         ops. ``slot_mapping``/``block_table`` stay ``None`` under the V2
         runner, whose hashing is slotless.
         """
+        if getattr(self, "engram_host_backend", "uva") in ("ram", "mmap"):
+            mode = cg_mode
+            if mode is None and is_forward_context_available():
+                mode = get_forward_context().cudagraph_runtime_mode
+            if mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL) or self._engram_overlap_enabled:
+                raise RuntimeError("RAM Engram preparation requires NONE or FULL execution without side-stream overlap")
         graph_inputs = self.prepare_engram_graph_inputs(padded_tokens, prime=False)
         if not graph_inputs["engram_lookups"]:
             return graph_inputs
