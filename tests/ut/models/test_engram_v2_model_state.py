@@ -297,7 +297,7 @@ def make_state(model, monkeypatch):
 
 
 @pytest.mark.parametrize("updatable", [False, True])
-@pytest.mark.parametrize("backend", ["ram", "mmap"])
+@pytest.mark.parametrize("backend", ["ram", "mmap", "ssd"])
 def test_ram_full_replay_refreshes_fixed_buffers_outside_capture(runtime, monkeypatch, updatable, backend):
     from vllm_ascend.worker.v2 import aclgraph_utils as graph_mod
 
@@ -389,7 +389,7 @@ def test_ram_full_replay_refreshes_fixed_buffers_outside_capture(runtime, monkey
 
 
 @pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY, None, "FULL"])
-@pytest.mark.parametrize("backend", ["ram", "mmap"])
+@pytest.mark.parametrize("backend", ["ram", "mmap", "ssd"])
 def test_ram_runtime_refuses_nonconcrete_or_unsupported_mode_before_lookup(runtime, mode, backend):
     model = make_model()
     model.engram_host_backend = backend
@@ -401,7 +401,7 @@ def test_ram_runtime_refuses_nonconcrete_or_unsupported_mode_before_lookup(runti
     model.prepare_engram.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["ram", "mmap"])
+@pytest.mark.parametrize("backend", ["ram", "mmap", "ssd"])
 def test_ram_cannot_capture_a_producer_even_if_overlap_is_accidentally_enabled(runtime, backend):
     model = make_model()
     model.engram_host_backend = backend

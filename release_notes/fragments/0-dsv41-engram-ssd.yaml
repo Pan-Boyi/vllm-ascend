@@ -1,0 +1,6 @@
+# Assign the PR number when this feature branch is submitted upstream.
+pr: 0
+entries:
+  - category: feature
+    text: Added opt-in SSD-backed native Engram tables for single-card DeepSeek V4.1 Flash, with verified read-only preparation and bounded row staging for eager and full decode graphs.
+    model: deepseek-v4.1

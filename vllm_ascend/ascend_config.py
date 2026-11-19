@@ -583,7 +583,9 @@ class AscendConfig:
     )
     # Only used with EngramConfig.cpu_offload. RAM and checkpoint mmap stage
     # queried raw rows through bounded device buffers, without whole-table UVA.
-    engram_host_backend: Literal["uva", "ram", "mmap"] = "uva"
+    engram_host_backend: Literal["uva", "ram", "mmap", "ssd"] = "uva"
+    # Explicit, verified disk-backed table directory; used only by SSD mode.
+    engram_ssd_path: str | None = None
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False

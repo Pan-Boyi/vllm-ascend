@@ -49,6 +49,7 @@ from .parallel import (
     get_engram_dp_group,
     get_engram_dp_size,
 )
+from .ssd import SsdEngramBuffer, ssd_directory
 
 
 class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
@@ -66,14 +67,18 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         storage_dtype: torch.dtype = torch.int8,
         host_backend: str = "uva",
         max_tokens: int = 256,
+        ssd_path: str | None = None,
     ) -> None:
-        if host_backend not in ("uva", "ram", "mmap"):
+        if host_backend not in ("uva", "ram", "mmap", "ssd"):
             raise ValueError(f"Unknown Engram host backend: {host_backend}")
-        if host_backend in ("ram", "mmap") and (not cpu_offload or dp_shared_memory or max_tokens <= 0):
+        if host_backend in ("ram", "mmap", "ssd") and (not cpu_offload or dp_shared_memory or max_tokens <= 0):
             raise ValueError(
                 "RAM Engram requires host offload, a positive token capacity and unshared single-card storage"
             )
         self.host_backend = host_backend
+        self.ssd_path = str(ssd_directory(ssd_path)) if host_backend == "ssd" else None
+        if host_backend == "ssd" and storage_dtype != torch.float8_e4m3fn:
+            raise ValueError("Engram SSD requires native MXFP8/E8M0 checkpoints; conversion is unsupported")
         self.max_tokens = max_tokens
         self.storage_dtype = storage_dtype
         if storage_dtype not in (torch.bfloat16, torch.int8, torch.float8_e4m3fn):
@@ -113,7 +118,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         self.block_size = block_size
         self.n_hash_cols = len(head_sizes)
         self.tp_size = get_tensor_model_parallel_world_size()
-        if host_backend in ("ram", "mmap") and (self.tp_size != 1 or self.dp_size != 1):
+        if host_backend in ("ram", "mmap", "ssd") and (self.tp_size != 1 or self.dp_size != 1):
             raise ValueError("RAM Engram staging currently requires TP=DP=1")
         num_shards, head_rank = self._get_shard_info()
         if self.n_hash_cols % num_shards:
@@ -170,11 +175,13 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 torch.zeros(codes_shape, dtype=self.storage_dtype, device=device),
                 torch.zeros(scales_shape, dtype=self.scale_dtype, device=device) if quantized else None,
             )
-        if self.host_backend in ("ram", "mmap"):
+        if self.host_backend in ("ram", "mmap", "ssd"):
             try:
                 # These are ordinary, unpinned CPU allocations. The full table
                 # is neither registered with CANN nor allocated on the NPU.
-                buffer_cls = MmapEngramBuffer if self.host_backend == "mmap" else RamEngramBuffer
+                buffer_cls = {"ram": RamEngramBuffer, "mmap": MmapEngramBuffer, "ssd": SsdEngramBuffer}[
+                    self.host_backend
+                ]
                 self._codes_uva = buffer_cls(codes_shape, self.storage_dtype)
                 if quantized:
                     self._scales_uva = buffer_cls(scales_shape, self.scale_dtype)
@@ -332,6 +339,9 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 target.copy_(source)
 
     def _load_into_storage(self, model_path, key, chunk_rows) -> None:
+        if getattr(self, "host_backend", "uva") == "ssd":
+            self._bind_ssd_storage(model_path, key)
+            return
         if getattr(self, "host_backend", "uva") == "mmap":
             self._bind_mmap_storage(model_path, key)
             return
@@ -403,6 +413,24 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         if any(not buffer.loaded for buffer in host_buffers):
             raise RuntimeError("Engram checkpoint did not populate every RAM table row")
         logger.info("Engram rows [%d, %d) loaded from %s", start, end, index[key])
+
+    def _bind_ssd_storage(self, model_path, key):
+        buffers = [buffer for buffer in (self._codes_uva, self._scales_uva) if buffer is not None]
+        for buffer in buffers:
+            buffer.begin_load()
+        try:
+            scale_key = key.removesuffix(".weight") + ".scale"
+            for buffer, name in ((self._codes_uva, key), (self._scales_uva, scale_key)):
+                if not isinstance(buffer, SsdEngramBuffer):
+                    raise RuntimeError("Engram SSD requires a matched native codes/scales pair")
+                buffer.bind_table(self.ssd_path, model_path, name)
+            if not all(buffer.loaded for buffer in buffers):
+                raise RuntimeError("Engram SSD checkpoint pair is not fully bound")
+        except Exception:
+            for buffer in buffers:
+                buffer.begin_load()
+            raise
+        logger.info("Engram SSD native rows bound read-only from %s without a table copy", self.ssd_path)
 
     def _bind_mmap_storage(self, model_path, key):
         """Bind the indexed native checkpoint pair without writing or copying it."""
@@ -511,7 +539,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             vocab_end=self.vocab_end_idx,
             output=out.view(-1, self.dim),
         )
-        if getattr(self, "host_backend", "uva") in ("ram", "mmap"):
+        if getattr(self, "host_backend", "uva") in ("ram", "mmap", "ssd"):
             staging = getattr(self, "_ram_staging", None)
             if staging is None or self._codes_uva is None:
                 raise RuntimeError("RAM Engram storage is closed or missing")

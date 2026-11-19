@@ -5,12 +5,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.ascend_config import AscendConfig
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.deepseek_v41 import model as model_mod
+from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
 
 
 def make_ascend_config(**kwargs):
@@ -29,15 +31,70 @@ def test_host_backend_defaults_to_uva():
     assert make_ascend_config().engram_host_backend == "uva"
 
 
-@pytest.mark.parametrize("backend", ["uva", "ram", "mmap"])
+def test_adding_ssd_path_preserves_the_existing_positional_token_capacity(monkeypatch):
+    monkeypatch.setattr(embedding_mod, "get_tp_group", lambda: SimpleNamespace(cpu_group=None))
+    monkeypatch.setattr(embedding_mod, "in_the_same_node_as", lambda group: [True])
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_group", lambda: None)
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_size", lambda: 1)
+    monkeypatch.setattr(embedding_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(embedding_mod, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_mod.AscendParallelEngramEmbedding,
+        "_allocate_weights",
+        lambda self: (
+            torch.empty((17, 32), dtype=torch.float8_e4m3fn, device="meta"),
+            torch.empty((17, 1), dtype=torch.uint8, device="meta"),
+        ),
+    )
+    table = embedding_mod.AscendParallelEngramEmbedding(
+        17, 32, (17,), 0, 32, True, False, torch.float8_e4m3fn, "ram", 9
+    )
+    assert table.max_tokens == 9 and table.ssd_path is None
+
+
+@pytest.mark.parametrize("backend", ["uva", "ram", "mmap", "ssd"])
 def test_host_backend_accepts_explicit_storage_choice(backend):
     assert make_ascend_config(engram_host_backend=backend).engram_host_backend == backend
 
 
-@pytest.mark.parametrize("backend", ["ssd", "", None, True, 1])
+@pytest.mark.parametrize("backend", ["unknown", "", None, True, 1])
 def test_host_backend_rejects_unknown_storage_choice(backend):
     with pytest.raises(ValueError, match="engram_host_backend"):
         make_ascend_config(engram_host_backend=backend)
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY])
+def test_ssd_uses_the_same_external_staging_graph_contract(monkeypatch, tmp_path, mode):
+    config = make_ascend_config(
+        engram_host_backend="ssd", engram_ssd_path=str(tmp_path), multistream_engram_overlap=False
+    )
+    monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
+    validate = Mock(return_value=tmp_path)
+    monkeypatch.setattr(model_mod, "ssd_directory", validate)
+    assert (
+        model_mod._engram_host_backend_for_runtime(make_vllm_config(eager=False, graph_mode=mode), has_engram=True)
+        == "ssd"
+    )
+    validate.assert_called_once_with(str(tmp_path))
+
+
+def test_ssd_path_validation_precedes_allocation(monkeypatch):
+    config = make_ascend_config(engram_host_backend="ssd", multistream_engram_overlap=False)
+    monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
+    with pytest.raises(ValueError, match="explicit absolute"):
+        model_mod._engram_host_backend_for_runtime(make_vllm_config(), has_engram=True)
+
+
+def test_ssd_rejects_rfork_before_it_can_materialize_a_meta_table(monkeypatch, tmp_path):
+    config = make_ascend_config(
+        engram_host_backend="ssd", engram_ssd_path=str(tmp_path), multistream_engram_overlap=False
+    )
+    monkeypatch.setattr(model_mod, "get_ascend_config", lambda: config)
+    monkeypatch.setattr(model_mod, "ssd_directory", Mock(return_value=tmp_path))
+    runtime = make_vllm_config()
+    runtime.load_config = SimpleNamespace(load_format="rfork")
+    with pytest.raises(ValueError, match="standard checkpoint loader"):
+        model_mod._engram_host_backend_for_runtime(runtime, has_engram=True)
 
 
 @pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY])

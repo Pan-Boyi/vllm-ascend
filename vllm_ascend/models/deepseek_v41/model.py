@@ -96,6 +96,7 @@ from .engram.embedding import (
 )
 from .engram.layer import AscendEngram
 from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
+from .engram.ssd import ssd_directory
 from .indexer import DeepseekV41Indexer
 
 
@@ -104,13 +105,17 @@ def _engram_enabled_for_runtime(config, vllm_config) -> bool:
     return engram_enabled(config) and vllm_config.engram_config is not None
 
 
-def _engram_host_backend_for_runtime(vllm_config, *, has_engram: bool) -> Literal["uva", "ram", "mmap"]:
+def _engram_host_backend_for_runtime(vllm_config, *, has_engram: bool) -> Literal["uva", "ram", "mmap", "ssd"]:
     """Validate RAM staging before model or host-table allocation begins."""
     if not has_engram or not engram_cpu_offload(vllm_config):
         return "uva"
     ascend_config = get_ascend_config()
     backend = ascend_config.engram_host_backend
-    if backend in ("ram", "mmap"):
+    if backend == "ssd":
+        ssd_directory(ascend_config.engram_ssd_path)
+        if getattr(getattr(vllm_config, "load_config", None), "load_format", None) == "rfork":
+            raise ValueError("Engram SSD currently requires the standard checkpoint loader, not RFork")
+    if backend in ("ram", "mmap", "ssd"):
         if ascend_config.multistream_engram_overlap:
             raise ValueError(f"engram_host_backend={backend!r} requires multistream_engram_overlap=false")
         if not vllm_config.model_config.enforce_eager:
@@ -1102,6 +1107,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     cpu_offload=cpu_offload,
                     dp_shared_memory=self.engram_dp_shared_memory,
                     host_backend=self.engram_host_backend,
+                    ssd_path=get_ascend_config().engram_ssd_path,
                     max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
                 )
                 embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
@@ -1318,7 +1324,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         """MRV2 slotless, local/shared tables need no graph-side collectives."""
         return (
             self.has_engram
-            and getattr(self, "engram_host_backend", "uva") not in ("ram", "mmap")
+            and getattr(self, "engram_host_backend", "uva") not in ("ram", "mmap", "ssd")
             and self._engram_overlap_enabled
             and self.engram_hash is not None
             and not self.engram_hash.use_slot_cache
@@ -1340,7 +1346,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         main graph. Eager and unsupported parallel layouts keep their existing
         preparation path. Both streams are joined before any buffer reuse.
         """
-        if getattr(self, "engram_host_backend", "uva") in ("ram", "mmap"):
+        if getattr(self, "engram_host_backend", "uva") in ("ram", "mmap", "ssd"):
             raise RuntimeError(
                 "RAM Engram lookup requires graph-external preparation; captured producers are unsupported"
             )
@@ -1483,7 +1489,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         ops. ``slot_mapping``/``block_table`` stay ``None`` under the V2
         runner, whose hashing is slotless.
         """
-        if getattr(self, "engram_host_backend", "uva") in ("ram", "mmap"):
+        if getattr(self, "engram_host_backend", "uva") in ("ram", "mmap", "ssd"):
             mode = cg_mode
             if mode is None and is_forward_context_available():
                 mode = get_forward_context().cudagraph_runtime_mode

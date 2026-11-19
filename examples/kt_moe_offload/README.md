@@ -12,8 +12,8 @@ attention, cache and Engram implementations. Engram stays in host RAM through
 the existing `--engram-config '{"cpu_offload":true}'` option. The default
 `engram_host_backend: "uva"` uses CANN-registered host tables. Explicit
 `engram_host_backend: "ram"` uses CPU RAM tables and bounded raw-row staging.
-This port adds
-neither DSpark execution nor an Engram SSD store. Speculative decoding is
+The optional [Engram SSD backend](engram_ssd.md) maps independently verified
+native table files read-only. This port adds no DSpark execution. Speculative decoding is
 rejected while expert offload is enabled.
 
 ## Environment
@@ -101,8 +101,9 @@ with Model Runner V2. Prefill then remains eager. `"FULL"` is also accepted;
 its runtime mode must still be NONE or FULL. Compare generated token IDs
 against eager under the same workload before measuring TPOT; CPU tests
 alone do not establish NPU graph correctness or performance. The RAM backend is optional;
-`"uva"` remains the default. This path introduces no DSpark execution or SSD
-storage and does not establish multi-card performance support.
+`"uva"` remains the default. The optional SSD backend uses the same execution contract; see
+[SSD preparation and measurement](engram_ssd.md). These paths introduce no
+DSpark execution and do not establish multi-card performance support.
 
 ## Start the service
 
